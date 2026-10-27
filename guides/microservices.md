@@ -180,4 +180,4 @@ a database, in memory. `quillo check` checks them as it checks the call itself.
 [examples/services](/docs/examples/services/) is a shop (`shop.qwe`) that bills through
 a billing service (`billing.qwe`), put together by `app.qwe`. The shop declares billing
 with a two-second timeout and one retry. Run it in one process with
-`quillo run examples/services/app.qwe`, or split with `--split`.
+`quillo run services/app.qwe` (in a clone of [quillolang/examples](https://github.com/quillolang/examples)), or split with `--split`.

@@ -181,8 +181,8 @@ send readings twice a second, the server keeps the last minute of each, and a pa
 from that (a `server fn` sets its first state) and follows the channel from there.
 
 ```sh
-quillo run examples/telemetry.qwe --watch     # then open http://127.0.0.1:8080
-quillo run examples/sensors.qwe               # in another terminal
+quillo run telemetry.qwe --watch     # in quillolang/examples; then open http://127.0.0.1:8080
+quillo run sensors.qwe               # in another terminal
 ```
 
 ### A camera in the page

@@ -2,24 +2,25 @@
 
 The website of [Quillo](https://github.com/quillolang/quillo), written in Quillo: the
 home page, the tour, the guides, and the docs, which are made from Quillo's own
-`USERGUIDE.md` and `examples/` so they never drift from them. `brand/` holds the logo
+`USERGUIDE.md` and from [quillolang/examples](https://github.com/quillolang/examples), so they never drift from them. `brand/` holds the logo
 and the banners for the site, GitHub and social accounts.
 
 ## Running it
 
-The site needs a checkout of [quillolang/quillo](https://github.com/quillolang/quillo)
-beside it, built once:
+The site needs checkouts of [quillolang/quillo](https://github.com/quillolang/quillo)
+(built once) and [quillolang/examples](https://github.com/quillolang/examples) beside it:
 
 ```sh
 git clone https://github.com/quillolang/quillo.git ../quillo
+git clone https://github.com/quillolang/examples.git ../quillo-examples
 (cd ../quillo && cargo build --release)
 
-./link.sh                                         # content/ → ../quillo's docs and examples
+./link.sh                                         # content/ → the user guide and the examples
 ../quillo/target/release/quillo run main.qwe --watch
 ```
 
-`QUILLO_DIR=/path/to/quillo` names a checkout somewhere else (for `link.sh` and
-`export.sh` alike).
+`QUILLO_DIR=/path/to/quillo` and `QUILLO_EXAMPLES=/path/to/examples` name checkouts
+somewhere else (for `link.sh` and `export.sh` alike).
 
 ## Publishing
 

@@ -168,7 +168,7 @@ cross between files.
 ### Editors
 
 **VS Code.** The Quillo extension
-([editors/vscode](https://github.com/quillolang/quillo/tree/main/editors/vscode)) brings
+([quillolang/editors](https://github.com/quillolang/editors)) brings
 diagnostics as you type, hover, Go to Definition across `use`d files, completion (your
 names, builtins with their signatures, the members of `db.`, `http.`, `channel.` and the
 other modules, effects after `with`), an outline, snippets, and a debugger (F5, with
@@ -177,8 +177,8 @@ finds `quillo` in the `quillo.path` setting, then in the workspace's `target/rel
 `target/debug`, then on your `PATH`.
 
 ```sh
-cargo install --path .            # in the Quillo repository: puts quillo on your PATH
-cd editors/vscode
+cargo install --git https://github.com/quillolang/quillo quillo   # puts quillo on your PATH
+git clone https://github.com/quillolang/editors.git && cd editors/vscode
 npm install && npm run package    # builds quillo-lang-<version>.vsix
 code --install-extension quillo-lang-*.vsix
 ```
@@ -210,7 +210,7 @@ it `use`s changes, and refreshes the pages you have open.
 
 ### A larger example
 
-The [CRM](https://github.com/quillolang/quillo/tree/main/apps/crm) in the repository is 47
+The [CRM](https://github.com/quillolang/apps/tree/main/crm) in quillolang/apps is 47
 files in this shape, with every `use` in its `main.qwe`:
 
 ```
