@@ -1,0 +1,159 @@
+# Installing
+
+Quillo is one binary, `quillo`, built from its source with Cargo. Building it needs two
+things on your machine: **Rust** and a **C compiler**. Everything else it uses, Cargo
+downloads by itself. This page lists what each system needs, how to check a machine in
+one command, and what is optional.
+
+### What you need
+
+| | Needed for | How to get it |
+|---|---|---|
+| **Rust 1.94 or later** | building Quillo | [rustup.rs](https://rustup.rs), then `rustup update stable` to stay current |
+| **A C compiler** | building: a few dependencies compile C (the bundled SQLite, `ring`, mimalloc) | macOS: Xcode's command line tools. Linux: gcc or clang. Windows: Visual Studio's C++ build tools |
+| **git** | getting the source | [git-scm.com](https://git-scm.com), or your package manager |
+| **About 5 GB of disk** | the build's `target/` folder | |
+
+### Check your machine
+
+The repository has a script that checks all of this, says what to install for anything
+missing, and with `--build` builds Quillo and runs the sample app to prove it works:
+
+```sh
+# macOS, Linux, WSL
+sh scripts/doctor.sh --build
+
+# Windows, in PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
+```
+
+It installs nothing: each line it marks *missing* comes with the command that fixes it.
+
+```
+To build and run Quillo
+  ok       Rust 1.99.0
+  ok       C compiler (Apple clang version 21.0.0)
+  ok       17 GB free on disk
+  ok       port 8080 is free (quillo run's default)
+
+Optional: the tests, and extras
+  ok       Node 24.11.0
+  --       Chrome or Chromium: the browser tests are skipped without it
+           install it, or set QUILLO_CHROME to its path
+```
+
+### macOS
+
+```sh
+# The C compiler, then Rust
+xcode-select --install
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+git clone https://github.com/quillolang/quillo.git && cd quillo
+sh scripts/doctor.sh --build
+```
+
+### Linux
+
+The C compiler and git, from your distribution, then Rust from rustup (a distribution's
+own Rust is often older than 1.94):
+
+```sh
+sudo apt-get install build-essential git curl    # Debian, Ubuntu
+sudo dnf install gcc make git                    # Fedora
+sudo pacman -S base-devel git                    # Arch
+
+# Then Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/quillolang/quillo.git && cd quillo
+sh scripts/doctor.sh --build
+```
+
+### Windows
+
+Rust's Windows toolchain links with Microsoft's C++ build tools. `rustup-init.exe` offers
+to install them; with winget, all three come in a PowerShell window:
+
+```sh
+winget install Microsoft.VisualStudio.2022.BuildTools `
+    --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install Rustlang.Rustup
+winget install Git.Git
+```
+
+Then, in a new PowerShell window (so it sees them):
+
+```sh
+git clone https://github.com/quillolang/quillo.git; cd quillo
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
+```
+
+Quillo is built and tested on Windows in CI; macOS and Linux are where it is used most.
+In [WSL](https://learn.microsoft.com/windows/wsl/install), follow the Linux steps.
+
+### Building
+
+```sh
+cargo build --release    # the binary is target/release/quillo
+cargo install --path .   # or: build it and put quillo on your PATH
+```
+
+Without a clone, Cargo can fetch, build and install it in one step:
+
+```sh
+cargo install --git https://github.com/quillolang/quillo quillo
+```
+
+Then run the sample app in the clone, `quillo run app/main.qwe --watch`, and open
+http://localhost:8080.
+
+### What Cargo downloads
+
+The first build fetches Quillo's Rust dependencies from crates.io and builds them; none of
+them is installed by hand, and none needs a library from the system:
+
+| | Crates |
+|---|---|
+| HTTP and waiting | `mio`, `httparse`, `tokio`, `ureq` (requests a program makes) |
+| Databases | `rusqlite` with SQLite built in, `tokio-postgres` and `postgres`, `mysql_async` |
+| TLS | `rustls` and `webpki-roots`: no OpenSSL |
+| Compiled numbers | `cranelift-*`, the code generator for [compiled numbers](/docs/compiled-numbers/) |
+| Real time | `wtransport`, for WebTransport |
+| The rest | `image`, `pulldown-cmark` (Markdown), `argon2` and `sha2` (passwords, hashes), `serde_json`, `flate2`, `libmimalloc-sys` (the allocator) |
+
+Three of them are features, on by default, that a smaller build can leave out:
+
+| Feature | Brings | Without it |
+|---|---|---|
+| `mysql` | MySQL and MariaDB for `db` | SQLite and PostgreSQL still work |
+| `jit` | compiled numbers (Cranelift) | arithmetic runs in the interpreter, with the same answers |
+| `realtime` | WebTransport for channels and media | pages use a WebSocket |
+
+```sh
+# For example, without MySQL and WebTransport:
+cargo build --release --no-default-features --features jit
+```
+
+One more, `app`, is off by default: `cargo build --release --features app` adds
+`quillo app`, a program in a native window (`wry`, `tao`, `muda`).
+
+### Optional: the tests, and extras
+
+| | Needed for | Found by |
+|---|---|---|
+| **Node 22 or later** | the component compiler's tests, the browser tests, the [VS Code extension](https://github.com/quillolang/editors) | `node` on your PATH |
+| **Chrome or Chromium** | the browser tests (skipped without it) | the usual places, or `QUILLO_CHROME` |
+| **PostgreSQL** | its tests, which start a server of their own (skipped without it) | `initdb` and `pg_ctl` on your PATH or in Homebrew's folders, or `QUILLO_TEST_PG_BIN` |
+| **MariaDB** | its tests, the same way | `mariadbd` and `mariadb-install-db`, or `QUILLO_TEST_MYSQL_BIN` |
+| **WebKitGTK 4.1, GTK 3** (Linux) | `quillo app` | `sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev` |
+| **WebView2** (Windows) | `quillo app` | part of Windows 11; [an installer](https://developer.microsoft.com/microsoft-edge/webview2/) for Windows 10 |
+
+`cargo test` runs everything it can and says what it skipped.
+
+### Running a program
+
+The `quillo` binary is all a program needs to run: SQLite is built in. A program that
+uses PostgreSQL or MySQL needs a server to connect to, like any program. One with
+[Rust files](/docs/rust/) (`.qwer`) builds them with Cargo the first time it starts, so
+it needs Rust there too, unless you build them beforehand with `quillo build app.qwe` and
+deploy `.quillo/native/` with it.
