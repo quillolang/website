@@ -152,7 +152,8 @@ One more, `app`, is off by default: `cargo build --release --features app` adds
 
 ### Running a program
 
-The `quillo` binary is all a program needs to run: SQLite is built in. A program that
+The `quillo` binary is all a program needs to run (see [Hosting](/docs/hosting/) for
+putting one online): SQLite is built in. A program that
 uses PostgreSQL or MySQL needs a server to connect to, like any program. One with
 [Rust files](/docs/rust/) (`.qwer`) builds them with Cargo the first time it starts, so
 it needs Rust there too, unless you build them beforehand with `quillo build app.qwe` and
