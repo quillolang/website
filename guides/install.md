@@ -12,7 +12,7 @@ one command, and what is optional.
 | **Rust 1.94 or later** | building Quillo | [rustup.rs](https://rustup.rs), then `rustup update stable` to stay current |
 | **A C compiler** | building: a few dependencies compile C (the bundled SQLite, `ring`, mimalloc) | macOS: Xcode's command line tools. Linux: gcc or clang. Windows: Visual Studio's C++ build tools |
 | **git** | getting the source | [git-scm.com](https://git-scm.com), or your package manager |
-| **About 5 GB of disk** | the build's `target/` folder | |
+| **About 1 GB of disk** | Cargo's compiled dependencies, kept in `target/` to make the next build fast. Quillo itself is a 21 MB binary; the tests take about 6 GB more | `target/` can be deleted once `quillo` is installed |
 
 ### Check your machine
 
