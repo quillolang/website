@@ -56,7 +56,9 @@ let missing = db.one("select * from todos where id = ?", 999)               // n
 ```
 
 Values are given after the SQL, one for each `?`, or as a map for `:name`
-placeholders. PostgreSQL also takes its own `$1`, `$2`. Rows are maps from column
+placeholders. PostgreSQL also takes its own `$1`, `$2`. Every `:name` needs a value, but
+keys the SQL does not use are ignored, so one map can serve a query put together from
+optional parts. Rows are maps from column
 names to values, so `todo.text` reads a column, and a list of rows goes straight into
 `for` in a page or out as JSON.
 
@@ -186,7 +188,29 @@ component Todos() {
 The tables a loader reads are found in its SQL (`from`, `join`), and every `insert`,
 `update` and `delete` through `db` announces the tables it writes. This works the same on
 SQLite, PostgreSQL and MySQL. Changes made by other programs (`psql`, a script) are not
-seen. See [Live data](/docs/components/#live-data), and
+seen.
+
+A write wakes every loader that read the table, whatever rows it read: a reply in one
+thread runs `load_posts` again on every open thread page. To follow one thread only,
+read the table inside `unwatched` and watch a topic of your own, which the writer
+publishes:
+
+```quillo
+server fn load_posts(thread: int) {
+    watch(`thread:${thread}`)
+    unwatched(() => db.query("select * from posts where thread = ?", thread))
+}
+
+server fn reply_to(thread: int, text: str) {
+    db.exec("insert into posts (thread, text) values (?, ?)", thread, text)
+    publish(`thread:${thread}`)
+}
+```
+
+What a loader's helpers read counts too: a `me()` that looks up `sessions` makes every
+loader calling it run again when anyone signs in, so call it as `unwatched(() => me())`.
+Keep what changes often but is not shown (view counts, last-seen times) in a table of
+its own. See [Live data](/docs/components/#live-data), and
 [Several servers](/docs/components/#several-servers) for apps on more than one server.
 
 ### Several databases

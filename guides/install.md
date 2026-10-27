@@ -1,9 +1,32 @@
 # Installing
 
-Quillo is one binary, `quillo`, built from its source with Cargo. Building it needs two
-things on your machine: **Rust** and a **C compiler**. Everything else it uses, Cargo
-downloads by itself. This page lists what each system needs, how to check a machine in
-one command, and what is optional.
+Quillo is one binary, `quillo`. Download it built, or build it from its source with
+Cargo, which needs two things on your machine: **Rust** and a **C compiler**. Everything
+else it uses, Cargo downloads by itself. This page lists what each system needs, how to
+check a machine in one command, and what is optional.
+
+### Download
+
+Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built for:
+
+| System | File |
+|---|---|
+| Linux, x86-64 | `quillo-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM | `quillo-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `quillo-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `quillo-<version>-x86_64-apple-darwin.tar.gz` |
+| Windows | `quillo-<version>-x86_64-pc-windows-msvc.zip` |
+
+Unpack it and put `quillo` on your `PATH`. The Linux builds need glibc 2.35 or later
+(Ubuntu 22.04, Debian 12, Fedora 36 and since). Beside each archive is a `.sha256`
+that checks the download:
+
+```sh
+shasum -a 256 -c quillo-v0.5.0-aarch64-apple-darwin.tar.gz.sha256   # macOS
+sha256sum -c quillo-v0.5.0-x86_64-unknown-linux-gnu.tar.gz.sha256    # Linux
+```
+
+The rest of this page is for building it yourself.
 
 ### What you need
 
@@ -28,6 +51,9 @@ powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
 ```
 
 It installs nothing: each line it marks *missing* comes with the command that fixes it.
+It also points out a `quillo` on your `PATH` older than the one just built: that one runs
+when you type `quillo`, and fails on newer code as if the code were wrong
+(`cargo install --path .` replaces it).
 
 ```
 To build and run Quillo
