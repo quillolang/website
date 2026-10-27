@@ -45,6 +45,19 @@ for js in $(find "$out" -name index.html -exec grep -oh '/_quillo/b/[0-9a-f]*\.j
     curl -sf "http://127.0.0.1:$port$js" -o "$out$js"
 done
 
+# The kit's files, to download: the whole kit in one file, each component, and a
+# zip of the repository's files (what git tracks, or all but dot-files).
+kit="$here/content/components"
+mkdir -p "$out/components/ui"
+cp "$kit/quillo-ui.qwe" "$out/components/"
+cp "$kit"/ui/*.qwe "$out/components/ui/"
+(cd "$kit" && { git ls-files 2>/dev/null | grep . || find . -type f ! -path './.*' | sed 's|^\./||'; } \
+    | sed 's|^|quillo-ui/|' > "$out/kit-files.txt")
+tmpkit=$(mktemp -d)
+ln -s "$kit" "$tmpkit/quillo-ui"
+(cd "$tmpkit" && zip -q -X "$out/components/quillo-ui.zip" -@ < "$out/kit-files.txt")
+rm -rf "$tmpkit" "$out/kit-files.txt"
+
 # Bundles are named by their content, so browsers may keep them for good.
 # Pages may be kept 30 seconds, as quillo run lets a prefetched page be kept:
 # a browser without speculation rules fetches the page a link points to, and
@@ -58,9 +71,15 @@ cat > "$out/.htaccess" <<'EOF'
   <FilesMatch "\.html$">
     Header set Cache-Control "private, max-age=30"
   </FilesMatch>
+  <FilesMatch "\.qwe$">
+    Header set Cache-Control "public, max-age=300"
+  </FilesMatch>
+</IfModule>
+<IfModule mod_mime.c>
+  AddType text/plain;charset=utf-8 .qwe
 </IfModule>
 <IfModule mod_deflate.c>
-  AddOutputFilterByType DEFLATE text/html text/css application/javascript image/svg+xml
+  AddOutputFilterByType DEFLATE text/html text/css text/plain application/javascript image/svg+xml
 </IfModule>
 EOF
 
