@@ -6,6 +6,9 @@ what goes wrong comes back as an error value, so `?` and `??` handle a failed qu
 they handle anything else. This page goes through it in the order an app needs it; the
 details are also in [Standard library](/docs/standard-library/#database).
 
+`db` is a library for SQL databases, not syntax. Another kind of store (Redis, MongoDB, a
+graph database) comes in through its Rust crate: see [Other stores](/docs/rust/#other-stores).
+
 ### Opening a database
 
 ```quillo

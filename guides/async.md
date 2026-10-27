@@ -122,10 +122,12 @@ let [user, orders] = parallel(() => load_user(id), () => load_orders(id))
 ```
 
 In the browser that is `Promise.all`: two calls of 300 ms each take about 300 ms
-together instead of 600. On the server each function runs on a thread of its own, so
-their waits (on the database, `http.*`, `sleep`) overlap the same way; inside a
-transaction they run one after another, since another thread's SQL would not be part of
-it. A function that fails stops the whole call; error values are results like any other.
+together instead of 600. On the server each function runs as a coroutine of its own on
+the event loop, so their waits (on the database, `http.*`, `sleep`) overlap the same way.
+Their computing does not: Quillo code runs one piece at a time, so `parallel` shortens
+waiting, not arithmetic. Inside a transaction they run one after another, since the
+others' SQL would not be part of it. A function that fails stops the whole call; error
+values are results like any other.
 
 ### On the server, too
 
@@ -145,6 +147,12 @@ route GET /profile/:id(int) = {
 There are no callbacks and no promises to chain. Updating shared state is safe without
 locks, too, since only one request runs its code at a time.
 
+The other side of that: code that computes for long without waiting (a loop over a
+million rows) keeps the other requests waiting until it ends. Images, password hashing,
+files and Rust functions run off the loop; put long computing in Rust, or run more
+instances. See [Concurrency](/docs/concurrency-and-reloading/), which also says how long
+each kind of wait may last.
+
 ### Streams
 
 A stream is just as plain. `receive(url, f)` in a handler sends a request and calls `f`
@@ -160,6 +168,11 @@ answer is `{"ok": value}` or `{"err": payload}`. Only `server fn`s can be called
 with `content-type: application/json`, and only from the program's own pages: a request
 a browser marks as coming from another site gets a 403. Inside one, `request` is the
 current request, and `reply` becomes the HTTP response, so the usual middleware works.
+
+That makes each `server fn` a public address: anyone can call it, with any arguments,
+from a script or the browser's console. Check who is asking and what they may touch in
+each one, give its parameters types, and return only the columns the page shows. See
+[What the browser can reach](/docs/components/#what-the-browser-can-reach).
 
 From hand-written JavaScript, a page's `server fn`s are under `quillo.server`, and
 there, being JavaScript, they are awaited:
