@@ -111,8 +111,11 @@ route GET / = <html><body><SignupForm/></body></html>
 - **Inputs bind to plain variables.** `bind:value` needs a variable of the component, not
   a field of a map, which is why each input has its own `state`. Do not put an `@input`
   handler on an input that has `bind:value`: it currently takes the binding's place, and
-  the variable stops following the input. Work out what depends on the input with `let`,
-  as `draft` is here.
+  the variable stops following the input (`quillo check` does not say so). Work out
+  what depends on the input with `let`, as `draft` is here.
+- **There is no debounce.** Rules run on every keystroke, in the browser, which is cheap.
+  A check only the server can make (is the address taken?) waits for the submit, as
+  here, or for an `every` tick under a state flag: there is no `setTimeout`.
 
 ### On the server: the same rules decide
 
@@ -136,10 +139,11 @@ server fn sign_up(input: Signup) -> Signup ! list with db {
 - **The shape is checked on the way in.** A parameter typed `Signup` is checked before
   the function runs; a call that does not fit is answered 400 with the reason, and the
   function never sees it.
-- **Rebuild the record before using it.** A typed parameter checks the fields `Signup`
-  has but keeps any others the caller added. `Signup(input)` keeps only its own fields,
-  so an `is_admin: true` sent by a script goes no further. `input` has already passed the
-  check, so making it again cannot fail: `unwrap` says so.
+- **The record is made on the way in.** A parameter typed `Signup` is made as
+  `Signup(v)` makes it: missing fields with defaults get them, and fields `Signup` does
+  not have are left out, so an `is_admin: true` sent by a script goes no further. The
+  `unwrap(Signup(input))` above changes nothing, then; it is there for a function that
+  is also called from the server's own code with a map.
 - **Errors come back in the shape the form reads.** `! list` declares that errors are a
   list of problems, so the component shows the server's under the right field, exactly as
   it shows its own. `quillo check` holds the function to it: a `?` that would pass on an
@@ -157,9 +161,8 @@ get back:
 | every field, `email: "nope"` | 200: `{"err": [{"field": "email", "message": "Not an email address"}]}` |
 | every field, plus `is_admin: true` | 200: the sign-up, without `is_admin` |
 
-A typed parameter needs every field, including those with defaults: `Signup(...)` puts
-the defaults in, which is why the component sends the record it made and not the raw
-form. A client of your own should send every field too.
+A call may leave out fields with defaults (`plan`, `seats`): they are filled in as
+`Signup(...)` fills them. Fields without one (`name`, `email`) must be there.
 
 ### Keeping rules pure
 

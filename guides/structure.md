@@ -63,7 +63,8 @@ component Cart() {
   twice, or by two files, still runs once, and files that `use` each other are fine.
 - **Paths count from the main file's folder, in every file.** A `use` in `ui/cart.qwe`
   is written `use "lib/money.qwe"`, not `"../lib/money.qwe"`. Paths outside the folder
-  work too (`use "../shared/auth.qwe"`). There are no globs: list each file.
+  work too (`use "../shared/auth.qwe"`). There are no globs: list each file. `quillo
+  run` with no file, or a folder, runs that folder's `main.qwe`.
 - **Put the `use` lines in the main file.** A part can `use` what it needs, but one list
   in one place shows the whole program at a glance, and its order says what comes first.
 - **Start each file with a comment** saying what it holds. It is the first thing a
@@ -85,17 +86,25 @@ queries, rules), then views and pages, as in `main.qwe` above.
 
 ### Names are global
 
-There are no namespaces inside a program. Two files that define the same name do not
-fail: one of them wins, without a word.
+There are no namespaces inside a program, so a name is defined once in it. `quillo
+check` (and `quillo run`, which checks first) refuses a second definition, naming both
+places:
 
-| Defined twice | The one used |
+```
+main.qwe:4: error: `total` is defined twice, at lib/b.qwe:1 and main.qwe:4: the second replaces the first everywhere, so rename one
+```
+
+| Defined twice | What happens |
 |---|---|
-| Function, view, component | The last one loaded |
-| Variable (`let`) | The last one loaded |
-| Route (same method, path) | The first one loaded |
+| Function, view, component, `type`, `service` | An error, in one file or two |
+| Top-level `let` in two files | An error |
+| `let x` twice in one file | Allowed: the second gives the variable again |
+| Route (same method, path) | Not reported: the first one loaded answers |
 
-`quillo check` does not warn about either yet, so name things after their part:
-`order_total` and `cart_total` rather than two `total`s.
+So name things after their part: `order_total` and `cart_total` rather than two
+`total`s. A top-level `let` named like a builtin (`let last = ...`) or a module (`let
+json = request.json`, `let date = ...`) hides it in every file of the program: name such
+values otherwise (`body`, `created`).
 
 When a part needs names of its own, give it a boundary:
 
@@ -174,7 +183,8 @@ names, builtins with their signatures, the members of `db.`, `http.`, `channel.`
 other modules, effects after `with`), an outline, snippets, and a debugger (F5, with
 breakpoints, stepping and the variables). *Run this file* starts it with `--watch`. It
 finds `quillo` in the `quillo.path` setting, then in the workspace's `target/release` or
-`target/debug`, then on your `PATH`.
+`target/debug`, then on your `PATH`. Errors on code that runs fine usually mean an old
+`quillo` was found: `quillo --version` names its commit.
 
 ```sh
 cargo install --git https://github.com/quillolang/quillo quillo   # puts quillo on your PATH

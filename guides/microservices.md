@@ -109,8 +109,9 @@ quillo run app.qwe --service-url billing=http://10.0.0.5:8081,http://10.0.0.6:80
 A call that got no connection, or a server answering 502, 503 or 504, is tried at the
 next address, a little later each time. A call sent but not answered in time is tried
 again at the same address, with the same call id. The service remembers the calls it
-answered for ten minutes and gives the same answer again, so the function runs once
-however often the call is sent. A call still running there is waited for.
+answered for eleven minutes (in its database too, `_quillo_calls`, when it has one, so
+copies sharing it remember together) and gives the same answer again, so the function
+runs once however often the call is sent. A call still running there is waited for.
 
 #### Failing servers left alone
 
@@ -135,7 +136,9 @@ service billing = "billing.qwe" { timeout: "2s", retries: 1, failures: 5, cooldo
 | `failures` | `5` | Failures in a row after which an address is left alone |
 | `cooldown` | `"5s"` | How long it is left alone the first time |
 
-Durations are `"500ms"`, `"2s"`, `"1m"`, or a number of milliseconds.
+Durations are `"500ms"`, `"2s"`, `"1m"` (`ms`, `s` and `m` only), or a number of
+milliseconds. They apply when a service runs elsewhere; in one process a call is a
+function's, which runs to its end.
 
 ### Following a request across services
 
@@ -164,12 +167,35 @@ The call is tried every second, then a little later each time (up to five minute
 until it gets through; since the service remembers call ids, it runs once. Calls kept for
 later are stored in the program's database when it has one (the `_quillo_later` table),
 so they outlive a restart, and servers sharing the database make each call once; without
-a database, in memory. `quillo check` checks them as it checks the call itself.
+a database, in a `quillo-system.db` file next to the program. `quillo check` checks them
+as it checks the call itself.
+
+### What it does not do
+
+- **No transaction across services.** Each service's `db.transaction` is its own, so a
+  chain of calls commits step by step. Give each step a reference the caller makes up,
+  and keep what was done, so a request sent again goes on from where it stopped instead
+  of doing a step twice.
+- **No discovery.** Each caller is told where a service runs (`--service-url` or
+  `QUILLO_SERVICE_<NAME>`), and `QUILLO_SERVICE_SECRET` is set on every machine by hand.
+  A copy can join a running app with `--join`, but it is recorded at the address it
+  connects from, so a copy behind NAT or a proxy belongs behind a balancer instead.
+- **Variables are each copy's.** Copies of a service (`--scale`, `--join`, several
+  addresses) share its database, not its global variables.
+- **A service's own publishing.** A topic a service publishes while answering a call
+  reaches the caller's pages; one it publishes on its own (a job, a call made later
+  being delivered) reaches only the service's pages when it runs apart.
+
+[Services](/docs/routes/#services) in the reference has the rest: `--scale`, `--join`,
+`/_quillo/ready`, contracts between versions, `quillo docs`, deadlines that pass down a
+chain, and the calls on the wire, for a service written in another language.
 
 ### Security
 
-- A call is signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` and the time; a call
-  more than five minutes old is refused. The tenant goes with it.
+- A call is signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET`, together with the
+  time, the service it is for, the function, the tenant, the call's id and its
+  arguments; a call more than five minutes old, or signed for another service, is
+  refused. The tenant goes with it.
 - Only `server fn`s are offered at `/_quillo/service/<name>`: a service's other functions
   and its globals cannot be reached from outside.
 - A service's routes, under its prefix, are passed on to it, and are public as any route

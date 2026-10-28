@@ -18,8 +18,9 @@ Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built
 | Windows | `quillo-<version>-x86_64-pc-windows-msvc.zip` |
 
 Unpack it and put `quillo` on your `PATH`. The Linux builds need glibc 2.35 or later
-(Ubuntu 22.04, Debian 12, Fedora 36 and since). Beside each archive is a `.sha256`
-that checks the download:
+(Ubuntu 22.04, Debian 12, Fedora 36 and since). They are built without `quillo app`
+(desktop windows): build from source with `--features app` for that. Beside each
+archive is a `.sha256` that checks the download:
 
 ```sh
 shasum -a 256 -c quillo-v0.5.0-aarch64-apple-darwin.tar.gz.sha256   # macOS
@@ -35,7 +36,7 @@ The rest of this page is for building it yourself.
 | **Rust 1.94 or later** | building Quillo | [rustup.rs](https://rustup.rs), then `rustup update stable` to stay current |
 | **A C compiler** | building: a few dependencies compile C (the bundled SQLite, `ring`, mimalloc) | macOS: Xcode's command line tools. Linux: gcc or clang. Windows: Visual Studio's C++ build tools |
 | **git** | getting the source | [git-scm.com](https://git-scm.com), or your package manager |
-| **About 1 GB of disk** | Cargo's compiled dependencies, kept in `target/` to make the next build fast. Quillo itself is a 21 MB binary; the tests take about 6 GB more | `target/` can be deleted once `quillo` is installed |
+| **About 1 GB of disk** | Cargo's compiled dependencies, kept in `target/` to make the next build fast. Quillo itself is a binary of 20 to 25 MB; the tests take about 6 GB more | `target/` can be deleted once `quillo` is installed |
 
 ### Check your machine
 
@@ -167,14 +168,23 @@ One more, `app`, is off by default: `cargo build --release --features app` adds
 
 | | Needed for | Found by |
 |---|---|---|
-| **Node 22 or later** | the component compiler's tests, the browser tests, the [VS Code extension](https://github.com/quillolang/editors) | `node` on your PATH |
+| **Node 22 or later** | the component compiler's tests, the browser tests, the [VS Code extension](https://github.com/quillolang/editors); the money tests compare with Node 24's CLDR data, and skip on older ones | `node` on your PATH |
 | **Chrome or Chromium** | the browser tests (skipped without it) | the usual places, or `QUILLO_CHROME` |
 | **PostgreSQL** | its tests, which start a server of their own (skipped without it) | `initdb` and `pg_ctl` on your PATH or in Homebrew's folders, or `QUILLO_TEST_PG_BIN` |
 | **MariaDB** | its tests, the same way | `mariadbd` and `mariadb-install-db`, or `QUILLO_TEST_MYSQL_BIN` |
+| **limer** | the tests of several servers behind it | `LIMER`, or `../limer/limer` |
+| **The network** | the Rust (`.qwer`) tests, whose first build fetches a crate; they are not skipped | crates.io |
 | **WebKitGTK 4.1, GTK 3** (Linux) | `quillo app` | `sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev` |
 | **WebView2** (Windows) | `quillo app` | part of Windows 11; [an installer](https://developer.microsoft.com/microsoft-edge/webview2/) for Windows 10 |
 
-`cargo test` runs everything it can and says what it skipped.
+`cargo test` runs everything it can and says what it skipped; `QUILLO_TEST_LOG=1` shows
+the output of the servers the tests start.
+
+### Which systems
+
+Releases are built for Linux and macOS, on x86-64 and ARM, and for Windows (see
+[Download](#download)). On Windows, `quillo dap` (the debugger) is not there yet, and
+`--with` needs a `sh` on the `PATH`.
 
 ### Running a program
 

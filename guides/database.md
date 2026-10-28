@@ -62,6 +62,16 @@ optional parts. Rows are maps from column
 names to values, so `todo.text` reads a column, and a list of rows goes straight into
 `for` in a page or out as JSON.
 
+Three things that surprise people:
+
+- **A row is a map**, so two columns with one name (`select a.id, b.id`) leave only the
+  last: name them apart with `as`.
+- **`db.exec` with values runs one statement.** On SQLite, what follows the first `;` is
+  ignored; without values, the whole text runs (a seed file). On SQLite, a statement
+  that gives rows (`insert ... returning id`) goes to `db.one`, not `db.exec`.
+- **`db.query` gives every row at once**, in memory: page through large tables with
+  `limit` and the last row's key.
+
 A query that fails (a syntax error, a constraint, the server unreachable) is an error
 value with the database's message:
 
@@ -72,6 +82,15 @@ route POST /todos { form: { text: str } } {
     let id = add(text) ?? reply 422 "Could not add that"
     redirect(`/todos/${id}`)
 }
+```
+
+`db.error_kind(e)` says what kind of failure it was, the same on every database:
+`"unique"`, `"foreign_key"`, `"not_null"`, `"check"`, `"conflict"` (another
+transaction), or `null`:
+
+```quillo
+let r = db.exec("insert into seats (show, seat) values (?, ?)", show, seat)
+if db.error_kind(r) == "unique" { return err("Someone has just taken that seat") }
 ```
 
 `` sql`...` `` writes a query over several lines and tells editors to highlight it as
@@ -160,7 +179,9 @@ db.migrate()
 ```
 
 - Each file runs once, in its own transaction, and is recorded in the table
-  `_quillo_migrations` with its SHA-256.
+  `_quillo_migrations` with its SHA-256. Only `.sql` files directly in the folder count,
+  sorted by name as text: pad the numbers (`002`, not `2`), since `10_x.sql` sorts
+  before `2_x.sql`. A file renamed is a new file, and runs again.
 - A file that fails is rolled back and stops the program from starting, with the file's
   name and the database's message.
 - A recorded file whose text changed afterwards gets a warning, not a second run: add a
@@ -188,7 +209,8 @@ component Todos() {
 The tables a loader reads are found in its SQL (`from`, `join`), and every `insert`,
 `update` and `delete` through `db` announces the tables it writes. This works the same on
 SQLite, PostgreSQL and MySQL. Changes made by other programs (`psql`, a script) are not
-seen.
+seen, nor what a trigger or a stored procedure writes, nor writes to the tables behind a
+view a loader reads: `publish` a topic for those.
 
 A write wakes every loader that read the table, whatever rows it read: a reply in one
 thread runs `load_posts` again on every open thread page. To follow one thread only,
@@ -383,31 +405,45 @@ prefixes, and how many databases stay open at once.
 #### SQLite
 
 Built in, nothing to install: the database runs inside the server process, in a file
-next to the program or in memory, with foreign keys on and WAL mode. Booleans are
-stored as `0` and `1`.
+next to the program or in memory, with foreign keys on and WAL mode. It is SQLite 3.46,
+with JSON and FTS5 full-text search, and without math functions (`sin`, `radians`).
+Booleans are stored as `0` and `1`, and a column declared `boolean` reads them back as
+`true` and `false`. Queries run on the server's own thread: a long one holds up the
+other requests of its instance. Several processes may share the file: readers do not
+wait, writers take turns, for up to 5 seconds before a write fails as a conflict.
 
 #### PostgreSQL
 
 - Placeholders: `?`, `:name` with a map, or `$1`. The first two are translated, skipping
   quotes, comments and `$$` strings.
 - Values convert both ways: numbers, text, booleans, `json` and `jsonb` as maps and
-  lists, arrays as lists, `numeric` as numbers; `uuid`, `date`, `timestamp` and
-  `timestamptz` (ISO 8601, in UTC) and `interval` as text. Other types are sent as text
-  for PostgreSQL to convert.
-- `last_id` is `null`: use `insert ... returning id` with `db.one`.
-- Connections come from a pool, 8 unless the URL says `?pool_size=N`. A query lets other
-  requests run while it waits, and a request's queries share a connection, pipelined.
-- TLS is used when the server offers it, and `?sslmode=require` insists, with
-  certificates checked as hosted PostgreSQL services expect.
+  lists, arrays as lists, `numeric` as [decimals](/docs/money/) with their scale (an int
+  when it has none); `uuid`, `date`, `timestamptz` (ISO 8601, in UTC), `timestamp` (as
+  stored, no zone) and `interval` (PostgreSQL's own text) as text. Other parameters are
+  sent as text for PostgreSQL to convert; columns of types it does not decode (`inet`,
+  ranges, composites) are cast to text in the query: `ip::text`.
+- `last_id` is `null`: use `insert ... returning id` with `db.one`. `db.one` fetches the
+  whole answer and keeps the first row, so write `limit 1`.
+- Connections come from a pool, 8 unless the URL says `?pool_size=N`, and queries outside
+  transactions share a second set, pipelined: plan for about twice `pool_size` per
+  server. A query lets other requests run while it waits.
+- TLS is required for a server on another machine, with its certificate and name
+  checked (`sslmode=verify-full`); on this machine it is used when the server offers it.
+  A hosted database with a CA of its own (Amazon RDS, Cloud SQL) names it with
+  `?sslrootcert=/path/ca.pem`. See [TLS to the database](/docs/standard-library/#tls-to-the-database).
 
 #### MySQL and MariaDB
 
 - Placeholders: `?`, or `:name` with a map (translated, skipping quotes, backticks and
   comments).
 - Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
-  numbers, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
-  dates and times as ISO text. `last_id` is the new row's `auto_increment` id.
-- Connections come from a pool, and a query lets other requests run while it waits.
+  decimals, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
+  dates and times as text (`2026-10-27 14:30:00`). `last_id` is the new row's
+  `auto_increment` id, or `0`.
+- Connections come from the driver's pool, and a query lets other requests run while it
+  waits. `pool_size` is PostgreSQL's: in a MySQL URL it stops the database from opening.
+- TLS is required for a server on another machine, as for PostgreSQL; `?ssl_ca=` names a
+  CA of its own.
 - Built in by default as the `mysql` feature; `cargo build --no-default-features`
   leaves it out.
 
@@ -420,6 +456,7 @@ stored as `0` and `1`.
 | `db.query(sql, ...values)` | Every row, as a list of maps |
 | `db.one(sql, ...values)` | The first row, or `null` |
 | `db.exec(sql, ...values)` | `{ changes, last_id }` |
+| `db.error_kind(e)` | `"unique"`, `"foreign_key"`, `"not_null"`, `"check"`, `"conflict"` or `null` |
 | `db.transaction(f)` | Runs `f`; commits, or rolls back on failure, error value or early reply |
 | `db.migrate(folder = "migrations")` | Applies the SQL files not yet applied, in name order |
 | `db.open(url, { replicas })` | Sends reads to replicas (also `db.connect`) |
@@ -435,3 +472,21 @@ stored as `0` and `1`.
 A function declared with effects may use the database only if `db` is among them: one
 declared `with http` cannot query, and `quillo check` says so before the program runs.
 Functions without `with` may do anything.
+
+### What it does not do
+
+- **Other databases.** SQLite, PostgreSQL, MySQL and MariaDB only; any other text given
+  to `db.open` is taken for a SQLite file. Redis, MongoDB, SQL Server and the rest come
+  in through [Rust](/docs/rust/#other-stores).
+- **An ORM or a query builder.** SQL with parameters; [records](/docs/language-tour/#records)
+  check the shape of what comes back.
+- **Bytes.** There is no bytes value: a BLOB comes back as text, `bytea` as hex. Keep
+  files on disk, or base64 text.
+- **Streaming, `COPY`, `LISTEN`/`NOTIFY`.** Page with `limit`; insert many rows with
+  `values (?, ?), (?, ?)`; use `publish` for notifications.
+- **Per-query time limits, read-only connections, encryption at rest.** These are the
+  database server's settings (`statement_timeout`, a read-only role, the disk's
+  encryption); SQLite has none of them here.
+
+The [reference](/docs/standard-library/#database) has the rest: parameters and their
+traps, type conversions in full, pools and connections, tenants' schemas.

@@ -34,8 +34,9 @@ These links are left alone:
 A route asked for ahead of a click may read (the database, files, other servers) but not
 write. Writing to the database, assigning a global variable, setting cookies or the
 session, writing files, `publish`, `http.post` and the like, and calls to services stop
-it, and the server answers "not prefetched" (`204`, `cache-control: no-store`). The page is
-then made as usual when the link is followed.
+it, and the server answers "not prefetched" (`503`, `cache-control: no-store`), which the
+browser drops; a `204` would leave it where it was. The page is then made as usual when
+the link is followed.
 
 ```quillo
 route GET /count {
@@ -60,6 +61,8 @@ writes itself).
   `<nav data-no-prefetch>…</nav>`.
 - A route that sets its own `cache-control` keeps it: a prefetch of it is answered as the
   route says.
+- A page whose live loader writes (marking messages read, say) is not prefetched either:
+  it is made when the link is followed.
 - `quillo run --no-prefetch` turns it off for the whole program: pages no longer carry
   it, and prefetch requests are answered as ordinary ones.
 
@@ -86,6 +89,7 @@ A cache or a static file server in front may not tell the two kinds of request a
 and then the browsers that fetch in the background re-ask on the click. Chrome and
 Edge do not depend on it.
 
-This site is served as static files by LiteSpeed, which keeps a file's headers whatever
-the request, so every page is sent with `cache-control: private, max-age=30`. A page
-then may be up to 30 seconds old after a change, which suits documentation.
+A static copy of a site (as `export.sh` makes of this one) is served with a file's
+headers whatever the request, so every page is sent with `cache-control: private,
+max-age=30`, and may be up to 30 seconds old after a change. This site is now served by
+`quillo run` itself, so it answers each kind of request as described above.

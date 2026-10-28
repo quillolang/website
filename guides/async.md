@@ -110,7 +110,15 @@ if is_err(r) { problem = r.error }               // show what went wrong
 ```
 
 A `server fn`'s own errors (`err("A note needs some text")`) arrive the same way, with
-the payload it gave, so the page tells the two apart only if it wants to.
+the payload it gave, so the page tells the two apart only if it wants to. A call the
+server refused says its status: ``server fn `add_note` failed (403): ...``. A `reply 401
+"Log in first"` inside a `server fn` reaches the page as its status alone, since its body
+is plain text: return `err("Log in first")` for the page to show the words.
+
+There is no loading flag and nothing done for you on a failure (no retry, no redirect to
+a sign-in page): set a `state busy` around the call, and decide what an error shows. A
+state set by a `server fn` while the server renders arrives with the page; on a page
+reached by `navigate`, it is `null` until the answer comes.
 
 ### One after another, or all at once
 
@@ -162,10 +170,11 @@ long as the component's code that started it stands. No reader loop, no decoder,
 
 ### Under the hood
 
-Each call is `POST /_quillo/rpc/<name>` with the arguments as a JSON array. They are
+Each call is `POST /_quillo/rpc/<name>` with the arguments as a JSON array (as multipart,
+when one of them is a file from an input). They are
 checked against the parameter types before the function runs (a 400 otherwise), and the
 answer is `{"ok": value}` or `{"err": payload}`. Only `server fn`s can be called, only
-with `content-type: application/json`, and only from the program's own pages: a request
+with `content-type: application/json` (or that multipart, marked `x-quillo-rpc: 1`), and only from the program's own pages: a request
 a browser marks as coming from another site gets a 403. Inside one, `request` is the
 current request, and `reply` becomes the HTTP response, so the usual middleware works.
 
@@ -181,6 +190,10 @@ there, being JavaScript, they are awaited:
 const notes = await quillo.server.add_note("from a script");
 // An error value does not reject: it resolves to { error: ... }.
 ```
+
+`quillo` is there once the page's components have loaded, which is when someone reaches
+for one. A script that runs as the page loads puts `<script src="/_quillo/quillo.js">`
+before itself.
 
 See [Server functions](/docs/components/#server-functions) for the rest, and
 [Validation](/docs/validation/) for checking what a call sends.

@@ -291,8 +291,9 @@ joins its channels again) when it drops:
 - **WebTransport** where it can: HTTP/3 over UDP, on the UDP port with the HTTP port's
   number. This is what carries datagrams.
 - **A WebSocket** where it cannot: the browser lacks WebTransport, UDP is blocked on the
-  way, or the server cannot be reached over it. Everything still arrives, reliably and
-  in order, so a page works the same, only without datagrams.
+  way, or the server cannot be reached over it within a second and a half. Everything
+  still arrives, reliably and in order, so a page works the same, only without
+  datagrams. A page that fell back keeps the WebSocket until it is loaded again.
 
 In the Network panel, the connection is the request to `/_quillo/wt`; if its type is
 **websocket**, the page fell back.
@@ -316,6 +317,29 @@ you would rather keep the name.
   messages dropped because a page's queue was full, and `quillo_udp_received_total` and
   `quillo_udp_dropped_total` the packets.
 - `--no-wt` turns WebTransport off, and every page uses the WebSocket.
+
+### Limits, and what it does not do
+
+- **Messages are values, as JSON**, up to 1 MiB each: there are no binary messages
+  (bytes go as a list of numbers). Each page has room for 4,096 messages on their way to
+  it; when that fills, a plain message is dropped, and a `reliable` one closes the
+  connection so the page joins again rather than miss it. Nothing is kept for a page
+  while it is away.
+- **A page's session is the one it connected with.** Someone who signs in afterwards is
+  seen so by `join` and `channel.on` once the page reconnects. A page that reconnects has
+  a new `peer.id`.
+- **No presence list** beyond `channel.peers(name)` and what `join` and `leave` record.
+- **One server's pages.** Channels and media streams are kept in memory by the server
+  the page is connected to: servers behind limer share live data, not channels or
+  streams, and a restart starts them empty (pages reconnect and join again by
+  themselves).
+- **No WebRTC and no TURN.** Pages talk to the server, never to each other directly; the
+  server relays video. Streams are not recorded; have the encoder write a copy.
+- **UDP is plain**, IPv4 unless `host: "::"`, without multicast or DTLS. RTP has no
+  RTCP or SRTP, and any sender that reaches a port is taken: keep media ports to the
+  camera's network.
+- **No WebSocket of your own.** Channels are the way a page's messages reach the
+  program.
 
 ### Which one to use
 
