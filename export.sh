@@ -31,6 +31,7 @@ until curl -sf -o /dev/null "http://127.0.0.1:$port/"; do
 done
 
 curl -sf "http://127.0.0.1:$port/sitemap.txt" -o "$out/sitemap.txt"
+curl -sf "http://127.0.0.1:$port/sitemap.xml" -o "$out/sitemap.xml"
 for path in $(sed 's|^https://[^/]*||' "$out/sitemap.txt"); do
     mkdir -p "$out$path"
     curl -sf "http://127.0.0.1:$port$path" -o "$out${path}index.html"
