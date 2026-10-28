@@ -2,12 +2,13 @@
 
 Some data cannot wait for a page to ask: a sensor's reading, a player's move, a cursor, a
 camera's picture. A Quillo program takes UDP packets on a port, passes messages between
-the server and its pages as they happen, and plays a camera's stream in any page. There
-is no message broker, no socket server beside the app, and no video pipeline: it is the
-same program, with the same functions and the same checks.
+the server and its pages as they happen, plays a camera's stream in any page, and lets
+pages send their own camera and microphone to each other. There is no message broker, no
+socket server beside the app, and no media server: it is the same program, with the same
+functions and the same checks.
 
-> **Try it on your machine.** This site is static files, so there is no server here for a
-> page to talk to. Each part below has a command to run instead. Open the pages at
+> **Try it on your machine.** These programs need ports, a camera or a sender of their
+> own, so each part below has a command to run. Open the pages at
 > `http://127.0.0.1:8080` rather than `localhost`: see
 > [Which way a page connects](#which-way-a-page-connects).
 
@@ -218,18 +219,21 @@ On a laptop, the picture shows about 0.3 seconds after the page opens, at the st
   encoder from holding frames back.
 - **The page decodes with the browser's own decoders** (WebCodecs), from a small script
   (4.5 KB compressed) that loads only on pages with `<quillo-media>`. Its `data-state`
-  is `connecting`, `waiting`, `playing` or `unsupported`, for styling. `controls` adds a
-  button for sound and `muted` starts without it: browsers play sound only after a click
-  on the page.
+  is `connecting`, `waiting`, `playing`, `ended` or `unsupported`, for styling. `controls`
+  adds a button for sound and `muted` starts without it: browsers play sound only after a
+  click on the page.
+- **A dropped connection comes back.** The page opens it again (after half a second, then
+  longer, up to 15 seconds) and goes on watching. With no frames for 3 seconds (the
+  camera stopped, the connection is down), its `data-state` is `waiting`.
 - **How it is going**: `media.streams()` gives each stream's viewers and, per track,
   `frames`, `fps`, `kbps` and `lost` packets.
 
 ```quillo
-server fn stats() -> list = media.streams()
+server fn live_streams() -> list = media.streams()
 
 component Stats() {
-    state streams = stats()
-    every(1000, () => { streams = stats() ?? streams })
+    state streams = live_streams()
+    every(1000, () => { streams = live_streams() ?? streams })
     <p>{for s in streams =>
         <span key={s.name}>{s.video.fps} fps · {s.viewers} watching</span>}</p>
 }
@@ -237,6 +241,47 @@ component Stats() {
 
 The [Camera](/docs/examples/media/) example is a whole page, with the command for a Mac's
 own camera and microphone.
+
+### Pages that send: a video call
+
+A page can send too. `media.on` lets pages send a stream (or every stream a name ending
+in `*` starts), and `<quillo-media publish>` sends the page's camera and microphone to it,
+for every `<quillo-media stream>` of that name to play. A video call is a stream per
+person:
+
+```quillo
+media.on("call:*", { publish: (peer) => session().user != null })
+
+component Call(room: str, me: str, others: list) {
+    <div>
+        <quillo-media publish={`call:${room}:${me}`}/>
+        {for p in others => <quillo-media key={p} stream={`call:${room}:${p}`}/>}
+    </div>
+}
+```
+
+- **Encoded in the browser, passed on by the server.** The page encodes with WebCodecs
+  (H.264 baseline and Opus, what the server passes on) and sends the frames on its
+  channel connection. The server sends each person's picture on to everyone watching,
+  decoding nothing, as it does a camera's RTP: what video services call an SFU.
+- **`publish(peer)` says who may**, as a channel's `join` does, with the page's
+  `session()`. Without it, any page may.
+- **Not only the camera.** `no-video` or `no-audio` leaves one out. Given a MediaStream as
+  its `source` (a canvas's, or the screen's:
+  `el.source = js("navigator.mediaDevices.getDisplayMedia")` in `@mount`), it sends that
+  instead.
+- **How the sending goes.** Its `data-state` is `starting`, `sending`, `refused` (no
+  camera, or `publish` said no), `ended` or `unsupported`, and `el.mediaStats` counts
+  what it encoded and sent.
+- **Networks that block UDP** get no TURN relay: the page's WebSocket carries the frames
+  instead (see [Which way a page connects](#which-way-a-page-connects)).
+
+### Ending a stream
+
+Streams can be made while the program runs: `media.rtp` in a route or a channel's handler
+makes one for each room, once for a name. `media.close(name)` ends one: it stops taking
+RTP, lets its ports go for another stream to take, and tells its pages, whose `data-state`
+turns `ended`. It gives true if there was such a stream.
 
 ### Which way a page connects
 
@@ -281,6 +326,7 @@ you would rather keep the name.
 | Messages both ways, many a second, between the server and its pages | Channels |
 | Packets from devices or other programs | `udp.listen` |
 | A camera or an encoder, live | `media.rtp` and `<quillo-media>` |
+| Pages' own cameras, microphones or screens, to each other: a video call | `media.on` and `<quillo-media publish>` |
 
 The reference for each is under Routes: [UDP](/docs/routes/#udp),
 [Channels](/docs/routes/#channels) and [Media](/docs/routes/#media).
