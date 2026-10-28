@@ -36,6 +36,7 @@ for path in $(sed 's|^https://[^/]*||' "$out/sitemap.txt"); do
     curl -sf "http://127.0.0.1:$port$path" -o "$out${path}index.html"
 done
 curl -sf "http://127.0.0.1:$port/favicon.svg" -o "$out/favicon.svg"
+curl -sf "http://127.0.0.1:$port/robots.txt" -o "$out/robots.txt"
 curl -sf "http://127.0.0.1:$port/banner.png" -o "$out/banner.png"
 mkdir -p "$out/fonts"
 for f in "$here"/public/fonts/*.woff2; do
