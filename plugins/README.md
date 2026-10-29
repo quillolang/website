@@ -70,6 +70,7 @@ Each with a one-line repro, for the next FEEDBACK report:
 - `quillo check` does not see arguments in the wrong order for `reduce`: `reduce(xs, (a, x) => a + x, 0)` fails only when run.
 - A plugin's `pub fn f() -> serde_json::Map<String, serde_json::Value>` is "not exported", nor is `serde_json::Map` taken as a parameter type; `Value` and `std::collections::HashMap<String, serde_json::Value>` are.
 - A plugin parameter named like one of the file's private functions hides it inside that function: "expected function, found `&str`".
+- `quillo check` says "ok" for a program whose plugin does not compile: the Rust error only shows at `quillo run` (an `ocr.qwer` calling `.take()` on a `Box<dyn Read>` without `use std::io::Read`).
 
 ## The first 37
 

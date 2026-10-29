@@ -1,0 +1,303 @@
+//! Text read from pictures (OCR), in pure Rust: photos of documents, receipts, labels and screenshots to plain text, or to lines and words with their boxes, phone photos turned upright first; English printed text, and only the characters you allow when you know what to expect (digits for a meter, capitals for a plate).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ocrs = "=0.13.1"
+//! rten = "=0.26.0"
+//! image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine as _;
+use image::{DynamicImage, ImageDecoder, ImageReader};
+use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+// The models of the ocrs project (https://github.com/robertknight/ocrs-models), fetched once.
+const MODELS: [(&str, &str); 2] = [
+    ("text-detection.onnx", "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx"),
+    ("text-recognition.onnx", "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx"),
+];
+
+fn models_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("OCR_MODELS") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("quillo").join("ocr")
+}
+
+// Each model downloaded beside its final name and moved there whole, so a broken download is never loaded.
+fn fetch_models() -> Result<PathBuf, String> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = models_dir();
+    for (name, url) in MODELS {
+        let path = dir.join(name);
+        if path.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {}", dir.display(), e))?;
+        let res = ureq::get(url).timeout(std::time::Duration::from_secs(300)).call()
+            .map_err(|e| format!("cannot download the OCR model {} ({}); or put it in {} yourself, or set OCR_MODELS", name, e, dir.display()))?;
+        let mut bytes = Vec::new();
+        res.into_reader().take(64 << 20).read_to_end(&mut bytes).map_err(|e| format!("downloading {}: {}", name, e))?;
+        if bytes.len() < 100_000 {
+            return Err(format!("the OCR model {} came back with only {} bytes", name, bytes.len()));
+        }
+        let part = dir.join(format!("{}.part", name));
+        std::fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {}", part.display(), e))?;
+        std::fs::rename(&part, &path).map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+    }
+    Ok(dir)
+}
+
+// One engine per set of allowed characters, kept: loading the models takes a moment.
+fn engine(chars: Option<&str>) -> Result<Arc<OcrEngine>, String> {
+    static ENGINES: OnceLock<Mutex<HashMap<String, Arc<OcrEngine>>>> = OnceLock::new();
+    let engines = ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = chars.unwrap_or("").to_string();
+    if let Some(e) = engines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(e.clone());
+    }
+    let dir = fetch_models()?;
+    let load = |name: &str| rten::Model::load_file(dir.join(name)).map_err(|e| format!("cannot load the OCR model {}: {}", name, e));
+    let e = OcrEngine::new(OcrEngineParams {
+        detection_model: Some(load(MODELS[0].0)?),
+        recognition_model: Some(load(MODELS[1].0)?),
+        allowed_chars: chars.filter(|c| !c.is_empty()).map(|c| c.to_string()),
+        ..Default::default()
+    })
+    .map_err(|e| e.to_string())?;
+    let e = Arc::new(e);
+    engines.lock().unwrap_or_else(|e| e.into_inner()).insert(key, e.clone());
+    Ok(e)
+}
+
+// A picture from its bytes, turned as its EXIF orientation says (phone photos are often stored on their side).
+fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| format!("not a picture this can read: {}", e))?;
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| format!("cannot read the picture: {}", e))?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    Ok(img)
+}
+
+fn num(options: &Value, key: &str) -> Option<f64> {
+    options.get(key).and_then(|v| v.as_f64())
+}
+
+// One side of a range in pixels: a number is pixels, `"25%"` a share of the picture's `full` side.
+fn side(v: Option<&Value>, full: u32) -> Result<Option<u32>, String> {
+    let px = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Value::String(t)) => match t.trim().strip_suffix('%') {
+            Some(p) => p.trim().parse::<f64>().map_err(|_| format!("`{}` is not a percentage", t))? / 100.0 * full as f64,
+            None => t.trim().parse::<f64>().map_err(|_| format!("`{}` is not pixels or a percentage", t))?,
+        },
+        Some(other) => return Err(format!("{} is not pixels or a percentage", other)),
+    };
+    Ok(Some(px.round().clamp(0.0, full as f64) as u32))
+}
+
+// The part of the picture a `range` names, `(x, y, width, height)` in pixels: width and height left out run to the edge.
+fn range_of(range: &Value, w: u32, h: u32) -> Result<(u32, u32, u32, u32), String> {
+    if !range.is_object() {
+        return Err(format!("a range is {{ x, y, width, height }}, not {}", range));
+    }
+    let x = side(range.get("x"), w)?.unwrap_or(0);
+    let y = side(range.get("y"), h)?.unwrap_or(0);
+    let rw = side(range.get("width"), w)?.unwrap_or(w - x).min(w - x);
+    let rh = side(range.get("height"), h)?.unwrap_or(h - y).min(h - y);
+    if rw == 0 || rh == 0 {
+        return Err(format!("the range {} is empty in a {}×{} picture", range, w, h));
+    }
+    Ok((x, y, rw, rh))
+}
+
+fn read(img: DynamicImage, options: &Value) -> Result<Value, String> {
+    let started = std::time::Instant::now();
+    let mut img = img;
+    let (full_w, full_h) = (img.width(), img.height());
+    let (mut dx, mut dy) = (0.0, 0.0);
+    let mut range = Value::Null;
+    if let Some(r) = options.get("range").filter(|r| !r.is_null()) {
+        let (x, y, w, h) = range_of(r, full_w, full_h)?;
+        img = img.crop_imm(x, y, w, h);
+        (dx, dy) = (x as f64, y as f64);
+        range = json!({ "x": x, "y": y, "width": w, "height": h });
+    }
+    let scale = num(options, "scale").unwrap_or(1.0);
+    if !(0.1..=8.0).contains(&scale) {
+        return Err(format!("scale {} is out of range: 0.1 to 8", scale));
+    }
+    if scale != 1.0 {
+        let (w, h) = (((img.width() as f64) * scale).round().max(1.0) as u32, ((img.height() as f64) * scale).round().max(1.0) as u32);
+        img = img.resize_exact(w, h, image::imageops::FilterType::CatmullRom);
+    }
+    let rgb = img.into_rgb8();
+    let (width, height) = rgb.dimensions();
+    let chars = options.get("chars").and_then(|v| v.as_str());
+    let min_length = num(options, "min_length").unwrap_or(2.0).max(1.0) as usize;
+    let engine = engine(chars)?;
+    let source = ImageSource::from_bytes(rgb.as_raw(), (width, height)).map_err(|e| e.to_string())?;
+    let input = engine.prepare_input(source).map_err(|e| e.to_string())?;
+    let words = engine.detect_words(&input).map_err(|e| e.to_string())?;
+    let line_boxes = engine.find_text_lines(&input, &words);
+    let found = engine.recognize_text(&input, &line_boxes).map_err(|e| e.to_string())?;
+    // Boxes in the caller's picture: undo the scale, add the range's corner back.
+    let place = |item: &dyn TextItem| {
+        let r = item.bounding_rect();
+        let s = |v: i32| ((v as f64) / scale).round() as i64;
+        json!({ "x": s(r.left()) + dx as i64, "y": s(r.top()) + dy as i64, "width": s(r.width()), "height": s(r.height()) })
+    };
+    let mut lines = Vec::new();
+    for line in found.iter().flatten() {
+        let text = line.to_string();
+        if text.trim().chars().count() < min_length {
+            continue;
+        }
+        let mut out = place(line);
+        let ws: Vec<Value> = line.words().map(|w| {
+            let mut b = place(&w);
+            b.as_object_mut().unwrap().insert("text".into(), json!(w.to_string()));
+            b
+        }).collect();
+        let m = out.as_object_mut().unwrap();
+        m.insert("text".into(), json!(text.trim()));
+        m.insert("words".into(), Value::Array(ws));
+        let mut ordered = serde_json::Map::new();
+        for k in ["text", "x", "y", "width", "height", "words"] {
+            ordered.insert(k.into(), m.remove(k).unwrap());
+        }
+        lines.push(Value::Object(ordered));
+    }
+    let rows = match options.get("order").and_then(|v| v.as_str()) {
+        None | Some("reading") => false,
+        Some("rows") => true,
+        Some(o) => return Err(format!("order `{}` is not \"reading\" or \"rows\"", o)),
+    };
+    let text = if rows { by_rows(&mut lines) } else { lines.iter().map(|l| l["text"].as_str().unwrap_or("")).collect::<Vec<_>>().join("\n") };
+    Ok(json!({
+        "text": text,
+        "lines": lines,
+        "width": full_w,
+        "height": full_h,
+        "range": range,
+        "seconds": (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
+    }))
+}
+
+// Lines sorted into rows, top to bottom and left to right, as a receipt or a table is read: a line joins the row whose
+// middle it covers. The text has a row on each line, its pieces two spaces apart (`2 x Label rolls  18.40`).
+fn by_rows(lines: &mut Vec<Value>) -> String {
+    let n = |l: &Value, k: &str| l[k].as_i64().unwrap_or(0);
+    lines.sort_by_key(|l| (n(l, "y") + n(l, "height") / 2, n(l, "x")));
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for l in lines.drain(..) {
+        let mid = n(&l, "y") + n(&l, "height") / 2;
+        match rows.last_mut() {
+            Some(row) if row.iter().any(|r| mid >= n(r, "y") && mid <= n(r, "y") + n(r, "height")) => row.push(l),
+            _ => rows.push(vec![l]),
+        }
+    }
+    let mut text = Vec::new();
+    for row in rows.iter_mut() {
+        row.sort_by_key(|l| n(l, "x"));
+        text.push(row.iter().map(|l| l["text"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>().join("  "));
+        lines.extend(row.drain(..));
+    }
+    text.join("\n")
+}
+
+fn read_path(path: &str) -> Result<DynamicImage, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    decode(&bytes)
+}
+
+/// The text in the picture at `path`, line by line in reading order, joined by newlines. `""` when there is none.
+pub fn ocr_text(path: &str) -> Result<String, String> {
+    Ok(read(read_path(path)?, &json!({}))?["text"].as_str().unwrap_or("").to_string())
+}
+
+/// The lines of text in the picture at `path`, in reading order: `[{ text, x, y, width, height, words }]`, boxes in the
+/// picture's pixels, each word `{ text, x, y, width, height }`; for finding a field by where it is (the total at the right).
+pub fn ocr_lines(path: &str) -> Result<Value, String> {
+    Ok(read(read_path(path)?, &json!({}))?["lines"].clone())
+}
+
+/// The picture at `path` read with `options`: `chars` (only these characters may be read, e.g. `"0123456789."`),
+/// `scale` (enlarge small or low-resolution pictures, e.g. `2.0`), `range` (`{ x, y, width, height }`: read only that part,
+/// each in pixels or as a percentage of the picture like `"50%"`; width and height left out run to the edge),
+/// `order` (`"reading"`, the default: column by column; `"rows"`: row by row, a receipt's item and price on one line),
+/// `min_length` (drop lines shorter than this, default 2: specks read as letters). `{ text, lines, width, height, range, seconds }`,
+/// boxes always in the whole picture's pixels, `range` the part read in pixels (null for all of it).
+pub fn ocr_read(path: &str, options: serde_json::Value) -> Result<Value, String> {
+    read(read_path(path)?, &options)
+}
+
+/// Several parts of the picture at `path` read at once, for forms whose fields are always in the same place: `ranges` maps a
+/// name to a range (as `ocr_read`'s `range`, or `{ range, chars, scale }` to give that field its own options), and the answer
+/// maps each name to its text. `options` (`chars`, `scale`, `min_length`) apply to every range that does not set its own.
+pub fn ocr_ranges(path: &str, ranges: std::collections::HashMap<String, serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    let img = read_path(path)?;
+    let mut out = serde_json::Map::new();
+    let mut names: Vec<&String> = ranges.keys().collect();
+    names.sort();
+    for name in names {
+        let spec = &ranges[name];
+        let mut o = if options.is_object() { options.clone() } else { json!({}) };
+        if spec.get("range").is_some() {
+            for (k, v) in spec.as_object().unwrap() {
+                o[k] = v.clone();
+            }
+        } else {
+            o["range"] = spec.clone();
+        }
+        let r = read(img.clone(), &o).map_err(|e| format!("{}: {}", name, e))?;
+        out.insert(name.clone(), r["text"].clone());
+    }
+    Ok(Value::Object(out))
+}
+
+/// As `ocr_read`, for a picture given as base64 or as a `data:image/...;base64,` URL: a camera capture or a pasted screenshot.
+pub fn ocr_read_base64(data: &str, options: serde_json::Value) -> Result<Value, String> {
+    let b64 = match data.split_once(";base64,") {
+        Some((_, rest)) => rest,
+        None => data,
+    };
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(clean.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean.trim_end_matches('=')))
+        .map_err(|e| format!("not base64: {}", e))?;
+    read(decode(&bytes)?, &options)
+}
+
+/// Where the models are, `{ dir, ready, files }`: with `download` true they are fetched first if missing (12 MB, once),
+/// so a deploy can get them before the first picture arrives. `OCR_MODELS` names another folder.
+pub fn ocr_models(download: bool) -> Result<Value, String> {
+    if download {
+        fetch_models()?;
+    }
+    let dir = models_dir();
+    let files: Vec<Value> = MODELS.iter().map(|(name, _)| {
+        let p = dir.join(name);
+        json!({ "name": name, "bytes": std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) })
+    }).collect();
+    let ready = files.iter().all(|f| f["bytes"].as_u64().unwrap_or(0) > 0);
+    Ok(json!({ "dir": dir.display().to_string(), "ready": ready, "files": files }))
+}
