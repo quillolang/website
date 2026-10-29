@@ -23,6 +23,11 @@ db.exec("create table if not exists comments (id integer primary key, page text,
 db.exec("create index if not exists comments_page on comments (page, status)")
 db.exec("create table if not exists samples (id integer primary key, page text, user_id integer, title text, lang text, code text, notes text, status text, reports integer default 0, created integer)")
 db.exec("create index if not exists samples_page on samples (page, status)")
+// A reply names what it answers by kind and id ("comment:12", "sample:5"), in either
+// table; comments.parent (a comment's id) is kept for what was written before.
+for t in ["comments", "samples"] {
+    if !any(db.query(`pragma table_info(${t})`), (col) => col.name == "parent_key") { db.exec(`alter table ${t} add column parent_key text default ''`) }
+}
 db.exec("create table if not exists reports (target text, user_id integer, reason text, created integer, primary key (target, user_id))")
 
 let CM_SITE = env("SITE_URL") ?? "https://quillolang.org"
@@ -109,16 +114,7 @@ server fn cm_vote(target: str) {
     cm_votes(target)
 }
 
-// ---- comments ---------------------------------------------------------------------------
-
-server fn cm_comments(page: str) {
-    if !cm_page_ok(page) { return [] }
-    let likes = db.query("select target, count(*) as n from votes where target like 'comment:%' group by target")
-    let liked = reduce(likes, {}, (m, r) => set(m, r.target, r.n))
-    db.query("select c.id, c.parent, c.body, c.created, u.login, u.name, u.avatar from comments c join users u on u.id = c.user_id where c.page = ? and c.status = 'shown' and u.banned = 0 order by c.id", page)
-        | map((c) => { id: c.id, parent: c.parent, html: str(markdown(c.body)), ago: cm_ago(c.created), login: c.login,
-                       name: c.name ?? c.login, avatar: c.avatar, likes: liked[`comment:${c.id}`] ?? 0 })
-}
+// ---- the thread: comments and code samples on a page ------------------------------------
 
 fn cm_signed_in() {
     let u = cm_me_row()
@@ -127,13 +123,62 @@ fn cm_signed_in() {
     u
 }
 
-server fn cm_comment(page: str, body: str, parent: int = 0) {
+// What a thread is about: the page's title, from the site's own lists.
+fn cm_title(page: str) {
+    let d = find(pages + ref_pages, (p) => p.url == page)
+    if d != null { return d.title }
+    let k = find(kit_items, (x) => `/components/${x.slug}/` == page)
+    if k != null { return k.name }
+    let g = find(plug_items, (x) => `/plugins/${x.slug}/` == page)
+    if g != null { return g.name }
+    let b = find(blog_posts, (x) => x.url == page)
+    if b != null { return b.title }
+    page
+}
+
+fn cm_parent_key(row) = row.parent_key != null && row.parent_key != "" ? row.parent_key : (row.parent ?? 0) > 0 ? `comment:${row.parent}` : ""
+
+fn cm_code_lines(code: str, lang: str) =
+    lang == "quillo" || lang == "rust" ? highlight(code, lang) : split(code, "\n") | map((l) => [{ k: "plain", text: l }])
+
+// Every post on a page, comments and code samples alike, oldest first: the first one
+// opened the thread. Each carries `text` for searching in the browser.
+server fn cm_thread(page: str) {
+    if !cm_page_ok(page) { return [] }
+    let likes = db.query("select target, count(*) as n from votes where target like 'comment:%' or target like 'sample:%' group by target")
+    let liked = reduce(likes, {}, (m, r) => set(m, r.target, r.n))
+    let comments = db.query("select c.id, c.parent, c.parent_key, c.body, c.created, u.login, u.name, u.avatar from comments c join users u on u.id = c.user_id where c.page = ? and c.status = 'shown' and u.banned = 0", page)
+        | map((r) => { key: `comment:${r.id}`, id: r.id, kind: "comment", parent: cm_parent_key(r), created: r.created, ago: cm_ago(r.created),
+                       login: r.login, name: r.name ?? r.login, avatar: r.avatar, likes: liked[`comment:${r.id}`] ?? 0,
+                       html: str(markdown(r.body)), title: "", lang: "", code: "", lines: [], notes: "",
+                       text: lower(`${r.body} ${r.name ?? ""} ${r.login}`) })
+    let samples = db.query("select s.id, s.parent_key, s.title, s.lang, s.code, s.notes, s.created, u.login, u.name, u.avatar from samples s join users u on u.id = s.user_id where s.page = ? and s.status = 'shown' and u.banned = 0", page)
+        | map((r) => { key: `sample:${r.id}`, id: r.id, kind: "sample", parent: cm_parent_key(r), created: r.created, ago: cm_ago(r.created),
+                       login: r.login, name: r.name ?? r.login, avatar: r.avatar, likes: liked[`sample:${r.id}`] ?? 0,
+                       html: "", title: r.title, lang: r.lang, code: r.code, lines: cm_code_lines(r.code, r.lang),
+                       notes: r.notes == "" ? "" : str(markdown(r.notes)),
+                       text: lower(`${r.title} ${r.notes} ${r.code} ${r.name ?? ""} ${r.login}`) })
+    sort_by(comments + samples, (p) => p.created)
+}
+
+// Whether `parent` ("comment:12", "sample:5", or "" for a top-level post) is a post of this page.
+fn cm_parent_ok(page: str, parent: str) {
+    if parent == "" { return true }
+    if !re.test(parent, "^(comment|sample):[0-9]{1,9}$") { return false }
+    let [kind, id] = split(parent, ":")
+    let row = kind == "comment"
+        ? db.one("select 1 as x from comments where id = ? and page = ? and status = 'shown'", int(id), page)
+        : db.one("select 1 as x from samples where id = ? and page = ? and status = 'shown'", int(id), page)
+    row != null
+}
+
+server fn cm_comment(page: str, body: str, parent: str = "") {
     let u = cm_signed_in()?
     let text = trim(body)
     if !cm_page_ok(page) { return err("Comments are not open on this page") }
     if len(text) < 2 { return err("Write something first") }
     if len(text) > 5000 { return err("At most 5,000 characters") }
-    if parent != 0 && db.one("select 1 as x from comments where id = ? and page = ?", parent, page) == null { return err("That comment is gone") }
+    if !cm_parent_ok(page, parent) { return err("What you answered is gone") }
     if db.one("select count(*) as n from comments where user_id = ? and created > ?", u.id, now() - 10 * CM_MINUTE).n >= 5 {
         return err("Slow down: at most 5 comments in 10 minutes")
     }
@@ -141,37 +186,13 @@ server fn cm_comment(page: str, body: str, parent: int = 0) {
         return err("You said that already")
     }
     let why = cm_hold_reason(u, text)
-    db.exec("insert into comments (page, user_id, parent, body, status, created) values (?, ?, ?, ?, ?, ?)",
-        page, u.id, parent, text, why == null ? "shown" : "held", now())
+    let parent_id = starts_with(parent, "comment:") ? int(last(split(parent, ":"))) : 0
+    db.exec("insert into comments (page, user_id, parent, parent_key, body, status, created) values (?, ?, ?, ?, ?, ?, ?)",
+        page, u.id, parent_id, parent, text, why == null ? "shown" : "held", now())
     { held: why != null, why }
 }
 
-// The author, or an admin, takes a comment down.
-server fn cm_delete_comment(id: int) {
-    let u = cm_signed_in()?
-    let c = db.one("select user_id from comments where id = ?", id) ?? return err("That comment is gone")
-    if c.user_id != u.id && !cm_is_admin(u) { return err("Only its author can delete it") }
-    db.exec("update comments set status = 'hidden' where id = ?", id)
-    true
-}
-
-// ---- code samples ------------------------------------------------------------------------
-
-fn cm_code_lines(code: str, lang: str) =
-    lang == "quillo" || lang == "rust" ? highlight(code, lang) : split(code, "\n") | map((l) => [{ k: "plain", text: l }])
-
-server fn cm_samples(page: str) {
-    if !cm_page_ok(page) { return [] }
-    let likes = db.query("select target, count(*) as n from votes where target like 'sample:%' group by target")
-    let liked = reduce(likes, {}, (m, r) => set(m, r.target, r.n))
-    db.query("select s.id, s.title, s.lang, s.code, s.notes, s.created, u.login, u.name, u.avatar from samples s join users u on u.id = s.user_id where s.page = ? and s.status = 'shown' and u.banned = 0", page)
-        | map((s) => { id: s.id, title: s.title, lang: s.lang, code: s.code, lines: cm_code_lines(s.code, s.lang),
-                       notes: s.notes == "" ? "" : str(markdown(s.notes)), ago: cm_ago(s.created), login: s.login,
-                       name: s.name ?? s.login, avatar: s.avatar, likes: liked[`sample:${s.id}`] ?? 0 })
-        | sort_by((s) => -s.likes)
-}
-
-server fn cm_sample(page: str, title: str, lang: str, code: str, notes: str) {
+server fn cm_sample(page: str, title: str, lang: str, code: str, notes: str, parent: str = "") {
     let u = cm_signed_in()?
     let t = trim(title)
     if !cm_page_ok(page) { return err("Samples are not open on this page") }
@@ -180,21 +201,40 @@ server fn cm_sample(page: str, title: str, lang: str, code: str, notes: str) {
     if len(trim(code)) < 10 { return err("Paste the code") }
     if len(code) > 20000 { return err("At most 20,000 characters of code") }
     if len(notes) > 2000 { return err("At most 2,000 characters of notes") }
+    if !cm_parent_ok(page, parent) { return err("What you answered is gone") }
     if db.one("select count(*) as n from samples where user_id = ? and created > ?", u.id, now() - 60 * CM_MINUTE).n >= 3 {
         return err("At most 3 samples an hour")
     }
     let why = cm_hold_reason(u, notes)
-    db.exec("insert into samples (page, user_id, title, lang, code, notes, status, created) values (?, ?, ?, ?, ?, ?, ?, ?)",
-        page, u.id, t, lang, re.replace(code, "\\s+$", ""), trim(notes), why == null ? "shown" : "held", now())
+    db.exec("insert into samples (page, user_id, parent_key, title, lang, code, notes, status, created) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        page, u.id, parent, t, lang, re.replace(code, "\\s+$", ""), trim(notes), why == null ? "shown" : "held", now())
     { held: why != null, why }
 }
 
-server fn cm_delete_sample(id: int) {
+// The author, or an admin, takes a post down.
+server fn cm_delete(key: str) {
     let u = cm_signed_in()?
-    let s = db.one("select user_id from samples where id = ?", id) ?? return err("That sample is gone")
-    if s.user_id != u.id && !cm_is_admin(u) { return err("Only its author can delete it") }
-    db.exec("update samples set status = 'hidden' where id = ?", id)
+    if !re.test(key, "^(comment|sample):[0-9]{1,9}$") { return err("Nothing to delete") }
+    let [kind, id] = split(key, ":")
+    let row = (kind == "comment" ? db.one("select user_id from comments where id = ?", int(id)) : db.one("select user_id from samples where id = ?", int(id))) ?? return err("That post is gone")
+    if row.user_id != u.id && !cm_is_admin(u) { return err("Only its author can delete it") }
+    if kind == "comment" { db.exec("update comments set status = 'hidden' where id = ?", int(id)) } else { db.exec("update samples set status = 'hidden' where id = ?", int(id)) }
     true
+}
+
+// The threads of the site: every page with posts, with their counts and last activity;
+// `q` keeps the pages where a post says it.
+fn cm_threads(q: str, sort: str) {
+    let needle = `%${lower(trim(q))}%`
+    let rows = db.query("select page, count(*) as n, max(created) as last, min(created) as opened, count(distinct user_id) as people from (select c.page, c.user_id, c.created, c.body as text from comments c join users u on u.id = c.user_id where c.status = 'shown' and u.banned = 0 union all select s.page, s.user_id, s.created, s.title || ' ' || s.notes || ' ' || s.code from samples s join users u on u.id = s.user_id where s.status = 'shown' and u.banned = 0) where ? = '%%' or lower(text) like ? group by page", needle, needle)
+    let likes = reduce(db.query("select target, count(*) as n from votes where target like 'page:%' group by target"), {}, (m, r) => set(m, r.target, r.n))
+    let threads = rows | map((r) => merge(r, { title: cm_title(r.page), ago: cm_ago(r.last), likes: likes[`page:${r.page}`] ?? 0 }))
+    match sort {
+        "newest" => sort_by(threads, (t) => -t.opened)
+        "most" => sort_by(threads, (t) => -t.n)
+        "liked" => sort_by(threads, (t) => -t.likes)
+        _ => sort_by(threads, (t) => -t.last)
+    }
 }
 
 // ---- reports --------------------------------------------------------------------------------
@@ -324,129 +364,166 @@ view SiteSignIn(next: str, text: str = "Sign in with GitHub", ready: bool = true
         {text}
     </a>
 
-// The comments of a page, answered one level deep.
-component SiteComments(page: str) {
-    state items = live(cm_comments, page)
+// One post of a thread: a comment, or a code sample with its code.
+view SitePost(p: map, page: str, me, opener: bool, answer: fn, refresh: fn, say: fn, to: str = "") =
+    <article class={`cm-post cm-${p.kind}${opener ? " cm-opener" : ""}`} id={`${p.kind}-${p.id}`}>
+        <header>
+            <SiteAvatar login={p.login} avatar={p.avatar}/>
+            <a href={`https://github.com/${p.login}`} rel="nofollow ugc">{p.name}</a>
+            {opener && <span.cm-tag>opened this thread</span>}
+            {to != "" && <span.cm-to>to {to}</span>}
+            {p.kind == "sample" && <span.cm-tag.cm-tag-code>{p.lang}</span>}
+            <span.cm-ago>{p.ago}</span>
+        </header>
+        {p.kind == "sample"
+            ? [<h3.cm-sample-title>{p.title}</h3>,
+               p.notes != "" && <div.cm-body>{raw(p.notes)}</div>,
+               <div.snippet.cm-code><Code lines={p.lines}/></div>]
+            : <div.cm-body>{raw(p.html)}</div>}
+        <footer>
+            <SiteLike target={p.key}/>
+            {p.kind == "sample" && <button.cm-link type="button" @click={() => { js("navigator.clipboard.writeText", p.code); say("Copied.") }}>Copy</button>}
+            {me != null && <button.cm-link type="button" @click={() => answer(p.key)}>Reply</button>}
+            {me != null && me.login != p.login && <button.cm-link type="button" @click={() => { let r = cm_report(p.key, ""); say(is_err(r) ? r.error : "Reported: thank you.") }}>Report</button>}
+            {me != null && (me.login == p.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete(p.key); refresh() }}>Delete</button>}
+        </footer>
+    </article>
+
+// Writing a post: a comment, or code with a title and notes. `parent` is the post it
+// answers, or "" at the foot of the thread.
+component SiteComposer(page: str, parent: str = "", done: fn, cancel: fn? = null) {
+    state kind = "comment"
+    state draft = ""
+    state title = ""
+    state lang = "quillo"
+    state code = ""
+    state notes = ""
+    state problem = null
+    <form.cm-form class={parent != "" && "cm-reply"} @submit={() => {
+        let r = kind == "comment" ? cm_comment(page, draft, parent) : cm_sample(page, title, lang, code, notes, parent)
+        if is_err(r) { problem = r.error } else {
+            problem = null; draft = ""; title = ""; code = ""; notes = ""
+            done(r.held ? `Thanks: it shows once it has been looked at (${r.why}).` : null)
+        }
+    }}>
+        <div.cm-kinds role="tablist">
+            <button type="button" role="tab" aria-selected={kind == "comment" ? "true" : "false"} @click={() => { kind = "comment" }}>{parent == "" ? "Comment" : "Reply"}</button>
+            <button type="button" role="tab" aria-selected={kind == "sample" ? "true" : "false"} @click={() => { kind = "sample" }}>Share code</button>
+        </div>
+        {kind == "comment"
+            ? <textarea bind:value={draft} rows={parent == "" ? "4" : "3"} maxlength="5000" aria-label={parent == "" ? "Your comment" : "Your reply"}
+                placeholder={parent == "" ? "Add to the thread. Markdown works: \`code\`, **bold**, links." : "Your reply (Markdown)"}></textarea>
+            : [<div.cm-row>
+                   <input bind:value={title} maxlength="100" placeholder="What it shows: “A sortable table of orders”" aria-label="Title"/>
+                   <select bind:value={lang} aria-label="Language">{for l in CM_LANGS => <option value={l}>{l}</option>}</select>
+               </div>,
+               <textarea.cm-code-input bind:value={code} rows="10" maxlength="20000" spellcheck="false" aria-label="Code" placeholder="Paste the code"></textarea>,
+               <textarea bind:value={notes} rows="2" maxlength="2000" aria-label="Notes" placeholder="Notes (optional, Markdown)"></textarea>]}
+        {problem != null && <p.cm-problem role="alert">{problem}</p>}
+        <div.cm-row>
+            <button.cm-btn>{kind == "comment" ? (parent == "" ? "Post" : "Reply") : "Share"}</button>
+            {cancel != null && <button.cm-link type="button" @click={() => cancel()}>Cancel</button>}
+        </div>
+    </form>
+}
+
+// A page's thread: every comment and code sample on it, the first post as its opener,
+// replies under what they answer; sorted and searched here, in the browser.
+component SiteThread(page: str, title: str) {
+    state items = live(cm_thread, page)
     state me = cm_me()
     state ready = cm_signin_ready()
-    state draft = ""
-    state reply_to = 0
-    state reply_draft = ""
-    state problem = null
+    state sort = "oldest"
+    state q = ""
+    state reply_to = ""
     state note = null
-    let send = (parent: int, text: str) => {
-        let r = cm_comment(page, text, parent)
-        if is_err(r) { problem = r.error; return false }
-        problem = null
-        note = r.held ? `Thanks: it shows once it has been looked at (${r.why}).` : null
-        items = cm_comments(page)
-        true
+    let needle = lower(trim(q))
+    let hit = (p) => needle == "" || contains(p.text, needle)
+    // Everything said under a post, replies to replies included, in order.
+    let under = (p) => {
+        let keys = reduce(range(0, 8), [p.key], (ks, _) => ks + (items | filter((r) => contains(ks, r.parent) && !contains(ks, r.key)) | map((r) => r.key)))
+        items | filter((r) => r.key != p.key && contains(keys, r.key))
     }
-    let tops = items | filter((c) => c.parent == 0)
-    <section.cm-block aria-labelledby="cm-comments">
-        <h2 id="cm-comments">Comments <small>{len(items)}</small></h2>
-        {len(items) == 0 && <p.cm-empty>No comments yet. Questions, tips and corrections are all welcome.</p>}
-        <ol.cm-list>{for c in tops =>
-            <li key={c.id} id={`comment-${c.id}`}>
-                <article.cm-comment>
-                    <header><SiteAvatar login={c.login} avatar={c.avatar}/><a href={`https://github.com/${c.login}`} rel="nofollow ugc">{c.name}</a><span.cm-ago>{c.ago}</span></header>
-                    <div.cm-body>{raw(c.html)}</div>
-                    <footer>
-                        <SiteLike target={`comment:${c.id}`}/>
-                        {me != null && <button.cm-link type="button" @click={() => { reply_to = reply_to == c.id ? 0 : c.id }}>Reply</button>}
-                        {me != null && me.login != c.login && <button.cm-link type="button" @click={() => { let r = cm_report(`comment:${c.id}`, ""); note = is_err(r) ? r.error : "Reported: thank you." }}>Report</button>}
-                        {me != null && (me.login == c.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_comment(c.id); items = cm_comments(page) }}>Delete</button>}
-                    </footer>
-                </article>
-                <ol.cm-replies>{for r in items | filter((x) => x.parent == c.id) =>
-                    <li key={r.id} id={`comment-${r.id}`}>
-                        <article.cm-comment>
-                            <header><SiteAvatar login={r.login} avatar={r.avatar}/><a href={`https://github.com/${r.login}`} rel="nofollow ugc">{r.name}</a><span.cm-ago>{r.ago}</span></header>
-                            <div.cm-body>{raw(r.html)}</div>
-                            <footer>
-                                <SiteLike target={`comment:${r.id}`}/>
-                                {me != null && (me.login == r.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_comment(r.id); items = cm_comments(page) }}>Delete</button>}
-                            </footer>
-                        </article>
+    let author = (key) => (find(items, (x) => x.key == key) ?? { name: "" }).name
+    let shows = (p) => hit(p) || any(under(p), hit)
+    let tops = items | filter((p) => p.parent == "")
+    let opener = first(tops)
+    let others = drop(tops, 1)
+    let ordered = sort == "newest" ? reverse(others) : sort == "liked" ? sort_by(others, (p) => -p.likes) : others
+    let shown = (opener != null && shows(opener) ? [opener] : []) + filter(ordered, shows)
+    let people = len(unique(items | map((p) => p.login)))
+    let refresh = () => { items = cm_thread(page) }
+    let say = (m) => { note = m }
+    <section.cm-thread aria-labelledby="cm-thread">
+        <h2 id="cm-thread">Thread <small>{len(items)} {len(items) == 1 ? "post" : "posts"}{people > 1 ? `, ${people} people` : ""}</small></h2>
+        <p.cm-topic>On <b>{title}</b>: questions, tips, corrections, and code that uses it.</p>
+        {len(items) > 1 &&
+            <div.cm-tools>
+                <label.cm-sort>Sort <select bind:value={sort}><option value="oldest">in order</option><option value="newest">newest first</option><option value="liked">most liked</option></select></label>
+                <input.cm-search type="search" bind:value={q} placeholder="Search this thread" aria-label="Search this thread"/>
+                {needle != "" && <span.cm-count>{len(shown)} of {len(tops)}</span>}
+            </div>}
+        {len(items) == 0 && <p.cm-empty>No posts yet. The first one opens the thread.</p>}
+        {len(items) > 0 && len(shown) == 0 && <p.cm-empty>Nothing in this thread says “{trim(q)}”.</p>}
+        <ol.cm-list>{for p in shown =>
+            <li key={p.key}>
+                <SitePost p={p} page={page} me={me} opener={opener != null && p.key == opener.key} answer={(k) => { reply_to = reply_to == k ? "" : k }} refresh={refresh} say={say}/>
+                <ol.cm-replies>{for r in under(p) | filter((r) => needle == "" || hit(r) || hit(p)) =>
+                    <li key={r.key}>
+                        <SitePost p={r} page={page} me={me} opener={false} to={r.parent != p.key ? author(r.parent) : ""} answer={(k) => { reply_to = reply_to == k ? "" : k }} refresh={refresh} say={say}/>
                     </li>}</ol>
-                {reply_to == c.id &&
-                    <form.cm-form.cm-reply @submit={() => { if send(c.id, reply_draft) { reply_draft = ""; reply_to = 0 } }}>
-                        <textarea bind:value={reply_draft} rows="3" maxlength="5000" aria-label="Your reply" placeholder="Your reply (Markdown)"></textarea>
-                        <button.cm-btn>Reply</button>
-                    </form>}
+                {reply_to == p.key && me != null &&
+                    <SiteComposer page={page} parent={p.key} done={(n) => { note = n; reply_to = ""; refresh() }} cancel={() => { reply_to = "" }}/>}
+                {reply_to != "" && reply_to != p.key && any(under(p), (r) => r.key == reply_to) && me != null &&
+                    <SiteComposer page={page} parent={reply_to} done={(n) => { note = n; reply_to = ""; refresh() }} cancel={() => { reply_to = "" }}/>}
             </li>}</ol>
         {note != null && <p.cm-note role="status">{note}</p>}
-        {problem != null && <p.cm-problem role="alert">{problem}</p>}
         {me == null
-            ? <p.cm-signin-row><SiteSignIn next={page} text="Sign in with GitHub to comment" ready={ready}/></p>
+            ? <p.cm-signin-row><SiteSignIn next={page} text={len(items) == 0 ? "Sign in with GitHub to open the thread" : "Sign in with GitHub to post"} ready={ready}/></p>
             : <div>
-              <div.cm-as><SiteAvatar login={me.login} avatar={me.avatar}/><span>Commenting as <b>{me.name}</b></span>
-                  <form.cm-out method="post" action={`/auth/signout?next=${url_encode(page)}`}><button.cm-link>Sign out</button></form></div>
-              <form.cm-form @submit={() => { if send(0, draft) { draft = "" } }}>
-                <textarea bind:value={draft} rows="4" maxlength="5000" aria-label="Your comment" placeholder="Add a comment. Markdown works: `code`, **bold**, links."></textarea>
-                <button.cm-btn>Comment</button>
-              </form>
+                <div.cm-as><SiteAvatar login={me.login} avatar={me.avatar}/><span>Posting as <b>{me.name}</b></span>
+                    <form.cm-out method="post" action={`/auth/signout?next=${url_encode(page)}`}><button.cm-link>Sign out</button></form></div>
+                <SiteComposer page={page} parent="" done={(n) => { note = n; refresh() }}/>
               </div>}
     </section>
 }
 
-// Code people shared for a component or a plugin: the most liked first.
-component SiteSamples(page: str, name: str) {
-    state items = live(cm_samples, page)
-    state me = cm_me()
-    state ready = cm_signin_ready()
-    state open = false
-    state title = ""
-    state lang = starts_with(page, "/plugins/") ? "quillo" : "quillo"
-    state code = ""
-    state notes = ""
-    state problem = null
-    state note = null
-    <section.cm-block aria-labelledby="cm-samples">
-        <h2 id="cm-samples">Code samples <small>{len(items)}</small></h2>
-        <p.cm-empty>{len(items) == 0 ? `How do you use ${name}? Share a sample others can copy.` : `Shared by people using ${name}, the most liked first.`}</p>
-        {for s in items =>
-            <article.cm-sample key={s.id} id={`sample-${s.id}`}>
-                <header>
-                    <h3>{s.title}</h3>
-                    <span.cm-meta><SiteAvatar login={s.login} avatar={s.avatar}/><a href={`https://github.com/${s.login}`} rel="nofollow ugc">{s.name}</a> · {s.lang} · {s.ago}</span>
-                </header>
-                {s.notes != "" && <div.cm-body>{raw(s.notes)}</div>}
-                <div.snippet.cm-code><Code lines={s.lines}/></div>
-                <footer>
-                    <SiteLike target={`sample:${s.id}`}/>
-                    <button.cm-link type="button" @click={() => { js("navigator.clipboard.writeText", s.code); note = "Copied." }}>Copy</button>
-                    {me != null && me.login != s.login && <button.cm-link type="button" @click={() => { let r = cm_report(`sample:${s.id}`, ""); note = is_err(r) ? r.error : "Reported: thank you." }}>Report</button>}
-                    {me != null && (me.login == s.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_sample(s.id); items = cm_samples(page) }}>Delete</button>}
-                </footer>
-            </article>}
-        {note != null && <p.cm-note role="status">{note}</p>}
-        {me == null
-            ? <p.cm-signin-row><SiteSignIn next={page} text="Sign in with GitHub to share a sample" ready={ready}/></p>
-            : !open
-                ? <button.cm-btn.cm-btn-quiet type="button" @click={() => { open = true }}>Share a sample</button>
-                : <form.cm-form @submit={() => {
-                        let r = cm_sample(page, title, lang, code, notes)
-                        if is_err(r) { problem = r.error } else {
-                            problem = null; open = false; title = ""; code = ""; notes = ""
-                            note = r.held ? `Thanks: it shows once it has been looked at (${r.why}).` : "Thanks for sharing."
-                            items = cm_samples(page)
-                        }
-                    }}>
-                    <input bind:value={title} maxlength="100" placeholder="What it shows: “A sortable table of orders”" aria-label="Title"/>
-                    <select bind:value={lang} aria-label="Language">{for l in CM_LANGS => <option value={l}>{l}</option>}</select>
-                    <textarea.cm-code-input bind:value={code} rows="10" maxlength="20000" spellcheck="false" aria-label="Code" placeholder="Paste the code"></textarea>
-                    <textarea bind:value={notes} rows="2" maxlength="2000" aria-label="Notes" placeholder="Notes (optional, Markdown)"></textarea>
-                    {problem != null && <p.cm-problem role="alert">{problem}</p>}
-                    <div.cm-row><button.cm-btn>Share</button><button.cm-link type="button" @click={() => { open = false }}>Cancel</button></div>
-                  </form>}
-    </section>
-}
-
-// What goes at the foot of a page: its likes, its samples (components and plugins), its comments.
+// What goes at the foot of a page: its likes, and its thread. `name` is what the
+// thread is about when the page's title does not say (a component, a function).
 view SiteCommunity(page: str, name: str = "", samples: bool = false) =
     <div.cm>
-        <div.cm-bar><SiteLike target={`page:${page}`} label="Like this page"/><span>Useful? Like it, share a sample, or ask below.</span></div>
-        {samples && <SiteSamples page={page} name={name}/>}
-        <SiteComments page={page}/>
+        <div.cm-bar><SiteLike target={`page:${page}`} label="Like this page"/><span>Useful? Like it, or add to its thread below.</span></div>
+        <SiteThread page={page} title={name != "" ? name : cm_title(page)}/>
     </div>
+
+// ---- /community/: every thread on the site -------------------------------------------------------
+
+route GET /community ? { q: str = "", sort: str = "active" } {
+    let threads = cm_threads(slice(q, 0, 100), sort)
+    let sorts = [["active", "Active"], ["newest", "Newest"], ["most", "Most posts"], ["liked", "Most liked"]]
+    <SitePage title="Community" path="/community/" label="Community" href="/community/"
+              description="Every thread on quillolang.org: the questions, tips and code samples people posted on the docs, the components, the plugins and the blog.">
+        <div.prose>
+            <p.kicker>Community</p>
+            <h1>Threads</h1>
+            <p.lede>Every page of the docs, every component, plugin and post has a thread. These are the ones people have
+                opened: {len(threads)} {len(threads) == 1 ? "thread" : "threads"}{q != "" ? ` saying “${q}”` : ""}.</p>
+        </div>
+        <form.cm-threads-search method="get" action="/community/">
+            <input type="search" name="q" value={q} placeholder="Search every thread" aria-label="Search every thread" maxlength="100"/>
+            <input type="hidden" name="sort" value={sort}/>
+            <button.cm-btn.cm-btn-quiet>Search</button>
+        </form>
+        <div.sc-tools><nav.sc-sort aria-label="Sort">{for s in sorts =>
+            <a href={`/community/?sort=${s[0]}${q != "" ? `&q=${url_encode(q)}` : ""}`} aria-current={sort == s[0] ? "page" : null}>{s[1]}</a>}</nav></div>
+        {len(threads) == 0 && <p.cm-empty>{q == "" ? "No threads yet: open one on any page." : "No thread says that."}</p>}
+        <ol.cm-threads>{for t in threads =>
+            <li key={t.page}>
+                <a.cm-thread-link href={`${t.page}#cm-thread`}>
+                    <b>{t.title}</b>
+                    <span.cm-thread-meta>{t.n} {t.n == 1 ? "post" : "posts"} · {t.people} {t.people == 1 ? "person" : "people"}{t.likes > 0 ? ` · ${t.likes} likes` : ""} · {t.ago}</span>
+                    <span.cm-thread-path>{t.page}</span>
+                </a>
+            </li>}</ol>
+    </SitePage>
+}
