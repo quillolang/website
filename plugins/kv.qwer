@@ -1,0 +1,127 @@
+//! A fast embedded key-value store in one file: settings, sessions, counters and caches that survive restarts, with keys listed by prefix.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! redb = "2.6"
+
+use redb::{Database, ReadableTable, TableDefinition};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const TABLE: TableDefinition<&str, &str> = TableDefinition::new("kv");
+
+/// One open database per file, kept for the life of the server (redb locks its file).
+fn db(path: &str) -> Result<Arc<Database>, String> {
+    static DBS: OnceLock<Mutex<HashMap<String, Arc<Database>>>> = OnceLock::new();
+    let mut dbs = DBS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(d) = dbs.get(path) {
+        return Ok(d.clone());
+    }
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let d = Arc::new(Database::create(path).map_err(|e| format!("{}: {}", path, e))?);
+    dbs.insert(path.to_string(), d.clone());
+    Ok(d)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The stored value, or None when it is missing or its time is up.
+fn live(raw: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let exp = v.get("e").and_then(Value::as_i64).unwrap_or(0);
+    if exp > 0 && exp <= now() {
+        return None;
+    }
+    v.get("v").cloned()
+}
+
+fn put(path: &str, key: &str, value: &Value, ttl: i64) -> Result<(), String> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err("a key is 1 to 1024 bytes".into());
+    }
+    let rec = json!({ "v": value, "e": if ttl > 0 { now() + ttl } else { 0 } }).to_string();
+    let d = db(path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut t = w.open_table(TABLE).map_err(|e| e.to_string())?;
+        t.insert(key, rec.as_str()).map_err(|e| e.to_string())?;
+    }
+    w.commit().map_err(|e| e.to_string())
+}
+
+/// Keeps `value` (any value: text, number, list, map) at `key` in the store file `db_path`, made if missing.
+/// `ttl_seconds` above 0 makes it expire; 0 keeps it for good.
+pub fn kv_set(db_path: &str, key: &str, value: serde_json::Value, ttl_seconds: i64) -> Result<(), String> {
+    put(db_path, key, &value, ttl_seconds)
+}
+
+/// The value at `key`, or null when it was never set, was deleted, or has expired.
+pub fn kv_get(db_path: &str, key: &str) -> Result<Value, String> {
+    let d = db(db_path)?;
+    let r = d.begin_read().map_err(|e| e.to_string())?;
+    let t = match r.open_table(TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Value::Null),
+        Err(e) => return Err(e.to_string()),
+    };
+    let got = t.get(key).map_err(|e| e.to_string())?;
+    Ok(got.and_then(|g| live(g.value())).unwrap_or(Value::Null))
+}
+
+/// Removes `key`, and says whether it was there.
+pub fn kv_delete(db_path: &str, key: &str) -> Result<bool, String> {
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    let had = {
+        let mut t = w.open_table(TABLE).map_err(|e| e.to_string())?;
+        let old = t.remove(key).map_err(|e| e.to_string())?;
+        old.is_some()
+    };
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(had)
+}
+
+/// Adds `by` to the number at `key` (missing counts as 0) in one transaction, and gives the new number: safe with many requests at once.
+pub fn kv_incr(db_path: &str, key: &str, by: i64) -> Result<i64, String> {
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    let n = {
+        let mut t = w.open_table(TABLE).map_err(|e| e.to_string())?;
+        let old = t.get(key).map_err(|e| e.to_string())?.and_then(|g| live(g.value())).and_then(|v| v.as_i64()).unwrap_or(0);
+        let n = old.saturating_add(by);
+        let rec = json!({ "v": n, "e": 0 }).to_string();
+        t.insert(key, rec.as_str()).map_err(|e| e.to_string())?;
+        n
+    };
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+/// The keys starting with `prefix` ("" for all), in order, with their values: `[{ key, value }]`, at most `limit` (1 to 10,000). Expired ones are left out.
+pub fn kv_list(db_path: &str, prefix: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let d = db(db_path)?;
+    let r = d.begin_read().map_err(|e| e.to_string())?;
+    let t = match r.open_table(TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = Vec::new();
+    for item in t.range(prefix..).map_err(|e| e.to_string())? {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        if !k.value().starts_with(prefix) || out.len() >= limit.clamp(1, 10_000) as usize {
+            break;
+        }
+        if let Some(v) = live(v.value()) {
+            out.push(json!({ "key": k.value(), "value": v }));
+        }
+    }
+    Ok(out)
+}

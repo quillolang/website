@@ -1,0 +1,452 @@
+// The site's community: GitHub sign-in, likes, comments and code samples on the
+// components', plugins', docs and blog pages, reports, and the moderation the admin
+// pages use (admin.qwe). The project showcase is showcase.qwe; the newsletter,
+// newsletter.qwe. Everything is in one SQLite database: SITE_DB (on the server, in
+// the service's state folder, so deploys keep it), else site.db beside the program.
+//
+// Settings, from the environment (or a .env beside the program):
+//   GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET   a GitHub OAuth app, its callback
+//                                            https://quillolang.org/auth/github/callback
+//   SITE_ADMINS                              GitHub logins that may moderate, with commas
+//   SITE_URL                                 the site's address (https://quillolang.org)
+//   SITE_DEV_LOGIN=1                         on this machine only: sign in as "dev", to test
+//   QUILLO_SECRET                            signs the session cookie
+//
+// Moderation: what signed-in people post shows at once. A post with many links, from
+// a GitHub account under a week old, or reported by three people is held for review;
+// admins hide, show or delete anything, and ban accounts.
+
+db.open(env("SITE_DB") ?? "site.db")
+db.exec("create table if not exists users (id integer primary key, github_id integer unique, login text, name text, avatar text, gh_created text, created integer, banned integer default 0)")
+db.exec("create table if not exists votes (target text, voter text, ip text, created integer, primary key (target, voter))")
+db.exec("create table if not exists comments (id integer primary key, page text, user_id integer, parent integer default 0, body text, status text, reports integer default 0, created integer)")
+db.exec("create index if not exists comments_page on comments (page, status)")
+db.exec("create table if not exists samples (id integer primary key, page text, user_id integer, title text, lang text, code text, notes text, status text, reports integer default 0, created integer)")
+db.exec("create index if not exists samples_page on samples (page, status)")
+db.exec("create table if not exists reports (target text, user_id integer, reason text, created integer, primary key (target, user_id))")
+
+let CM_SITE = env("SITE_URL") ?? "https://quillolang.org"
+let CM_ADMINS = split(env("SITE_ADMINS") ?? "", ",") | map((s) => lower(trim(s))) | filter((s) => s != "")
+let CM_MINUTE = 60 * 1000
+let CM_DAY = 24 * 60 * CM_MINUTE
+let CM_LANGS = ["quillo", "rust", "shell", "sql", "css", "javascript", "html", "json", "text"]
+
+// ---- who is here ----------------------------------------------------------------------
+
+fn cm_user(id) = id == null ? null : db.one("select id, login, name, avatar, gh_created, banned from users where id = ?", id)
+fn cm_me_row() = unwatched(() => cm_user(session().uid ?? null))
+fn cm_is_admin(u) = u != null && contains(CM_ADMINS, lower(u.login))
+
+// Whether signing in works here: a GitHub OAuth app is set, or the dev account on this machine.
+fn cm_ready() = (env("GITHUB_CLIENT_ID") ?? "") != "" || env("SITE_DEV_LOGIN") == "1"
+server fn cm_signin_ready() = cm_ready()
+
+// The visitor, for the page: null when signed out.
+server fn cm_me() {
+    let u = cm_me_row()
+    u == null ? null : { id: u.id, login: u.login, name: u.name ?? u.login, avatar: u.avatar, admin: cm_is_admin(u), banned: u.banned == 1 }
+}
+
+// Who votes: a signed-in person, or this browser (an id kept in its session for a year).
+fn cm_voter(create: bool) {
+    let u = cm_me_row()
+    if u != null { return `u${u.id}` }
+    let s = session()
+    if s.vid != null { return s.vid }
+    if !create { return null }
+    let vid = `a${crypto.token(12)}`
+    set_session({ ...s, vid }, { max_age: "365d" })
+    vid
+}
+
+// A page is one of the site's own addresses; a target, a page or a post on one.
+fn cm_page_ok(page: str) = len(page) < 200 && re.test(page, "^/(components|plugins|blog|docs|showcase)/[a-z0-9_./-]*$")
+fn cm_target_ok(t: str) =
+    starts_with(t, "page:") ? cm_page_ok(slice(t, 5)) : re.test(t, "^(comment|sample|project):[0-9]{1,9}$")
+
+fn cm_links(text: str) = len(re.find_all(text, "https?://"))
+
+// Why a new post waits for review, or null: too many links, or a GitHub account under a week old.
+fn cm_hold_reason(u, text: str) {
+    if cm_links(text) > 3 { return "many links" }
+    let cutoff = date.format(date.from_ms(now() - 7 * CM_DAY), "yyyy-MM-dd")
+    if u.gh_created != null && slice(u.gh_created, 0, 10) > cutoff { return "a new GitHub account" }
+    null
+}
+
+fn cm_ago(ms: int) {
+    let s = (now() - ms) / 1000
+    s < 60 ? "just now"
+        : s < 3600 ? `${floor(s / 60)} min ago`
+        : s < 86400 ? `${floor(s / 3600)} h ago`
+        : s < 30 * 86400 ? `${floor(s / 86400)} d ago`
+        : date.format(date.from_ms(ms), "d MMM yyyy")
+}
+
+// ---- likes ----------------------------------------------------------------------------
+
+server fn cm_votes(target: str) {
+    if !cm_target_ok(target) { return { n: 0, mine: false } }
+    let n = db.one("select count(*) as n from votes where target = ?", target).n
+    let v = unwatched(() => cm_voter(false))
+    { n, mine: v != null && db.one("select 1 as x from votes where target = ? and voter = ?", target, v) != null }
+}
+
+// Likes `target`, or takes the like back. A browser without an account counts once;
+// at most three likes of one thing come from one address.
+server fn cm_vote(target: str) {
+    if !cm_target_ok(target) { return err("Nothing to like here") }
+    let v = cm_voter(true)
+    let ip = crypto.sha256(`${env("QUILLO_SECRET") ?? "dev"}:${request.ip}`)
+    if db.one("select 1 as x from votes where target = ? and voter = ?", target, v) != null {
+        db.exec("delete from votes where target = ? and voter = ?", target, v)
+    } else {
+        if starts_with(v, "a") && db.one("select count(*) as n from votes where target = ? and ip = ?", target, ip).n >= 3 {
+            return err("This has enough likes from here")
+        }
+        db.exec("insert into votes (target, voter, ip, created) values (?, ?, ?, ?)", target, v, ip, now())
+    }
+    cm_votes(target)
+}
+
+// ---- comments ---------------------------------------------------------------------------
+
+server fn cm_comments(page: str) {
+    if !cm_page_ok(page) { return [] }
+    let likes = db.query("select target, count(*) as n from votes where target like 'comment:%' group by target")
+    let liked = reduce(likes, {}, (m, r) => set(m, r.target, r.n))
+    db.query("select c.id, c.parent, c.body, c.created, u.login, u.name, u.avatar from comments c join users u on u.id = c.user_id where c.page = ? and c.status = 'shown' and u.banned = 0 order by c.id", page)
+        | map((c) => { id: c.id, parent: c.parent, html: str(markdown(c.body)), ago: cm_ago(c.created), login: c.login,
+                       name: c.name ?? c.login, avatar: c.avatar, likes: liked[`comment:${c.id}`] ?? 0 })
+}
+
+fn cm_signed_in() {
+    let u = cm_me_row()
+    if u == null { return err("Sign in with GitHub first") }
+    if u.banned == 1 { return err("This account cannot post here") }
+    u
+}
+
+server fn cm_comment(page: str, body: str, parent: int = 0) {
+    let u = cm_signed_in()?
+    let text = trim(body)
+    if !cm_page_ok(page) { return err("Comments are not open on this page") }
+    if len(text) < 2 { return err("Write something first") }
+    if len(text) > 5000 { return err("At most 5,000 characters") }
+    if parent != 0 && db.one("select 1 as x from comments where id = ? and page = ?", parent, page) == null { return err("That comment is gone") }
+    if db.one("select count(*) as n from comments where user_id = ? and created > ?", u.id, now() - 10 * CM_MINUTE).n >= 5 {
+        return err("Slow down: at most 5 comments in 10 minutes")
+    }
+    if db.one("select 1 as x from comments where user_id = ? and body = ? and created > ?", u.id, text, now() - 60 * CM_MINUTE) != null {
+        return err("You said that already")
+    }
+    let why = cm_hold_reason(u, text)
+    db.exec("insert into comments (page, user_id, parent, body, status, created) values (?, ?, ?, ?, ?, ?)",
+        page, u.id, parent, text, why == null ? "shown" : "held", now())
+    { held: why != null, why }
+}
+
+// The author, or an admin, takes a comment down.
+server fn cm_delete_comment(id: int) {
+    let u = cm_signed_in()?
+    let c = db.one("select user_id from comments where id = ?", id) ?? return err("That comment is gone")
+    if c.user_id != u.id && !cm_is_admin(u) { return err("Only its author can delete it") }
+    db.exec("update comments set status = 'hidden' where id = ?", id)
+    true
+}
+
+// ---- code samples ------------------------------------------------------------------------
+
+fn cm_code_lines(code: str, lang: str) =
+    lang == "quillo" || lang == "rust" ? highlight(code, lang) : split(code, "\n") | map((l) => [{ k: "plain", text: l }])
+
+server fn cm_samples(page: str) {
+    if !cm_page_ok(page) { return [] }
+    let likes = db.query("select target, count(*) as n from votes where target like 'sample:%' group by target")
+    let liked = reduce(likes, {}, (m, r) => set(m, r.target, r.n))
+    db.query("select s.id, s.title, s.lang, s.code, s.notes, s.created, u.login, u.name, u.avatar from samples s join users u on u.id = s.user_id where s.page = ? and s.status = 'shown' and u.banned = 0", page)
+        | map((s) => { id: s.id, title: s.title, lang: s.lang, code: s.code, lines: cm_code_lines(s.code, s.lang),
+                       notes: s.notes == "" ? "" : str(markdown(s.notes)), ago: cm_ago(s.created), login: s.login,
+                       name: s.name ?? s.login, avatar: s.avatar, likes: liked[`sample:${s.id}`] ?? 0 })
+        | sort_by((s) => -s.likes)
+}
+
+server fn cm_sample(page: str, title: str, lang: str, code: str, notes: str) {
+    let u = cm_signed_in()?
+    let t = trim(title)
+    if !cm_page_ok(page) { return err("Samples are not open on this page") }
+    if len(t) < 3 || len(t) > 100 { return err("A title of 3 to 100 characters") }
+    if !contains(CM_LANGS, lang) { return err("Pick the language of the code") }
+    if len(trim(code)) < 10 { return err("Paste the code") }
+    if len(code) > 20000 { return err("At most 20,000 characters of code") }
+    if len(notes) > 2000 { return err("At most 2,000 characters of notes") }
+    if db.one("select count(*) as n from samples where user_id = ? and created > ?", u.id, now() - 60 * CM_MINUTE).n >= 3 {
+        return err("At most 3 samples an hour")
+    }
+    let why = cm_hold_reason(u, notes)
+    db.exec("insert into samples (page, user_id, title, lang, code, notes, status, created) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        page, u.id, t, lang, re.replace(code, "\\s+$", ""), trim(notes), why == null ? "shown" : "held", now())
+    { held: why != null, why }
+}
+
+server fn cm_delete_sample(id: int) {
+    let u = cm_signed_in()?
+    let s = db.one("select user_id from samples where id = ?", id) ?? return err("That sample is gone")
+    if s.user_id != u.id && !cm_is_admin(u) { return err("Only its author can delete it") }
+    db.exec("update samples set status = 'hidden' where id = ?", id)
+    true
+}
+
+// ---- reports --------------------------------------------------------------------------------
+
+let CM_KINDS = ["comment", "sample", "project"]
+
+// One more report of a comment, sample or project; at three it is held.
+fn cm_set_reported(kind: str, id: int) {
+    match kind {
+        "comment" => { db.exec("update comments set reports = reports + 1, status = case when reports + 1 >= 3 and status = 'shown' then 'held' else status end where id = ?", id) }
+        "sample" => { db.exec("update samples set reports = reports + 1, status = case when reports + 1 >= 3 and status = 'shown' then 'held' else status end where id = ?", id) }
+        _ => { db.exec("update projects set reports = reports + 1, status = case when reports + 1 >= 3 and status = 'shown' then 'held' else status end where id = ?", id) }
+    }
+}
+
+// Sets a comment's, sample's or project's status: shown (its reports forgotten), held, hidden.
+fn cm_set_status(kind: str, id: int, status: str) {
+    match kind {
+        "comment" => { db.exec("update comments set status = ?, reports = case when ? = 'shown' then 0 else reports end where id = ?", status, status, id) }
+        "sample" => { db.exec("update samples set status = ?, reports = case when ? = 'shown' then 0 else reports end where id = ?", status, status, id) }
+        _ => { db.exec("update projects set status = ?, reports = case when ? = 'shown' then 0 else reports end where id = ?", status, status, id) }
+    }
+}
+
+fn cm_remove(kind: str, id: int) {
+    match kind {
+        "comment" => { db.exec("delete from comments where id = ?", id) }
+        "sample" => { db.exec("delete from samples where id = ?", id) }
+        _ => { db.exec("delete from projects where id = ?", id) }
+    }
+    db.exec("delete from votes where target = ?", `${kind}:${id}`)
+    db.exec("delete from reports where target = ?", `${kind}:${id}`)
+}
+
+// Reports a comment, sample or project; three reports hold it for review.
+server fn cm_report(target: str, reason: str) {
+    let u = cm_signed_in()?
+    if !cm_target_ok(target) || starts_with(target, "page:") { return err("Nothing to report") }
+    let kind = first(split(target, ":"))
+    let id = int(last(split(target, ":")))
+    if db.one("select 1 as x from reports where target = ? and user_id = ?", target, u.id) != null { return { reported: true } }
+    db.exec("insert into reports (target, user_id, reason, created) values (?, ?, ?, ?)", target, u.id, slice(trim(reason), 0, 300), now())
+    cm_set_reported(kind, id)
+    { reported: true }
+}
+
+// ---- signing in with GitHub -------------------------------------------------------------------
+
+fn cm_next(next: str) = starts_with(next, "/") && !starts_with(next, "//") && !contains(next, "\\") ? next : "/"
+
+fn cm_sign_in(gh) {
+    let had = db.one("select id from users where github_id = ?", gh.id)
+    if had == null {
+        db.exec("insert into users (github_id, login, name, avatar, gh_created, created) values (?, ?, ?, ?, ?, ?)",
+            gh.id, gh.login, gh.name, gh.avatar_url, gh.created_at, now())
+    } else {
+        db.exec("update users set login = ?, name = ?, avatar = ? where github_id = ?", gh.login, gh.name, gh.avatar_url, gh.id)
+    }
+    let u = db.one("select id from users where github_id = ?", gh.id)
+    set_session({ uid: u.id, vid: session().vid ?? null }, { max_age: "60d" })
+}
+
+route GET /auth/github ? { next: str = "/" } {
+    let id = env("GITHUB_CLIENT_ID") ?? ""
+    if id == "" {
+        // On this machine, for trying the site: a "dev" account.
+        if env("SITE_DEV_LOGIN") == "1" && (request.ip == "127.0.0.1" || request.ip == "::1") {
+            cm_sign_in({ id: 1, login: "dev", name: "Dev Person", avatar_url: "", created_at: "2015-01-01T00:00:00Z" })
+            return redirect(cm_next(next))
+        }
+        reply 503 "Signing in is not set up on this server yet."
+    }
+    let state = crypto.token(16)
+    set_session({ ...session(), oauth: state, next: cm_next(next) }, { max_age: "1h" })
+    redirect(`https://github.com/login/oauth/authorize?client_id=${url_encode(id)}&redirect_uri=${url_encode(CM_SITE + "/auth/github/callback")}&state=${state}&allow_signup=true`)
+}
+
+route GET /auth/github/callback ? { code: str = "", state: str = "" } {
+    let s = session()
+    if code == "" || s.oauth == null || !crypto.equal(state, s.oauth) { reply 400 "That sign-in link is out of date: try again." }
+    let token = http.post("https://github.com/login/oauth/access_token",
+        { client_id: env("GITHUB_CLIENT_ID"), client_secret: env("GITHUB_CLIENT_SECRET"), code, redirect_uri: CM_SITE + "/auth/github/callback" },
+        { accept: "application/json" }, { timeout: 15 })
+    let access = token?.json?.access_token ?? reply 502 "GitHub did not sign you in: try again."
+    let me = http.get("https://api.github.com/user", { authorization: `Bearer ${access}`, accept: "application/vnd.github+json", "user-agent": "quillolang.org" }, { timeout: 15 })
+    let gh = me?.json ?? reply 502 "GitHub did not say who you are: try again."
+    if gh.id == null { reply 502 "GitHub did not say who you are: try again." }
+    let next = s.next ?? "/"
+    cm_sign_in(gh)
+    redirect(next)
+}
+
+route POST /auth/signout ? { next: str = "/" } {
+    let vid = session().vid ?? null
+    set_session(vid == null ? null : { vid }, { max_age: "365d" })
+    redirect(cm_next(next))
+}
+
+// ---- on the pages ------------------------------------------------------------------------------
+
+view SiteAvatar(login: str, avatar: str?) =
+    avatar != null && avatar != ""
+        ? <img.cm-avatar src={`${avatar}${contains(avatar, "?") ? "&" : "?"}s=64`} alt="" width="28" height="28" loading="lazy" referrerpolicy="no-referrer"/>
+        : <span.cm-avatar.cm-initial aria-hidden="true">{upper(slice(login, 0, 1))}</span>
+
+// Like a page, a comment, a sample or a project.
+component SiteLike(target: str, label: str = "Like") {
+    state v = live(cm_votes, target)
+    state problem = null
+    <span.cm-like-wrap>
+        <button.cm-like type="button" aria-pressed={v.mine ? "true" : "false"} aria-label={`${label} (${v.n})`}
+            @click={() => {
+                let r = cm_vote(target)
+                if is_err(r) { problem = r.error } else { v = r; problem = null }
+            }}>
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.2 5.4 3.2C13.8 6.2 15.3 5 17.4 5 21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>
+            <span>{v.n}</span>
+        </button>
+        {problem != null && <small.cm-problem>{problem}</small>}
+    </span>
+}
+
+view SiteSignIn(next: str, text: str = "Sign in with GitHub", ready: bool = true) =
+    !ready ? <span.cm-empty>Posting opens soon: signing in with GitHub is being set up.</span> :
+    <a.cm-signin href={`/auth/github?next=${url_encode(next)}`}>
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8 0C3.6 0 0 3.6 0 8c0 3.5 2.3 6.5 5.5 7.6.4.1.5-.2.5-.4v-1.4c-2.2.5-2.7-1-2.7-1-.4-.9-.9-1.2-.9-1.2-.7-.5.1-.5.1-.5.8.1 1.2.8 1.2.8.7 1.2 1.9.9 2.4.7.1-.5.3-.9.5-1.1-1.8-.2-3.6-.9-3.6-4 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8.6-.2 1.3-.3 2-.3s1.4.1 2 .3c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.6.8 1.3.8 2.1 0 3.1-1.9 3.7-3.6 3.9.3.3.5.8.5 1.5v2.2c0 .2.1.5.6.4C13.7 14.5 16 11.5 16 8c0-4.4-3.6-8-8-8z"/></svg>
+        {text}
+    </a>
+
+// The comments of a page, answered one level deep.
+component SiteComments(page: str) {
+    state items = live(cm_comments, page)
+    state me = cm_me()
+    state ready = cm_signin_ready()
+    state draft = ""
+    state reply_to = 0
+    state reply_draft = ""
+    state problem = null
+    state note = null
+    let send = (parent: int, text: str) => {
+        let r = cm_comment(page, text, parent)
+        if is_err(r) { problem = r.error; return false }
+        problem = null
+        note = r.held ? `Thanks: it shows once it has been looked at (${r.why}).` : null
+        items = cm_comments(page)
+        true
+    }
+    let tops = items | filter((c) => c.parent == 0)
+    <section.cm-block aria-labelledby="cm-comments">
+        <h2 id="cm-comments">Comments <small>{len(items)}</small></h2>
+        {len(items) == 0 && <p.cm-empty>No comments yet. Questions, tips and corrections are all welcome.</p>}
+        <ol.cm-list>{for c in tops =>
+            <li key={c.id} id={`comment-${c.id}`}>
+                <article.cm-comment>
+                    <header><SiteAvatar login={c.login} avatar={c.avatar}/><a href={`https://github.com/${c.login}`} rel="nofollow ugc">{c.name}</a><span.cm-ago>{c.ago}</span></header>
+                    <div.cm-body>{raw(c.html)}</div>
+                    <footer>
+                        <SiteLike target={`comment:${c.id}`}/>
+                        {me != null && <button.cm-link type="button" @click={() => { reply_to = reply_to == c.id ? 0 : c.id }}>Reply</button>}
+                        {me != null && me.login != c.login && <button.cm-link type="button" @click={() => { let r = cm_report(`comment:${c.id}`, ""); note = is_err(r) ? r.error : "Reported: thank you." }}>Report</button>}
+                        {me != null && (me.login == c.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_comment(c.id); items = cm_comments(page) }}>Delete</button>}
+                    </footer>
+                </article>
+                <ol.cm-replies>{for r in items | filter((x) => x.parent == c.id) =>
+                    <li key={r.id} id={`comment-${r.id}`}>
+                        <article.cm-comment>
+                            <header><SiteAvatar login={r.login} avatar={r.avatar}/><a href={`https://github.com/${r.login}`} rel="nofollow ugc">{r.name}</a><span.cm-ago>{r.ago}</span></header>
+                            <div.cm-body>{raw(r.html)}</div>
+                            <footer>
+                                <SiteLike target={`comment:${r.id}`}/>
+                                {me != null && (me.login == r.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_comment(r.id); items = cm_comments(page) }}>Delete</button>}
+                            </footer>
+                        </article>
+                    </li>}</ol>
+                {reply_to == c.id &&
+                    <form.cm-form.cm-reply @submit={() => { if send(c.id, reply_draft) { reply_draft = ""; reply_to = 0 } }}>
+                        <textarea bind:value={reply_draft} rows="3" maxlength="5000" aria-label="Your reply" placeholder="Your reply (Markdown)"></textarea>
+                        <button.cm-btn>Reply</button>
+                    </form>}
+            </li>}</ol>
+        {note != null && <p.cm-note role="status">{note}</p>}
+        {problem != null && <p.cm-problem role="alert">{problem}</p>}
+        {me == null
+            ? <p.cm-signin-row><SiteSignIn next={page} text="Sign in with GitHub to comment" ready={ready}/></p>
+            : <div>
+              <div.cm-as><SiteAvatar login={me.login} avatar={me.avatar}/><span>Commenting as <b>{me.name}</b></span>
+                  <form.cm-out method="post" action={`/auth/signout?next=${url_encode(page)}`}><button.cm-link>Sign out</button></form></div>
+              <form.cm-form @submit={() => { if send(0, draft) { draft = "" } }}>
+                <textarea bind:value={draft} rows="4" maxlength="5000" aria-label="Your comment" placeholder="Add a comment. Markdown works: `code`, **bold**, links."></textarea>
+                <button.cm-btn>Comment</button>
+              </form>
+              </div>}
+    </section>
+}
+
+// Code people shared for a component or a plugin: the most liked first.
+component SiteSamples(page: str, name: str) {
+    state items = live(cm_samples, page)
+    state me = cm_me()
+    state ready = cm_signin_ready()
+    state open = false
+    state title = ""
+    state lang = starts_with(page, "/plugins/") ? "quillo" : "quillo"
+    state code = ""
+    state notes = ""
+    state problem = null
+    state note = null
+    <section.cm-block aria-labelledby="cm-samples">
+        <h2 id="cm-samples">Code samples <small>{len(items)}</small></h2>
+        <p.cm-empty>{len(items) == 0 ? `How do you use ${name}? Share a sample others can copy.` : `Shared by people using ${name}, the most liked first.`}</p>
+        {for s in items =>
+            <article.cm-sample key={s.id} id={`sample-${s.id}`}>
+                <header>
+                    <h3>{s.title}</h3>
+                    <span.cm-meta><SiteAvatar login={s.login} avatar={s.avatar}/><a href={`https://github.com/${s.login}`} rel="nofollow ugc">{s.name}</a> · {s.lang} · {s.ago}</span>
+                </header>
+                {s.notes != "" && <div.cm-body>{raw(s.notes)}</div>}
+                <div.snippet.cm-code><Code lines={s.lines}/></div>
+                <footer>
+                    <SiteLike target={`sample:${s.id}`}/>
+                    <button.cm-link type="button" @click={() => { js("navigator.clipboard.writeText", s.code); note = "Copied." }}>Copy</button>
+                    {me != null && me.login != s.login && <button.cm-link type="button" @click={() => { let r = cm_report(`sample:${s.id}`, ""); note = is_err(r) ? r.error : "Reported: thank you." }}>Report</button>}
+                    {me != null && (me.login == s.login || me.admin) && <button.cm-link type="button" @click={() => { cm_delete_sample(s.id); items = cm_samples(page) }}>Delete</button>}
+                </footer>
+            </article>}
+        {note != null && <p.cm-note role="status">{note}</p>}
+        {me == null
+            ? <p.cm-signin-row><SiteSignIn next={page} text="Sign in with GitHub to share a sample" ready={ready}/></p>
+            : !open
+                ? <button.cm-btn.cm-btn-quiet type="button" @click={() => { open = true }}>Share a sample</button>
+                : <form.cm-form @submit={() => {
+                        let r = cm_sample(page, title, lang, code, notes)
+                        if is_err(r) { problem = r.error } else {
+                            problem = null; open = false; title = ""; code = ""; notes = ""
+                            note = r.held ? `Thanks: it shows once it has been looked at (${r.why}).` : "Thanks for sharing."
+                            items = cm_samples(page)
+                        }
+                    }}>
+                    <input bind:value={title} maxlength="100" placeholder="What it shows: “A sortable table of orders”" aria-label="Title"/>
+                    <select bind:value={lang} aria-label="Language">{for l in CM_LANGS => <option value={l}>{l}</option>}</select>
+                    <textarea.cm-code-input bind:value={code} rows="10" maxlength="20000" spellcheck="false" aria-label="Code" placeholder="Paste the code"></textarea>
+                    <textarea bind:value={notes} rows="2" maxlength="2000" aria-label="Notes" placeholder="Notes (optional, Markdown)"></textarea>
+                    {problem != null && <p.cm-problem role="alert">{problem}</p>}
+                    <div.cm-row><button.cm-btn>Share</button><button.cm-link type="button" @click={() => { open = false }}>Cancel</button></div>
+                  </form>}
+    </section>
+}
+
+// What goes at the foot of a page: its likes, its samples (components and plugins), its comments.
+view SiteCommunity(page: str, name: str = "", samples: bool = false) =
+    <div.cm>
+        <div.cm-bar><SiteLike target={`page:${page}`} label="Like this page"/><span>Useful? Like it, share a sample, or ask below.</span></div>
+        {samples && <SiteSamples page={page} name={name}/>}
+        <SiteComments page={page}/>
+    </div>

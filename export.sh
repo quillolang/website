@@ -37,6 +37,8 @@ for path in $(sed 's|^https://[^/]*||' "$out/sitemap.txt"); do
     curl -sf "http://127.0.0.1:$port$path" -o "$out${path}index.html"
 done
 curl -sf "http://127.0.0.1:$port/favicon.svg" -o "$out/favicon.svg"
+mkdir -p "$out/plugins"
+curl -sf "http://127.0.0.1:$port/plugins/index.json" -o "$out/plugins/index.json"
 curl -sf "http://127.0.0.1:$port/robots.txt" -o "$out/robots.txt"
 curl -sf "http://127.0.0.1:$port/banner.png" -o "$out/banner.png"
 mkdir -p "$out/fonts"
@@ -67,7 +69,10 @@ if [ "${SKIP_PLUGIN_TESTS:-}" != 1 ]; then
 fi
 "$here/plugins/zip.sh"
 mkdir -p "$out/plugins/files"
-cp "$here"/plugins/*.qwer "$here"/plugins/*.qwe "$here"/plugins/sample.jpg "$here/plugins/quillo-plugins.zip" "$out/plugins/files/"
+cp "$here"/plugins/*.qwer "$here"/plugins/*.qwe "$here/plugins/quillo-plugins.zip" "$out/plugins/files/"
+for f in $(node -e 'for (const p of require(process.argv[1])) for (const f of p.files ?? []) console.log(f)' "$here/plugins/catalog.json"); do
+    cp "$here/plugins/$f" "$out/plugins/files/"
+done
 
 # Bundles are named by their content, so browsers may keep them for good.
 # Pages may be kept 30 seconds, as quillo run lets a prefetched page be kept:

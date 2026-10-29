@@ -1,0 +1,161 @@
+//! GPX tracks from watches, phones and bike computers read: distance, climbing, duration, moving pace and per-kilometre splits, and the points for a map line. For running, cycling and hiking apps.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! gpx = "0.10"
+//! time = "0.3"
+
+use serde_json::{json, Value};
+
+const MAX_FILE: u64 = 64 << 20;
+
+struct Pt {
+    lat: f64,
+    lon: f64,
+    ele: Option<f64>,
+    t: Option<i64>,
+}
+
+/// The GPX: a file's path, or its XML text.
+fn read(source: &str) -> Result<gpx::Gpx, String> {
+    if source.trim_start().starts_with('<') {
+        return gpx::read(source.as_bytes()).map_err(|e| format!("not GPX: {}", e));
+    }
+    let meta = std::fs::metadata(source).map_err(|e| format!("{}: {}", source, e))?;
+    if meta.len() > MAX_FILE {
+        return Err("a GPX file is at most 64 MB".into());
+    }
+    let f = std::fs::File::open(source).map_err(|e| format!("{}: {}", source, e))?;
+    gpx::read(std::io::BufReader::new(f)).map_err(|e| format!("not GPX: {}", e))
+}
+
+/// Every track point in order (all tracks and segments), or the route points when there is no track.
+fn points(g: &gpx::Gpx) -> Vec<Pt> {
+    let conv = |w: &gpx::Waypoint| {
+        let p = w.point();
+        Pt { lat: p.y(), lon: p.x(), ele: w.elevation, t: w.time.map(|t| time::OffsetDateTime::from(t).unix_timestamp()) }
+    };
+    let mut out: Vec<Pt> = g.tracks.iter().flat_map(|t| t.segments.iter()).flat_map(|s| s.points.iter()).map(conv).collect();
+    if out.is_empty() {
+        out = g.routes.iter().flat_map(|r| r.points.iter()).map(conv).collect();
+    }
+    out
+}
+
+fn km(a: &Pt, b: &Pt) -> f64 {
+    let (p1, p2) = (a.lat.to_radians(), b.lat.to_radians());
+    let (dp, dl) = ((b.lat - a.lat).to_radians(), (b.lon - a.lon).to_radians());
+    let h = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * 6371.0088 * h.sqrt().asin()
+}
+
+fn iso(t: i64) -> Value {
+    time::OffsetDateTime::from_unix_timestamp(t).ok().and_then(|d| d.format(&time::format_description::well_known::Rfc3339).ok()).map(Value::from).unwrap_or(Value::Null)
+}
+
+fn r(x: f64, d: f64) -> f64 {
+    (x * d).round() / d
+}
+
+/// A track's numbers: `{ name, points, distance_km, climb_m, descent_m, min_elevation_m, max_elevation_m, start, end, duration_s, moving_s, avg_kmh, moving_kmh, bbox }`.
+/// Climbing counts rises of more than 2 m, so GPS noise on the flat is not climbing; `moving_s` leaves out stops (under 1 km/h). Times are null when the file has none.
+pub fn gpx_summary(source: &str) -> Result<Value, String> {
+    let g = read(source)?;
+    let pts = points(&g);
+    let name = g.tracks.first().and_then(|t| t.name.clone()).or_else(|| g.metadata.as_ref().and_then(|m| m.name.clone()));
+    if pts.is_empty() {
+        return Ok(json!({ "name": name, "points": 0, "distance_km": 0.0 }));
+    }
+    let (mut dist, mut climb, mut descent, mut moving) = (0.0, 0.0, 0.0, 0i64);
+    let mut base = pts[0].ele;
+    for w in pts.windows(2) {
+        let d = km(&w[0], &w[1]);
+        dist += d;
+        if let (Some(t0), Some(t1)) = (w[0].t, w[1].t) {
+            let dt = t1 - t0;
+            if dt > 0 && d / (dt as f64 / 3600.0) >= 1.0 {
+                moving += dt;
+            }
+        }
+        if let (Some(b), Some(e)) = (base, w[1].ele) {
+            if e - b > 2.0 {
+                climb += e - b;
+                base = Some(e);
+            } else if b - e > 2.0 {
+                descent += b - e;
+                base = Some(e);
+            }
+        } else if base.is_none() {
+            base = w[1].ele;
+        }
+    }
+    let eles: Vec<f64> = pts.iter().filter_map(|p| p.ele).collect();
+    let times: Vec<i64> = pts.iter().filter_map(|p| p.t).collect();
+    let (start, end) = (times.first().copied(), times.last().copied());
+    let duration = match (start, end) {
+        (Some(a), Some(b)) => Some(b - a),
+        _ => None,
+    };
+    let kmh = |s: i64| if s > 0 { Some(r(dist / (s as f64 / 3600.0), 100.0)) } else { None };
+    Ok(json!({
+        "name": name, "points": pts.len(), "distance_km": r(dist, 1000.0), "climb_m": r(climb, 10.0), "descent_m": r(descent, 10.0),
+        "min_elevation_m": eles.iter().cloned().reduce(f64::min), "max_elevation_m": eles.iter().cloned().reduce(f64::max),
+        "start": start.map(iso), "end": end.map(iso), "duration_s": duration, "moving_s": if times.is_empty() { None } else { Some(moving) },
+        "avg_kmh": duration.and_then(kmh), "moving_kmh": if times.is_empty() { None } else { kmh(moving) },
+        "bbox": {
+            "min_lat": pts.iter().map(|p| p.lat).fold(f64::MAX, f64::min), "min_lon": pts.iter().map(|p| p.lon).fold(f64::MAX, f64::min),
+            "max_lat": pts.iter().map(|p| p.lat).fold(f64::MIN, f64::max), "max_lon": pts.iter().map(|p| p.lon).fold(f64::MIN, f64::max),
+        },
+    }))
+}
+
+/// The track as `[[lat, lon, elevation], ...]` for a map line (Leaflet's `L.polyline`), thinned evenly to at most `max_points` (2 to 100,000); the first and last points are kept.
+pub fn gpx_points(source: &str, max_points: i64) -> Result<Vec<Vec<Value>>, String> {
+    let pts = points(&read(source)?);
+    let max = max_points.clamp(2, 100_000) as usize;
+    let step = (pts.len() as f64 / max as f64).max(1.0);
+    let mut out = Vec::new();
+    let mut i = 0.0;
+    while (i as usize) < pts.len() && out.len() < max {
+        let p = &pts[i as usize];
+        out.push(vec![json!(p.lat), json!(p.lon), json!(p.ele)]);
+        i += step;
+    }
+    if let (Some(last), Some(o)) = (pts.last(), out.last_mut()) {
+        if pts.len() > 1 && (o[0] != json!(last.lat) || o[1] != json!(last.lon)) {
+            *o = vec![json!(last.lat), json!(last.lon), json!(last.ele)];
+        }
+    }
+    Ok(out)
+}
+
+/// The time each `split_km` took (1 for kilometre splits, 1.609 for miles): `[{ split, km, seconds, pace }]`, `pace` as minutes:seconds per split; the last one may be shorter. Needs times in the file.
+pub fn gpx_splits(source: &str, split_km: f64) -> Result<Vec<Value>, String> {
+    if !(split_km >= 0.1) {
+        return Err("a split is at least 0.1 km".into());
+    }
+    let pts = points(&read(source)?);
+    let mut out = Vec::new();
+    let (mut dist, mut from_t, mut from_d) = (0.0, pts.first().and_then(|p| p.t), 0.0);
+    let pace = |s: f64| format!("{}:{:02}", (s / 60.0) as i64, (s % 60.0).round() as i64 % 60);
+    for w in pts.windows(2) {
+        dist += km(&w[0], &w[1]);
+        if dist - from_d >= split_km {
+            let (Some(a), Some(b)) = (from_t, w[1].t) else { return Err("the track has no times".into()) };
+            let secs = (b - a) as f64;
+            out.push(json!({ "split": out.len() + 1, "km": r(dist, 1000.0), "seconds": secs, "pace": pace(secs * split_km / (dist - from_d)) }));
+            from_t = w[1].t;
+            from_d = dist;
+            if out.len() >= 10_000 {
+                break;
+            }
+        }
+    }
+    if dist - from_d > 0.01 {
+        if let (Some(a), Some(b)) = (from_t, pts.last().and_then(|p| p.t)) {
+            let secs = (b - a) as f64;
+            out.push(json!({ "split": out.len() + 1, "km": r(dist, 1000.0), "seconds": secs, "pace": pace(secs * split_km / (dist - from_d)) }));
+        }
+    }
+    Ok(out)
+}

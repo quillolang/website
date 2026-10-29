@@ -1,0 +1,143 @@
+//! Read a git repository from the server, in pure Rust with no git installed: recent commits, who wrote them, the files each changed, and a file as it was at any commit. For changelogs, "last updated" dates and dashboards.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! gix = { version = "0.66", default-features = false, features = ["revision"] }
+
+use gix::bstr::ByteSlice;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+
+const MAX_COMMITS: i64 = 1000;
+const MAX_FILE: usize = 16 << 20;
+
+fn repo(path: &str) -> Result<gix::Repository, String> {
+    gix::discover(path).map_err(|e| format!("{}: not inside a git repository ({})", path, e))
+}
+
+fn commit<'r>(repo: &'r gix::Repository, rev: &str) -> Result<gix::Commit<'r>, String> {
+    let rev = if rev.is_empty() { "HEAD" } else { rev };
+    let id = repo.rev_parse_single(rev).map_err(|e| format!("{}: {}", rev, e))?;
+    id.object().map_err(|e| e.to_string())?.try_into_commit().map_err(|e| e.to_string())
+}
+
+fn iso(t: gix::date::Time) -> String {
+    t.format(gix::date::time::format::ISO8601_STRICT)
+}
+
+fn summary(c: &gix::Commit<'_>) -> Result<Value, String> {
+    let a = c.author().map_err(|e| e.to_string())?;
+    let msg = c.message().map_err(|e| e.to_string())?;
+    let id = c.id.to_string();
+    Ok(json!({
+        "id": id, "short": &id[..7.min(id.len())],
+        "author": a.name.to_str_lossy(), "email": a.email.to_str_lossy(), "date": iso(a.time),
+        "summary": msg.summary().to_str_lossy(),
+        "parents": c.parent_ids().map(|p| p.to_string()).collect::<Vec<_>>(),
+    }))
+}
+
+/// Every file in a commit's tree: path to blob id.
+fn files(c: &gix::Commit<'_>) -> Result<BTreeMap<String, gix::ObjectId>, String> {
+    let tree = c.tree().map_err(|e| e.to_string())?;
+    let entries = tree.traverse().breadthfirst.files().map_err(|e| e.to_string())?;
+    Ok(entries.into_iter().filter(|e| !e.mode.is_tree()).map(|e| (e.filepath.to_str_lossy().into_owned(), e.oid)).collect())
+}
+
+fn walk(repo: &gix::Repository, rev: &str, limit: i64) -> Result<Vec<gix::ObjectId>, String> {
+    let tip = commit(repo, rev)?.id;
+    let mut out = Vec::new();
+    for info in repo.rev_walk([tip]).all().map_err(|e| e.to_string())? {
+        out.push(info.map_err(|e| e.to_string())?.id);
+        if out.len() as i64 >= limit.clamp(1, MAX_COMMITS) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The latest commits reachable from `rev` ("" or "HEAD", a branch, a tag, an id), newest first, at most `limit` (1 to 1,000):
+/// `[{ id, short, author, email, date, summary, parents }]`. `repo_path` may be any folder inside the repository.
+pub fn git_log(repo_path: &str, rev: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let repo = repo(repo_path)?;
+    walk(&repo, rev, limit)?.into_iter().map(|id| summary(&repo.find_object(id).map_err(|e| e.to_string())?.into_commit())).collect()
+}
+
+/// One commit in full: what `git_log` gives, the whole `message`, and `files`, each `{ path, change }` with change "added", "modified" or "deleted" (against its first parent).
+pub fn git_commit(repo_path: &str, rev: &str) -> Result<Value, String> {
+    let repo = repo(repo_path)?;
+    let c = commit(&repo, rev)?;
+    let mut out = summary(&c)?;
+    out["message"] = json!(c.message_raw_sloppy().to_str_lossy());
+    let now = files(&c)?;
+    let before = match c.parent_ids().next() {
+        Some(p) => files(&p.object().map_err(|e| e.to_string())?.into_commit())?,
+        None => BTreeMap::new(),
+    };
+    let mut changed = Vec::new();
+    for (path, id) in &now {
+        match before.get(path) {
+            None => changed.push(json!({ "path": path, "change": "added" })),
+            Some(old) if old != id => changed.push(json!({ "path": path, "change": "modified" })),
+            _ => {}
+        }
+    }
+    for path in before.keys().filter(|p| !now.contains_key(*p)) {
+        changed.push(json!({ "path": path, "change": "deleted" }));
+    }
+    changed.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    out["files"] = Value::Array(changed);
+    Ok(out)
+}
+
+/// A file's text as it was at `rev` (`path` from the repository's root, with `/`), or null when it did not exist then. Files over 16 MB, or not text, are an error.
+pub fn git_show_file(repo_path: &str, rev: &str, path: &str) -> Result<Option<String>, String> {
+    let repo = repo(repo_path)?;
+    let tree = commit(&repo, rev)?.tree().map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    let Some(entry) = tree.lookup_entry_by_path(path, &mut buf).map_err(|e| e.to_string())? else { return Ok(None) };
+    let obj = entry.object().map_err(|e| e.to_string())?;
+    if obj.data.len() > MAX_FILE {
+        return Err(format!("{} is over 16 MB", path));
+    }
+    String::from_utf8(obj.data.clone()).map(Some).map_err(|_| format!("{} is not text", path))
+}
+
+/// The commits (from the last `limit`, 1 to 1,000) that changed one file, newest first, as `git_log` gives them: a page's history, or its "last updated" date.
+pub fn git_file_history(repo_path: &str, rev: &str, path: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let repo = repo(repo_path)?;
+    let blob_at = |c: &gix::Commit<'_>| -> Result<Option<gix::ObjectId>, String> {
+        let tree = c.tree().map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        Ok(tree.lookup_entry_by_path(path, &mut buf).map_err(|e| e.to_string())?.map(|e| e.object_id()))
+    };
+    let mut out = Vec::new();
+    for id in walk(&repo, rev, limit)? {
+        let c = repo.find_object(id).map_err(|e| e.to_string())?.into_commit();
+        let now = blob_at(&c)?;
+        let before = match c.parent_ids().next() {
+            Some(p) => blob_at(&p.object().map_err(|e| e.to_string())?.into_commit())?,
+            None => None,
+        };
+        if now != before {
+            out.push(summary(&c)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Who wrote the last `limit` commits (1 to 1,000): `[{ name, email, commits, last }]`, most commits first.
+pub fn git_authors(repo_path: &str, rev: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let repo = repo(repo_path)?;
+    let mut by: HashMap<String, (String, i64, String)> = HashMap::new();
+    for id in walk(&repo, rev, limit)? {
+        let c = repo.find_object(id).map_err(|e| e.to_string())?.into_commit();
+        let a = c.author().map_err(|e| e.to_string())?;
+        let email = a.email.to_str_lossy().to_lowercase();
+        let e = by.entry(email).or_insert_with(|| (a.name.to_str_lossy().into_owned(), 0, iso(a.time)));
+        e.1 += 1;
+    }
+    let mut out: Vec<Value> = by.into_iter().map(|(email, (name, n, last))| json!({ "name": name, "email": email, "commits": n, "last": last })).collect();
+    out.sort_by(|a, b| b["commits"].as_i64().cmp(&a["commits"].as_i64()).then(a["email"].as_str().cmp(&b["email"].as_str())));
+    Ok(out)
+}

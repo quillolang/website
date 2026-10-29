@@ -1,0 +1,163 @@
+//! Find and mask personal data in text before it reaches logs, tickets or an AI model: emails, phone numbers, card numbers (Luhn-checked), IBANs (checksum-checked) and IP addresses.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! regex = "1"
+
+use regex::Regex;
+use serde_json::{json, Value};
+use std::sync::OnceLock;
+
+/// Texts up to 10 MB are read.
+const MAX: usize = 10 * 1024 * 1024;
+
+struct Found {
+    kind: &'static str,
+    start: usize,
+    end: usize,
+}
+
+fn patterns() -> &'static [(&'static str, Regex)] {
+    static P: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    P.get_or_init(|| {
+        let r = |s: &str| Regex::new(s).expect("pattern");
+        vec![
+            ("email", r(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b")),
+            ("iban", r(r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]){11,30}\b")),
+            ("card", r(r"\b[0-9](?:[ -]?[0-9]){12,18}\b")),
+            ("ip", r(r"\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b")),
+            ("phone", r(r"(?:\+|\b00)?[0-9]{1,4}?[ .-]?\(?[0-9]{1,4}\)?(?:[ .-]?[0-9]{2,4}){2,4}\b")),
+        ]
+    })
+}
+
+fn digits(s: &str) -> Vec<u32> {
+    s.chars().filter_map(|c| c.to_digit(10)).collect()
+}
+
+fn luhn(s: &str) -> bool {
+    let d = digits(s);
+    if !(13..=19).contains(&d.len()) {
+        return false;
+    }
+    let sum: u32 = d.iter().rev().enumerate().map(|(i, &x)| if i % 2 == 1 { let y = x * 2; if y > 9 { y - 9 } else { y } } else { x }).sum();
+    sum % 10 == 0
+}
+
+fn iban_ok(s: &str) -> bool {
+    let c: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if !(15..=34).contains(&c.len()) {
+        return false;
+    }
+    let moved = format!("{}{}", &c[4..], &c[..4]);
+    let mut rem: u64 = 0;
+    for ch in moved.chars() {
+        let v = match ch.to_digit(36) {
+            Some(v) => v as u64,
+            None => return false,
+        };
+        rem = if v >= 10 { (rem * 100 + v) % 97 } else { (rem * 10 + v) % 97 };
+    }
+    rem == 1
+}
+
+fn find(text: &str, kinds: &[String]) -> Vec<Found> {
+    let mut out: Vec<Found> = vec![];
+    for (kind, re) in patterns() {
+        for m in re.find_iter(text) {
+            if out.iter().any(|f| m.start() < f.end && f.start < m.end()) {
+                continue;
+            }
+            let s = m.as_str();
+            let ok = match *kind {
+                "card" => luhn(s),
+                "iban" => iban_ok(s),
+                "phone" => (8..=15).contains(&digits(s).len()) && !s.contains('/'),
+                _ => true,
+            };
+            if ok {
+                out.push(Found { kind, start: m.start(), end: m.end() });
+            }
+        }
+    }
+    // Every kind is looked for, so a card number is never taken for a phone number when only phones are asked for.
+    out.retain(|f| kinds.is_empty() || kinds.iter().any(|x| x == f.kind));
+    out.sort_by_key(|f| f.start);
+    out
+}
+
+fn chars_before(text: &str, byte: usize) -> usize {
+    text[..byte].chars().count()
+}
+
+fn mask(kind: &str, s: &str) -> String {
+    match kind {
+        "email" => {
+            let (user, domain) = s.split_once('@').unwrap_or((s, ""));
+            format!("{}***@{}", user.chars().next().unwrap_or('*'), domain)
+        }
+        "card" | "phone" => {
+            let d = digits(s);
+            let keep: String = d[d.len().saturating_sub(4)..].iter().map(|x| x.to_string()).collect();
+            format!("{}{}", "*".repeat(d.len().saturating_sub(4)), keep)
+        }
+        "iban" => {
+            let c: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            format!("{}{}{}", &c[..2], "*".repeat(c.len() - 4), &c[c.len() - 2..])
+        }
+        "ip" => {
+            let mut parts: Vec<&str> = s.split('.').collect();
+            if let Some(last) = parts.last_mut() {
+                *last = "0";
+            }
+            parts.join(".")
+        }
+        _ => "***".into(),
+    }
+}
+
+fn check(text: &str) -> Result<(), String> {
+    if text.len() > MAX { Err("texts up to 10 MB".into()) } else { Ok(()) }
+}
+
+/// The personal data in `text`: `{ kind, text, start, end }` each, in order, `kind` being "email", "phone", "card", "iban"
+/// or "ip"; positions count characters, as Quillo's `slice` does. Card numbers must pass the Luhn check and IBANs their
+/// checksum, so order numbers and dates are left alone; phone numbers are 8 to 15 digits, and may catch other long numbers.
+pub fn pii_find(text: &str) -> Result<Vec<Value>, String> {
+    check(text)?;
+    Ok(find(text, &[]).iter().map(|f| json!({
+        "kind": f.kind,
+        "text": &text[f.start..f.end],
+        "start": chars_before(text, f.start),
+        "end": chars_before(text, f.end),
+    })).collect())
+}
+
+/// `text` with each piece of personal data of `kinds` (empty: all five) replaced by its kind in brackets: `[email]`, `[card]`.
+pub fn pii_redact(text: &str, kinds: Vec<String>) -> Result<String, String> {
+    check(text)?;
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for f in find(text, &kinds) {
+        out.push_str(&text[at..f.start]);
+        out.push_str(&format!("[{}]", f.kind));
+        at = f.end;
+    }
+    out.push_str(&text[at..]);
+    Ok(out)
+}
+
+/// `text` with personal data partly hidden, enough to tell items apart: `a***@example.com`, `************4242`, `NL**************00`,
+/// `203.0.113.0`; for support screens and logs read by people.
+pub fn pii_mask(text: &str) -> Result<String, String> {
+    check(text)?;
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for f in find(text, &[]) {
+        out.push_str(&text[at..f.start]);
+        out.push_str(&mask(f.kind, &text[f.start..f.end]));
+        at = f.end;
+    }
+    out.push_str(&text[at..]);
+    Ok(out)
+}

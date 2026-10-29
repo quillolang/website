@@ -1,0 +1,154 @@
+//! The text of Word documents (.docx): all of it, paragraph by paragraph with their styles, the tables as rows, and the title and author.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! roxmltree = "0.20"
+
+use serde_json::{json, Value};
+use std::io::Read;
+
+const MAX_XML: u64 = 64 * 1024 * 1024;
+
+fn part(path: &str, name: &str) -> Result<Option<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut z = zip::ZipArchive::new(f).map_err(|_| format!("{}: not a .docx file (it is not a zip)", path))?;
+    let Ok(entry) = z.by_name(name) else { return Ok(None) };
+    let mut s = String::new();
+    entry.take(MAX_XML).read_to_string(&mut s).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(Some(s))
+}
+
+fn document(path: &str) -> Result<String, String> {
+    part(path, "word/document.xml")?.ok_or_else(|| format!("{}: not a Word document (no word/document.xml)", path))
+}
+
+fn is(n: &roxmltree::Node, name: &str) -> bool {
+    n.is_element() && n.tag_name().name() == name
+}
+
+fn attr(n: &roxmltree::Node, name: &str) -> Option<String> {
+    n.attributes().find(|a| a.name() == name).map(|a| a.value().to_string())
+}
+
+fn para_text(p: &roxmltree::Node) -> String {
+    let mut s = String::new();
+    for d in p.descendants() {
+        if is(&d, "t") {
+            s.push_str(d.text().unwrap_or(""));
+        } else if is(&d, "tab") && d.parent().map_or(false, |x| is(&x, "r")) {
+            s.push('\t');
+        } else if is(&d, "br") || is(&d, "cr") {
+            s.push('\n');
+        }
+    }
+    s
+}
+
+fn para_style(p: &roxmltree::Node) -> Option<String> {
+    p.children().find(|c| is(c, "pPr")).and_then(|ppr| ppr.children().find(|c| is(c, "pStyle"))).and_then(|s| attr(&s, "val"))
+}
+
+fn table_rows(t: &roxmltree::Node) -> Vec<Vec<String>> {
+    t.children()
+        .filter(|r| is(r, "tr"))
+        .map(|r| {
+            r.children()
+                .filter(|c| is(c, "tc"))
+                .map(|c| c.descendants().filter(|p| is(p, "p")).map(|p| para_text(&p)).collect::<Vec<_>>().join("\n").trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+enum Block {
+    Para(Option<String>, bool, String),
+    Table(Vec<Vec<String>>),
+}
+
+// The body's paragraphs and tables in order; content controls (w:sdt) are looked into.
+fn blocks(xml: &str) -> Result<Vec<Block>, String> {
+    let doc = roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 20_000_000 }).map_err(|e| format!("the document's XML: {}", e))?;
+    let body = doc.descendants().find(|n| is(n, "body")).ok_or("the document has no body")?;
+    let mut out = vec![];
+    fn walk(n: roxmltree::Node, out: &mut Vec<Block>) {
+        for c in n.children() {
+            if is(&c, "p") {
+                let list = c.descendants().any(|d| is(&d, "numPr"));
+                out.push(Block::Para(para_style(&c), list, para_text(&c)));
+            } else if is(&c, "tbl") {
+                out.push(Block::Table(table_rows(&c)));
+            } else if is(&c, "sdt") || is(&c, "sdtContent") || is(&c, "customXml") {
+                walk(c, out);
+            }
+        }
+    }
+    walk(body, &mut out);
+    Ok(out)
+}
+
+fn heading_level(style: &str) -> Option<i64> {
+    let s = style.to_lowercase().replace(' ', "");
+    if s == "title" {
+        return Some(0);
+    }
+    s.strip_prefix("heading").and_then(|n| n.parse().ok())
+}
+
+/// All the text of a .docx: a line for each paragraph, table rows with their cells parted by tabs. Deleted (tracked) text is left out.
+pub fn docx_text(path: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = vec![];
+    for b in blocks(&document(path)?)? {
+        match b {
+            Block::Para(_, _, t) => lines.push(t),
+            Block::Table(rows) => lines.extend(rows.into_iter().map(|r| r.join("\t"))),
+        }
+    }
+    let text = lines.join("\n");
+    Ok(text.trim().to_string())
+}
+
+/// The paragraphs outside tables, as `{ style, heading, list, text }`: `style` the Word style's id ("Heading1", or null), `heading` its level (0 for Title, 1 to 9, else null), `list` true for list items.
+/// Empty paragraphs are left out: for importing a document's outline.
+pub fn docx_paragraphs(path: &str) -> Result<Vec<Value>, String> {
+    Ok(blocks(&document(path)?)?
+        .into_iter()
+        .filter_map(|b| match b {
+            Block::Para(style, list, text) if !text.trim().is_empty() => {
+                let heading = style.as_deref().and_then(heading_level);
+                Some(json!({ "style": style, "heading": heading, "list": list, "text": text }))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// The tables of a .docx, each a list of rows, each row a list of cell texts.
+pub fn docx_tables(path: &str) -> Result<Vec<Vec<Vec<String>>>, String> {
+    Ok(blocks(&document(path)?)?.into_iter().filter_map(|b| if let Block::Table(t) = b { Some(t) } else { None }).collect())
+}
+
+/// What the file says about itself: `{ title, subject, creator, last_modified_by, created, modified, words, pages }`, null when missing.
+/// Works for .xlsx and .pptx files too, but for `words` and `pages`.
+pub fn docx_properties(path: &str) -> Result<Value, String> {
+    let mut v = json!({ "title": null, "subject": null, "creator": null, "last_modified_by": null, "created": null, "modified": null, "words": null, "pages": null });
+    if let Some(core) = part(path, "docProps/core.xml")? {
+        if let Ok(doc) = roxmltree::Document::parse(&core) {
+            for (key, name) in [("title", "title"), ("subject", "subject"), ("creator", "creator"), ("last_modified_by", "lastModifiedBy"), ("created", "created"), ("modified", "modified")] {
+                if let Some(t) = doc.descendants().find(|n| is(n, name)).and_then(|n| n.text()) {
+                    v[key] = Value::String(t.trim().to_string());
+                }
+            }
+        }
+    }
+    if let Some(app) = part(path, "docProps/app.xml")? {
+        if let Ok(doc) = roxmltree::Document::parse(&app) {
+            for (key, name) in [("words", "Words"), ("pages", "Pages")] {
+                if let Some(n) = doc.descendants().find(|n| is(n, name)).and_then(|n| n.text()).and_then(|t| t.trim().parse::<i64>().ok()) {
+                    v[key] = n.into();
+                }
+            }
+        }
+    }
+    Ok(v)
+}

@@ -1,0 +1,189 @@
+//! MT940 bank statements (SWIFT, as most European banks export them): accounts, opening and closing balances, and each transaction with its date, amount, counterparty and description, for bookkeeping imports.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! regex = "1"
+
+use regex::Regex;
+use serde_json::{json, Map, Value};
+use std::sync::OnceLock;
+
+/// Files up to 50 MB are read.
+const MAX: usize = 50 * 1024 * 1024;
+
+fn date(yymmdd: &str) -> String {
+    format!("20{}-{}-{}", &yymmdd[0..2], &yymmdd[2..4], &yymmdd[4..6])
+}
+
+/// `1234,56` with its mark as signed text and cents.
+fn money(mark: &str, amount: &str) -> (String, i64) {
+    let (whole, frac) = amount.split_once(',').unwrap_or((amount, ""));
+    let frac2 = format!("{:0<2}", frac).chars().take(2).collect::<String>();
+    let cents = whole.trim_start_matches('0').parse::<i64>().unwrap_or(0) * 100 + frac2.parse::<i64>().unwrap_or(0);
+    let neg = mark.ends_with('D') && mark != "RD" || mark == "RC";
+    let w = whole.trim_start_matches('0');
+    let text = format!("{}{}.{}", if neg { "-" } else { "" }, if w.is_empty() { "0" } else { w }, frac2);
+    (text, if neg { -cents } else { cents })
+}
+
+fn balance(v: &str) -> Value {
+    static B: OnceLock<Regex> = OnceLock::new();
+    let re = B.get_or_init(|| Regex::new(r"^([CD])([0-9]{6})([A-Z]{3})([0-9,]+)").expect("pattern"));
+    match re.captures(v.trim()) {
+        Some(c) => {
+            let (text, cents) = money(&c[1], &c[4]);
+            json!({ "date": date(&c[2]), "currency": &c[3], "amount": text, "cents": cents })
+        }
+        None => Value::Null,
+    }
+}
+
+/// The parts of a :86: text: `/KEY/value/KEY/value` (Dutch banks) or `?20...?32...` (German banks).
+fn info_fields(info: &str) -> Value {
+    let flat = info.replace('\n', "");
+    let mut m = Map::new();
+    if flat.starts_with('/') {
+        let parts: Vec<&str> = flat.split('/').collect();
+        let mut i = 1;
+        while i + 1 < parts.len() {
+            let key = parts[i].trim();
+            if !key.is_empty() && key.chars().all(|c| c.is_ascii_uppercase()) {
+                m.insert(key.to_string(), Value::String(parts[i + 1].trim().to_string()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    } else if flat.contains("?2") || flat.contains("?3") {
+        for piece in flat.split('?').skip(1) {
+            if piece.len() >= 2 && piece[..2].chars().all(|c| c.is_ascii_digit()) {
+                let e = m.entry(piece[..2].to_string()).or_insert_with(|| Value::String(String::new()));
+                if let Value::String(s) = e {
+                    s.push_str(&piece[2..]);
+                }
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+fn transaction(line: &str) -> Option<Map<String, Value>> {
+    static T: OnceLock<Regex> = OnceLock::new();
+    let re = T.get_or_init(|| Regex::new(r"(?s)^([0-9]{6})([0-9]{4})?(RC|RD|C|D)([A-Z])?([0-9,]+)([NFS][A-Z0-9]{3})([^\n]*?)(?://([^\n]*))?(?:\n(.*))?$").expect("pattern"));
+    let c = re.captures(line.trim())?;
+    let value_date = date(&c[1]);
+    let entry_date = c.get(2).map(|m| {
+        let md = m.as_str();
+        let mut year: i32 = c[1][0..2].parse::<i32>().unwrap_or(0) + 2000;
+        // An entry dated in January for a value date in December is the next year, and the reverse.
+        if &c[1][2..4] == "12" && &md[0..2] == "01" { year += 1; }
+        if &c[1][2..4] == "01" && &md[0..2] == "12" { year -= 1; }
+        format!("{}-{}-{}", year, &md[0..2], &md[2..4])
+    });
+    let (text, cents) = money(&c[3], &c[5]);
+    let mut m = Map::new();
+    m.insert("date".into(), json!(value_date));
+    m.insert("entry_date".into(), json!(entry_date));
+    m.insert("amount".into(), json!(text));
+    m.insert("cents".into(), json!(cents));
+    m.insert("reversal".into(), json!(c[3].starts_with('R')));
+    m.insert("type".into(), json!(&c[6]));
+    m.insert("reference".into(), json!(c[7].trim()));
+    m.insert("bank_reference".into(), json!(c.get(8).map(|x| x.as_str().trim())));
+    m.insert("details".into(), json!(c.get(9).map(|x| x.as_str().trim()).filter(|s| !s.is_empty())));
+    Some(m)
+}
+
+/// The statements in MT940 text: each `{ reference, account, number, opening, closing, available, transactions }`.
+/// Balances are `{ date, currency, amount, cents }`, `amount` signed text (`-23.45`, exact; `dec(amount)` for a decimal)
+/// and `cents` the same as a whole number. Transactions are `{ date, entry_date, amount, cents, reversal, type, reference,
+/// bank_reference, details, info, info_fields }`: `info` is the :86: text, `info_fields` its parts when the bank structures
+/// it (`/NAME/.../REMI/...` or `?20...`). SWIFT headers (`{1:...}`) and Windows line ends are taken care of.
+pub fn mt940_parse(text: &str) -> Result<Vec<Value>, String> {
+    if text.len() > MAX {
+        return Err("statements up to 50 MB".into());
+    }
+    // Each tag starts a line with `:NN:` or `:NNa:`; the lines after it, up to the next tag, belong to it.
+    let mut tags: Vec<(String, String)> = vec![];
+    for line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let l = line.trim_end();
+        if l.starts_with('{') || l == "-}" || l == "-" {
+            if l == "-" || l == "-}" {
+                tags.push(("-".into(), String::new()));
+            }
+            // A header line may end with the start of block 4: `{4:`.
+            continue;
+        }
+        let tag = l.strip_prefix(':').and_then(|r| r.split_once(':')).filter(|(t, _)| t.len() <= 3 && t.chars().next().is_some_and(|c| c.is_ascii_digit()));
+        match tag {
+            Some((t, v)) => tags.push((t.to_string(), v.to_string())),
+            None => {
+                if let Some(last) = tags.last_mut() {
+                    last.1.push('\n');
+                    last.1.push_str(l);
+                }
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut cur: Option<Map<String, Value>> = None;
+    let mut txs: Vec<Value> = vec![];
+    let finish = |cur: &mut Option<Map<String, Value>>, txs: &mut Vec<Value>, out: &mut Vec<Value>| {
+        if let Some(mut s) = cur.take() {
+            s.insert("transactions".into(), Value::Array(std::mem::take(txs)));
+            out.push(Value::Object(s));
+        }
+    };
+    for (t, v) in tags {
+        match t.as_str() {
+            "20" => {
+                finish(&mut cur, &mut txs, &mut out);
+                let mut s = Map::new();
+                s.insert("reference".into(), json!(v.trim()));
+                for k in ["account", "number", "opening", "closing", "available"] {
+                    s.insert(k.into(), Value::Null);
+                }
+                cur = Some(s);
+            }
+            "-" => finish(&mut cur, &mut txs, &mut out),
+            _ => {
+                let Some(s) = cur.as_mut() else { continue };
+                match t.as_str() {
+                    "25" => { s.insert("account".into(), json!(v.trim())); }
+                    "28C" | "28" => { s.insert("number".into(), json!(v.trim())); }
+                    "60F" | "60M" => { s.insert("opening".into(), balance(&v)); }
+                    "62F" | "62M" => { s.insert("closing".into(), balance(&v)); }
+                    "64" => { s.insert("available".into(), balance(&v)); }
+                    "61" => {
+                        if let Some(mut tx) = transaction(&v) {
+                            tx.insert("info".into(), Value::Null);
+                            tx.insert("info_fields".into(), json!({}));
+                            txs.push(Value::Object(tx));
+                        } else {
+                            return Err(format!("`:61:{}` is not a transaction line", v.lines().next().unwrap_or("")));
+                        }
+                    }
+                    "86" => {
+                        if let Some(Value::Object(tx)) = txs.last_mut() {
+                            tx.insert("info".into(), json!(v.trim()));
+                            tx.insert("info_fields".into(), info_fields(v.trim()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    finish(&mut cur, &mut txs, &mut out);
+    if out.is_empty() {
+        return Err("no statement (no :20: line) in the text".into());
+    }
+    Ok(out)
+}
+
+/// The statements of an MT940 file (.sta, .940, .txt), read as mt940_parse reads text; Latin-1 files are read too.
+pub fn mt940_read_file(path: &str) -> Result<Vec<Value>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let text = String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| b as char).collect());
+    mt940_parse(&text)
+}

@@ -1,0 +1,162 @@
+//! A spam filter that learns from your own messages: naive Bayes trained on what your users mark as spam or not, kept in a file, scoring comments, contact forms and sign-ups from 0 to 1.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+const MAX_TEXT: usize = 200_000;
+const MAX_WORDS: usize = 500_000;
+
+#[derive(Default, Clone)]
+struct Model {
+    spam: i64,
+    ham: i64,
+    words: HashMap<String, (i64, i64)>,
+}
+
+fn models() -> std::sync::MutexGuard<'static, HashMap<String, Model>> {
+    static M: OnceLock<Mutex<HashMap<String, Model>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load(path: &str) -> Result<Model, String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Ok(Model::default()) };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {}", path, e))?;
+    let mut m = Model { spam: v["spam"].as_i64().unwrap_or(0), ham: v["ham"].as_i64().unwrap_or(0), words: HashMap::new() };
+    if let Some(ws) = v["words"].as_object() {
+        for (w, c) in ws {
+            m.words.insert(w.clone(), (c[0].as_i64().unwrap_or(0), c[1].as_i64().unwrap_or(0)));
+        }
+    }
+    Ok(m)
+}
+
+fn save(path: &str, m: &Model) -> Result<(), String> {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let words: serde_json::Map<String, Value> = m.words.iter().map(|(w, (s, h))| (w.clone(), json!([s, h]))).collect();
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, json!({ "spam": m.spam, "ham": m.ham, "words": words }).to_string()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// The distinct words of a message, lower case, with links and amounts kept as signals of their own.
+fn tokens(text: &str) -> HashSet<String> {
+    let text: String = text.chars().take(MAX_TEXT).collect();
+    let mut out = HashSet::new();
+    for raw in text.split_whitespace() {
+        let low = raw.to_lowercase();
+        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("www.") {
+            out.insert("__link__".to_string());
+            if let Some(host) = low.split("//").nth(1).unwrap_or(&low).split('/').next() {
+                out.insert(format!("__host:{}", host.trim_start_matches("www.")));
+            }
+            continue;
+        }
+        if low.contains('$') || low.contains('€') || low.contains('£') {
+            out.insert("__money__".to_string());
+        }
+        for w in low.split(|c: char| !c.is_alphanumeric() && c != '\'') {
+            let w = w.trim_matches('\'');
+            let n = w.chars().count();
+            if (2..=30).contains(&n) && !w.chars().all(|c| c.is_ascii_digit()) {
+                out.insert(w.to_string());
+            }
+        }
+    }
+    if text.chars().filter(|c| c.is_alphabetic()).count() > 20 && text.chars().filter(|c| c.is_uppercase()).count() * 2 > text.chars().filter(|c| c.is_alphabetic()).count() {
+        out.insert("__shouting__".to_string());
+    }
+    out
+}
+
+fn with_model<T>(path: &str, f: impl FnOnce(&mut Model) -> Result<T, String>) -> Result<T, String> {
+    let mut ms = models();
+    if !ms.contains_key(path) {
+        let m = load(path)?;
+        ms.insert(path.to_string(), m);
+    }
+    f(ms.get_mut(path).expect("just inserted"))
+}
+
+/// The log-odds of each word, and the message's probability of being spam.
+fn score(m: &Model, text: &str) -> (f64, Vec<(String, f64)>) {
+    if m.spam == 0 || m.ham == 0 {
+        return (0.5, vec![]);
+    }
+    let (s, h) = (m.spam as f64, m.ham as f64);
+    let mut logit = (s / h).ln();
+    let mut why = Vec::new();
+    for t in tokens(text) {
+        let (ws, wh) = m.words.get(&t).copied().unwrap_or((0, 0));
+        if ws + wh == 0 {
+            continue;
+        }
+        // Bernoulli naive Bayes with add-one smoothing: does the word appear in spam / in ham messages?
+        let ps = (ws as f64 + 1.0) / (s + 2.0);
+        let ph = (wh as f64 + 1.0) / (h + 2.0);
+        let w = (ps / ph).ln();
+        logit += w;
+        why.push((t, w));
+    }
+    why.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    (1.0 / (1.0 + (-logit.clamp(-700.0, 700.0)).exp()), why)
+}
+
+/// Learns from one message: `is_spam` true for spam, false for a good one ("ham"). The model is kept in the JSON file `model_path` (made if missing). Gives `{ spam, ham }`, the messages learnt.
+pub fn spam_train(model_path: &str, text: &str, is_spam: bool) -> Result<Value, String> {
+    with_model(model_path, |m| {
+        for t in tokens(text) {
+            if m.words.len() >= MAX_WORDS && !m.words.contains_key(&t) {
+                continue;
+            }
+            let e = m.words.entry(t).or_insert((0, 0));
+            if is_spam { e.0 += 1 } else { e.1 += 1 }
+        }
+        if is_spam { m.spam += 1 } else { m.ham += 1 }
+        save(model_path, m)?;
+        Ok(json!({ "spam": m.spam, "ham": m.ham }))
+    })
+}
+
+/// Takes back a message learnt with the wrong label (call it before `spam_train` with the right one). Gives `{ spam, ham }`.
+pub fn spam_untrain(model_path: &str, text: &str, was_spam: bool) -> Result<Value, String> {
+    with_model(model_path, |m| {
+        for t in tokens(text) {
+            if let Some(e) = m.words.get_mut(&t) {
+                if was_spam { e.0 = (e.0 - 1).max(0) } else { e.1 = (e.1 - 1).max(0) }
+                if *e == (0, 0) {
+                    m.words.remove(&t);
+                }
+            }
+        }
+        if was_spam { m.spam = (m.spam - 1).max(0) } else { m.ham = (m.ham - 1).max(0) }
+        save(model_path, m)?;
+        Ok(json!({ "spam": m.spam, "ham": m.ham }))
+    })
+}
+
+/// How likely a message is spam, from 0 to 1 (0.5 until the model has learnt at least one spam and one good message).
+pub fn spam_score(model_path: &str, text: &str) -> Result<f64, String> {
+    with_model(model_path, |m| Ok((score(m, text).0 * 1e4).round() / 1e4))
+}
+
+/// The verdict for a message: `{ spam, score, words }`, `spam` when the score is at least `threshold` (0.9 is careful), `words` the five that weighed most (positive: spammy).
+pub fn spam_check(model_path: &str, text: &str, threshold: f64) -> Result<Value, String> {
+    with_model(model_path, |m| {
+        let (p, why) = score(m, text);
+        let words: Vec<Value> = why.iter().take(5).map(|(w, x)| json!({ "word": w, "weight": (x * 100.0).round() / 100.0 })).collect();
+        Ok(json!({ "spam": p >= threshold, "score": (p * 1e4).round() / 1e4, "words": words }))
+    })
+}
+
+/// What the model knows: `{ spam, ham, words }`, the messages of each kind it learnt and the distinct words seen.
+pub fn spam_stats(model_path: &str) -> Result<Value, String> {
+    with_model(model_path, |m| Ok(json!({ "spam": m.spam, "ham": m.ham, "words": m.words.len() })))
+}

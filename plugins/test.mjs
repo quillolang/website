@@ -2,18 +2,23 @@
 //
 //   node plugins/test.mjs [slug ...]          QUILLO=/path/to/quillo to pick the binary
 //
+// CATALOG=catalog-x.json tests another list; PORT_BASE=20000 moves its ports, so several
+// runs can go at once.
+//
 // Each example is started with `quillo run <slug>.qwe` (which builds its .qwer file the
 // first time), each `try` request is made, and its answer must be a 2xx holding `expect`.
 // A plugin that `needs` a server gets a small stand-in: an SMTP sink or a Redis.
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const quillo = process.env.QUILLO ?? join(here, "../../quillo/target/release/quillo");
-const catalog = JSON.parse(readFileSync(join(here, "catalog.json"), "utf8"));
+const catalog = JSON.parse(readFileSync(join(here, process.env.CATALOG ?? "catalog.json"), "utf8"));
+const BASE = Number(process.env.PORT_BASE ?? 18700);
 const only = process.argv.slice(2);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -36,6 +41,17 @@ function smtpSink(port) {
                 else s.write("250 ok\r\n");
             }
         });
+    }).listen(port, "127.0.0.1");
+}
+
+// An HTTP server that answers every request with 201 and `{"ok":true}`, and keeps what
+// it got: for plugins that send webhooks or pushes.
+const received = [];
+function httpSink(port) {
+    return createHttpServer((req, res) => {
+        let body = "";
+        req.on("data", (d) => (body += d));
+        req.on("end", () => { received.push({ method: req.method, url: req.url, headers: req.headers, body }); res.writeHead(201, { "content-type": "application/json" }); res.end('{"ok":true}'); });
     }).listen(port, "127.0.0.1");
 }
 
@@ -72,13 +88,14 @@ function redisStandIn(port) {
     }).listen(port, "127.0.0.1");
 }
 
-let port = 18700, failed = 0, passed = 0;
+let port = BASE, failed = 0, passed = 0;
 for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug))) {
     port += 1;
     const env = { ...process.env, ...(p.env ?? {}) };
     const helpers = [];
-    if (p.needs === "smtp") { helpers.push(smtpSink(18625)); env.SMTP_URL = "smtp://127.0.0.1:18625"; env.SMTP_FROM = "Shop <shop@example.com>"; }
-    if (p.needs === "redis") { helpers.push(redisStandIn(18679)); env.REDIS_URL = "redis://127.0.0.1:18679/"; }
+    if (p.needs === "smtp") { helpers.push(smtpSink(BASE + 990)); env.SMTP_URL = `smtp://127.0.0.1:${BASE + 990}`; env.SMTP_FROM = "Shop <shop@example.com>"; }
+    if (p.needs === "redis") { helpers.push(redisStandIn(BASE + 991)); env.REDIS_URL = `redis://127.0.0.1:${BASE + 991}/`; }
+    if (p.needs === "http") { received.length = 0; helpers.push(httpSink(BASE + 992)); env.SINK_URL = `http://127.0.0.1:${BASE + 992}`; }
     const child = spawn(quillo, ["run", `${p.slug}.qwe`, "--port", String(port), "--log", "off"], { cwd: here, env });
     let out = "";
     child.stdout.on("data", (d) => (out += d)); child.stderr.on("data", (d) => (out += d));
@@ -96,6 +113,10 @@ for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug)
         if (r.status < 200 || r.status > 299 || !r.text.includes(t.expect)) problems.push(`${t.path} -> ${r.status} ${r.text.slice(0, 300)} (expected ${JSON.stringify(t.expect)})`);
     }
     if (p.needs === "smtp" && up && !mail.some((l) => l.startsWith("Subject:"))) problems.push("the SMTP sink got no message");
+    if (p.needs === "http" && up && received.length === 0) problems.push("the HTTP sink got no request");
+    // Every plugin says its version, on the second line of its header.
+    const head = readFileSync(join(here, `${p.slug}.qwer`), "utf8").split("\n").slice(0, 3).join("\n");
+    if (!/^\/\/! version: \d+\.\d+\.\d+$/m.test(head)) problems.push("no `//! version: X.Y.Z` line at the top of the file");
     child.kill(); helpers.forEach((h) => h.close());
     if (problems.length) { failed++; console.log(`FAIL ${p.slug}\n  ${problems.join("\n  ")}`); } else { passed++; console.log(`ok   ${p.slug}`); }
 }

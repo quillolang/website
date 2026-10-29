@@ -1,0 +1,169 @@
+//! Linear programming in pure Rust: the best plan under constraints (production mix, diet, shift staffing, ad budgets), with whole-number variables when needed, plus knapsack and assignment problems ready made.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! good_lp = { version = "1.15", default-features = false, features = ["microlp"] }
+
+use good_lp::{microlp, variable, Expression, ProblemVariables, ResolutionError, Solution, SolverModel, Variable};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+const MAX_VARS: usize = 500;
+const MAX_CONSTRAINTS: usize = 2000;
+
+fn num(v: &Value, what: &str) -> Result<f64, String> {
+    v.as_f64().filter(|f| f.is_finite()).ok_or(format!("{} is a number, not {}", what, v))
+}
+
+/// A result rounded to 6 decimals, whole ones as ints.
+fn r(x: f64) -> Value {
+    let y = (x * 1e6).round() / 1e6;
+    if y.fract() == 0.0 && y.abs() < 9e15 { json!(y as i64) } else { json!(y) }
+}
+
+fn solve(problem: &Value) -> Result<Value, String> {
+    let (sense, objective) = match (problem.get("maximize"), problem.get("minimize")) {
+        (Some(o), None) => ("max", o),
+        (None, Some(o)) => ("min", o),
+        _ => return Err("give `maximize` or `minimize`: a map of variable to coefficient".into()),
+    };
+    let obj = objective.as_object().ok_or("the objective is a map of variable to coefficient")?;
+    let cons = problem.get("constraints").and_then(Value::as_array).cloned().unwrap_or_default();
+    if cons.len() > MAX_CONSTRAINTS {
+        return Err(format!("at most {} constraints", MAX_CONSTRAINTS));
+    }
+    let specs = problem.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut names: BTreeMap<String, ()> = BTreeMap::new();
+    for k in obj.keys().chain(specs.keys()) {
+        names.insert(k.clone(), ());
+    }
+    for c in &cons {
+        for k in c.get("terms").and_then(Value::as_object).ok_or("each constraint has `terms`: a map of variable to coefficient")?.keys() {
+            names.insert(k.clone(), ());
+        }
+    }
+    if names.len() > MAX_VARS {
+        return Err(format!("at most {} variables", MAX_VARS));
+    }
+    let mut pv = ProblemVariables::new();
+    let mut vars: BTreeMap<String, Variable> = BTreeMap::new();
+    for name in names.keys() {
+        let s = specs.get(name).cloned().unwrap_or(Value::Null);
+        let mut d = variable().name(name.clone());
+        d = match s.get("min") {
+            Some(Value::Null) => d,
+            Some(m) => d.min(num(m, "min")?),
+            None => d.min(0.0),
+        };
+        if let Some(m) = s.get("max").filter(|m| !m.is_null()) {
+            d = d.max(num(m, "max")?);
+        }
+        if s.get("integer") == Some(&Value::Bool(true)) {
+            d = d.integer();
+        }
+        if s.get("binary") == Some(&Value::Bool(true)) {
+            d = d.binary();
+        }
+        vars.insert(name.clone(), pv.add(d));
+    }
+    let expr = |terms: &Map<String, Value>| -> Result<Expression, String> {
+        let mut e = Expression::from(0.0);
+        for (k, c) in terms {
+            e.add_mul(num(c, k)?, vars[k]);
+        }
+        Ok(e)
+    };
+    let goal = expr(obj)?;
+    let mut model = if sense == "max" { pv.maximise(goal.clone()) } else { pv.minimise(goal.clone()) }.using(microlp);
+    for c in &cons {
+        let e = expr(c["terms"].as_object().expect("checked above"))?;
+        let v = num(c.get("value").ok_or("each constraint has a `value`")?, "value")?;
+        let op = c.get("op").and_then(Value::as_str).unwrap_or("<=");
+        model = model.with(match op {
+            "<=" => e.leq(v),
+            ">=" => e.geq(v),
+            "=" | "==" => e.eq(v),
+            other => return Err(format!("`{}` is not a constraint: <=, >= or =", other)),
+        });
+    }
+    match model.solve() {
+        Ok(sol) => {
+            let values: Map<String, Value> = vars.iter().map(|(k, v)| (k.clone(), r(sol.value(*v)))).collect();
+            let slack: Vec<Value> = cons
+                .iter()
+                .map(|c| {
+                    let lhs: f64 = c["terms"].as_object().map(|t| t.iter().map(|(k, x)| x.as_f64().unwrap_or(0.0) * sol.value(vars[k])).sum()).unwrap_or(0.0);
+                    json!({ "name": c.get("name"), "used": r(lhs), "value": c["value"], "binding": (lhs - c["value"].as_f64().unwrap_or(0.0)).abs() < 1e-6 })
+                })
+                .collect();
+            Ok(json!({ "status": "optimal", "objective": r(sol.eval(goal)), "values": values, "constraints": slack }))
+        }
+        Err(ResolutionError::Infeasible) => Ok(json!({ "status": "infeasible", "objective": null, "values": null })),
+        Err(ResolutionError::Unbounded) => Ok(json!({ "status": "unbounded", "objective": null, "values": null })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Solves a linear program: `{ maximize: { chairs: 45, tables: 80 }, constraints: [{ name, terms: { chairs: 5, tables: 20 }, op: "<=", value: 400 }], variables: { tables: { max: 15, integer: true } } }`
+/// (`minimize` in place of `maximize`; variables are 0 or more unless `min` says, `min: null` for none; `integer` or `binary` make them whole).
+/// Gives `{ status: "optimal", objective, values, constraints: [{ name, used, value, binding }] }`, or `status` "infeasible" or "unbounded" with null values. Up to 500 variables.
+pub fn optimize_lp(problem: serde_json::Value) -> Result<Value, String> {
+    solve(&problem)
+}
+
+/// The 0/1 knapsack: which `items` (`[{ name, value, weight }]`) to take for the most value within `capacity`. Gives `{ take, value, weight }`. Up to 500 items.
+pub fn optimize_knapsack(items: Vec<serde_json::Value>, capacity: f64) -> Result<Value, String> {
+    let mut obj = Map::new();
+    let mut w = Map::new();
+    let mut vars = Map::new();
+    for (i, it) in items.iter().enumerate() {
+        let k = format!("i{}", i);
+        obj.insert(k.clone(), json!(num(it.get("value").unwrap_or(&Value::Null), "value")?));
+        w.insert(k.clone(), json!(num(it.get("weight").unwrap_or(&Value::Null), "weight")?));
+        vars.insert(k, json!({ "binary": true }));
+    }
+    let s = solve(&json!({ "maximize": obj, "constraints": [{ "terms": w, "op": "<=", "value": capacity }], "variables": vars }))?;
+    if s["status"] != "optimal" {
+        return Ok(json!({ "take": [], "value": 0, "weight": 0 }));
+    }
+    let take: Vec<&Value> = items.iter().enumerate().filter(|(i, _)| s["values"][format!("i{}", i)].as_f64().unwrap_or(0.0) > 0.5).map(|(_, it)| it).collect();
+    let weight: f64 = take.iter().map(|it| it["weight"].as_f64().unwrap_or(0.0)).sum();
+    Ok(json!({ "take": take.iter().map(|it| it.get("name").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(), "value": s["objective"], "weight": r(weight) }))
+}
+
+/// The assignment problem: `cost[i][j]` is what giving task j to worker i costs; each worker gets one task and each task one worker (as many as the smaller side),
+/// for the least total cost. Gives `{ pairs: [[worker, task], ...], cost }` (indexes from 0). Up to 20 by 20.
+pub fn optimize_assign(cost: Vec<Vec<f64>>) -> Result<Value, String> {
+    let n = cost.len();
+    let m = cost.first().map(Vec::len).unwrap_or(0);
+    if n == 0 || m == 0 || n > 20 || m > 20 || cost.iter().any(|row| row.len() != m) {
+        return Err("cost is a rectangle of numbers, at most 20 by 20".into());
+    }
+    let mut obj = Map::new();
+    let mut vars = Map::new();
+    for (i, row) in cost.iter().enumerate() {
+        for (j, c) in row.iter().enumerate() {
+            obj.insert(format!("x{}_{}", i, j), json!(c));
+            vars.insert(format!("x{}_{}", i, j), json!({ "binary": true }));
+        }
+    }
+    let k = n.min(m) as f64;
+    let mut cons = Vec::new();
+    for i in 0..n {
+        cons.push(json!({ "terms": (0..m).map(|j| (format!("x{}_{}", i, j), json!(1))).collect::<Map<_, _>>(), "op": "<=", "value": 1 }));
+    }
+    for j in 0..m {
+        cons.push(json!({ "terms": (0..n).map(|i| (format!("x{}_{}", i, j), json!(1))).collect::<Map<_, _>>(), "op": "<=", "value": 1 }));
+    }
+    cons.push(json!({ "terms": obj.keys().map(|key| (key.clone(), json!(1))).collect::<Map<_, _>>(), "op": "=", "value": k }));
+    let s = solve(&json!({ "minimize": obj, "constraints": cons, "variables": vars }))?;
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        for j in 0..m {
+            if s["values"][format!("x{}_{}", i, j)].as_f64().unwrap_or(0.0) > 0.5 {
+                pairs.push(json!([i, j]));
+            }
+        }
+    }
+    Ok(json!({ "pairs": pairs, "cost": s["objective"] }))
+}

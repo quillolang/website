@@ -1,0 +1,102 @@
+//! An in-memory cache shared by all requests, with a lifetime per entry and a size limit: slow lookups, API answers and rendered fragments kept for a while, the least used dropped first when it is full. No Redis needed for one server.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! moka = { version = "0.12", features = ["sync"] }
+
+use moka::sync::Cache;
+use moka::Expiry;
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct Entry {
+    value: Arc<Value>,
+    /// When the entry ends, if ever: kept as a moment, so changing the value keeps it.
+    deadline: Option<Instant>,
+    bytes: u32,
+}
+
+struct PerEntry;
+
+impl Expiry<String, Entry> for PerEntry {
+    fn expire_after_create(&self, _k: &String, v: &Entry, at: Instant) -> Option<Duration> {
+        v.deadline.map(|d| d.saturating_duration_since(at))
+    }
+    fn expire_after_update(&self, _k: &String, v: &Entry, at: Instant, _left: Option<Duration>) -> Option<Duration> {
+        v.deadline.map(|d| d.saturating_duration_since(at))
+    }
+}
+
+fn max_bytes() -> u64 {
+    std::env::var("MEMORY_CACHE_MB").ok().and_then(|m| m.parse::<u64>().ok()).unwrap_or(64).clamp(1, 16_384) * 1024 * 1024
+}
+
+fn cache() -> &'static Cache<String, Entry> {
+    static C: OnceLock<Cache<String, Entry>> = OnceLock::new();
+    C.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(max_bytes())
+            .weigher(|k: &String, v: &Entry| (k.len() as u32).saturating_add(v.bytes).saturating_add(64))
+            .expire_after(PerEntry)
+            .build()
+    })
+}
+
+static HITS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
+static INCR: Mutex<()> = Mutex::new(());
+
+fn deadline(seconds: i64) -> Option<Instant> {
+    if seconds > 0 { Instant::now().checked_add(Duration::from_secs(seconds.min(1_000_000_000) as u64)) } else { None }
+}
+
+/// Keeps `value` (any value) at `key` for `ttl_seconds` seconds (0: until it is pushed out for room). The whole cache holds 64 MB by default, `MEMORY_CACHE_MB` to change it; one value may be up to 16 MB of JSON.
+pub fn memcache_set(key: &str, value: serde_json::Value, ttl_seconds: i64) -> Result<(), String> {
+    let bytes = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    if bytes > 16 * 1024 * 1024 {
+        return Err("values up to 16 MB".into());
+    }
+    cache().insert(key.to_string(), Entry { value: Arc::new(value), deadline: deadline(ttl_seconds), bytes: bytes as u32 });
+    Ok(())
+}
+
+/// The value at `key`, or null when there is none or it has expired.
+pub fn memcache_get(key: &str) -> Option<Value> {
+    match cache().get(key) {
+        Some(e) => { HITS.fetch_add(1, Ordering::Relaxed); Some((*e.value).clone()) }
+        None => { MISSES.fetch_add(1, Ordering::Relaxed); None }
+    }
+}
+
+/// Takes `key` out of the cache; whether it was there.
+pub fn memcache_delete(key: &str) -> bool {
+    cache().remove(key).is_some()
+}
+
+/// Adds `by` to the number at `key` (0 when there is none or it is not a number) and gives the new number; a new key lives `ttl_seconds`, and adding does not extend it. For rate limits: "at most 100 requests a minute from this IP".
+pub fn memcache_incr(key: &str, by: i64, ttl_seconds: i64) -> i64 {
+    let _one_at_a_time = INCR.lock().unwrap_or_else(|e| e.into_inner());
+    let c = cache();
+    let e = match c.get(key) {
+        Some(e) => Entry { value: Arc::new(json!(e.value.as_i64().unwrap_or(0).saturating_add(by))), ..e },
+        None => Entry { value: Arc::new(json!(by)), deadline: deadline(ttl_seconds), bytes: 20 },
+    };
+    let n = e.value.as_i64().unwrap_or(0);
+    c.insert(key.to_string(), e);
+    n
+}
+
+/// How the cache is doing: `{ entries, bytes, max_bytes, hits, misses }` since the server started.
+pub fn memcache_stats() -> Value {
+    let c = cache();
+    c.run_pending_tasks();
+    json!({ "entries": c.entry_count(), "bytes": c.weighted_size(), "max_bytes": max_bytes(), "hits": HITS.load(Ordering::Relaxed), "misses": MISSES.load(Ordering::Relaxed) })
+}
+
+/// Empties the cache.
+pub fn memcache_clear() {
+    cache().invalidate_all();
+}

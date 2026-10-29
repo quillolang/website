@@ -1,0 +1,113 @@
+//! Read .ics calendar files (Google Calendar, Outlook, Apple, booking sites): each event's start, end, summary, location and repeat rule, for importing bookings and showing feeds.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ical = { version = "0.11", default-features = false, features = ["ical"] }
+
+use ical::parser::ical::component::IcalEvent;
+use ical::property::Property;
+use serde_json::{json, Value};
+
+/// Calendars up to 20 MB, and 100,000 events, are read.
+const MAX_TEXT: usize = 20 * 1024 * 1024;
+const MAX_EVENTS: usize = 100_000;
+
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n') | Some('N') => out.push('\n'),
+                Some(o) => out.push(o),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn param(p: &Property, name: &str) -> Option<String> {
+    p.params.as_ref()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).and_then(|(_, v)| v.first().cloned())
+}
+
+/// `20261102T093000Z` as `2026-11-02T09:30:00Z`, `20261102T093000` as `2026-11-02T09:30:00`, `20261225` as `2026-12-25`.
+fn when(v: &str) -> (String, bool) {
+    let v = v.trim();
+    let b = v.as_bytes();
+    if !v.is_ascii() {
+        return (v.to_string(), false);
+    }
+    if b.len() == 8 && v.chars().all(|c| c.is_ascii_digit()) {
+        return (format!("{}-{}-{}", &v[0..4], &v[4..6], &v[6..8]), true);
+    }
+    if b.len() >= 15 && b[8] == b'T' {
+        let z = if v.ends_with('Z') { "Z" } else { "" };
+        return (format!("{}-{}-{}T{}:{}:{}{}", &v[0..4], &v[4..6], &v[6..8], &v[9..11], &v[11..13], &v[13..15], z), false);
+    }
+    (v.to_string(), false)
+}
+
+fn event(e: &IcalEvent) -> Value {
+    let get = |n: &str| e.properties.iter().find(|p| p.name.eq_ignore_ascii_case(n));
+    let text = |n: &str| get(n).and_then(|p| p.value.as_deref()).map(unescape);
+    let (start, all_day, tz) = match get("DTSTART") {
+        Some(p) => {
+            let (w, d) = when(p.value.as_deref().unwrap_or(""));
+            (Some(w), d || param(p, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")), param(p, "TZID"))
+        }
+        None => (None, false, None),
+    };
+    let end = get("DTEND").or_else(|| get("DUE")).and_then(|p| p.value.as_deref()).map(|v| when(v).0);
+    // A repeating event's lines, ready for the rrule plugin's rrule_between.
+    let rule_lines: Vec<String> = e.properties.iter()
+        .filter(|p| ["DTSTART", "RRULE", "RDATE", "EXDATE"].iter().any(|n| p.name.eq_ignore_ascii_case(n)))
+        .map(|p| {
+            let params: String = p.params.iter().flatten().map(|(k, v)| format!(";{}={}", k, v.join(","))).collect();
+            format!("{}{}:{}", p.name, params, p.value.as_deref().unwrap_or(""))
+        }).collect();
+    let repeats = get("RRULE").is_some() || get("RDATE").is_some();
+    json!({
+        "uid": text("UID"),
+        "summary": text("SUMMARY"),
+        "description": text("DESCRIPTION"),
+        "location": text("LOCATION"),
+        "start": start,
+        "end": end,
+        "duration": text("DURATION"),
+        "all_day": all_day,
+        "timezone": tz,
+        "status": text("STATUS"),
+        "url": text("URL"),
+        "organizer": get("ORGANIZER").map(|p| json!({ "name": param(p, "CN"), "email": p.value.as_deref().map(|v| v.trim_start_matches("mailto:").trim_start_matches("MAILTO:")) })),
+        "rrule": text("RRULE"),
+        "recurrence": if repeats { Value::String(rule_lines.join("\n")) } else { Value::Null },
+    })
+}
+
+/// The calendars in `text`: `{ name, timezone, events }` for the first one (most files hold one), each event
+/// `{ uid, summary, description, location, start, end, duration, all_day, timezone, status, url, organizer, rrule, recurrence }`.
+/// Times are as written: `2026-11-02T09:30:00Z` in UTC, `2026-11-02T09:30:00` local to `timezone`, `2026-12-25` for an all-day
+/// event (whose `end` is the day after it, as .ics says). `recurrence` holds a repeating event's DTSTART and RRULE lines for
+/// the rrule plugin; `\,` and `\n` in texts are read as a comma and a line break.
+pub fn ics_parse(text: &str) -> Result<Value, String> {
+    if text.len() > MAX_TEXT {
+        return Err("calendars up to 20 MB".into());
+    }
+    let mut p = ical::IcalParser::new(std::io::BufReader::new(text.as_bytes()));
+    let cal = p.next().ok_or("no BEGIN:VCALENDAR in the text")?.map_err(|e| format!("not an iCalendar file: {}", e))?;
+    let prop = |n: &str| cal.properties.iter().find(|p| p.name.eq_ignore_ascii_case(n)).and_then(|p| p.value.as_deref()).map(unescape);
+    let events: Vec<Value> = cal.events.iter().take(MAX_EVENTS).map(event).collect();
+    Ok(json!({ "name": prop("X-WR-CALNAME"), "timezone": prop("X-WR-TIMEZONE"), "events": events }))
+}
+
+/// The events of an .ics file, as ics_parse gives them, read from `path`.
+pub fn ics_parse_file(path: &str) -> Result<Value, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?.len();
+    if size as usize > MAX_TEXT {
+        return Err(format!("{}: calendars up to 20 MB", path));
+    }
+    ics_parse(&std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?)
+}

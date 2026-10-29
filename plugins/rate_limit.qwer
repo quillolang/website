@@ -1,0 +1,68 @@
+//! Rate limits kept in the server's memory, per key (an IP, a user, an API key): GCRA, as Redis-cell and Stripe use, with "allowed, or retry after so many ms".
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+/// At most this many keys are kept; past it, keys whose limit has fully refilled are dropped first.
+const MAX_KEYS: usize = 200_000;
+
+struct State {
+    start: Instant,
+    /// For each key, its theoretical arrival time in ms since `start`.
+    tat: HashMap<String, f64>,
+}
+
+fn state() -> &'static Mutex<State> {
+    static S: OnceLock<Mutex<State>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(State { start: Instant::now(), tat: HashMap::new() }))
+}
+
+fn take(key: &str, rate: i64, period_ms: f64, burst: i64, cost: i64) -> Result<Value, String> {
+    if rate < 1 || period_ms <= 0.0 {
+        return Err("the rate is at least 1 per period, and the period above 0".into());
+    }
+    let burst = burst.clamp(1, 1_000_000) as f64;
+    let cost = cost.clamp(0, 1_000_000) as f64;
+    let interval = period_ms / rate as f64;
+    let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+    let now = s.start.elapsed().as_secs_f64() * 1000.0;
+    if s.tat.len() >= MAX_KEYS && !s.tat.contains_key(key) {
+        s.tat.retain(|_, t| *t > now);
+        if s.tat.len() >= MAX_KEYS {
+            return Err("too many keys are being limited at once".into());
+        }
+    }
+    let tat = s.tat.get(key).copied().unwrap_or(now).max(now);
+    let new_tat = tat + interval * cost;
+    let allow_at = new_tat - interval * burst;
+    if now < allow_at {
+        let left = ((now - (tat - interval * burst)) / interval).floor().max(0.0);
+        return Ok(json!({ "allowed": false, "retry_after_ms": (allow_at - now).ceil() as i64, "remaining": left as i64, "limit": burst as i64 }));
+    }
+    s.tat.insert(key.to_string(), new_tat);
+    let left = ((now - allow_at) / interval).floor().max(0.0);
+    Ok(json!({ "allowed": true, "retry_after_ms": 0, "remaining": left as i64, "limit": burst as i64 }))
+}
+
+/// Counts one request for `key` against `limit` requests per `period_seconds`: `{ allowed, retry_after_ms, remaining, limit }`.
+/// The whole `limit` may come at once, then they refill evenly (10 per 60 s: one more every 6 s). A refused request does not count.
+/// Limits live in this process: each server of several keeps its own, and a restart forgets them.
+pub fn rate_limit(key: &str, limit: i64, period_seconds: i64) -> Result<Value, String> {
+    take(key, limit, period_seconds as f64 * 1000.0, limit, 1)
+}
+
+/// As rate_limit, with the refill (`rate` per `period_seconds`) and the burst (how many at once) set apart, and a `cost` for
+/// requests that weigh more than one (an export costing 10). A cost of 0 only looks.
+pub fn rate_limit_burst(key: &str, rate: i64, period_seconds: i64, burst: i64, cost: i64) -> Result<Value, String> {
+    take(key, rate, period_seconds as f64 * 1000.0, burst, cost)
+}
+
+/// Forgets `key`, so its next request starts full: after a successful sign-in, say. Whether it was there.
+pub fn rate_limit_reset(key: &str) -> bool {
+    state().lock().unwrap_or_else(|e| e.into_inner()).tat.remove(key).is_some()
+}

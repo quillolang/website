@@ -1,0 +1,162 @@
+//! OpenAPI 3 documents read (JSON or YAML, 3.0 and 3.1): the API's operations with their paths, parameters, bodies and responses, and a request path matched to its operation. For API gateways, mocks, docs and client generators.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_yaml = "0.9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+const METHODS: [&str; 8] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+const MAX_DOC: usize = 32 << 20;
+
+/// The document: a path to a .json/.yaml file, or the text itself.
+fn load(source: &str) -> Result<Value, String> {
+    let text = if !source.contains('\n') && !source.trim_start().starts_with('{') && std::path::Path::new(source.trim()).is_file() {
+        let meta = std::fs::metadata(source.trim()).map_err(|e| e.to_string())?;
+        if meta.len() as usize > MAX_DOC {
+            return Err("the document is over 32 MB".into());
+        }
+        std::fs::read_to_string(source.trim()).map_err(|e| format!("{}: {}", source, e))?
+    } else {
+        source.to_string()
+    };
+    let v: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => serde_yaml::from_str(&text).map_err(|e| format!("not JSON or YAML: {}", e))?,
+    };
+    if !v.get("openapi").map(|o| o.is_string()).unwrap_or(false) {
+        return Err(if v.get("swagger").is_some() { "this is Swagger 2.0; convert it to OpenAPI 3 first".into() } else { "not an OpenAPI 3 document (no `openapi` field)".into() });
+    }
+    Ok(v)
+}
+
+/// Follows a local `$ref` (`#/components/parameters/Limit`), up to 16 steps.
+fn resolve<'a>(doc: &'a Value, mut v: &'a Value) -> &'a Value {
+    for _ in 0..16 {
+        let Some(r) = v.get("$ref").and_then(Value::as_str) else { break };
+        let Some(ptr) = r.strip_prefix('#') else { break };
+        match doc.pointer(ptr) {
+            Some(t) => v = t,
+            None => break,
+        }
+    }
+    v
+}
+
+fn schema_type(doc: &Value, s: &Value) -> Value {
+    if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+        return json!(r.rsplit('/').next().unwrap_or(r));
+    }
+    let s = resolve(doc, s);
+    match s.get("type") {
+        Some(Value::String(t)) if t == "array" => json!(format!("{}[]", schema_type(doc, s.get("items").unwrap_or(&Value::Null)).as_str().unwrap_or("any"))),
+        Some(Value::String(t)) => json!(t),
+        Some(Value::Array(ts)) => json!(ts.iter().filter_map(Value::as_str).filter(|t| *t != "null").collect::<Vec<_>>().join("|")),
+        _ => json!(if s.get("oneOf").is_some() || s.get("anyOf").is_some() { "oneOf" } else { "any" }),
+    }
+}
+
+fn params(doc: &Value, list: Option<&Value>) -> Vec<Value> {
+    list.and_then(Value::as_array)
+        .map(|ps| {
+            ps.iter()
+                .map(|p| {
+                    let p = resolve(doc, p);
+                    json!({
+                        "name": p["name"], "in": p["in"],
+                        "required": p["required"].as_bool().unwrap_or(p["in"] == "path"),
+                        "type": schema_type(doc, p.get("schema").unwrap_or(&Value::Null)),
+                        "description": p.get("description"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn operations(doc: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(paths) = doc["paths"].as_object() else { return out };
+    for (path, item) in paths {
+        let item = resolve(doc, item);
+        let shared = params(doc, item.get("parameters"));
+        for m in METHODS {
+            let Some(op) = item.get(m) else { continue };
+            let mut ps = shared.clone();
+            for p in params(doc, op.get("parameters")) {
+                ps.retain(|q| !(q["name"] == p["name"] && q["in"] == p["in"]));
+                ps.push(p);
+            }
+            let body = op.get("requestBody").map(|b| resolve(doc, b));
+            let responses: Vec<String> = op["responses"].as_object().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+            out.push(json!({
+                "method": m.to_uppercase(), "path": path,
+                "operation_id": op.get("operationId"), "summary": op.get("summary"), "tags": op.get("tags").cloned().unwrap_or(json!([])),
+                "parameters": ps,
+                "request_body": body.map(|b| json!({
+                    "required": b["required"].as_bool().unwrap_or(false),
+                    "content_types": b["content"].as_object().map(|c| c.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                    "schema": b["content"].as_object().and_then(|c| c.values().next()).map(|c| schema_type(doc, c.get("schema").unwrap_or(&Value::Null))),
+                })),
+                "responses": responses,
+                "deprecated": op["deprecated"].as_bool().unwrap_or(false),
+            }));
+        }
+    }
+    out
+}
+
+/// What the API is: `{ openapi, title, version, description, servers, tags, paths, operations }` (`paths` and `operations` are counts). `source` is a file path or the document's text.
+pub fn openapi_info(source: &str) -> Result<Value, String> {
+    let doc = load(source)?;
+    let tags: Vec<Value> = doc["tags"].as_array().map(|t| t.iter().map(|t| t["name"].clone()).collect()).unwrap_or_default();
+    Ok(json!({
+        "openapi": doc["openapi"], "title": doc["info"]["title"], "version": doc["info"]["version"], "description": doc["info"].get("description"),
+        "servers": doc["servers"].as_array().map(|s| s.iter().map(|s| s["url"].clone()).collect::<Vec<_>>()).unwrap_or_default(),
+        "tags": tags, "paths": doc["paths"].as_object().map(Map::len).unwrap_or(0), "operations": operations(&doc).len(),
+    }))
+}
+
+/// Every operation: `[{ method, path, operation_id, summary, tags, parameters: [{ name, in, required, type }], request_body: { required, content_types, schema }, responses, deprecated }]`,
+/// with `$ref`s to the document's own components followed. Types are `string`, `integer`, `Pet[]`, or a schema's name.
+pub fn openapi_operations(source: &str) -> Result<Vec<Value>, String> {
+    Ok(operations(&load(source)?))
+}
+
+/// The operation a request would reach: `method` and a real `path` (`/pets/42`, query left off) matched against the templates (`/pets/{petId}`),
+/// literal paths before templated ones. Gives `{ operation_id, path, params: { petId: "42" }, operation }`, or null when nothing matches.
+pub fn openapi_match(source: &str, method: &str, path: &str) -> Result<Value, String> {
+    let doc = load(source)?;
+    let path = path.split('?').next().unwrap_or("").trim_end_matches('/');
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut best: Option<(usize, Value, HashMap<String, String>)> = None;
+    for op in operations(&doc) {
+        if op["method"] != method.to_uppercase() {
+            continue;
+        }
+        let tpl: Vec<&str> = op["path"].as_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+        if tpl.len() != segs.len() {
+            continue;
+        }
+        let mut vars = HashMap::new();
+        let mut literal = 0;
+        let ok = tpl.iter().zip(&segs).all(|(t, s)| {
+            if t.starts_with('{') && t.ends_with('}') {
+                vars.insert(t[1..t.len() - 1].to_string(), s.to_string());
+                true
+            } else {
+                literal += 1;
+                t == s
+            }
+        });
+        if ok && best.as_ref().map(|b| literal > b.0).unwrap_or(true) {
+            best = Some((literal, op, vars));
+        }
+    }
+    Ok(match best {
+        Some((_, op, vars)) => json!({ "operation_id": op["operation_id"], "path": op["path"], "params": vars, "operation": op }),
+        None => Value::Null,
+    })
+}

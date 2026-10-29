@@ -1,0 +1,128 @@
+//! Browser push notifications without a third party: VAPID keys made and used, and a message encrypted for a subscription (RFC 8291) and sent to its push service (Chrome, Firefox, Safari, Edge).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+//! rand_core = { version = "0.6", features = ["getrandom"] }
+//! hkdf = "0.12"
+//! sha2 = "0.10"
+//! aes-gcm = "0.10"
+//! base64 = "0.22"
+//! ureq = "2"
+
+use aes_gcm::aead::{Aead, KeyInit};
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
+use p256::ecdsa::signature::Signer;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use rand_core::{OsRng, RngCore};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+const MAX_PAYLOAD: usize = 3800; // what fits in one 4096-byte record, as push services require
+
+fn b64(b: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(b)
+}
+
+/// base64url with or without padding, as browsers and libraries hand it out.
+fn unb64(s: &str, what: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).or_else(|_| URL_SAFE.decode(s)).map_err(|_| format!("{} is not base64url", what))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn signing_key(private_key: &str) -> Result<p256::ecdsa::SigningKey, String> {
+    p256::ecdsa::SigningKey::from_slice(&unb64(private_key, "the VAPID private key")?).map_err(|_| "the VAPID private key is not a P-256 key".to_string())
+}
+
+/// A new VAPID key pair, base64url: `{ public_key, private_key }`. Keep the private key secret (an environment variable),
+/// and give the public key to the browser as `applicationServerKey` in `pushManager.subscribe`.
+pub fn webpush_vapid_keys() -> HashMap<String, String> {
+    let k = p256::ecdsa::SigningKey::random(&mut OsRng);
+    HashMap::from([
+        ("private_key".to_string(), b64(&k.to_bytes())),
+        ("public_key".to_string(), b64(k.verifying_key().to_encoded_point(false).as_bytes())),
+    ])
+}
+
+/// The public key that goes with a VAPID private key, for the browser.
+pub fn webpush_public_key(private_key: &str) -> Result<String, String> {
+    Ok(b64(signing_key(private_key)?.verifying_key().to_encoded_point(false).as_bytes()))
+}
+
+/// The message encrypted for one subscription (RFC 8291, aes128gcm): the body to POST.
+fn encrypt(p256dh: &[u8], auth: &[u8], payload: &[u8]) -> Result<Vec<u8>, String> {
+    let ua_public = p256::PublicKey::from_sec1_bytes(p256dh).map_err(|_| "the subscription's p256dh key is not a P-256 public key".to_string())?;
+    let ua_bytes = ua_public.to_encoded_point(false);
+    let eph = p256::ecdh::EphemeralSecret::random(&mut OsRng);
+    let as_public = eph.public_key().to_encoded_point(false);
+    let shared = eph.diffie_hellman(&ua_public);
+
+    let mut key_info = b"WebPush: info\0".to_vec();
+    key_info.extend_from_slice(ua_bytes.as_bytes());
+    key_info.extend_from_slice(as_public.as_bytes());
+    let mut ikm = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(auth), shared.raw_secret_bytes()).expand(&key_info, &mut ikm).map_err(|e| e.to_string())?;
+
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let prk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), &ikm);
+    let (mut cek, mut nonce) = ([0u8; 16], [0u8; 12]);
+    prk.expand(b"Content-Encoding: aes128gcm\0", &mut cek).map_err(|e| e.to_string())?;
+    prk.expand(b"Content-Encoding: nonce\0", &mut nonce).map_err(|e| e.to_string())?;
+
+    let mut plain = payload.to_vec();
+    plain.push(2); // the last (and only) record
+    let sealed = aes_gcm::Aes128Gcm::new_from_slice(&cek).map_err(|e| e.to_string())?.encrypt(aes_gcm::Nonce::from_slice(&nonce), plain.as_ref()).map_err(|e| e.to_string())?;
+
+    let mut body = salt.to_vec();
+    body.extend_from_slice(&4096u32.to_be_bytes());
+    body.push(as_public.as_bytes().len() as u8);
+    body.extend_from_slice(as_public.as_bytes());
+    body.extend_from_slice(&sealed);
+    Ok(body)
+}
+
+/// The `Authorization: vapid ...` header for an endpoint: a JWT for its origin, signed ES256, valid 12 hours.
+fn vapid_header(endpoint: &str, key: &p256::ecdsa::SigningKey, subject: &str) -> Result<String, String> {
+    let rest = endpoint.split_once("://").ok_or("the endpoint is not a URL")?;
+    let origin = format!("{}://{}", rest.0, rest.1.split('/').next().unwrap_or(""));
+    let head = b64(br#"{"typ":"JWT","alg":"ES256"}"#);
+    let claims = b64(json!({ "aud": origin, "exp": now() + 12 * 3600, "sub": subject }).to_string().as_bytes());
+    let input = format!("{}.{}", head, claims);
+    let sig: p256::ecdsa::Signature = key.sign(input.as_bytes());
+    Ok(format!("vapid t={}.{}, k={}", input, b64(&sig.to_bytes()), b64(key.verifying_key().to_encoded_point(false).as_bytes())))
+}
+
+/// Sends `payload` (text, often JSON: `{ title, body, url }` for the service worker to show) to one browser.
+/// `subscription` is what the browser's `pushManager.subscribe()` gave, as JSON: `{ endpoint, keys: { p256dh, auth } }`.
+/// `subject` is a `mailto:` or `https:` address the push service can reach you at; `ttl_seconds` how long it may wait for an offline device (0 to 4 weeks).
+/// Gives `{ status, ok, gone }`: `gone` is true for 404 and 410, when the subscription has ended and should be deleted. Payloads are at most 3,800 bytes.
+pub fn webpush_send(subscription: serde_json::Value, payload: &str, vapid_private_key: &str, subject: &str, ttl_seconds: i64) -> Result<Value, String> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(format!("a push payload is at most {} bytes", MAX_PAYLOAD));
+    }
+    let endpoint = subscription["endpoint"].as_str().ok_or("the subscription has no endpoint")?;
+    let p256dh = unb64(subscription["keys"]["p256dh"].as_str().ok_or("the subscription has no keys.p256dh")?, "keys.p256dh")?;
+    let auth = unb64(subscription["keys"]["auth"].as_str().ok_or("the subscription has no keys.auth")?, "keys.auth")?;
+    let key = signing_key(vapid_private_key)?;
+    let body = encrypt(&p256dh, &auth, payload.as_bytes())?;
+    let res = ureq::post(endpoint)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Content-Encoding", "aes128gcm")
+        .set("Content-Type", "application/octet-stream")
+        .set("TTL", &ttl_seconds.clamp(0, 2_419_200).to_string())
+        .set("Urgency", "normal")
+        .set("Authorization", &vapid_header(endpoint, &key, subject)?)
+        .send_bytes(&body);
+    let status = match res {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(json!({ "status": status, "ok": (200..300).contains(&status), "gone": status == 404 || status == 410 }))
+}

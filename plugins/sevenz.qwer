@@ -1,0 +1,126 @@
+//! 7-Zip archives (.7z): listed, one file read, opened safely into a folder, and made from a folder.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sevenz-rust2 = { version = "0.20", default-features = false, features = ["compress", "util", "bzip2", "ppmd"] }
+
+use serde_json::{json, Value};
+use sevenz_rust2::{ArchiveReader, Password};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+const MAX_ENTRIES: usize = 100_000;
+const MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_TEXT: u64 = 64 * 1024 * 1024;
+
+fn open(path: &str) -> Result<ArchiveReader<std::fs::File>, String> {
+    ArchiveReader::open(path, Password::empty()).map_err(|e| format!("{}: {}", path, e))
+}
+
+// A name inside the archive that stays inside the folder: no absolute paths, no "..", no drive letters.
+fn safe(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in Path::new(&name.replace('\\', "/")).components() {
+        match c {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if out.as_os_str().is_empty() || name.contains(':') { None } else { Some(out) }
+}
+
+fn modified(e: &sevenz_rust2::ArchiveEntry) -> Value {
+    if !e.has_last_modified_date {
+        return Value::Null;
+    }
+    let t: std::time::SystemTime = e.last_modified_date.into();
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| Value::from(d.as_secs())).unwrap_or(Value::Null)
+}
+
+/// The archive's entries as `{ name, size, kind, modified }`: `kind` is file or dir, `size` in bytes, `modified` in seconds since 1970 (null when not kept).
+pub fn sevenz_list(path: &str) -> Result<Vec<Value>, String> {
+    let r = open(path)?;
+    // A folder packed whole has an entry with no name, for the folder itself: it is left out.
+    Ok(r.archive().files.iter().filter(|e| !e.name.is_empty()).take(MAX_ENTRIES).map(|e| json!({
+        "name": e.name,
+        "size": e.size,
+        "kind": if e.is_directory { "dir" } else { "file" },
+        "modified": modified(e),
+    })).collect())
+}
+
+/// The text of one file in the archive, by its name there; an error when it is missing. Up to 64 MB.
+pub fn sevenz_read_file(path: &str, name: &str) -> Result<String, String> {
+    let mut r = open(path)?;
+    let want = name.replace('\\', "/");
+    let entry = r.archive().files.iter().find(|e| e.name.replace('\\', "/") == want && !e.is_directory).ok_or_else(|| format!("{}: no file `{}` in it", path, name))?;
+    if entry.size > MAX_TEXT {
+        return Err(format!("{}: larger than 64 MB", name));
+    }
+    let bytes = r.read_file(&entry.name.clone()).map_err(|e| format!("{}: {}", name, e))?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8 text", name))
+}
+
+/// Opens the archive into the folder `to` (made if needed): the paths written. Safe for archives from anywhere:
+/// names that would land outside `to` (absolute, with "..", or a drive) are skipped, and it stops past 100,000 entries or 4 GB.
+/// Archives with a password are refused.
+pub fn sevenz_extract(path: &str, to: &str) -> Result<Vec<String>, String> {
+    let mut r = open(path)?;
+    let files = &r.archive().files;
+    if files.len() > MAX_ENTRIES {
+        return Err(format!("{}: more than {} entries", path, MAX_ENTRIES));
+    }
+    if files.iter().map(|e| e.size).sum::<u64>() > MAX_TOTAL {
+        return Err(format!("{}: more than 4 GB unpacked", path));
+    }
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {}", to, e))?;
+    let mut written = vec![];
+    let mut failed: Option<String> = None;
+    let mut total = 0u64;
+    r.for_each_entries(|entry, data| {
+        let target = safe(&entry.name).map(|rel| Path::new(to).join(rel));
+        let result: Result<(), String> = (|| {
+            let Some(dest) = target else {
+                std::io::copy(data, &mut std::io::sink()).map_err(|e| e.to_string())?;
+                return Ok(());
+            };
+            if entry.is_directory {
+                return std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {}", dest.display(), e));
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+            }
+            let mut out = std::fs::File::create(&dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
+            total += std::io::copy(&mut data.take(MAX_TOTAL + 1 - total.min(MAX_TOTAL)), &mut out).map_err(|e| format!("{}: {}", dest.display(), e))?;
+            if total > MAX_TOTAL {
+                return Err("more than 4 GB unpacked".into());
+            }
+            written.push(dest.to_string_lossy().into_owned());
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                failed = Some(e);
+                Ok(false)
+            }
+        }
+    }).map_err(|e| format!("{}: {}", path, e))?;
+    match failed {
+        Some(e) => Err(format!("{}: {}", path, e)),
+        None => Ok(written),
+    }
+}
+
+/// Makes the .7z archive `to` from the folder `from`, its files named relative to it (LZMA2): the archive's size in bytes.
+pub fn sevenz_create(to: &str, from: &str) -> Result<i64, String> {
+    if !Path::new(from).is_dir() {
+        return Err(format!("{}: not a folder", from));
+    }
+    if let Some(dir) = Path::new(to).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    sevenz_rust2::compress_to_path(from, to).map_err(|e| format!("{}: {}", to, e))?;
+    Ok(std::fs::metadata(to).map_err(|e| e.to_string())?.len() as i64)
+}
