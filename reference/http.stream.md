@@ -37,7 +37,7 @@ print(http.stream("not a url", (e) => print(e)))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -59,8 +59,8 @@ print(http.stream("http://127.0.0.1:9/events", print, { method: "get", timeout: 
 ```
 
 ```output
-err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 61)")
-err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)")
+err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)")
 ```
 
 ### Errors
@@ -75,7 +75,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)
 ```
 
 ```quillo error

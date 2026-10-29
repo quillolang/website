@@ -24,7 +24,7 @@ print(http.patch("not a url", { role: "admin" }))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -42,8 +42,8 @@ print(http.patch("http://127.0.0.1:9/users/1", [{ op: "replace", path: "/role", 
 ```
 
 ```output
-err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 61)")
-err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 111)")
+err("http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 111)")
 ```
 
 ### Errors
@@ -57,7 +57,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/users/1: Connection Failed: Connect error: Connection refused (os error 111)
 ```
 
 ```quillo error

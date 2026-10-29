@@ -93,7 +93,6 @@ set_session({ user: 7 }, { max_age: 0 })
 line 1: `set_session`'s max_age is seconds or a duration like "30d", got 0
 ```
 
-
 ### Chaining
 
 A sliding session is `set_session` called again on the requests that count as use,

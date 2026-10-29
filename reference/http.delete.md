@@ -23,7 +23,7 @@ print(http.delete("not a url"))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -43,7 +43,7 @@ print(http.delete("http://127.0.0.1:9/items/1", {}, { public_only: true }))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: http://127.0.0.1:9/items/1: refused by public_only: 127.0.0.1 is not on the public internet")
 ```
 
@@ -58,7 +58,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 111)
 ```
 
 ```quillo error

@@ -15,7 +15,7 @@ print(math.tan(math.radians(45)), math.tan(-math.pi / 4))
 ```
 
 ```output
-0.0 0.9999999999999999 1.557407724654902
+0.0 0.9999999999999999 1.5574077246549023
 0.9999999999999999 -0.9999999999999999
 ```
 
@@ -26,13 +26,14 @@ print(math.tan(math.radians(45)), math.tan(-math.pi / 4))
 - `math.pi / 2` is not exactly a right angle, so `math.tan(math.pi / 2)` is a huge
   number (about `1.6e16`), not infinity and not an error.
 - `NaN` gives `NaN`; an infinite angle is a domain error.
-- `math.tan(x)` is `math.sin(x) / math.cos(x)`.
+- `math.tan(x)` is `math.sin(x) / math.cos(x)` to within a last digit, which differs by
+  platform: compare with `math.isclose`, not `==`.
 
 ```quillo
 print(math.tan(math.radians(45)), round(math.tan(math.radians(45)), 10))
 print(math.tan(math.pi / 2) > 1e16, math.isfinite(math.tan(math.pi / 2)))
 print(math.tan(math.nan))
-print(math.tan(1) == math.sin(1) / math.cos(1))
+print(math.isclose(math.tan(1), math.sin(1) / math.cos(1)))
 ```
 
 ```output
@@ -74,7 +75,7 @@ print(30 | math.radians | math.tan | math.atan | math.degrees)
 ```
 
 ```output
-0.5773502691896256
+0.5773502691896257
 29.999999999999996
 ```
 

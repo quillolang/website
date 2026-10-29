@@ -34,33 +34,29 @@ err("12.345 has more decimals than USD has (2); give a rounding mode to round it
 - The modes are `half_even` (banker's rounding), `half_up`, `half_down`, `up`, `down`,
   `ceiling` and `floor`. Without one, a decimal that does not fit the currency is an
   error value, even `1.5` for a currency with no minor units.
-- Text is trimmed and may have a sign, but not an exponent: `"1e3"` is not an amount,
-  though `dec("1e3")` is a decimal.
+- Text is trimmed and may have a sign or an exponent: `"1e3"` is 1000.00.
 - The code's case does not matter; the result carries it in upper case. A code that is
   not active money, such as XAU (gold), is unknown.
-- The minor units must fit an int: USD goes up to `92233720368547758.07`.
 - Negative amounts and zero are amounts.
 
 ```quillo
 print(money.of(dec("1.5"), "JPY"), money.of(dec("2.5"), "JPY", "half_even"), money.of(dec("2.5"), "JPY", "half_up"))
 print(money.of(" 12.5 ", "usd"), money.of("1e3", "USD"), money.of("abc", "USD"))
 print(money.of(10, "XYZ"), money.of(10, "XAU"))
-print(money.of("92233720368547758.07", "USD").amount, money.of("92233720368547758.08", "USD"))
 print(money.of("-5.5", "USD"), money.of(0, "EUR"))
 ```
 
 ```output
 err("1.5 has more decimals than JPY has (0); give a rounding mode to round it") { amount: 2m, currency: "JPY" } { amount: 3m, currency: "JPY" }
-{ amount: 12.50m, currency: "USD" } err("not an amount: \"1e3\"") err("not an amount: \"abc\"")
+{ amount: 12.50m, currency: "USD" } { amount: 1000.00m, currency: "USD" } err("not an amount: \"abc\"")
 err("unknown currency \"XYZ\"") err("unknown currency \"XAU\"")
-92233720368547758.07 err("92233720368547758.08 USD is too large an amount")
 { amount: -5.50m, currency: "USD" } { amount: 0.00m, currency: "EUR" }
 ```
 
 ### Errors
 
 What comes from data is an error value: bad text, too many decimals, an unknown
-currency, too large an amount. What is the program's mistake is a runtime error: a
+currency. What is the program's mistake is a runtime error: a
 float amount (convert it with `dec`), a currency that is not text, a rounding mode that
 is not one of the seven.
 

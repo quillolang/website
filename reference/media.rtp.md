@@ -95,7 +95,7 @@ media.rtp("cam", { video: 45004, host: "203.0.113.1" })
 ```
 
 ```output
-line 1: `media.rtp`: cannot listen on UDP port 45004: Can't assign requested address (os error 49)
+line 1: `media.rtp`: cannot listen on UDP port 45004: Cannot assign requested address (os error 99)
 ```
 
 ### Chaining
