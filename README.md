@@ -38,6 +38,7 @@ nothing on the server.
 | `hero.qwe`, `hero/` | The home page's carousel and the code on each slide |
 | `tour/`, `demos/` | The tour's snippets and the live components beside them |
 | `guides/` | Hand-written guides (reactivity, async, real time, database, …) |
+| `plugins.qwe`, `plugins/` | /plugins/: Rust plugins (`.qwer`), each with an example; `catalog.json` lists them, `test.mjs` runs every example, `zip.sh` makes the download of them all |
 | `bench/` | The benchmark figures shown on the home page, from [quillolang/benchmarks](https://github.com/quillolang/benchmarks) |
 | `brand/` | Logo and banners; `brand/render-banner.sh` renders the banners with headless Chrome |
 
