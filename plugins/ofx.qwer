@@ -1,0 +1,228 @@
+//! Bank statements in OFX and QFX (Quicken, Money, most banks' "download transactions"), SGML 1.x and XML 2.x: accounts, balances and every transaction, ready to import.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+
+const MAX: usize = 64 * 1024 * 1024;
+
+struct Node {
+    tag: String,
+    text: Option<String>,
+    kids: Vec<Node>,
+}
+
+impl Node {
+    fn get(&self, tag: &str) -> Option<&Node> {
+        self.kids.iter().find(|k| k.tag == tag)
+    }
+    fn all<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
+        self.kids.iter().filter(move |k| k.tag == tag)
+    }
+    fn text(&self, tag: &str) -> Option<String> {
+        self.get(tag).and_then(|n| n.text.clone())
+    }
+    fn path(&self, path: &[&str]) -> Option<&Node> {
+        path.iter().try_fold(self, |n, t| n.get(t))
+    }
+    /// Every node with this tag, at any depth.
+    fn find<'a>(&'a self, tag: &str, out: &mut Vec<&'a Node>) {
+        for k in &self.kids {
+            if k.tag == tag {
+                out.push(k);
+            } else {
+                k.find(tag, out);
+            }
+        }
+    }
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&nbsp;", " ").replace("&amp;", "&")
+}
+
+/// OFX 1.x leaves leaf tags unclosed (`<TRNAMT>-12.50`), 2.x closes them; both read the same way.
+fn parse(text: &str) -> Result<Node, String> {
+    if text.len() > MAX {
+        return Err("the file is over 64 MB".into());
+    }
+    let start = text.find("<OFX>").ok_or("not OFX: no <OFX> element")?;
+    let body = &text[start..];
+    let mut stack = vec![Node { tag: "#root".into(), text: None, kids: vec![] }];
+    let mut rest = body;
+    while let Some(lt) = rest.find('<') {
+        let gt = rest[lt..].find('>').ok_or("an unclosed `<`")? + lt;
+        let tag = rest[lt + 1..gt].trim();
+        let after = &rest[gt + 1..];
+        let next = after.find('<').unwrap_or(after.len());
+        let value = after[..next].trim();
+        rest = &after[next..];
+        if tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        if let Some(close) = tag.strip_prefix('/') {
+            let close = close.trim().to_uppercase();
+            // A closing tag for a leaf that 2.x closes: already a leaf, nothing to pop.
+            if stack.last().and_then(|n| n.kids.last()).is_some_and(|k| k.tag == close && k.text.is_some()) && stack.last().map(|n| n.tag != close).unwrap_or(true) {
+                continue;
+            }
+            if let Some(pos) = stack.iter().rposition(|n| n.tag == close) {
+                while stack.len() > pos {
+                    let n = stack.pop().unwrap();
+                    stack.last_mut().ok_or("unbalanced tags")?.kids.push(n);
+                }
+            }
+            continue;
+        }
+        let tag = tag.to_uppercase();
+        if value.is_empty() {
+            stack.push(Node { tag, text: None, kids: vec![] });
+        } else {
+            stack.last_mut().unwrap().kids.push(Node { tag, text: Some(unescape(value)), kids: vec![] });
+        }
+    }
+    while stack.len() > 1 {
+        let n = stack.pop().unwrap();
+        stack.last_mut().unwrap().kids.push(n);
+    }
+    let root = stack.pop().unwrap();
+    root.kids.into_iter().find(|k| k.tag == "OFX").ok_or_else(|| "not OFX: no <OFX> element".into())
+}
+
+fn date(s: Option<String>) -> Value {
+    match s {
+        Some(s) if s.len() >= 8 && s[..8].bytes().all(|b| b.is_ascii_digit()) => Value::String(format!("{}-{}-{}", &s[..4], &s[4..6], &s[6..8])),
+        _ => Value::Null,
+    }
+}
+
+/// "-1,234.56", "12,50" and "+3.4" as text with a dot, and in cents.
+fn amount(s: Option<String>) -> (Value, Value) {
+    let Some(s) = s else { return (Value::Null, Value::Null) };
+    let mut t: String = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    if t.contains(',') && !t.contains('.') {
+        t = t.replace(',', ".");
+    } else {
+        t = t.replace(',', "");
+    }
+    let t = t.trim_start_matches('+').to_string();
+    let neg = t.starts_with('-');
+    let digits = t.trim_start_matches('-');
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let frac2: String = format!("{:0<2}", frac).chars().take(2).collect();
+    let cents = format!("{}{}", whole, frac2).parse::<i64>().ok().map(|c| if neg { -c } else { c });
+    (Value::String(t), cents.map(Value::from).unwrap_or(Value::Null))
+}
+
+fn balance(n: Option<&Node>) -> Value {
+    match n {
+        None => Value::Null,
+        Some(b) => {
+            let (a, c) = amount(b.text("BALAMT"));
+            json!({ "amount": a, "cents": c, "date": date(b.text("DTASOF")) })
+        }
+    }
+}
+
+fn transaction(t: &Node) -> Value {
+    let (a, c) = amount(t.text("TRNAMT"));
+    let name = t.text("NAME").or_else(|| t.path(&["PAYEE"]).and_then(|p| p.text("NAME")));
+    json!({
+        "id": t.text("FITID"),
+        "type": t.text("TRNTYPE").map(|s| s.to_lowercase()),
+        "date": date(t.text("DTPOSTED")),
+        "user_date": date(t.text("DTUSER")),
+        "amount": a,
+        "cents": c,
+        "name": name,
+        "memo": t.text("MEMO"),
+        "check": t.text("CHECKNUM"),
+        "ref": t.text("REFNUM"),
+    })
+}
+
+fn statements(ofx: &Node) -> Vec<Value> {
+    let mut found = vec![];
+    ofx.find("STMTRS", &mut found);
+    ofx.find("CCSTMTRS", &mut found);
+    found
+        .into_iter()
+        .map(|s| {
+            let card = s.tag == "CCSTMTRS";
+            let acct = s.get("BANKACCTFROM").or_else(|| s.get("CCACCTFROM"));
+            let list = s.get("BANKTRANLIST");
+            json!({
+                "kind": if card { "credit card" } else { "bank" },
+                "currency": s.text("CURDEF"),
+                "bank_id": acct.and_then(|a| a.text("BANKID")),
+                "branch_id": acct.and_then(|a| a.text("BRANCHID")),
+                "account": acct.and_then(|a| a.text("ACCTID")),
+                "account_type": acct.and_then(|a| a.text("ACCTTYPE")).map(|t| t.to_lowercase()).or(if card { Some("creditline".into()) } else { None }),
+                "from": date(list.and_then(|l| l.text("DTSTART"))),
+                "to": date(list.and_then(|l| l.text("DTEND"))),
+                "balance": balance(s.get("LEDGERBAL")),
+                "available": balance(s.get("AVAILBAL")),
+                "transactions": list.map(|l| l.all("STMTTRN").map(transaction).collect::<Vec<_>>()).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn read(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    // OFX 1.x files are often Windows-1252: read bytes that are not UTF-8 as Latin-1.
+    Ok(String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| b as char).collect()))
+}
+
+fn tree(n: &Node) -> Value {
+    if let Some(t) = &n.text {
+        return Value::String(t.clone());
+    }
+    let mut m = Map::new();
+    for k in &n.kids {
+        let v = tree(k);
+        match m.get_mut(&k.tag) {
+            Some(Value::Array(a)) if n.kids.iter().filter(|x| x.tag == k.tag).count() > 1 => a.push(v),
+            Some(old) => *old = Value::Array(vec![old.take(), v]),
+            None => {
+                m.insert(k.tag.clone(), v);
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+/// The statements in OFX or QFX text: `[{ kind, currency, bank_id, branch_id, account, account_type, from, to, balance,
+/// available, transactions }]`, `kind` "bank" or "credit card", dates as "2026-10-15", `balance` `{ amount, cents, date }`,
+/// and each transaction `{ id, type, date, user_date, amount, cents, name, memo, check, ref }` (`id` is the bank's
+/// FITID: keep it to skip a transaction imported twice).
+pub fn ofx_parse(text: &str) -> Result<Vec<Value>, String> {
+    Ok(statements(&parse(text)?))
+}
+
+/// `ofx_parse` of an .ofx or .qfx file (UTF-8, or Windows-1252 as older banks send).
+pub fn ofx_read_file(path: &str) -> Result<Vec<Value>, String> {
+    ofx_parse(&read(path)?)
+}
+
+/// Every transaction of every statement in the file as one list of rows, each with its `account` and `currency`: for an
+/// import into a table.
+pub fn ofx_transactions(path: &str) -> Result<Vec<Value>, String> {
+    let mut rows = vec![];
+    for s in ofx_read_file(path)? {
+        for mut t in s["transactions"].as_array().cloned().unwrap_or_default() {
+            t["account"] = s["account"].clone();
+            t["currency"] = s["currency"].clone();
+            rows.push(t);
+        }
+    }
+    Ok(rows)
+}
+
+/// The whole OFX document as nested maps (tags as keys, repeated tags as lists, values as text): for what
+/// `ofx_parse` does not read, such as investment statements or the sign-on's status.
+pub fn ofx_tree(text: &str) -> Result<Value, String> {
+    let ofx = parse(text)?;
+    Ok(json!({ "OFX": tree(&ofx) }))
+}

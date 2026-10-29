@@ -1,0 +1,451 @@
+//! IPP (Internet Printing Protocol, RFC 8011), which nearly every network printer and CUPS speak: requests built (Get-Printer-Attributes, Print-Job with copies, sides, media and colour, Get-Jobs, Get-Job-Attributes, Cancel-Job), sent over http:// or ipps://, and answers read into attributes, with the printer's state, reasons, formats and media summed up.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+
+use serde_json::{json, Map, Value};
+
+const OP_PRINT_JOB: u16 = 0x0002;
+const OP_CANCEL_JOB: u16 = 0x0008;
+const OP_GET_JOB_ATTRIBUTES: u16 = 0x0009;
+const OP_GET_JOBS: u16 = 0x000a;
+const OP_GET_PRINTER_ATTRIBUTES: u16 = 0x000b;
+
+struct Req {
+    b: Vec<u8>,
+}
+
+impl Req {
+    fn new(op: u16, id: u32) -> Req {
+        let mut b = vec![2, 0];
+        b.extend_from_slice(&op.to_be_bytes());
+        b.extend_from_slice(&id.to_be_bytes());
+        Req { b }
+    }
+    fn group(&mut self, tag: u8) {
+        self.b.push(tag);
+    }
+    fn attr(&mut self, tag: u8, name: &str, value: &[u8]) {
+        self.b.push(tag);
+        self.b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        self.b.extend_from_slice(name.as_bytes());
+        self.b.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        self.b.extend_from_slice(value);
+    }
+    fn text(&mut self, tag: u8, name: &str, v: &str) {
+        self.attr(tag, name, v.as_bytes());
+    }
+    fn int(&mut self, tag: u8, name: &str, v: i32) {
+        self.attr(tag, name, &v.to_be_bytes());
+    }
+    /// One attribute with several values: the name on the first only.
+    fn many(&mut self, tag: u8, name: &str, vs: &[String]) {
+        for (i, v) in vs.iter().enumerate() {
+            self.attr(tag, if i == 0 { name } else { "" }, v.as_bytes());
+        }
+    }
+    fn start(&mut self, uri: &str, user: &str) {
+        self.group(0x01);
+        self.text(0x47, "attributes-charset", "utf-8");
+        self.text(0x48, "attributes-natural-language", "en");
+        self.text(0x45, "printer-uri", uri);
+        self.text(0x42, "requesting-user-name", user);
+    }
+}
+
+/// `ipp://host/ipp/print` as the printer-uri, and the http(s) address to post to (port 631).
+fn urls(url: &str) -> Result<(String, String), String> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| format!("{:?} is not an ipp://, ipps:// or http:// address", url))?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/ipp/print"),
+    };
+    let hp = if hostport.contains(':') && !hostport.ends_with(']') { hostport.to_string() } else { format!("{}:631", hostport) };
+    let (post, uri_scheme) = match scheme {
+        "ipp" | "http" => ("http", "ipp"),
+        "ipps" | "https" => ("https", "ipps"),
+        other => return Err(format!("{}:// is not IPP", other)),
+    };
+    Ok((format!("{}://{}{}", uri_scheme, hp, path), format!("{}://{}{}", post, hp, path)))
+}
+
+fn job_template(r: &mut Req, o: &Value) -> Result<(), String> {
+    let mut any = false;
+    let mut open = |r: &mut Req| {
+        if !any {
+            r.group(0x02);
+            any = true;
+        }
+    };
+    if let Some(c) = o["copies"].as_i64() {
+        open(r);
+        r.int(0x21, "copies", c.clamp(1, 999) as i32);
+    }
+    if let Some(s) = o["sides"].as_str() {
+        let k = match s {
+            "one" | "one-sided" => "one-sided",
+            "long" | "two-sided-long-edge" => "two-sided-long-edge",
+            "short" | "two-sided-short-edge" => "two-sided-short-edge",
+            other => return Err(format!("sides {:?}: one, long or short", other)),
+        };
+        open(r);
+        r.text(0x44, "sides", k);
+    }
+    if let Some(m) = o["media"].as_str() {
+        let k = match m {
+            "a4" => "iso_a4_210x297mm",
+            "a5" => "iso_a5_148x210mm",
+            "a3" => "iso_a3_297x420mm",
+            "letter" => "na_letter_8.5x11in",
+            "legal" => "na_legal_8.5x14in",
+            other => other,
+        };
+        open(r);
+        r.text(0x44, "media", k);
+    }
+    if let Some(c) = o["color"].as_bool() {
+        open(r);
+        r.text(0x44, "print-color-mode", if c { "color" } else { "monochrome" });
+    }
+    if o["landscape"] == true {
+        open(r);
+        r.int(0x23, "orientation-requested", 4);
+    }
+    if let Some(q) = o["quality"].as_str() {
+        let v = match q {
+            "draft" => 3,
+            "normal" => 4,
+            "high" => 5,
+            other => return Err(format!("quality {:?}: draft, normal or high", other)),
+        };
+        open(r);
+        r.int(0x23, "print-quality", v);
+    }
+    if let Some(p) = o["pages"].as_array() {
+        if p.len() == 2 {
+            open(r);
+            let mut v = (p[0].as_i64().unwrap_or(1) as i32).to_be_bytes().to_vec();
+            v.extend_from_slice(&(p[1].as_i64().unwrap_or(1) as i32).to_be_bytes());
+            r.attr(0x33, "page-ranges", &v);
+        }
+    }
+    Ok(())
+}
+
+fn build(op: &str, url: &str, options: &Value) -> Result<(Vec<u8>, String), String> {
+    let (uri, post) = urls(url)?;
+    let user = options["user"].as_str().unwrap_or("quillo");
+    let id = options["request_id"].as_u64().unwrap_or(1) as u32;
+    let r = match op {
+        "get-printer-attributes" => {
+            let mut r = Req::new(OP_GET_PRINTER_ATTRIBUTES, id);
+            r.start(&uri, user);
+            let wanted: Vec<String> = match options["requested"].as_array() {
+                Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                None => vec!["all".into()],
+            };
+            r.many(0x44, "requested-attributes", &wanted);
+            r
+        }
+        "print-job" => {
+            let mut r = Req::new(OP_PRINT_JOB, id);
+            r.start(&uri, user);
+            r.text(0x42, "job-name", options["name"].as_str().unwrap_or("Quillo job"));
+            r.text(0x49, "document-format", options["format"].as_str().unwrap_or("application/octet-stream"));
+            job_template(&mut r, options)?;
+            r
+        }
+        "get-jobs" => {
+            let mut r = Req::new(OP_GET_JOBS, id);
+            r.start(&uri, user);
+            r.text(0x44, "which-jobs", options["which"].as_str().unwrap_or("not-completed"));
+            if options["mine"] == true {
+                r.attr(0x22, "my-jobs", &[1]);
+            }
+            r.many(0x44, "requested-attributes", &["job-id".into(), "job-name".into(), "job-state".into(), "job-state-reasons".into(), "job-originating-user-name".into()]);
+            r
+        }
+        "get-job-attributes" | "cancel-job" => {
+            let mut r = Req::new(if op == "cancel-job" { OP_CANCEL_JOB } else { OP_GET_JOB_ATTRIBUTES }, id);
+            r.start(&uri, user);
+            let job = options["job_id"].as_i64().ok_or("give the job's `job_id`")?;
+            r.int(0x21, "job-id", job as i32);
+            r
+        }
+        other => return Err(format!("{:?}: get-printer-attributes, print-job, get-jobs, get-job-attributes or cancel-job", other)),
+    };
+    let mut b = r.b;
+    b.push(0x03);
+    Ok((b, post))
+}
+
+fn status_text(code: u16) -> &'static str {
+    match code {
+        0x0000 => "successful-ok",
+        0x0001 => "successful-ok-ignored-or-substituted-attributes",
+        0x0002 => "successful-ok-conflicting-attributes",
+        0x0400 => "client-error-bad-request",
+        0x0401 => "client-error-forbidden",
+        0x0402 => "client-error-not-authenticated",
+        0x0403 => "client-error-not-authorized",
+        0x0404 => "client-error-not-possible",
+        0x0405 => "client-error-timeout",
+        0x0406 => "client-error-not-found",
+        0x0407 => "client-error-gone",
+        0x0408 => "client-error-request-entity-too-large",
+        0x040a => "client-error-document-format-not-supported",
+        0x040b => "client-error-attributes-or-values-not-supported",
+        0x0500 => "server-error-internal-error",
+        0x0501 => "server-error-operation-not-supported",
+        0x0502 => "server-error-service-unavailable",
+        0x0503 => "server-error-version-not-supported",
+        0x0506 => "server-error-not-accepting-jobs",
+        0x0507 => "server-error-busy",
+        0x0508 => "server-error-job-canceled",
+        _ => "other",
+    }
+}
+
+fn enum_name(name: &str, v: i32) -> Value {
+    let s = match (name, v) {
+        ("printer-state", 3) => "idle",
+        ("printer-state", 4) => "processing",
+        ("printer-state", 5) => "stopped",
+        ("job-state", 3) => "pending",
+        ("job-state", 4) => "pending-held",
+        ("job-state", 5) => "processing",
+        ("job-state", 6) => "processing-stopped",
+        ("job-state", 7) => "canceled",
+        ("job-state", 8) => "aborted",
+        ("job-state", 9) => "completed",
+        ("orientation-requested", 3) => "portrait",
+        ("orientation-requested", 4) => "landscape",
+        ("print-quality", 3) => "draft",
+        ("print-quality", 4) => "normal",
+        ("print-quality", 5) => "high",
+        _ => return json!(v),
+    };
+    json!(s)
+}
+
+fn value(tag: u8, name: &str, v: &[u8]) -> Value {
+    let int = |b: &[u8]| -> i32 { if b.len() >= 4 { i32::from_be_bytes([b[0], b[1], b[2], b[3]]) } else { 0 } };
+    match tag {
+        0x21 => json!(int(v)),
+        0x23 => enum_name(name, int(v)),
+        0x22 => json!(v.first() == Some(&1)),
+        0x32 if v.len() == 9 => json!(format!("{}x{}{}", int(&v[0..4]), int(&v[4..8]), if v[8] == 3 { "dpi" } else { "dpcm" })),
+        0x33 if v.len() == 8 => json!([int(&v[0..4]), int(&v[4..8])]),
+        0x31 if v.len() == 11 => json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", u16::from_be_bytes([v[0], v[1]]), v[2], v[3], v[4], v[5], v[6], v[8] as char, v[9], v[10])),
+        0x10 => json!("unsupported"),
+        0x12 => json!("unknown"),
+        0x13 => Value::Null,
+        0x30 => json!(v.iter().map(|b| format!("{:02x}", b)).collect::<String>()),
+        0x35 | 0x36 => {
+            // With a language: two length-prefixed parts, the text second.
+            if v.len() >= 2 {
+                let l = u16::from_be_bytes([v[0], v[1]]) as usize;
+                if v.len() >= 4 + l {
+                    return json!(String::from_utf8_lossy(&v[4 + l..]));
+                }
+            }
+            json!(String::from_utf8_lossy(v))
+        }
+        _ => json!(String::from_utf8_lossy(v)),
+    }
+}
+
+/// An IPP answer read: `{ version, status, status_code, request_id, groups: [{ tag, attributes: { name: value or [values] } }] }`; collections are skipped and named in `skipped`.
+fn parse(b: &[u8]) -> Result<Value, String> {
+    if b.len() < 9 {
+        return Err(format!("not an IPP answer ({} bytes)", b.len()));
+    }
+    let code = u16::from_be_bytes([b[2], b[3]]);
+    let id = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+    let mut groups: Vec<Value> = vec![];
+    let mut cur: Option<(u8, Map<String, Value>)> = None;
+    let mut last = String::new();
+    let mut depth = 0;
+    let mut skipped: Vec<String> = vec![];
+    let mut i = 8;
+    let group_name = |t: u8| match t {
+        1 => "operation",
+        2 => "job",
+        4 => "printer",
+        5 => "unsupported",
+        _ => "other",
+    };
+    while i < b.len() {
+        let tag = b[i];
+        if tag == 0x03 {
+            break;
+        }
+        if tag < 0x10 {
+            if let Some((t, m)) = cur.take() {
+                groups.push(json!({ "tag": group_name(t), "attributes": m }));
+            }
+            cur = Some((tag, Map::new()));
+            i += 1;
+            continue;
+        }
+        if i + 3 > b.len() {
+            return Err("an attribute is cut short".into());
+        }
+        let nl = u16::from_be_bytes([b[i + 1], b[i + 2]]) as usize;
+        let name = String::from_utf8_lossy(b.get(i + 3..i + 3 + nl).ok_or("a name is cut short")?).into_owned();
+        let at = i + 3 + nl;
+        let vl = u16::from_be_bytes([*b.get(at).ok_or("cut short")?, *b.get(at + 1).ok_or("cut short")?]) as usize;
+        let v = b.get(at + 2..at + 2 + vl).ok_or("a value is cut short")?;
+        i = at + 2 + vl;
+        // Collections (begCollection ... endCollection) are passed over.
+        if tag == 0x34 {
+            if depth == 0 && !name.is_empty() && !skipped.contains(&name) {
+                skipped.push(name.clone());
+            }
+            depth += 1;
+            continue;
+        }
+        if tag == 0x37 {
+            depth -= 1;
+            continue;
+        }
+        if depth > 0 {
+            continue;
+        }
+        let name = if name.is_empty() { last.clone() } else { name };
+        last = name.clone();
+        let val = value(tag, &name, v);
+        if let Some((_, m)) = cur.as_mut() {
+            match m.get_mut(&name) {
+                Some(Value::Array(a)) if nl == 0 => a.push(val),
+                Some(old) if nl == 0 => *old = json!([old.clone(), val]),
+                _ => {
+                    m.insert(name, val);
+                }
+            }
+        }
+    }
+    if let Some((t, m)) = cur.take() {
+        groups.push(json!({ "tag": group_name(t), "attributes": m }));
+    }
+    Ok(json!({ "version": format!("{}.{}", b[0], b[1]), "status": status_text(code), "status_code": code, "ok": code < 0x0100, "request_id": id, "groups": groups, "skipped": skipped }))
+}
+
+fn list(v: &Value) -> Value {
+    match v {
+        Value::Array(_) => v.clone(),
+        Value::Null => json!([]),
+        other => json!([other]),
+    }
+}
+
+/// The printer's essentials from a Get-Printer-Attributes answer.
+fn summary(p: &Value) -> Value {
+    let a = p["groups"].as_array().and_then(|g| g.iter().find(|g| g["tag"] == "printer")).map(|g| g["attributes"].clone()).unwrap_or(json!({}));
+    let reasons = list(&a["printer-state-reasons"]);
+    let real: Vec<Value> = reasons.as_array().unwrap().iter().filter(|r| r.as_str().map_or(false, |s| s != "none" && !s.ends_with("-report"))).cloned().collect();
+    let state = a["printer-state"].clone();
+    json!({
+        "name": a["printer-name"], "model": a["printer-make-and-model"], "state": state, "reasons": real,
+        "ready": state != "stopped" && a["printer-is-accepting-jobs"] != false && real.iter().all(|r| r.as_str().map_or(true, |s| s.ends_with("-warning"))),
+        "accepting_jobs": a["printer-is-accepting-jobs"], "formats": list(&a["document-format-supported"]), "media": list(&a["media-supported"]),
+        "sides": list(&a["sides-supported"]), "color": a["color-supported"], "pages_per_minute": a["pages-per-minute"],
+    })
+}
+
+fn post(url: &str, body: &[u8], timeout_ms: i64) -> Result<Vec<u8>, String> {
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_millis(timeout_ms.clamp(500, 300_000) as u64)).build();
+    let resp = agent.post(url).set("Content-Type", "application/ipp").send_bytes(body);
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            if r.content_type() != "application/ipp" {
+                return Err(format!("the printer answered HTTP {}", code));
+            }
+            r
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = vec![];
+    use std::io::Read;
+    resp.into_reader().take(20_000_000).read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// An IPP request's bytes, in base64, to look at or send another way. `operation`: "get-printer-attributes", "print-job", "get-jobs", "get-job-attributes" or "cancel-job"; `url` like `ipp://printer.local/ipp/print`.
+/// `options`: `{ user, request_id, requested: [...] (attributes asked for), name, format: "application/pdf", copies, sides: "one" | "long" | "short", media: "a4" | "letter" | an IPP keyword, color: false, landscape, quality: "draft" | "normal" | "high", pages: [1, 3], job_id, which: "completed", mine }`. The document follows a print-job's bytes.
+pub fn ipp_request(operation: &str, url: &str, options: serde_json::Value) -> Result<String, String> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(build(operation, url, &options)?.0))
+}
+
+/// An IPP answer (given in base64) read into its status and attribute groups, with a printer's essentials in `summary` when it describes one.
+pub fn ipp_parse(answer_base64: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD.decode(answer_base64.trim()).map_err(|e| format!("not base64: {}", e))?;
+    let mut p = parse(&b)?;
+    if p["groups"].as_array().map_or(false, |g| g.iter().any(|g| g["tag"] == "printer")) {
+        p["summary"] = summary(&p);
+    }
+    Ok(p)
+}
+
+/// Asks a printer what it is and how it is (Get-Printer-Attributes): the full answer, and `summary`: `{ name, model, state: "idle" | "processing" | "stopped", reasons, ready, accepting_jobs, formats, media, sides, color, pages_per_minute }`.
+pub fn ipp_printer(url: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let (body, to) = build("get-printer-attributes", url, &json!({}))?;
+    let mut p = parse(&post(&to, &body, timeout_ms)?)?;
+    p["summary"] = summary(&p);
+    Ok(p)
+}
+
+/// Prints a file (Print-Job): its format from the extension unless `options.format` says (PDF, JPEG, PNG, PWG raster, PostScript, plain text), with the job options of `ipp_request`. Gives `{ ok, status, job_id, job_state }`.
+pub fn ipp_print(url: &str, path: &str, options: serde_json::Value, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut o = options.clone();
+    if o["format"].is_null() {
+        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+        o["format"] = json!(match ext.as_str() {
+            "pdf" => "application/pdf",
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "pwg" => "image/pwg-raster",
+            "urf" => "image/urf",
+            "ps" => "application/postscript",
+            "txt" => "text/plain",
+            _ => "application/octet-stream",
+        });
+    }
+    if o["name"].is_null() {
+        o["name"] = json!(std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("document"));
+    }
+    let (mut body, to) = build("print-job", url, &o)?;
+    body.extend_from_slice(&data);
+    let p = parse(&post(&to, &body, timeout_ms)?)?;
+    let job = p["groups"].as_array().and_then(|g| g.iter().find(|g| g["tag"] == "job")).map(|g| g["attributes"].clone()).unwrap_or(json!({}));
+    Ok(json!({ "ok": p["ok"], "status": p["status"], "job_id": job["job-id"], "job_state": job["job-state"], "job_uri": job["job-uri"] }))
+}
+
+/// The printer's jobs (Get-Jobs): `which` "not-completed" or "completed". Gives a list of `{ job-id, job-name, job-state, ... }`.
+pub fn ipp_jobs(url: &str, which: &str, timeout_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let (body, to) = build("get-jobs", url, &json!({ "which": which }))?;
+    let p = parse(&post(&to, &body, timeout_ms)?)?;
+    if p["ok"] != true {
+        return Err(format!("the printer said {}", p["status"]));
+    }
+    Ok(p["groups"].as_array().map(|g| g.iter().filter(|g| g["tag"] == "job").map(|g| g["attributes"].clone()).collect()).unwrap_or_default())
+}
+
+/// Cancels a job by its id (Cancel-Job). Gives the status the printer answered.
+pub fn ipp_cancel(url: &str, job_id: i64, user: &str, timeout_ms: i64) -> Result<String, String> {
+    let (body, to) = build("cancel-job", url, &json!({ "job_id": job_id, "user": user }))?;
+    Ok(parse(&post(&to, &body, timeout_ms)?)?["status"].as_str().unwrap_or("other").to_string())
+}
+
+/// An IPP answer saved in a file (a capture, or a test fixture) read as `ipp_parse` reads one.
+pub fn ipp_parse_file(path: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let b = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    ipp_parse(&base64::engine::general_purpose::STANDARD.encode(b))
+}

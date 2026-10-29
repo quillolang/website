@@ -1,0 +1,253 @@
+//! Forecasts from a series of numbers (daily sales, weekly visits, monthly demand): moving averages, simple exponential smoothing, Holt's trend (damped or not) and Holt-Winters with additive or multiplicative seasons, their smoothing weights fitted to the data, an automatic choice of the model that fits best, prediction intervals, and accuracy measures (MAE, RMSE, MAPE).
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+
+fn r(x: f64) -> Value {
+    if x.is_finite() { json!((x * 1e4).round() / 1e4) } else { Value::Null }
+}
+
+fn rs(v: &[f64]) -> Vec<Value> {
+    v.iter().map(|x| r(*x)).collect()
+}
+
+fn check(s: &[f64], min: usize) -> Result<(), String> {
+    if s.len() < min {
+        return Err(format!("this needs at least {} values", min));
+    }
+    if s.len() > 100_000 || s.iter().any(|x| !x.is_finite()) {
+        return Err("at most 100,000 values, all numbers".into());
+    }
+    Ok(())
+}
+
+/// One-step-ahead fitted values and the state after the last value, for each model.
+struct Fit {
+    fitted: Vec<f64>,
+    forecast: Vec<f64>,
+    sse: f64,
+}
+
+fn sse(s: &[f64], f: &[f64], skip: usize) -> f64 {
+    s.iter().zip(f).skip(skip).map(|(a, b)| (a - b).powi(2)).sum()
+}
+
+fn ses(s: &[f64], a: f64, h: usize) -> Fit {
+    let mut l = s[0];
+    let mut fitted = vec![s[0]];
+    for &x in &s[1..] {
+        fitted.push(l);
+        l = a * x + (1.0 - a) * l;
+    }
+    let e = sse(s, &fitted, 1);
+    Fit { fitted, forecast: vec![l; h], sse: e }
+}
+
+fn holt(s: &[f64], a: f64, b: f64, phi: f64, h: usize) -> Fit {
+    let mut l = s[0];
+    let mut t = s[1] - s[0];
+    let mut fitted = vec![s[0]];
+    for &x in &s[1..] {
+        fitted.push(l + phi * t);
+        let lp = l;
+        l = a * x + (1.0 - a) * (l + phi * t);
+        t = b * (l - lp) + (1.0 - b) * phi * t;
+    }
+    let mut fc = vec![];
+    let mut damp = 0.0;
+    for k in 1..=h {
+        damp += phi.powi(k as i32);
+        fc.push(l + damp * t);
+    }
+    let e = sse(s, &fitted, 2);
+    Fit { fitted, forecast: fc, sse: e }
+}
+
+fn holt_winters(s: &[f64], m: usize, mult: bool, a: f64, b: f64, g: f64, h: usize) -> Fit {
+    let first: f64 = s[..m].iter().sum::<f64>() / m as f64;
+    let second: f64 = s[m..2 * m].iter().sum::<f64>() / m as f64;
+    let mut l = first;
+    let mut t = (second - first) / m as f64;
+    let mut season: Vec<f64> = s[..m].iter().map(|x| if mult { x / first } else { x - first }).collect();
+    let mut fitted = vec![];
+    for (i, &x) in s.iter().enumerate() {
+        let si = season[i % m];
+        fitted.push(if mult { (l + t) * si } else { l + t + si });
+        let lp = l;
+        l = if mult { a * (x / si) + (1.0 - a) * (l + t) } else { a * (x - si) + (1.0 - a) * (l + t) };
+        t = b * (l - lp) + (1.0 - b) * t;
+        season[i % m] = if mult { g * (x / l) + (1.0 - g) * si } else { g * (x - l) + (1.0 - g) * si };
+    }
+    let n = s.len();
+    let fc = (1..=h).map(|k| {
+        let si = season[(n + k - 1) % m];
+        if mult { (l + k as f64 * t) * si } else { l + k as f64 * t + si }
+    }).collect();
+    let e = sse(s, &fitted, m);
+    Fit { fitted, forecast: fc, sse: e }
+}
+
+const GRID: [f64; 10] = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.95];
+
+/// The weights giving the smallest error: a coarse grid, then a finer one around the best.
+fn best<F: Fn(f64, f64, f64) -> f64>(dims: usize, given: [Option<f64>; 3], err: F) -> [f64; 3] {
+    let axis = |i: usize, c: f64, step: f64| -> Vec<f64> {
+        if i >= dims {
+            return vec![0.0];
+        }
+        match given[i] {
+            Some(v) => vec![v.clamp(0.0, 1.0)],
+            None if step == 0.0 => GRID.to_vec(),
+            None => (-4..=4).map(|k| (c + k as f64 * step).clamp(0.01, 0.99)).collect(),
+        }
+    };
+    let mut bestp = [0.0; 3];
+    let mut beste = f64::INFINITY;
+    for pass in 0..2 {
+        let step = if pass == 0 { 0.0 } else { 0.025 };
+        let c = bestp;
+        for a in axis(0, c[0], step) {
+            for b in axis(1, c[1], step) {
+                for g in axis(2, c[2], step) {
+                    let e = err(a, b, g);
+                    if e < beste {
+                        beste = e;
+                        bestp = [a, b, g];
+                    }
+                }
+            }
+        }
+    }
+    bestp
+}
+
+/// 80% and 95% bands from the one-step errors, widening with the horizon.
+fn bands(s: &[f64], f: &Fit, skip: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    let n = (s.len() - skip).max(1) as f64;
+    let sd = (f.sse / n).sqrt();
+    let mut l80 = vec![];
+    let mut u80 = vec![];
+    let mut l95 = vec![];
+    let mut u95 = vec![];
+    for (k, y) in f.forecast.iter().enumerate() {
+        let w = sd * ((k + 1) as f64).sqrt();
+        l80.push(y - 1.2816 * w);
+        u80.push(y + 1.2816 * w);
+        l95.push(y - 1.96 * w);
+        u95.push(y + 1.96 * w);
+    }
+    (l80, u80, l95, u95, sd)
+}
+
+fn out(model: &str, params: Value, s: &[f64], f: &Fit, skip: usize) -> Value {
+    let (l80, u80, l95, u95, sd) = bands(s, f, skip);
+    json!({ "model": model, "params": params, "forecast": rs(&f.forecast), "lower_80": rs(&l80), "upper_80": rs(&u80), "lower_95": rs(&l95), "upper_95": rs(&u95), "fitted": rs(&f.fitted), "rmse": r(sd), "sse": r(f.sse) })
+}
+
+/// A moving average of the last `window` values, carried forward `horizon` steps (a flat forecast), with each point's average as `fitted`.
+pub fn forecast_moving_average(series: Vec<f64>, window: i64, horizon: i64) -> Result<serde_json::Value, String> {
+    check(&series, 2)?;
+    let w = window.clamp(1, series.len() as i64) as usize;
+    let h = horizon.clamp(0, 10_000) as usize;
+    let mut fitted = vec![f64::NAN; w];
+    for i in w..series.len() {
+        fitted.push(series[i - w..i].iter().sum::<f64>() / w as f64);
+    }
+    let last = series[series.len() - w..].iter().sum::<f64>() / w as f64;
+    let f = Fit { sse: sse(&series, &fitted, w), fitted, forecast: vec![last; h] };
+    Ok(out("moving_average", json!({ "window": w }), &series, &f, w))
+}
+
+/// Simple exponential smoothing (no trend, no season): `alpha` from 0 to 1, or null to fit it.
+pub fn forecast_ses(series: Vec<f64>, alpha: Option<f64>, horizon: i64) -> Result<serde_json::Value, String> {
+    check(&series, 3)?;
+    let h = horizon.clamp(0, 10_000) as usize;
+    let p = best(1, [alpha, None, None], |a, _, _| ses(&series, a, 0).sse);
+    let f = ses(&series, p[0], h);
+    Ok(out("ses", json!({ "alpha": r(p[0]) }), &series, &f, 1))
+}
+
+/// Holt's linear trend: `alpha` (level) and `beta` (trend), null to fit; `damped` flattens the trend over the horizon (φ = 0.9), safer for long forecasts.
+pub fn forecast_holt(series: Vec<f64>, alpha: Option<f64>, beta: Option<f64>, damped: bool, horizon: i64) -> Result<serde_json::Value, String> {
+    check(&series, 4)?;
+    let h = horizon.clamp(0, 10_000) as usize;
+    let phi = if damped { 0.9 } else { 1.0 };
+    let p = best(2, [alpha, beta, None], |a, b, _| holt(&series, a, b, phi, 0).sse);
+    let f = holt(&series, p[0], p[1], phi, h);
+    Ok(out(if damped { "holt_damped" } else { "holt" }, json!({ "alpha": r(p[0]), "beta": r(p[1]), "phi": phi }), &series, &f, 2))
+}
+
+/// Holt-Winters: level, trend and a season of `period` values (7 for days of the week, 12 for months), `kind` "additive" (seasons add a fixed amount) or "multiplicative" (a share; all values must be above 0).
+/// `params` `{ alpha, beta, gamma }`, any of them left out to be fitted. Needs at least two full seasons.
+pub fn forecast_holt_winters(series: Vec<f64>, period: i64, kind: &str, params: serde_json::Value, horizon: i64) -> Result<serde_json::Value, String> {
+    let m = period.max(2) as usize;
+    check(&series, 2 * m)?;
+    let mult = match kind {
+        "additive" => false,
+        "multiplicative" => {
+            if series.iter().any(|x| *x <= 0.0) {
+                return Err("multiplicative seasons need values above 0".into());
+            }
+            true
+        }
+        other => return Err(format!("kind {:?}: additive or multiplicative", other)),
+    };
+    let h = horizon.clamp(0, 10_000) as usize;
+    let p = best(3, [params["alpha"].as_f64(), params["beta"].as_f64(), params["gamma"].as_f64()], |a, b, g| holt_winters(&series, m, mult, a, b, g, 0).sse);
+    let f = holt_winters(&series, m, mult, p[0], p[1], p[2], h);
+    Ok(out(if mult { "holt_winters_multiplicative" } else { "holt_winters_additive" }, json!({ "alpha": r(p[0]), "beta": r(p[1]), "gamma": r(p[2]), "period": m }), &series, &f, m))
+}
+
+/// Tries the models (SES, Holt, damped Holt, and Holt-Winters when `period` > 1 and the series has two seasons) and keeps the one with the smallest error on the last `holdout` values (a fifth of the series when 0), then fits it on all of it.
+/// Gives the chosen model's forecast and `compared: [{ model, holdout_rmse }]`.
+pub fn forecast_auto(series: Vec<f64>, period: i64, horizon: i64, holdout: i64) -> Result<serde_json::Value, String> {
+    check(&series, 6)?;
+    let n = series.len();
+    let ho = if holdout > 0 { holdout as usize } else { (n / 5).max(2) }.min(n / 2);
+    let (train, test) = series.split_at(n - ho);
+    let m = period.max(1) as usize;
+    let mut cands: Vec<(String, Box<dyn Fn(&[f64], usize) -> Result<Value, String>>)> = vec![
+        ("ses".into(), Box::new(|s: &[f64], h: usize| forecast_ses(s.to_vec(), None, h as i64))),
+        ("holt".into(), Box::new(|s: &[f64], h: usize| forecast_holt(s.to_vec(), None, None, false, h as i64))),
+        ("holt_damped".into(), Box::new(|s: &[f64], h: usize| forecast_holt(s.to_vec(), None, None, true, h as i64))),
+    ];
+    if m > 1 && train.len() >= 2 * m {
+        cands.push(("holt_winters_additive".into(), Box::new(move |s: &[f64], h: usize| forecast_holt_winters(s.to_vec(), m as i64, "additive", json!({}), h as i64))));
+        if series.iter().all(|x| *x > 0.0) {
+            cands.push(("holt_winters_multiplicative".into(), Box::new(move |s: &[f64], h: usize| forecast_holt_winters(s.to_vec(), m as i64, "multiplicative", json!({}), h as i64))));
+        }
+    }
+    let mut compared = vec![];
+    let mut best_i = 0;
+    let mut best_e = f64::INFINITY;
+    for (i, (name, f)) in cands.iter().enumerate() {
+        let Ok(res) = f(train, ho) else { continue };
+        let fc: Vec<f64> = res["forecast"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        let e = (test.iter().zip(&fc).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / ho as f64).sqrt();
+        compared.push(json!({ "model": name, "holdout_rmse": r(e) }));
+        if e < best_e {
+            best_e = e;
+            best_i = i;
+        }
+    }
+    let mut res = cands[best_i].1(&series, horizon.clamp(0, 10_000) as usize)?;
+    res["compared"] = json!(compared);
+    Ok(res)
+}
+
+/// How far predictions were from what happened: `{ mae, rmse, mape (%), smape (%), bias }`; MAPE leaves out actual zeros.
+pub fn forecast_accuracy(actual: Vec<f64>, predicted: Vec<f64>) -> Result<serde_json::Value, String> {
+    if actual.is_empty() || actual.len() != predicted.len() {
+        return Err("actual and predicted, as long as each other".into());
+    }
+    let n = actual.len() as f64;
+    let e: Vec<f64> = actual.iter().zip(&predicted).map(|(a, p)| a - p).collect();
+    let mape: Vec<f64> = actual.iter().zip(&e).filter(|(a, _)| **a != 0.0).map(|(a, e)| (e / a).abs()).collect();
+    let smape: f64 = actual.iter().zip(&predicted).map(|(a, p)| if a.abs() + p.abs() == 0.0 { 0.0 } else { 2.0 * (a - p).abs() / (a.abs() + p.abs()) }).sum::<f64>() / n;
+    Ok(json!({
+        "mae": r(e.iter().map(|x| x.abs()).sum::<f64>() / n), "rmse": r((e.iter().map(|x| x * x).sum::<f64>() / n).sqrt()),
+        "mape": if mape.is_empty() { Value::Null } else { r(mape.iter().sum::<f64>() / mape.len() as f64 * 100.0) }, "smape": r(smape * 100.0), "bias": r(e.iter().sum::<f64>() / n),
+    }))
+}

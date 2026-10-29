@@ -1,0 +1,243 @@
+//! Player and team ratings from results: Elo (chess, simple games), Glicko-2 (ratings with their uncertainty and volatility, as in Glickman's paper), and TrueSkill for two teams of any size with draws; one game at a time, or a season's results run in order into a table, with each side's chance to win.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! statrs = "0.17"
+
+use serde_json::{json, Map, Value};
+use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+use std::collections::HashMap;
+
+fn r(x: f64, d: i32) -> f64 {
+    let p = 10f64.powi(d);
+    (x * p).round() / p
+}
+
+fn elo_expected(a: f64, b: f64) -> f64 {
+    1.0 / (1.0 + 10f64.powf((b - a) / 400.0))
+}
+
+/// One Elo game: `a` and `b`'s ratings, `score_a` 1 (A won), 0.5 (draw) or 0, `k` the step (32 for new players, 16 or 10 for established).
+/// Gives `{ a, b, expected_a, change }`.
+pub fn rating_elo(a: f64, b: f64, score_a: f64, k: f64) -> Result<serde_json::Value, String> {
+    if !(0.0..=1.0).contains(&score_a) {
+        return Err("score_a is 1, 0.5 or 0".into());
+    }
+    let e = elo_expected(a, b);
+    let d = k * (score_a - e);
+    Ok(json!({ "a": r(a + d, 1), "b": r(b - d, 1), "expected_a": r(e, 4), "change": r(d, 1) }))
+}
+
+/// A's chance to beat B in Elo terms (draws counting half).
+pub fn rating_elo_chance(a: f64, b: f64) -> f64 {
+    r(elo_expected(a, b), 4)
+}
+
+const SCALE: f64 = 173.7178;
+
+fn g(phi: f64) -> f64 {
+    1.0 / (1.0 + 3.0 * phi * phi / (std::f64::consts::PI * std::f64::consts::PI)).sqrt()
+}
+
+/// Glicko-2's update of one player over a rating period.
+fn glicko2(rating: f64, rd: f64, vol: f64, results: &[(f64, f64, f64)], tau: f64) -> (f64, f64, f64) {
+    let mu = (rating - 1500.0) / SCALE;
+    let phi = rd / SCALE;
+    if results.is_empty() {
+        let p = (phi * phi + vol * vol).sqrt();
+        return (rating, (p * SCALE).min(350.0), vol);
+    }
+    let mut vinv = 0.0;
+    let mut sum = 0.0;
+    for (rj, rdj, s) in results {
+        let (mj, pj) = ((rj - 1500.0) / SCALE, rdj / SCALE);
+        let e = 1.0 / (1.0 + (-g(pj) * (mu - mj)).exp());
+        vinv += g(pj).powi(2) * e * (1.0 - e);
+        sum += g(pj) * (s - e);
+    }
+    let v = 1.0 / vinv;
+    let delta = v * sum;
+    let a = (vol * vol).ln();
+    let f = |x: f64| -> f64 {
+        let ex = x.exp();
+        ex * (delta * delta - phi * phi - v - ex) / (2.0 * (phi * phi + v + ex).powi(2)) - (x - a) / (tau * tau)
+    };
+    let mut big_a = a;
+    let mut big_b = if delta * delta > phi * phi + v {
+        (delta * delta - phi * phi - v).ln()
+    } else {
+        let mut k = 1.0;
+        while f(a - k * tau) < 0.0 && k < 1000.0 {
+            k += 1.0;
+        }
+        a - k * tau
+    };
+    let (mut fa, mut fb) = (f(big_a), f(big_b));
+    let mut n = 0;
+    while (big_b - big_a).abs() > 1e-6 && n < 200 {
+        let c = big_a + (big_a - big_b) * fa / (fb - fa);
+        let fc = f(c);
+        if fc * fb <= 0.0 {
+            big_a = big_b;
+            fa = fb;
+        } else {
+            fa /= 2.0;
+        }
+        big_b = c;
+        fb = fc;
+        n += 1;
+    }
+    let vol2 = (big_a / 2.0).exp();
+    let phistar = (phi * phi + vol2 * vol2).sqrt();
+    let phi2 = 1.0 / (1.0 / (phistar * phistar) + 1.0 / v).sqrt();
+    let mu2 = mu + phi2 * phi2 * sum;
+    (mu2 * SCALE + 1500.0, phi2 * SCALE, vol2)
+}
+
+/// One Glicko-2 rating period for a player `{ rating: 1500, rd: 350, volatility: 0.06 }` against `results` `[{ rating, rd, score }]` (score 1, 0.5 or 0); `tau` limits how fast volatility changes (0.3 to 1.2; 0.5 is usual).
+/// With no results the player's RD grows, as for a period without games. Gives `{ rating, rd, volatility, low, high }` (low and high: a 95% range).
+pub fn rating_glicko2(player: serde_json::Value, results: Vec<serde_json::Value>, tau: f64) -> Result<serde_json::Value, String> {
+    let rt = player["rating"].as_f64().unwrap_or(1500.0);
+    let rd = player["rd"].as_f64().unwrap_or(350.0).clamp(1.0, 350.0);
+    let vol = player["volatility"].as_f64().unwrap_or(0.06).clamp(1e-6, 1.0);
+    let res: Vec<(f64, f64, f64)> = results
+        .iter()
+        .map(|x| Ok((x["rating"].as_f64().ok_or("each result has a rating")?, x["rd"].as_f64().unwrap_or(350.0).clamp(1.0, 350.0), x["score"].as_f64().ok_or("each result has a score")?)))
+        .collect::<Result<_, String>>()?;
+    let (a, b, c) = glicko2(rt, rd, vol, &res, if tau > 0.0 { tau } else { 0.5 });
+    Ok(json!({ "rating": r(a, 2), "rd": r(b, 2), "volatility": r(c, 6), "low": r(a - 1.96 * b, 0), "high": r(a + 1.96 * b, 0) }))
+}
+
+fn v_win(t: f64, e: f64) -> f64 {
+    let n = Normal::new(0.0, 1.0).unwrap();
+    let d = n.cdf(t - e);
+    if d < 1e-12 { -(t - e) } else { n.pdf(t - e) / d }
+}
+
+fn w_win(t: f64, e: f64) -> f64 {
+    let v = v_win(t, e);
+    v * (v + t - e)
+}
+
+fn v_draw(t: f64, e: f64) -> f64 {
+    let n = Normal::new(0.0, 1.0).unwrap();
+    let d = n.cdf(e - t) - n.cdf(-e - t);
+    if d < 1e-12 { if t < 0.0 { -t - e } else { -t + e } } else { (n.pdf(-e - t) - n.pdf(e - t)) / d }
+}
+
+fn w_draw(t: f64, e: f64) -> f64 {
+    let n = Normal::new(0.0, 1.0).unwrap();
+    let d = n.cdf(e - t) - n.cdf(-e - t);
+    let v = v_draw(t, e);
+    if d < 1e-12 { 1.0 } else { v * v + ((e - t) * n.pdf(e - t) + (e + t) * n.pdf(-e - t)) / d }
+}
+
+/// TrueSkill for two teams: each team a list of players `{ mu: 25, sigma: 8.333 }`, `winner` 0 or 1 (or -1 for a draw).
+/// `options`: `{ beta: 4.1667, tau: 0.0833, draw_probability: 0.1 }`. Gives the two teams' players updated, each with `{ mu, sigma, rating (mu − 3σ, a cautious rating) }`, and `quality` (the chance of a draw: how even the match was).
+pub fn rating_trueskill(team_a: Vec<serde_json::Value>, team_b: Vec<serde_json::Value>, winner: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if team_a.is_empty() || team_b.is_empty() {
+        return Err("two teams of at least one player".into());
+    }
+    let beta = options["beta"].as_f64().unwrap_or(25.0 / 6.0);
+    let tau = options["tau"].as_f64().unwrap_or(25.0 / 300.0);
+    let pd = options["draw_probability"].as_f64().unwrap_or(0.1).clamp(0.0, 0.99);
+    let read = |t: &[Value]| -> Vec<(f64, f64)> { t.iter().map(|p| (p["mu"].as_f64().unwrap_or(25.0), (p["sigma"].as_f64().unwrap_or(25.0 / 3.0).powi(2) + tau * tau).sqrt())).collect() };
+    let (a, b) = (read(&team_a), read(&team_b));
+    let n_all = (a.len() + b.len()) as f64;
+    // c² = n·β² plus every player's σ².
+    let c2: f64 = n_all * beta * beta + a.iter().chain(&b).map(|p| p.1 * p.1).sum::<f64>();
+    let c = c2.sqrt();
+    let norm = Normal::new(0.0, 1.0).unwrap();
+    let eps = norm.inverse_cdf((pd + 1.0) / 2.0) * n_all.sqrt() * beta;
+    let (ma, mb) = (a.iter().map(|p| p.0).sum::<f64>(), b.iter().map(|p| p.0).sum::<f64>());
+    // From the winner's side (A when a draw).
+    let (wins_a, draw) = match winner {
+        0 => (true, false),
+        1 => (false, false),
+        -1 => (true, true),
+        _ => return Err("winner is 0 (team a), 1 (team b) or -1 (a draw)".into()),
+    };
+    let diff = if wins_a { ma - mb } else { mb - ma };
+    let t = diff / c;
+    let (v, w) = if draw { (v_draw(t, eps / c), w_draw(t, eps / c)) } else { (v_win(t, eps / c), w_win(t, eps / c)) };
+    let upd = |team: &[(f64, f64)], sign: f64| -> Vec<Value> {
+        team.iter()
+            .map(|(mu, s)| {
+                let m = mu + sign * s * s / c * v;
+                let s2 = (s * s * (1.0 - s * s / c2 * w).max(1e-6)).sqrt();
+                json!({ "mu": r(m, 4), "sigma": r(s2, 4), "rating": r(m - 3.0 * s2, 4) })
+            })
+            .collect()
+    };
+    let (sa, sb) = if wins_a { (1.0, -1.0) } else { (-1.0, 1.0) };
+    let quality = ((n_all * beta * beta) / c2).sqrt() * (-(ma - mb).powi(2) / (2.0 * c2)).exp();
+    Ok(json!({ "team_a": upd(&a, sa), "team_b": upd(&b, sb), "quality": r(quality, 4) }))
+}
+
+/// A season's results run in order into a table: `games` are `{ a, b, score_a }` (names; 1, 0.5 or 0). `system` "elo" (`options.k` 32, `options.start` 1500) or "glicko2" (each game its own rating period, `options.tau`).
+/// Gives the players best first: `{ name, rating, rd (Glicko-2), games, wins, draws, losses }`.
+pub fn rating_table(games: Vec<serde_json::Value>, system: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let start = options["start"].as_f64().unwrap_or(1500.0);
+    let k = options["k"].as_f64().unwrap_or(32.0);
+    let tau = options["tau"].as_f64().unwrap_or(0.5);
+    let mut p: HashMap<String, (f64, f64, f64, [i64; 4])> = HashMap::new();
+    let mut order: Vec<String> = vec![];
+    for gm in &games {
+        let a = gm["a"].as_str().ok_or("each game names its players a and b")?.to_string();
+        let b = gm["b"].as_str().ok_or("each game names its players a and b")?.to_string();
+        let s = gm["score_a"].as_f64().ok_or("each game has score_a")?;
+        for n in [&a, &b] {
+            if !p.contains_key(n) {
+                p.insert(n.clone(), (start, 350.0, 0.06, [0; 4]));
+                order.push(n.clone());
+            }
+        }
+        let (pa, pb) = (p[&a], p[&b]);
+        let (na, nb) = match system {
+            "elo" => {
+                let d = k * (s - elo_expected(pa.0, pb.0));
+                ((pa.0 + d, pa.1, pa.2), (pb.0 - d, pb.1, pb.2))
+            }
+            "glicko2" => (glicko2(pa.0, pa.1, pa.2, &[(pb.0, pb.1, s)], tau), glicko2(pb.0, pb.1, pb.2, &[(pa.0, pa.1, 1.0 - s)], tau)),
+            other => return Err(format!("system {:?}: elo or glicko2", other)),
+        };
+        let tally = |c: &mut [i64; 4], s: f64| {
+            c[0] += 1;
+            if s == 1.0 {
+                c[1] += 1
+            } else if s == 0.0 {
+                c[3] += 1
+            } else {
+                c[2] += 1
+            }
+        };
+        let ea = p.get_mut(&a).unwrap();
+        ea.0 = na.0;
+        ea.1 = na.1;
+        ea.2 = na.2;
+        tally(&mut ea.3, s);
+        let eb = p.get_mut(&b).unwrap();
+        eb.0 = nb.0;
+        eb.1 = nb.1;
+        eb.2 = nb.2;
+        tally(&mut eb.3, 1.0 - s);
+    }
+    let mut rows: Vec<(String, (f64, f64, f64, [i64; 4]))> = order.into_iter().map(|n| { let v = p[&n]; (n, v) }).collect();
+    rows.sort_by(|x, y| y.1 .0.partial_cmp(&x.1 .0).unwrap());
+    Ok(rows
+        .into_iter()
+        .map(|(n, (rt, rd, _, c))| {
+            let mut m = Map::new();
+            m.insert("name".into(), json!(n));
+            m.insert("rating".into(), json!(r(rt, 1)));
+            if system == "glicko2" {
+                m.insert("rd".into(), json!(r(rd, 1)));
+            }
+            m.insert("games".into(), json!(c[0]));
+            m.insert("wins".into(), json!(c[1]));
+            m.insert("draws".into(), json!(c[2]));
+            m.insert("losses".into(), json!(c[3]));
+            Value::Object(m)
+        })
+        .collect())
+}

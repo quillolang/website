@@ -1,0 +1,389 @@
+//! Brother label printers in raster mode: QL-700, QL-800, QL-820NWB, QL-1100 (DK rolls) and P-touch PT-P750W, PT-P900 (TZe tapes); a picture turned into the raster job with the media set, mirrored, padded to the head's pins, PackBits-compressed where the printer takes it, auto-cut; text made into a label picture first; sent to port 9100 or a USB device, and the printer's status read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+//! base64 = "0.22"
+//! ab_glyph = "0.2"
+//! dejavu = "2.37"
+
+use serde_json::{json, Value};
+
+/// A medium: its name, the printer family, tape width and length in mm (0 for continuous), printable dots across, the offset from the right edge of the head in dots, and its length in dots (die-cut).
+struct Media {
+    name: &'static str,
+    family: &'static str,
+    width_mm: u8,
+    length_mm: u8,
+    dots: usize,
+    right: usize,
+    length_dots: usize,
+}
+
+const MEDIA: &[Media] = &[
+    // QL series, 300 dpi, a 720-pin head (90 bytes a line); from Brother's raster reference.
+    Media { name: "62", family: "ql", width_mm: 62, length_mm: 0, dots: 696, right: 12, length_dots: 0 },
+    Media { name: "54", family: "ql", width_mm: 54, length_mm: 0, dots: 590, right: 0, length_dots: 0 },
+    Media { name: "50", family: "ql", width_mm: 50, length_mm: 0, dots: 554, right: 12, length_dots: 0 },
+    Media { name: "38", family: "ql", width_mm: 38, length_mm: 0, dots: 413, right: 12, length_dots: 0 },
+    Media { name: "29", family: "ql", width_mm: 29, length_mm: 0, dots: 306, right: 6, length_dots: 0 },
+    Media { name: "12", family: "ql", width_mm: 12, length_mm: 0, dots: 106, right: 29, length_dots: 0 },
+    Media { name: "62x29", family: "ql", width_mm: 62, length_mm: 29, dots: 696, right: 12, length_dots: 271 },
+    Media { name: "62x100", family: "ql", width_mm: 62, length_mm: 100, dots: 696, right: 12, length_dots: 1109 },
+    Media { name: "29x90", family: "ql", width_mm: 29, length_mm: 90, dots: 306, right: 6, length_dots: 991 },
+    Media { name: "38x90", family: "ql", width_mm: 38, length_mm: 90, dots: 413, right: 12, length_dots: 991 },
+    Media { name: "17x54", family: "ql", width_mm: 17, length_mm: 54, dots: 165, right: 0, length_dots: 566 },
+    Media { name: "29x42", family: "ql", width_mm: 29, length_mm: 42, dots: 306, right: 6, length_dots: 425 },
+    Media { name: "23x23", family: "ql", width_mm: 23, length_mm: 23, dots: 202, right: 42, length_dots: 202 },
+    // P-touch TZe tapes, 180 dpi, a 128-pin head (16 bytes a line), the print centred on it.
+    Media { name: "tze24", family: "pt", width_mm: 24, length_mm: 0, dots: 128, right: 0, length_dots: 0 },
+    Media { name: "tze18", family: "pt", width_mm: 18, length_mm: 0, dots: 112, right: 8, length_dots: 0 },
+    Media { name: "tze12", family: "pt", width_mm: 12, length_mm: 0, dots: 70, right: 29, length_dots: 0 },
+    Media { name: "tze9", family: "pt", width_mm: 9, length_mm: 0, dots: 50, right: 39, length_dots: 0 },
+    Media { name: "tze6", family: "pt", width_mm: 6, length_mm: 0, dots: 32, right: 48, length_dots: 0 },
+    Media { name: "tze3.5", family: "pt", width_mm: 4, length_mm: 0, dots: 24, right: 52, length_dots: 0 },
+];
+
+fn media(name: &str) -> Result<&'static Media, String> {
+    MEDIA.iter().find(|m| m.name == name).ok_or_else(|| format!("unknown media {:?}: {}", name, MEDIA.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")))
+}
+
+/// TIFF PackBits, as Brother's `M 02` mode takes it.
+fn packbits(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < data.len() {
+        let mut run = 1;
+        while i + run < data.len() && data[i + run] == data[i] && run < 128 {
+            run += 1;
+        }
+        if run >= 2 {
+            out.push((257 - run) as u8);
+            out.push(data[i]);
+            i += run;
+        } else {
+            let start = i;
+            let mut n = 0;
+            while i < data.len() && n < 128 && !(i + 1 < data.len() && data[i + 1] == data[i]) {
+                i += 1;
+                n += 1;
+            }
+            if n == 0 {
+                i += 1;
+                n = 1;
+            }
+            out.push((n - 1) as u8);
+            out.extend_from_slice(&data[start..start + n]);
+        }
+    }
+    out
+}
+
+/// The picture as raster lines across the tape, true for black: scaled to the printable dots, turned when asked.
+fn lines_of(path: &str, m: &Media, options: &Value) -> Result<Vec<Vec<bool>>, String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    // Brother prints along the tape: a picture wider than it is tall is turned for narrow continuous tapes ("auto").
+    let turn = match options["rotate"].as_str() {
+        Some("yes") => true,
+        Some("no") => false,
+        _ => options["rotate"] == true || (options["rotate"].is_null() && img.width() > img.height() && m.length_mm == 0 && m.dots < 400),
+    };
+    let img = if turn { img.rotate90() } else { img };
+    let w = m.dots as u32;
+    let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+    let h = if m.length_dots > 0 { m.length_dots as u32 } else { h };
+    if h > 20_000 {
+        return Err("the label would be over 20,000 lines long".into());
+    }
+    let img = img.resize_exact(w, h, image::imageops::FilterType::Triangle).to_rgba8();
+    let threshold = options["threshold"].as_u64().unwrap_or(128).clamp(1, 255) as f32;
+    let mut lum: Vec<f32> = img.pixels().map(|p| {
+        let a = p[3] as f32 / 255.0;
+        (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * a + 255.0 * (1.0 - a)
+    }).collect();
+    let (w, h) = (w as usize, h as usize);
+    let dither = options["dither"] == true;
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                for (dx, dy, f) in [(1isize, 0usize, 7.0f32 / 16.0), (-1, 1, 3.0 / 16.0), (0, 1, 5.0 / 16.0), (1, 1, 1.0 / 16.0)] {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+struct Job {
+    bytes: Vec<u8>,
+    lines: usize,
+    compressed: bool,
+}
+
+fn build(path: &str, options: &Value) -> Result<(Job, &'static Media), String> {
+    let m = media(options["media"].as_str().unwrap_or("62"))?;
+    let rows = lines_of(path, m, options)?;
+    let pt = m.family == "pt";
+    let pins = if pt { 128 } else { 720 };
+    let bpl = pins / 8;
+    let compress = options["compress"].as_bool().unwrap_or(pt);
+    let mut b: Vec<u8> = vec![0; if pt { 100 } else { 400 }];
+    b.extend_from_slice(&[0x1b, b'@']);
+    b.extend_from_slice(&[0x1b, b'i', b'a', 0x01]);
+    // Print information: which values are valid, media type, width, length, line count, first page.
+    let n = rows.len() as u32;
+    let (flags, kind) = if pt { (0x84u8, 0x00u8) } else if m.length_mm > 0 { (0x8eu8, 0x0bu8) } else { (0x86u8, 0x0au8) };
+    b.extend_from_slice(&[0x1b, b'i', b'z', flags, kind, m.width_mm, m.length_mm]);
+    b.extend_from_slice(&n.to_le_bytes());
+    b.extend_from_slice(&[0x00, 0x00]);
+    let cut = options["cut"] != false;
+    b.extend_from_slice(&[0x1b, b'i', b'M', if cut { 0x40 } else { 0x00 }]);
+    if cut {
+        b.extend_from_slice(&[0x1b, b'i', b'A', options["cut_every"].as_u64().unwrap_or(1).clamp(1, 255) as u8]);
+    }
+    b.extend_from_slice(&[0x1b, b'i', b'K', if cut { 0x08 } else { 0x00 }]);
+    let margin: u16 = if m.length_mm > 0 { 0 } else if pt { 14 } else { 35 };
+    let margin = options["margin"].as_u64().map(|v| v.min(1000) as u16).unwrap_or(margin);
+    b.extend_from_slice(&[0x1b, b'i', b'd', (margin & 0xff) as u8, (margin >> 8) as u8]);
+    b.extend_from_slice(&[b'M', if compress { 0x02 } else { 0x00 }]);
+    // Each line mirrored and placed on the head: the print sits `right` dots from the head's right end (P-touch: centred).
+    let offset = if pt { (pins - m.dots) / 2 } else { pins - m.dots - m.right };
+    for r in &rows {
+        let mut line = vec![0u8; bpl];
+        for (x, black) in r.iter().enumerate() {
+            if *black {
+                let pin = offset + (m.dots - 1 - x);
+                line[pin / 8] |= 0x80 >> (pin % 8);
+            }
+        }
+        let data = if compress { packbits(&line) } else { line };
+        // P-touch: G and a 16-bit length; QL: g, 0 and an 8-bit length (90 uncompressed).
+        if pt {
+            b.push(b'G');
+            b.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        } else {
+            b.extend_from_slice(&[b'g', 0x00, data.len() as u8]);
+        }
+        b.extend_from_slice(&data);
+    }
+    b.push(0x1a);
+    Ok((Job { bytes: b, lines: rows.len(), compressed: compress }, m))
+}
+
+/// A Brother raster job from a picture (PNG or JPEG), in base64. `options`: `{ media: "62" (a DK roll: 62, 54, 50, 38, 29, 12, or die-cut 62x29, 62x100, 29x90, 38x90, 17x54, 29x42, 23x23; or a TZe tape: tze24, tze18, tze12, tze9, tze6), rotate: "auto" | "yes" | "no", threshold: 128, dither, cut: true, cut_every: 1, margin (dots), compress }`.
+/// QL printers print at 300 dpi on 720 pins, P-touch at 180 dpi on 128; the picture is scaled to the medium's printable width.
+pub fn ptouch_job(image_path: &str, options: serde_json::Value) -> Result<String, String> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(build(image_path, &options)?.0.bytes))
+}
+
+/// What the job will be: `{ media, family, lines, dots_across, length_mm, bytes, compressed }`.
+pub fn ptouch_info(image_path: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (j, m) = build(image_path, &options)?;
+    let dpmm = if m.family == "pt" { 180.0 / 25.4 } else { 300.0 / 25.4 };
+    Ok(json!({ "media": m.name, "family": m.family, "lines": j.lines, "dots_across": m.dots, "length_mm": (j.lines as f64 / dpmm * 10.0).round() / 10.0, "bytes": j.bytes.len(), "compressed": j.compressed }))
+}
+
+/// Writes the job to a file or the printer's USB device (`/dev/usb/lp0`). Gives the bytes written.
+pub fn ptouch_write(image_path: &str, options: serde_json::Value, path: &str) -> Result<i64, String> {
+    use std::io::Write;
+    let (j, _) = build(image_path, &options)?;
+    let device = path.starts_with("/dev/");
+    if !device {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(!device).truncate(!device).open(path).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(&j.bytes).map_err(|e| e.to_string())?;
+    Ok(j.bytes.len() as i64)
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64);
+    let h = host.trim();
+    let target = if h.matches(':').count() == 1 || h.contains("]:") { h.to_string() } else if h.contains(':') { format!("[{}]:9100", h) } else { format!("{}:9100", h) };
+    let addr = target.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", addr, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends the job to a networked QL or P-touch (`host` or `host:port`, port 9100). Gives the bytes sent.
+pub fn ptouch_send(image_path: &str, options: serde_json::Value, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    use std::io::Write;
+    let (j, _) = build(image_path, &options)?;
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(&j.bytes).map_err(|e| format!("sending to the printer: {}", e))?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(j.bytes.len() as i64)
+}
+
+/// The 32-byte status a Brother printer sends (to `ESC i S`, or after a print) read: `{ ready, errors: [...], media_width_mm, media_type, media_length_mm, status, model }`. Give it in base64.
+pub fn ptouch_parse_status(status_base64: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let s = base64::engine::general_purpose::STANDARD.decode(status_base64.trim()).map_err(|e| format!("not base64: {}", e))?;
+    parse_status(&s)
+}
+
+fn parse_status(s: &[u8]) -> Result<Value, String> {
+    if s.len() < 32 || s[0] != 0x80 || s[1] != 0x20 || s[2] != b'B' {
+        return Err(format!("not a Brother status ({} bytes)", s.len()));
+    }
+    let mut errors = vec![];
+    for (bit, name) in [(0x01, "no media"), (0x02, "end of media"), (0x04, "cutter jam"), (0x10, "printer in use"), (0x20, "printer turned off"), (0x40, "high-voltage adapter"), (0x80, "fan motor error")] {
+        if s[8] & bit != 0 {
+            errors.push(name);
+        }
+    }
+    for (bit, name) in [(0x01, "replace media"), (0x02, "expansion buffer full"), (0x04, "communication error"), (0x08, "communication buffer full"), (0x10, "cover open"), (0x20, "cancel key"), (0x40, "media cannot be fed"), (0x80, "system error")] {
+        if s[9] & bit != 0 {
+            errors.push(name);
+        }
+    }
+    let media_type = match s[11] {
+        0x00 => "none",
+        0x01 => "laminated tape",
+        0x03 => "non-laminated tape",
+        0x04 => "fabric tape",
+        0x0a | 0x4a => "continuous roll",
+        0x0b | 0x4b => "die-cut labels",
+        0x11 => "heat-shrink tube 2:1",
+        0x13 => "flexible tape",
+        0x17 => "heat-shrink tube 3:1",
+        0xff => "incompatible tape",
+        _ => "other",
+    };
+    let status = match s[18] {
+        0x00 => "reply",
+        0x01 => "printing completed",
+        0x02 => "error",
+        0x04 => "turned off",
+        0x05 => "notification",
+        0x06 => "phase change",
+        _ => "other",
+    };
+    let model = match (s[3], s[4]) {
+        (b'4', b'8') => "QL-800",
+        (b'4', b'9') => "QL-810W",
+        (b'4', b'A') => "QL-820NWB",
+        (b'0', b'h') | (b'0', b'g') => "PT-P750W",
+        _ => "Brother",
+    };
+    Ok(json!({ "ready": errors.is_empty(), "errors": errors, "media_width_mm": s[10], "media_type": media_type, "media_length_mm": s[17], "status": status, "model": model }))
+}
+
+/// Asks a networked Brother printer for its status (`ESC i S`) and reads the 32 bytes back, as `ptouch_parse_status` gives them.
+pub fn ptouch_status(host: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    let mut s = connect(host, timeout_ms)?;
+    let mut ask = vec![0u8; 100];
+    ask.extend_from_slice(&[0x1b, b'@', 0x1b, b'i', b'S']);
+    s.write_all(&ask).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 32];
+    s.read_exact(&mut buf).map_err(|e| format!("no status from the printer: {}", e))?;
+    parse_status(&buf)
+}
+
+/// A label picture made from lines of text, sized for the medium (white, black text, centred or left), saved as PNG at `path`; then `ptouch_job` prints it.
+/// `options`: `{ media: "62", length_mm (continuous media: the label's length, else fitted to the text), align: "center" | "left", bold: true, border: false }`.
+pub fn ptouch_text(lines: Vec<String>, path: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+    let m = media(options["media"].as_str().unwrap_or("62"))?;
+    if lines.is_empty() || lines.len() > 20 {
+        return Err("1 to 20 lines of text".into());
+    }
+    let font = FontRef::try_from_slice(if options["bold"] == false { dejavu::sans::regular() } else { dejavu::sans::bold() }).map_err(|e| e.to_string())?;
+    let dpmm = if m.family == "pt" { 180.0 / 25.4 } else { 300.0 / 25.4 };
+    // The picture is drawn as the label reads: across is the tape's length for continuous media
+    // (turned when printed), the tape's width for die-cut labels.
+    let continuous = m.length_mm == 0;
+    let height = if continuous { m.dots } else { m.length_dots };
+    let pad = (height.min(m.dots) as f32 * 0.08).max(2.0);
+    let line_h = (height as f32 - 2.0 * pad) / lines.len() as f32;
+    let widest = |px: f32| -> f32 {
+        let sf = font.as_scaled(PxScale::from(px));
+        lines.iter().map(|l| l.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum::<f32>()).fold(0.0, f32::max)
+    };
+    // The text as big as the lines allow, smaller when it must fit a label's (or the given) length.
+    let mut px = line_h * 0.92;
+    let room = if continuous { options["length_mm"].as_f64().map(|mm| (mm * dpmm) as f32) } else { Some(m.dots as f32) };
+    if let Some(room) = room {
+        let wide = widest(px);
+        if wide > room - 4.0 * pad {
+            px *= (room - 4.0 * pad) / wide;
+        }
+    }
+    if px < 8.0 {
+        return Err(format!("the text does not fit {} mm at a readable size", m.width_mm));
+    }
+    let scale = PxScale::from(px);
+    let sf = font.as_scaled(scale);
+    let text_w = widest(px);
+    let (w, h) = if continuous {
+        let len = match options["length_mm"].as_f64() {
+            Some(mm) => (mm * dpmm).round() as u32,
+            None => (text_w + 4.0 * pad).ceil() as u32,
+        };
+        (len.max(16), height as u32)
+    } else {
+        (m.dots as u32, height as u32)
+    };
+    let mut img = image::GrayImage::from_pixel(w, h, image::Luma([255]));
+    let center = options["align"].as_str() != Some("left");
+    for (k, l) in lines.iter().enumerate() {
+        let lw: f32 = l.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum();
+        let mut caret = if center { ((w as f32 - lw) / 2.0).max(pad) } else { pad * 2.0 };
+        let top = pad + k as f32 * line_h + (line_h - (sf.ascent() - sf.descent())) / 2.0;
+        for c in l.chars() {
+            let id = font.glyph_id(c);
+            let g = id.with_scale_and_position(scale, ab_glyph::point(caret, top + sf.ascent()));
+            caret += sf.h_advance(id);
+            if let Some(og) = font.outline_glyph(g) {
+                let b = og.px_bounds();
+                og.draw(|x, y, cov| {
+                    let (px, py) = (b.min.x as i32 + x as i32, b.min.y as i32 + y as i32);
+                    if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                        let p = img.get_pixel_mut(px as u32, py as u32);
+                        p.0[0] = p.0[0].min((255.0 * (1.0 - cov)) as u8);
+                    }
+                });
+            }
+        }
+    }
+    if options["border"] == true {
+        let t = (pad / 3.0).max(2.0) as u32;
+        for y in 0..h {
+            for x in 0..w {
+                if x < t || y < t || x >= w - t || y >= h - t {
+                    img.put_pixel(x, y, image::Luma([0]));
+                }
+            }
+        }
+    }
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    img.save(path).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(json!({ "path": path, "width": w, "height": h, "length_mm": ((if continuous { w } else { h }) as f64 / dpmm * 10.0).round() / 10.0 }))
+}
+
+/// The media this plugin knows: `{ name, family: "ql" | "pt", width_mm, length_mm (0: continuous), dots_across }`.
+pub fn ptouch_media() -> Vec<serde_json::Value> {
+    MEDIA.iter().map(|m| json!({ "name": m.name, "family": m.family, "width_mm": m.width_mm, "length_mm": m.length_mm, "dots_across": m.dots })).collect()
+}

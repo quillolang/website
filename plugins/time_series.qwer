@@ -1,0 +1,252 @@
+//! Metrics kept in one file (an embedded redb database): points written by series name and time, read back for a time range, downsampled into buckets (average, min, max, sum, count, first, last, rate), several series at once for a chart, the latest value of each, and old points dropped by a retention period.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! redb = "2.6"
+
+use redb::{Database, ReadableTable, TableDefinition};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const POINTS: TableDefinition<(&str, i64), f64> = TableDefinition::new("points");
+
+/// One open database per file, kept for the life of the server (redb locks its file).
+fn db(path: &str) -> Result<Arc<Database>, String> {
+    static DBS: OnceLock<Mutex<HashMap<String, Arc<Database>>>> = OnceLock::new();
+    let mut dbs = DBS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(d) = dbs.get(path) {
+        return Ok(d.clone());
+    }
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let d = Arc::new(Database::create(path).map_err(|e| format!("{}: {}", path, e))?);
+    dbs.insert(path.to_string(), d.clone());
+    Ok(d)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn check_name(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 200 {
+        return Err("a series' name is 1 to 200 characters".into());
+    }
+    Ok(())
+}
+
+/// Writes points into `series`: each `[time_ms, value]` or `{ t, v }` (`t` in Unix milliseconds; null for now). A point at the same time replaces the one there. Gives the number written.
+pub fn ts_write(path: &str, series: &str, points: Vec<serde_json::Value>) -> Result<i64, String> {
+    check_name(series)?;
+    if points.len() > 1_000_000 {
+        return Err("at most a million points at once".into());
+    }
+    let d = db(path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut t = w.open_table(POINTS).map_err(|e| e.to_string())?;
+        for p in &points {
+            let (ts, v) = match p {
+                Value::Array(a) if a.len() == 2 => (a[0].as_i64().unwrap_or_else(now_ms), a[1].as_f64()),
+                Value::Object(m) => (m.get("t").and_then(Value::as_i64).unwrap_or_else(now_ms), m.get("v").and_then(Value::as_f64)),
+                Value::Number(n) => (now_ms(), n.as_f64()),
+                _ => (0, None),
+            };
+            let v = v.filter(|x| x.is_finite()).ok_or_else(|| format!("a point is [time_ms, value] or {{ t, v }}: {}", p))?;
+            t.insert((series, ts), v).map_err(|e| e.to_string())?;
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(points.len() as i64)
+}
+
+/// One value at the present time (a counter's reading, a gauge).
+pub fn ts_record(path: &str, series: &str, value: f64) -> Result<i64, String> {
+    ts_write(path, series, vec![json!([now_ms(), value])])
+}
+
+fn range(path: &str, series: &str, from: i64, to: i64) -> Result<Vec<(i64, f64)>, String> {
+    let d = db(path)?;
+    let r = d.begin_read().map_err(|e| e.to_string())?;
+    let t = match r.open_table(POINTS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = vec![];
+    for item in t.range((series, from)..(series, to)).map_err(|e| e.to_string())? {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        out.push((k.value().1, v.value()));
+        if out.len() > 5_000_000 {
+            return Err("over 5 million points: narrow the range or downsample".into());
+        }
+    }
+    Ok(out)
+}
+
+/// The raw points of `series` from `from_ms` (included) to `to_ms` (not included): `[[t, v], ...]`.
+pub fn ts_read(path: &str, series: &str, from_ms: i64, to_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    Ok(range(path, series, from_ms, to_ms)?.into_iter().map(|(t, v)| json!([t, v])).collect())
+}
+
+fn agg(vals: &[(i64, f64)], how: &str, bucket_ms: i64) -> Result<f64, String> {
+    Ok(match how {
+        "avg" | "mean" => vals.iter().map(|x| x.1).sum::<f64>() / vals.len() as f64,
+        "min" => vals.iter().map(|x| x.1).fold(f64::INFINITY, f64::min),
+        "max" => vals.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max),
+        "sum" => vals.iter().map(|x| x.1).sum(),
+        "count" => vals.len() as f64,
+        "first" => vals[0].1,
+        "last" => vals[vals.len() - 1].1,
+        // Per second, for a counter that only goes up: the rise between the bucket's first and last points.
+        "rate" => {
+            let dt = (vals[vals.len() - 1].0 - vals[0].0) as f64 / 1000.0;
+            if dt > 0.0 { (vals[vals.len() - 1].1 - vals[0].1).max(0.0) / dt } else { let _ = bucket_ms; 0.0 }
+        }
+        "p95" | "p50" | "p99" => {
+            let q = how[1..].parse::<f64>().unwrap() / 100.0;
+            let mut v: Vec<f64> = vals.iter().map(|x| x.1).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pos = q * (v.len() - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            v[lo] + (v[hi] - v[lo]) * (pos - lo as f64)
+        }
+        other => return Err(format!("{:?}: avg, min, max, sum, count, first, last, rate, p50, p95 or p99", other)),
+    })
+}
+
+fn buckets(pts: &[(i64, f64)], from: i64, to: i64, step: i64, how: &str, fill: &Value) -> Result<Vec<Value>, String> {
+    let n = ((to - from) + step - 1) / step;
+    if n > 100_000 {
+        return Err("at most 100,000 buckets: use a larger step".into());
+    }
+    let mut out = vec![];
+    let mut i = 0;
+    for b in 0..n {
+        let start = from + b * step;
+        let end = start + step;
+        let s = i;
+        while i < pts.len() && pts[i].0 < end {
+            i += 1;
+        }
+        let v = if i > s { json!((agg(&pts[s..i], how, step)? * 1e6).round() / 1e6) } else { fill.clone() };
+        out.push(json!([start, v]));
+    }
+    Ok(out)
+}
+
+/// `series` from `from_ms` to `to_ms` in buckets of `step_ms` (60000 for minutes), each summed up `how`: "avg", "min", "max", "sum", "count", "first", "last", "rate" (per second, for counters), "p50", "p95", "p99".
+/// Gives `[[bucket_start, value], ...]`, every bucket there, empty ones as `fill` (null, or 0 for counts).
+pub fn ts_downsample(path: &str, series: &str, from_ms: i64, to_ms: i64, step_ms: i64, how: &str, fill: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    if step_ms <= 0 || to_ms <= from_ms {
+        return Err("a positive step, and to after from".into());
+    }
+    let pts = range(path, series, from_ms, to_ms)?;
+    buckets(&pts, from_ms, to_ms, step_ms, how, &fill)
+}
+
+/// Several series in the same buckets, ready for a chart: `{ times: [...], series: { name: [values] } }`.
+pub fn ts_chart(path: &str, series: Vec<String>, from_ms: i64, to_ms: i64, step_ms: i64, how: &str) -> Result<serde_json::Value, String> {
+    let mut times = vec![];
+    let mut out = Map::new();
+    for s in &series {
+        let b = ts_downsample(path, s, from_ms, to_ms, step_ms, how, Value::Null)?;
+        if times.is_empty() {
+            times = b.iter().map(|x| x[0].clone()).collect();
+        }
+        out.insert(s.clone(), Value::Array(b.into_iter().map(|x| x[1].clone()).collect()));
+    }
+    Ok(json!({ "times": times, "series": out }))
+}
+
+/// The series in the file (those starting with `prefix`), each with its point count, first and last time and last value.
+pub fn ts_series(path: &str, prefix: &str) -> Result<Vec<serde_json::Value>, String> {
+    let d = db(path)?;
+    let r = d.begin_read().map_err(|e| e.to_string())?;
+    let t = match r.open_table(POINTS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out: Vec<Value> = vec![];
+    let mut cur: Option<(String, i64, i64, i64, f64)> = None;
+    for item in t.range((prefix, i64::MIN)..).map_err(|e| e.to_string())? {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        let (name, ts) = k.value();
+        if !name.starts_with(prefix) {
+            break;
+        }
+        match &mut cur {
+            Some(c) if c.0 == name => {
+                c.1 += 1;
+                c.3 = ts;
+                c.4 = v.value();
+            }
+            _ => {
+                if let Some(c) = cur.take() {
+                    out.push(json!({ "series": c.0, "points": c.1, "first": c.2, "last": c.3, "last_value": c.4 }));
+                }
+                cur = Some((name.to_string(), 1, ts, ts, v.value()));
+            }
+        }
+    }
+    if let Some(c) = cur {
+        out.push(json!({ "series": c.0, "points": c.1, "first": c.2, "last": c.3, "last_value": c.4 }));
+    }
+    Ok(out)
+}
+
+/// Drops the points older than `keep_ms` before now (or before `now_ms` when given), in every series starting with `prefix`. Gives how many were removed.
+pub fn ts_retain(path: &str, prefix: &str, keep_ms: i64, now_ms_at: Option<i64>) -> Result<i64, String> {
+    let cutoff = now_ms_at.unwrap_or_else(now_ms) - keep_ms.max(0);
+    let names: Vec<String> = ts_series(path, prefix)?.iter().filter_map(|s| s["series"].as_str().map(str::to_string)).collect();
+    let d = db(path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    let mut removed = 0;
+    {
+        let mut t = w.open_table(POINTS).map_err(|e| e.to_string())?;
+        for n in &names {
+            let old: Vec<i64> = t.range((n.as_str(), i64::MIN)..(n.as_str(), cutoff)).map_err(|e| e.to_string())?.filter_map(|x| x.ok().map(|(k, _)| k.value().1)).collect();
+            for ts in old {
+                t.remove((n.as_str(), ts)).map_err(|e| e.to_string())?;
+                removed += 1;
+            }
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(removed)
+}
+
+/// Replaces a series' raw points older than `older_than_ms` by one per `step_ms` bucket (summed up `how`), to keep history small: last week by minute, last year by hour. Gives `{ removed, kept }`.
+pub fn ts_compact(path: &str, series: &str, older_than_ms: i64, step_ms: i64, how: &str) -> Result<serde_json::Value, String> {
+    if step_ms <= 0 {
+        return Err("a positive step".into());
+    }
+    let pts = range(path, series, i64::MIN, older_than_ms)?;
+    if pts.is_empty() {
+        return Ok(json!({ "removed": 0, "kept": 0 }));
+    }
+    let from = pts[0].0.div_euclid(step_ms) * step_ms;
+    let b = buckets(&pts, from, older_than_ms, step_ms, how, &Value::Null)?;
+    let d = db(path)?;
+    let w = d.begin_write().map_err(|e| e.to_string())?;
+    let mut kept = 0;
+    {
+        let mut t = w.open_table(POINTS).map_err(|e| e.to_string())?;
+        for (ts, _) in &pts {
+            t.remove((series, *ts)).map_err(|e| e.to_string())?;
+        }
+        for x in &b {
+            if let (Some(ts), Some(v)) = (x[0].as_i64(), x[1].as_f64()) {
+                t.insert((series, ts), v).map_err(|e| e.to_string())?;
+                kept += 1;
+            }
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(json!({ "removed": pts.len(), "kept": kept }))
+}

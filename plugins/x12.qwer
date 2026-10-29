@@ -1,0 +1,482 @@
+//! ANSI X12 EDI, as US retailers and carriers trade it: interchanges parsed (850 orders, 810 invoices and 856 ship notices read into plain fields), built with their envelopes and counts, and 997 acknowledgments made.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+
+const MAX: usize = 64 * 1024 * 1024;
+
+struct Seps {
+    element: char,
+    component: char,
+    segment: char,
+    repetition: Option<char>,
+}
+
+struct Seg {
+    id: String,
+    els: Vec<String>,
+}
+
+impl Seg {
+    /// Element `n` (1-based, as X12 numbers them), or "".
+    fn e(&self, n: usize) -> &str {
+        self.els.get(n - 1).map(|s| s.as_str()).unwrap_or("")
+    }
+    fn opt(&self, n: usize) -> Value {
+        match self.e(n).trim() {
+            "" => Value::Null,
+            s => Value::String(s.to_string()),
+        }
+    }
+}
+
+fn seps(text: &str) -> Result<Seps, String> {
+    let t: Vec<char> = text.chars().collect();
+    if t.len() < 106 || t[..3].iter().collect::<String>() != "ISA" {
+        return Err("not X12: an interchange starts with a 106-character ISA segment".into());
+    }
+    let element = t[3];
+    // ISA16 is the component separator, the character after it ends segments.
+    let fields: Vec<usize> = t.iter().enumerate().filter(|(_, c)| **c == element).map(|(i, _)| i).take(16).collect();
+    if fields.len() < 16 {
+        return Err("the ISA segment does not have 16 elements".into());
+    }
+    let comp_at = fields[15] + 1;
+    let rep = t[fields[10] + 1];
+    Ok(Seps { element, component: t[comp_at], segment: t[comp_at + 1], repetition: if rep.is_ascii_alphanumeric() { None } else { Some(rep) } })
+}
+
+fn segments(text: &str) -> Result<(Seps, Vec<Seg>), String> {
+    if text.len() > MAX {
+        return Err("the interchange is over 64 MB".into());
+    }
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    let s = seps(text)?;
+    let segs = text
+        .split(s.segment)
+        .map(|x| x.trim_matches(|c| c == '\r' || c == '\n'))
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| {
+            let mut parts = x.split(s.element);
+            let id = parts.next().unwrap_or("").trim().to_string();
+            Seg { id, els: parts.map(|p| p.to_string()).collect() }
+        })
+        .collect();
+    Ok((s, segs))
+}
+
+fn element_value(e: &str, s: &Seps) -> Value {
+    if e.contains(s.component) {
+        Value::Array(e.split(s.component).map(|c| Value::String(c.into())).collect())
+    } else {
+        Value::String(e.to_string())
+    }
+}
+
+fn date8(d: &str) -> Value {
+    let d = d.trim();
+    match d.len() {
+        8 if d.bytes().all(|b| b.is_ascii_digit()) => Value::String(format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..])),
+        6 if d.bytes().all(|b| b.is_ascii_digit()) => Value::String(format!("20{}-{}-{}", &d[..2], &d[2..4], &d[4..])),
+        _ => Value::Null,
+    }
+}
+
+fn num(s: &str) -> Value {
+    let s = s.trim();
+    if let Ok(i) = s.parse::<i64>() {
+        return Value::from(i);
+    }
+    s.parse::<f64>().ok().map(Value::from).unwrap_or(Value::Null)
+}
+
+/// Product ids from qualifier/value pairs starting at element `from`: `{ VP: "SKU-1", UP: "0123..." }`.
+fn ids(seg: &Seg, from: usize) -> Value {
+    let mut m = Map::new();
+    let mut i = from;
+    while i < seg.els.len() + 1 {
+        let (q, v) = (seg.e(i).trim(), seg.e(i + 1).trim());
+        if !q.is_empty() && !v.is_empty() {
+            m.insert(q.to_string(), Value::String(v.to_string()));
+        }
+        i += 2;
+    }
+    Value::Object(m)
+}
+
+fn party(n1: &Seg) -> Value {
+    json!({ "role": n1.opt(1), "name": n1.opt(2), "id_qualifier": n1.opt(3), "id": n1.opt(4), "address": null, "city": null, "state": null, "zip": null, "country": null })
+}
+
+/// One transaction set's segments (ST to SE) in plain fields, for the types this reads.
+fn summary(kind: &str, segs: &[Seg]) -> Map<String, Value> {
+    let mut m = Map::new();
+    let mut parties: Vec<Value> = vec![];
+    let mut lines: Vec<Value> = vec![];
+    let mut refs = Map::new();
+    let mut items: Vec<Value> = vec![];
+    for s in segs {
+        match s.id.as_str() {
+            "BEG" => {
+                m.insert("purpose".into(), s.opt(1));
+                m.insert("order_type".into(), s.opt(2));
+                m.insert("po_number".into(), s.opt(3));
+                m.insert("date".into(), date8(s.e(5)));
+            }
+            "BIG" => {
+                m.insert("date".into(), date8(s.e(1)));
+                m.insert("invoice_number".into(), s.opt(2));
+                m.insert("po_date".into(), date8(s.e(3)));
+                m.insert("po_number".into(), s.opt(4));
+            }
+            "BSN" => {
+                m.insert("purpose".into(), s.opt(1));
+                m.insert("shipment_id".into(), s.opt(2));
+                m.insert("date".into(), date8(s.e(3)));
+            }
+            "REF" => {
+                refs.insert(s.e(1).trim().to_string(), s.opt(2));
+            }
+            "N1" => parties.push(party(s)),
+            "N3" => {
+                if let Some(p) = parties.last_mut() {
+                    p["address"] = Value::String([s.e(1), s.e(2)].iter().filter(|x| !x.is_empty()).cloned().collect::<Vec<_>>().join(", "));
+                }
+            }
+            "N4" => {
+                if let Some(p) = parties.last_mut() {
+                    p["city"] = s.opt(1);
+                    p["state"] = s.opt(2);
+                    p["zip"] = s.opt(3);
+                    p["country"] = s.opt(4);
+                }
+            }
+            "PO1" | "IT1" => lines.push(json!({ "line": s.opt(1), "qty": num(s.e(2)), "unit": s.opt(3), "price": s.opt(4), "ids": ids(s, 6), "description": null })),
+            "PID" => {
+                if let Some(l) = lines.last_mut().or(items.last_mut()) {
+                    l["description"] = s.opt(5);
+                }
+            }
+            "CTT" => {
+                m.insert("line_count".into(), num(s.e(1)));
+            }
+            "TDS" => {
+                // TDS01 has two implied decimals: 12345 is 123.45.
+                m.insert("total_cents".into(), num(s.e(1)));
+            }
+            "TD5" => {
+                m.insert("carrier".into(), json!({ "scac": s.opt(3), "name": s.opt(5) }));
+            }
+            "LIN" => items.push(json!({ "ids": ids(s, 2), "qty": null, "unit": null, "description": null })),
+            "SN1" => {
+                if let Some(i) = items.last_mut() {
+                    i["qty"] = num(s.e(2));
+                    i["unit"] = s.opt(3);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !parties.is_empty() {
+        m.insert("parties".into(), Value::Array(parties));
+    }
+    if !refs.is_empty() {
+        m.insert("refs".into(), Value::Object(refs));
+    }
+    if kind == "856" {
+        m.insert("items".into(), Value::Array(items));
+    } else if !lines.is_empty() {
+        m.insert("lines".into(), Value::Array(lines));
+    }
+    m
+}
+
+fn read(text: &str) -> Result<Value, String> {
+    let (s, segs) = segments(text)?;
+    let isa = &segs[0];
+    let mut problems: Vec<String> = vec![];
+    let mut groups: Vec<Value> = vec![];
+    let mut i = 1;
+    let mut gs_seen = 0;
+    while i < segs.len() {
+        let seg = &segs[i];
+        match seg.id.as_str() {
+            "GS" => {
+                gs_seen += 1;
+                let gs = seg;
+                let mut txs: Vec<Value> = vec![];
+                i += 1;
+                while i < segs.len() && segs[i].id != "GE" {
+                    if segs[i].id == "ST" {
+                        let st = &segs[i];
+                        let start = i;
+                        while i < segs.len() && segs[i].id != "SE" {
+                            i += 1;
+                        }
+                        if i >= segs.len() {
+                            problems.push(format!("transaction {} has no SE", st.e(2)));
+                            break;
+                        }
+                        let se = &segs[i];
+                        let count = i - start + 1;
+                        if se.e(1).trim().parse::<usize>().ok() != Some(count) {
+                            problems.push(format!("transaction {}: SE says {} segments, it has {}", st.e(2), se.e(1), count));
+                        }
+                        if se.e(2).trim() != st.e(2).trim() {
+                            problems.push(format!("transaction {}: SE's control number is {}", st.e(2), se.e(2)));
+                        }
+                        let body = &segs[start..=i];
+                        let mut t = Map::new();
+                        t.insert("type".into(), st.opt(1));
+                        t.insert("control".into(), st.opt(2));
+                        t.extend(summary(st.e(1).trim(), body));
+                        t.insert("segments".into(), Value::Array(body.iter().map(|x| json!({ "id": x.id, "elements": x.els.iter().map(|e| element_value(e, &s)).collect::<Vec<_>>() })).collect()));
+                        txs.push(Value::Object(t));
+                    }
+                    i += 1;
+                }
+                if i < segs.len() {
+                    let ge = &segs[i];
+                    if ge.e(1).trim().parse::<usize>().ok() != Some(txs.len()) {
+                        problems.push(format!("group {}: GE says {} transactions, it has {}", gs.e(6), ge.e(1), txs.len()));
+                    }
+                } else {
+                    problems.push(format!("group {} has no GE", gs.e(6)));
+                }
+                groups.push(json!({ "function": gs.opt(1), "sender": gs.opt(2), "receiver": gs.opt(3), "date": date8(gs.e(4)), "control": gs.opt(6), "version": gs.opt(8), "transactions": txs }));
+            }
+            "IEA" => {
+                if seg.e(1).trim().parse::<usize>().ok() != Some(gs_seen) {
+                    problems.push(format!("IEA says {} groups, there are {}", seg.e(1), gs_seen));
+                }
+                if seg.e(2).trim() != isa.e(13).trim() {
+                    problems.push(format!("IEA's control number {} is not ISA's {}", seg.e(2), isa.e(13)));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(json!({
+        "sender": isa.e(6).trim(),
+        "sender_qualifier": isa.e(5).trim(),
+        "receiver": isa.e(8).trim(),
+        "receiver_qualifier": isa.e(7).trim(),
+        "date": date8(isa.e(9)),
+        "time": isa.e(10).trim(),
+        "version": isa.e(12).trim(),
+        "control": isa.e(13).trim(),
+        "test": isa.e(15).trim() == "T",
+        "separators": { "element": s.element.to_string(), "component": s.component.to_string(), "segment": s.segment.to_string(), "repetition": s.repetition.map(|c| c.to_string()) },
+        "groups": groups,
+        "problems": problems,
+    }))
+}
+
+/// An X12 interchange read: `{ sender, receiver, date, control, test, version, separators, groups, problems }`, each
+/// group `{ function, sender, receiver, date, control, version, transactions }`. Each transaction has its `type`
+/// ("850"...), `control` and `segments` (`{ id, elements }`, composite elements as lists), and, for 850 orders, 810
+/// invoices and 856 ship notices, plain fields: `po_number`, `invoice_number`, `shipment_id`, `date`, `parties` (N1
+/// with address), `lines` (`{ line, qty, unit, price, ids, description }`, `price` as exact text, ids like `{ VP: "SKU" }`), `items`, `carrier`,
+/// `refs`, `total_cents`. `problems` lists counts and control numbers that do not match; the separators are read from ISA.
+pub fn x12_parse(text: &str) -> Result<Value, String> {
+    read(text)
+}
+
+/// `x12_parse` of a file (.edi, .x12, .txt).
+pub fn x12_read_file(path: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    read(&text)
+}
+
+/// Every transaction of the interchange in one list, its plain fields only (no `segments`), each with `function` and
+/// the `sender`: what an import loop wants.
+pub fn x12_documents(text: &str) -> Result<Vec<Value>, String> {
+    let x = read(text)?;
+    let mut out = vec![];
+    for g in x["groups"].as_array().into_iter().flatten() {
+        for t in g["transactions"].as_array().into_iter().flatten() {
+            let mut t = t.clone();
+            if let Some(o) = t.as_object_mut() {
+                o.remove("segments");
+                o.insert("sender".into(), x["sender"].clone());
+            }
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+fn days_to_date(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// Now, UTC: "20261029" and "1405".
+fn now() -> (String, String) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (y, m, d) = days_to_date(secs.div_euclid(86400));
+    let s = secs.rem_euclid(86400);
+    (format!("{:04}{:02}{:02}", y, m, d), format!("{:02}{:02}", s / 3600, s / 60 % 60))
+}
+
+fn function_of(kind: &str) -> &'static str {
+    match kind {
+        "850" => "PO",
+        "810" => "IN",
+        "856" => "SH",
+        "997" => "FA",
+        "855" => "PR",
+        "860" => "PC",
+        "846" => "IB",
+        "820" => "RA",
+        "940" => "OW",
+        "945" => "SW",
+        "214" => "QM",
+        "204" => "SM",
+        "990" => "GF",
+        "211" => "BL",
+        "832" => "SC",
+        "852" => "PD",
+        "824" => "AG",
+        "864" => "TX",
+        "999" => "FA",
+        "270" => "HS",
+        "271" => "HB",
+        "837" => "HC",
+        "835" => "HP",
+        _ => "",
+    }
+}
+
+fn text_of(v: &Value, comp: char) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().map(|x| text_of(x, comp)).collect::<Vec<_>>().join(&comp.to_string()),
+        other => other.to_string(),
+    }
+}
+
+fn pad(s: &str, n: usize) -> String {
+    format!("{:<width$}", s.chars().take(n).collect::<String>(), width = n)
+}
+
+/// An interchange built: `envelope` is `{ sender, receiver, control }` and may add `sender_qualifier` and
+/// `receiver_qualifier` ("ZZ"), `date` ("20261029", else today, UTC), `time` ("1405"), `version` (ISA12, "00401"),
+/// `gs_version` ("004010"), `test` (false), `newlines` (true: a line break after each `~`). `transactions` are
+/// `[{ type: "850", segments: [["BEG", "00", "SA", "PO-1"...], ...] }]`, the segments between ST and SE, an element a
+/// text, a number, null for empty, or a list for a composite. ISA, GS, ST, SE, GE and IEA are written with their
+/// counts and control numbers (the group's and the transactions' from `control`); one GS group per function (PO, IN, SH...).
+pub fn x12_build(envelope: serde_json::Value, transactions: Vec<serde_json::Value>) -> Result<String, String> {
+    let get = |k: &str, d: &str| envelope[k].as_str().map(|s| s.to_string()).or_else(|| envelope[k].as_i64().map(|n| n.to_string())).unwrap_or_else(|| d.to_string());
+    let sender = get("sender", "");
+    let receiver = get("receiver", "");
+    if sender.is_empty() || receiver.is_empty() {
+        return Err("the envelope needs `sender` and `receiver`".into());
+    }
+    let control: i64 = envelope["control"].as_i64().or_else(|| envelope["control"].as_str().and_then(|s| s.parse().ok())).ok_or("the envelope needs a numeric `control` (1 to 999999999)")?;
+    if !(1..=999_999_999).contains(&control) {
+        return Err("`control` runs from 1 to 999999999".into());
+    }
+    let (today, hhmm) = now();
+    let date = get("date", &today).replace('-', "");
+    if date.len() != 8 {
+        return Err("`date` is \"20261029\"".into());
+    }
+    let time = get("time", &hhmm).replace(':', "");
+    let nl = envelope["newlines"].as_bool().unwrap_or(true);
+    let (el, comp, term) = ('*', '>', if nl { "~\n" } else { "~" });
+    let mut out = String::new();
+    let put = |fields: Vec<String>, out: &mut String| {
+        out.push_str(&fields.join(&el.to_string()));
+        out.push_str(term);
+    };
+    let s = |x: &str| x.to_string();
+    put(
+        vec![
+            s("ISA"), s("00"), pad("", 10), s("00"), pad("", 10),
+            pad(&get("sender_qualifier", "ZZ"), 2), pad(&sender, 15), pad(&get("receiver_qualifier", "ZZ"), 2), pad(&receiver, 15),
+            s(&date[2..]), pad(&time, 4), s("U"), pad(&get("version", "00401"), 5), format!("{:09}", control), s("0"),
+            s(if envelope["test"].as_bool().unwrap_or(false) { "T" } else { "P" }), comp.to_string(),
+        ],
+        &mut out,
+    );
+    // Groups, in the order their function first appears.
+    let mut order: Vec<String> = vec![];
+    for t in &transactions {
+        let kind = t["type"].as_str().ok_or("each transaction needs a `type`, like \"850\"")?;
+        let f = function_of(kind);
+        let f = t["function"].as_str().unwrap_or(f);
+        if f.is_empty() {
+            return Err(format!("no functional group known for {}: give the transaction a `function`", kind));
+        }
+        if !order.iter().any(|o| o == f) {
+            order.push(f.to_string());
+        }
+    }
+    let mut tx_no = 0;
+    for (gi, f) in order.iter().enumerate() {
+        let gcontrol = (control + gi as i64 - 1) % 999_999_999 + 1;
+        put(vec![s("GS"), s(f), sender.clone(), receiver.clone(), date.clone(), time.clone(), gcontrol.to_string(), s("X"), get("gs_version", "004010")], &mut out);
+        let mut n = 0;
+        for t in transactions.iter().filter(|t| t["function"].as_str().unwrap_or(function_of(t["type"].as_str().unwrap_or(""))) == f) {
+            n += 1;
+            tx_no += 1;
+            let st = format!("{:04}", tx_no);
+            let segs = t["segments"].as_array().ok_or("each transaction needs `segments`, a list of lists")?;
+            put(vec![s("ST"), t["type"].as_str().unwrap_or("").to_string(), st.clone()], &mut out);
+            for seg in segs {
+                let parts = seg.as_array().ok_or("a segment is a list: [\"BEG\", \"00\", ...]")?;
+                let bad = |v: &Value| text_of(v, ' ').contains(|c| c == el || c == comp || c == '~');
+                if parts.iter().any(|p| match p { Value::Array(a) => a.iter().any(bad), v => bad(v) }) {
+                    return Err(format!("segment {}: a value holds a separator (* ~ >)", text_of(&parts[0], comp)));
+                }
+                let mut fields: Vec<String> = parts.iter().map(|p| text_of(p, comp)).collect();
+                while fields.len() > 1 && fields.last().is_some_and(|x| x.is_empty()) {
+                    fields.pop();
+                }
+                put(fields, &mut out);
+            }
+            put(vec![s("SE"), (segs.len() + 2).to_string(), st], &mut out);
+        }
+        put(vec![s("GE"), n.to_string(), gcontrol.to_string()], &mut out);
+    }
+    put(vec![s("IEA"), order.len().to_string(), format!("{:09}", control)], &mut out);
+    Ok(out)
+}
+
+/// The 997 functional acknowledgment for a received interchange `text`, accepting each group and transaction (AK1,
+/// AK2/AK5, AK9 with the counts), sent back with sender and receiver swapped, under the interchange `control` given.
+pub fn x12_997(text: &str, control: i64) -> Result<String, String> {
+    let x = read(text)?;
+    let mut txs = vec![];
+    for g in x["groups"].as_array().into_iter().flatten() {
+        let n = g["transactions"].as_array().map(|a| a.len()).unwrap_or(0);
+        let mut segs = vec![json!(["AK1", g["function"], g["control"]])];
+        for t in g["transactions"].as_array().into_iter().flatten() {
+            segs.push(json!(["AK2", t["type"], t["control"]]));
+            segs.push(json!(["AK5", "A"]));
+        }
+        segs.push(json!(["AK9", "A", n, n, n]));
+        txs.push(json!({ "type": "997", "segments": segs }));
+    }
+    if txs.is_empty() {
+        return Err("the interchange has no group to acknowledge".into());
+    }
+    let env = json!({
+        "sender": x["receiver"], "receiver": x["sender"],
+        "sender_qualifier": x["receiver_qualifier"], "receiver_qualifier": x["sender_qualifier"],
+        "control": control, "version": x["version"],
+    });
+    x12_build(env, txs)
+}

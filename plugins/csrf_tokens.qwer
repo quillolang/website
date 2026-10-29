@@ -1,0 +1,114 @@
+//! CSRF protection for forms and fetch calls: tokens signed for one session that expire, the signed double-submit cookie check, and the Origin, Referer and Sec-Fetch-Site checks browsers make possible.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! rand = "0.8"
+//! url = "2"
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use sha2::Sha256;
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn signature(secret: &str, session_id: &str, issued: i64, nonce: &str) -> Hmac<Sha256> {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    // Lengths first, so no two (session, nonce) pairs sign the same bytes.
+    m.update(format!("csrf.v1.{}.{}.{}.{}.{}", session_id.len(), session_id, issued, nonce.len(), nonce).as_bytes());
+    m
+}
+
+fn check_secret(secret: &str) -> Result<(), String> {
+    if secret.len() < 16 { Err("the secret should be at least 16 characters (32 random bytes is right)".into()) } else { Ok(()) }
+}
+
+/// A token for a form or a fetch call, signed with `secret` for `session_id` (an id kept in the session, never shown elsewhere):
+/// `issued.nonce.signature`, URL-safe. Each call gives a new one; any of them verifies while it is fresh.
+pub fn csrf_token(secret: &str, session_id: &str) -> Result<String, String> {
+    csrf_token_at(secret, session_id, now())
+}
+
+/// A token as `csrf_token` makes it, issued at `unix_seconds`: for tests of expiry.
+pub fn csrf_token_at(secret: &str, session_id: &str, unix_seconds: i64) -> Result<String, String> {
+    check_secret(secret)?;
+    if session_id.is_empty() {
+        return Err("a token needs a session id: give the visitor a session first".into());
+    }
+    let mut n = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut n);
+    let nonce = URL_SAFE_NO_PAD.encode(n);
+    let sig = URL_SAFE_NO_PAD.encode(signature(secret, session_id, unix_seconds, &nonce).finalize().into_bytes());
+    Ok(format!("{}.{}.{}", unix_seconds, nonce, sig))
+}
+
+/// Checks a token sent back with a form or a header: signed with `secret` for this `session_id`, and issued less than
+/// `max_age_seconds` ago (0: no limit). Gives true, or an error value saying why it is refused.
+pub fn csrf_verify(secret: &str, session_id: &str, token: &str, max_age_seconds: i64) -> Result<bool, String> {
+    check_secret(secret)?;
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    let [issued, nonce, sig] = parts[..] else { return Err("no CSRF token, or not one of ours".into()) };
+    let issued: i64 = issued.parse().map_err(|_| "no CSRF token, or not one of ours".to_string())?;
+    let sig = URL_SAFE_NO_PAD.decode(sig).map_err(|_| "the CSRF token is damaged".to_string())?;
+    signature(secret, session_id, issued, nonce).verify_slice(&sig).map_err(|_| "the CSRF token was made for another session, or changed".to_string())?;
+    let age = now() - issued;
+    if age < -300 {
+        return Err("the CSRF token was issued in the future: a clock is off".into());
+    }
+    if max_age_seconds > 0 && age > max_age_seconds {
+        return Err(format!("the CSRF token is {} s old, more than the {} s allowed: reload the page", age, max_age_seconds));
+    }
+    Ok(true)
+}
+
+/// The signed double-submit check, for pages that cannot keep a token on the server: the token in a cookie
+/// (`cookie_token`) and the one sent in the form or header (`sent_token`) must be the same, and signed for this session.
+pub fn csrf_double_submit(secret: &str, session_id: &str, cookie_token: &str, sent_token: &str, max_age_seconds: i64) -> Result<bool, String> {
+    let (a, b) = (cookie_token.trim().as_bytes(), sent_token.trim().as_bytes());
+    if a.is_empty() || b.is_empty() {
+        return Err("the CSRF cookie or the token sent with the request is missing".into());
+    }
+    if a.len() != b.len() || a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) != 0 {
+        return Err("the token sent is not the one in the CSRF cookie".into());
+    }
+    csrf_verify(secret, session_id, sent_token, max_age_seconds)
+}
+
+fn origin_of(u: &str) -> Option<String> {
+    let u = url::Url::parse(u).ok()?;
+    match u.origin() {
+        url::Origin::Tuple(..) => Some(u.origin().ascii_serialization()),
+        _ => None,
+    }
+}
+
+/// Whether a request that changes something came from your own pages, by its headers (lower-case names, as
+/// `request.headers` has them): `Sec-Fetch-Site` same-origin (or none: typed or bookmarked), else `Origin`, else the
+/// `Referer`'s origin, must be one of `allowed_origins` (`https://shop.example.com`). Gives true, or an error value saying why not.
+pub fn csrf_origin_check(headers: std::collections::HashMap<String, String>, allowed_origins: Vec<String>) -> Result<bool, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.trim().to_string());
+    let allowed: Vec<String> = allowed_origins.iter().filter_map(|o| origin_of(o)).collect();
+    if let Some(site) = h("sec-fetch-site") {
+        match site.as_str() {
+            "same-origin" | "none" => return Ok(true),
+            "same-site" | "cross-site" => {}
+            other => return Err(format!("Sec-Fetch-Site `{}` is not one browsers send", other)),
+        }
+    }
+    let (from, what) = match (h("origin").filter(|o| o != "null"), h("referer")) {
+        (Some(o), _) => (origin_of(&o), "Origin"),
+        (None, Some(r)) => (origin_of(&r), "Referer"),
+        (None, None) => return Err("no Origin, Referer or Sec-Fetch-Site header: refused, as a page on another site could send it".into()),
+    };
+    match from {
+        Some(o) if allowed.contains(&o) => Ok(true),
+        Some(o) => Err(format!("the request came from {} ({}), not from {}", o, what, allowed.join(", "))),
+        None => Err(format!("the {} header is not a URL", what)),
+    }
+}

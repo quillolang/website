@@ -1,0 +1,203 @@
+//! HTTP caching worked out as RFC 9111 says: Cache-Control read and written, ETags made, conditional requests answered 304, and a stored response's freshness, age and time to live, for servers, proxies and clients that cache.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! httpdate = "1"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ORDER: &[&str] = &["public", "private", "no-cache", "no-store", "max-age", "s-maxage", "must-revalidate", "proxy-revalidate", "no-transform", "immutable", "stale-while-revalidate", "stale-if-error", "must-understand"];
+const HEURISTIC_STATUSES: &[i64] = &[200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501];
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn header<'a>(h: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim())
+}
+
+fn date(s: &str) -> Option<i64> {
+    httpdate::parse_http_date(s.trim()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64)
+}
+
+fn directives(v: &str) -> Vec<(String, Option<String>)> {
+    v.split(',')
+        .filter_map(|d| {
+            let d = d.trim();
+            if d.is_empty() {
+                return None;
+            }
+            Some(match d.split_once('=') {
+                Some((k, v)) => (k.trim().to_lowercase(), Some(v.trim().trim_matches('"').to_string())),
+                None => (d.to_lowercase(), None),
+            })
+        })
+        .collect()
+}
+
+/// A `Cache-Control` value read into a map: flags are true, numbers (`max-age`, `s-maxage`, `stale-while-revalidate`...)
+/// ints, others text; the first of a directive given twice is kept.
+pub fn httpcache_parse(cache_control: &str) -> Value {
+    let mut m = Map::new();
+    for (k, v) in directives(cache_control) {
+        if m.contains_key(&k) {
+            continue;
+        }
+        let val = match v {
+            None => json!(true),
+            Some(v) => v.parse::<i64>().map(|n| json!(n)).unwrap_or(json!(v)),
+        };
+        m.insert(k, val);
+    }
+    Value::Object(m)
+}
+
+/// A `Cache-Control` value from a map like `httpcache_parse` gives (`{ public: true, "max-age": 3600 }`), directives in the usual order.
+pub fn httpcache_build(directives: std::collections::HashMap<String, serde_json::Value>) -> String {
+    let mut keys: Vec<&String> = directives.keys().filter(|k| !matches!(directives[*k], Value::Bool(false) | Value::Null)).collect();
+    keys.sort_by_key(|k| (ORDER.iter().position(|o| o == &k.as_str()).unwrap_or(ORDER.len()), k.to_string()));
+    keys.iter()
+        .map(|k| match &directives[*k] {
+            Value::Bool(true) => k.to_string(),
+            Value::Number(n) => format!("{}={}", k, n),
+            Value::String(s) => format!("{}=\"{}\"", k, s),
+            other => format!("{}={}", k, other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The Cache-Control for common cases: "immutable" (fingerprinted assets: a year, never revalidated), "static" (a day, then
+/// revalidated), "html" (always revalidated, kept for the back button), "api" (private, revalidated), "private" (never stored),
+/// "cdn" (a minute in browsers, ten in shared caches, stale for a day while one refreshes).
+pub fn httpcache_preset(name: &str) -> Result<String, String> {
+    Ok(match name {
+        "immutable" => "public, max-age=31536000, immutable",
+        "static" => "public, max-age=86400, must-revalidate",
+        "html" => "no-cache",
+        "api" => "private, no-cache",
+        "private" => "private, no-store",
+        "cdn" => "public, max-age=60, s-maxage=600, stale-while-revalidate=86400, stale-if-error=86400",
+        other => return Err(format!("unknown preset `{}`: immutable, static, html, api, private or cdn", other)),
+    }
+    .to_string())
+}
+
+/// An ETag for `content`: a SHA-256 of it, quoted (`"k3p9..."`), or weak (`W/"..."`) for content that is equal in meaning but
+/// not byte for byte (compressed differently, say).
+pub fn httpcache_etag(content: &str, weak: bool) -> String {
+    let h = URL_SAFE_NO_PAD.encode(&Sha256::digest(content.as_bytes())[..16]);
+    if weak { format!("W/\"{}\"", h) } else { format!("\"{}\"", h) }
+}
+
+/// Unix seconds as an HTTP date (`Thu, 29 Oct 2026 09:00:00 GMT`), for Last-Modified and Expires.
+pub fn httpcache_date(unix_seconds: i64) -> String {
+    httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(unix_seconds.max(0) as u64))
+}
+
+/// An HTTP date read into Unix seconds; an error value for text that is not one.
+pub fn httpcache_date_parse(text: &str) -> Result<i64, String> {
+    date(text).ok_or_else(|| format!("`{}` is not an HTTP date", text))
+}
+
+/// Whether a GET can be answered 304 Not Modified: the request's `If-None-Match` lists the current `etag` (weak comparison, `*`
+/// too), or, when it has none, its `If-Modified-Since` is at or after `last_modified` (Unix seconds; 0 when unknown).
+pub fn httpcache_not_modified(request_headers: std::collections::HashMap<String, String>, etag: &str, last_modified: i64) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").to_string();
+    if let Some(inm) = header(&request_headers, "if-none-match") {
+        let ours = strip(etag);
+        return inm.split(',').any(|t| t.trim() == "*" || (!ours.is_empty() && strip(t) == ours));
+    }
+    match (header(&request_headers, "if-modified-since").and_then(date), last_modified) {
+        (Some(since), lm) if lm > 0 => lm <= since,
+        _ => false,
+    }
+}
+
+/// Whether a response may be stored by a cache, and why not: `{ storable, reason }`. `shared` is true for a proxy or CDN, false
+/// for a browser or a client's own cache. Follows RFC 9111 section 3: the method, the status, no-store, private, Authorization.
+pub fn httpcache_storable(method: &str, status: i64, request_headers: std::collections::HashMap<String, String>, response_headers: std::collections::HashMap<String, String>, shared: bool) -> Value {
+    let res = |ok: bool, why: &str| json!({ "storable": ok, "reason": why });
+    let cc = directives(header(&response_headers, "cache-control").unwrap_or(""));
+    let has = |k: &str| cc.iter().any(|(n, _)| n == k);
+    let req_cc = directives(header(&request_headers, "cache-control").unwrap_or(""));
+    if !["GET", "HEAD"].contains(&method.to_uppercase().as_str()) {
+        return res(false, "only GET and HEAD answers are cached here");
+    }
+    if (100..200).contains(&status) || status == 206 || status == 304 {
+        return res(false, "partial and interim answers are not stored as they are");
+    }
+    if has("no-store") || req_cc.iter().any(|(n, _)| n == "no-store") {
+        return res(false, "no-store");
+    }
+    if shared && has("private") {
+        return res(false, "private: only the browser may keep it");
+    }
+    if shared && header(&request_headers, "authorization").is_some() && !(has("public") || has("s-maxage") || has("must-revalidate")) {
+        return res(false, "the request had Authorization, and the answer does not say public, s-maxage or must-revalidate");
+    }
+    if header(&response_headers, "vary").is_some_and(|v| v.trim() == "*") {
+        return res(false, "Vary: * matches no later request");
+    }
+    let explicit = has("max-age") || (shared && has("s-maxage")) || has("public") || header(&response_headers, "expires").is_some();
+    if explicit || HEURISTIC_STATUSES.contains(&status) {
+        res(true, if explicit { "explicit freshness" } else { "a status cacheable by default" })
+    } else {
+        res(false, "no freshness information, and the status is not cacheable by default")
+    }
+}
+
+/// How fresh a stored response is: `{ fresh, age, lifetime, ttl, heuristic, must_revalidate, stale_while_revalidate,
+/// stale_if_error, no_cache }`, seconds. `response_headers` are those it was stored with (Date, Age, Cache-Control, Expires,
+/// Last-Modified); `received_at` is when it was received (Unix seconds; 0: its Date). Without explicit freshness, a cacheable
+/// status gets a tenth of the time since Last-Modified, as caches do.
+pub fn httpcache_freshness(response_headers: std::collections::HashMap<String, String>, status: i64, received_at: i64, shared: bool) -> Value {
+    let cc = httpcache_parse(header(&response_headers, "cache-control").unwrap_or(""));
+    let n = |k: &str| cc.get(k).and_then(|v| v.as_i64());
+    let t = now();
+    let date_v = header(&response_headers, "date").and_then(date);
+    let received = if received_at > 0 { received_at } else { date_v.unwrap_or(t) };
+    let age_header = header(&response_headers, "age").and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
+    let apparent = date_v.map_or(0, |d| (received - d).max(0));
+    let age = apparent.max(age_header) + (t - received).max(0);
+    let mut heuristic = false;
+    let lifetime = if let Some(s) = n("s-maxage").filter(|_| shared) {
+        s
+    } else if let Some(m) = n("max-age") {
+        m
+    } else if let Some(e) = header(&response_headers, "expires") {
+        match (date(e), date_v) {
+            (Some(e), Some(d)) => (e - d).max(0),
+            (Some(e), None) => (e - received).max(0),
+            (None, _) => 0, // an invalid Expires means already expired
+        }
+    } else if let (Some(lm), true) = (header(&response_headers, "last-modified").and_then(date), HEURISTIC_STATUSES.contains(&status)) {
+        heuristic = true;
+        ((date_v.unwrap_or(received) - lm).max(0) / 10).min(86400)
+    } else {
+        0
+    };
+    let no_cache = cc.get("no-cache").is_some();
+    let fresh = !no_cache && lifetime > age;
+    json!({
+        "fresh": fresh,
+        "age": age,
+        "lifetime": lifetime,
+        "ttl": (lifetime - age).max(0),
+        "heuristic": heuristic,
+        "no_cache": no_cache,
+        "must_revalidate": cc.get("must-revalidate").is_some() || (shared && cc.get("proxy-revalidate").is_some()),
+        "stale_while_revalidate": n("stale-while-revalidate").unwrap_or(0),
+        "stale_if_error": n("stale-if-error").unwrap_or(0),
+        "immutable": cc.get("immutable").is_some(),
+    })
+}

@@ -1,0 +1,203 @@
+//! Outliers and odd moments found in numbers: z-scores, the robust median-absolute-deviation score, Tukey's IQR fences and Grubbs' test on a set; and in a series over time, points far from their rolling window, from the same moment of past seasons (Monday against Mondays), out of an EWMA control chart's limits, and level shifts by CUSUM.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! statrs = "0.17"
+
+use serde_json::{json, Value};
+use statrs::distribution::{ContinuousCDF, StudentsT};
+
+fn r(x: f64) -> Value {
+    if x.is_finite() { json!((x * 1e4).round() / 1e4) } else { Value::Null }
+}
+
+fn check(s: &[f64], min: usize) -> Result<(), String> {
+    if s.len() < min {
+        return Err(format!("at least {} values", min));
+    }
+    if s.len() > 1_000_000 || s.iter().any(|x| !x.is_finite()) {
+        return Err("at most a million values, all numbers".into());
+    }
+    Ok(())
+}
+
+fn mean(x: &[f64]) -> f64 {
+    x.iter().sum::<f64>() / x.len() as f64
+}
+
+fn sd(x: &[f64]) -> f64 {
+    let m = mean(x);
+    (x.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (x.len() as f64 - 1.0).max(1.0)).sqrt()
+}
+
+fn median(x: &[f64]) -> f64 {
+    let mut v = x.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+}
+
+fn quantile(x: &[f64], q: f64) -> f64 {
+    let mut v = x.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pos = q * (v.len() - 1) as f64;
+    let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+    v[lo] + (v[hi] - v[lo]) * (pos - lo as f64)
+}
+
+fn point(i: usize, v: f64, score: f64, expected: f64) -> Value {
+    json!({ "index": i, "value": r(v), "score": r(score), "expected": r(expected), "direction": if v > expected { "high" } else { "low" } })
+}
+
+/// Points more than `threshold` standard deviations from the mean (3 is usual). Gives `{ mean, sd, outliers: [{ index, value, score, expected, direction }] }`. One huge outlier inflates the sd: prefer `anomaly_mad`.
+pub fn anomaly_zscore(values: Vec<f64>, threshold: f64) -> Result<serde_json::Value, String> {
+    check(&values, 3)?;
+    let (m, s) = (mean(&values), sd(&values));
+    let out: Vec<Value> = if s == 0.0 { vec![] } else { values.iter().enumerate().filter(|(_, v)| ((*v - m) / s).abs() > threshold).map(|(i, v)| point(i, *v, (v - m) / s, m)).collect() };
+    Ok(json!({ "mean": r(m), "sd": r(s), "outliers": out }))
+}
+
+/// Robust: the modified z-score 0.6745·(x − median)/MAD, outliers above `threshold` (3.5 is Iglewicz and Hoaglin's). Not thrown by the outliers themselves.
+pub fn anomaly_mad(values: Vec<f64>, threshold: f64) -> Result<serde_json::Value, String> {
+    check(&values, 3)?;
+    let med = median(&values);
+    let dev: Vec<f64> = values.iter().map(|v| (v - med).abs()).collect();
+    let mad = median(&dev);
+    // With more than half the values equal the MAD is 0: fall back to the mean absolute deviation.
+    let scale = if mad > 0.0 { mad / 0.6745 } else { mean(&dev) * 1.2533 };
+    let out: Vec<Value> = if scale == 0.0 { vec![] } else { values.iter().enumerate().filter(|(_, v)| ((*v - med) / scale).abs() > threshold).map(|(i, v)| point(i, *v, (v - med) / scale, med)).collect() };
+    Ok(json!({ "median": r(med), "mad": r(mad), "outliers": out }))
+}
+
+/// Tukey's fences: below Q1 − k·IQR or above Q3 + k·IQR (`k` 1.5; 3 for "far out"). Gives `{ q1, q3, iqr, low, high, outliers }`.
+pub fn anomaly_iqr(values: Vec<f64>, k: f64) -> Result<serde_json::Value, String> {
+    check(&values, 4)?;
+    let (q1, q3) = (quantile(&values, 0.25), quantile(&values, 0.75));
+    let iqr = q3 - q1;
+    let (lo, hi) = (q1 - k * iqr, q3 + k * iqr);
+    let med = median(&values);
+    let out: Vec<Value> = values.iter().enumerate().filter(|(_, v)| **v < lo || **v > hi).map(|(i, v)| point(i, *v, if *v > hi { (v - hi) / iqr.max(1e-12) } else { (v - lo) / iqr.max(1e-12) }, med)).collect();
+    Ok(json!({ "q1": r(q1), "q3": r(q3), "iqr": r(iqr), "low": r(lo), "high": r(hi), "outliers": out }))
+}
+
+/// Grubbs' test, repeated: the most extreme value is an outlier when its G passes the critical value at `alpha` (0.05), then the next is tested. For data near normal.
+pub fn anomaly_grubbs(values: Vec<f64>, alpha: f64) -> Result<serde_json::Value, String> {
+    check(&values, 7)?;
+    let alpha = if alpha > 0.0 && alpha < 0.5 { alpha } else { 0.05 };
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    let mut out = vec![];
+    while idx.len() > 6 {
+        let x: Vec<f64> = idx.iter().map(|i| values[*i]).collect();
+        let (m, s) = (mean(&x), sd(&x));
+        if s == 0.0 {
+            break;
+        }
+        let (k, g) = x.iter().enumerate().map(|(k, v)| (k, (v - m).abs() / s)).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+        let n = x.len() as f64;
+        let t = StudentsT::new(0.0, 1.0, n - 2.0).map_err(|e| e.to_string())?.inverse_cdf(1.0 - alpha / (2.0 * n));
+        let crit = (n - 1.0) / n.sqrt() * (t * t / (n - 2.0 + t * t)).sqrt();
+        if g <= crit {
+            break;
+        }
+        out.push(json!({ "index": idx[k], "value": r(x[k]), "g": r(g), "critical": r(crit), "direction": if x[k] > m { "high" } else { "low" } }));
+        idx.remove(k);
+    }
+    Ok(json!({ "outliers": out }))
+}
+
+/// Each point against the `window` points before it (robust: their median and MAD), flagged above `threshold` (3.5): sudden spikes and drops in a metric.
+pub fn anomaly_rolling(series: Vec<f64>, window: i64, threshold: f64) -> Result<serde_json::Value, String> {
+    let w = window.max(3) as usize;
+    check(&series, w + 1)?;
+    let mut out = vec![];
+    for i in w..series.len() {
+        let win = &series[i - w..i];
+        let med = median(win);
+        let mad = median(&win.iter().map(|v| (v - med).abs()).collect::<Vec<_>>());
+        let scale = if mad > 0.0 { mad / 0.6745 } else { mean(&win.iter().map(|v| (v - med).abs()).collect::<Vec<_>>()) * 1.2533 };
+        if scale > 0.0 {
+            let z = (series[i] - med) / scale;
+            if z.abs() > threshold {
+                out.push(point(i, series[i], z, med));
+            }
+        } else if series[i] != med {
+            out.push(point(i, series[i], f64::INFINITY, med));
+        }
+    }
+    Ok(json!({ "window": w, "anomalies": out }))
+}
+
+/// Each point against the same moment of earlier seasons (`period` 7 for days of the week, 24 for hours of the day): the median of those, and how far this one is from it in robust units of the series' seasonal noise.
+pub fn anomaly_seasonal(series: Vec<f64>, period: i64, threshold: f64) -> Result<serde_json::Value, String> {
+    let p = period.max(2) as usize;
+    check(&series, 2 * p + 1)?;
+    let mut resid = vec![f64::NAN; series.len()];
+    let mut expected = vec![f64::NAN; series.len()];
+    for i in p..series.len() {
+        let past: Vec<f64> = (1..=i / p).map(|k| series[i - k * p]).take(8).collect();
+        expected[i] = median(&past);
+        resid[i] = series[i] - expected[i];
+    }
+    let rs: Vec<f64> = resid.iter().copied().filter(|x| x.is_finite()).collect();
+    let med = median(&rs);
+    let mad = median(&rs.iter().map(|v| (v - med).abs()).collect::<Vec<_>>());
+    let scale = if mad > 0.0 { mad / 0.6745 } else { sd(&rs) };
+    let out: Vec<Value> = (p..series.len())
+        .filter(|i| scale > 0.0 && ((resid[*i] - med) / scale).abs() > threshold)
+        .map(|i| point(i, series[i], (resid[i] - med) / scale, expected[i]))
+        .collect();
+    Ok(json!({ "period": p, "anomalies": out }))
+}
+
+/// An EWMA control chart (`lambda` 0.2, limits at `l` 3 sigma), its baseline from the first `baseline` points: where the smoothed series leaves its limits. Catches slow drifts a z-score misses.
+pub fn anomaly_ewma(series: Vec<f64>, lambda: f64, l: f64, baseline: i64) -> Result<serde_json::Value, String> {
+    let b = baseline.max(5) as usize;
+    check(&series, b + 1)?;
+    let lam = lambda.clamp(0.01, 1.0);
+    let (mu, s) = (mean(&series[..b]), sd(&series[..b]));
+    let mut z = mu;
+    let mut out = vec![];
+    let mut ewma = vec![];
+    for (i, x) in series.iter().enumerate() {
+        z = lam * x + (1.0 - lam) * z;
+        let width = l * s * (lam / (2.0 - lam) * (1.0 - (1.0 - lam).powi(2 * (i as i32 + 1)))).sqrt();
+        ewma.push(r(z));
+        if i >= b && (z - mu).abs() > width {
+            out.push(json!({ "index": i, "value": r(*x), "ewma": r(z), "limit": r(width), "direction": if z > mu { "high" } else { "low" } }));
+        }
+    }
+    Ok(json!({ "centre": r(mu), "sd": r(s), "ewma": ewma, "out_of_control": out }))
+}
+
+/// Level shifts by a two-sided CUSUM on the series standardized against its first `baseline` points: `k` the slack (0.5 sd), `h` the decision limit (5 sd).
+/// Gives where each shift was detected, where it began and its direction, and the new level; after a shift the new level is the reference, so a lasting shift is reported once.
+pub fn anomaly_cusum(series: Vec<f64>, k: f64, h: f64, baseline: i64) -> Result<serde_json::Value, String> {
+    let b = baseline.max(5) as usize;
+    check(&series, b + 1)?;
+    let (mut mu, s) = (mean(&series[..b]), sd(&series[..b]).max(1e-12));
+    let base = mu;
+    let (mut hi, mut lo) = (0.0f64, 0.0f64);
+    let mut out = vec![];
+    let mut start_hi = 0;
+    let mut start_lo = 0;
+    for (i, x) in series.iter().enumerate() {
+        let z = (x - mu) / s;
+        if hi == 0.0 {
+            start_hi = i;
+        }
+        if lo == 0.0 {
+            start_lo = i;
+        }
+        hi = (hi + z - k).max(0.0);
+        lo = (lo - z - k).max(0.0);
+        if hi > h || lo > h {
+            let (began, dir) = if hi > h { (start_hi, "up") } else { (start_lo, "down") };
+            // The new level from the points after the shift began (up to a baseline's worth: this reads the series whole).
+            mu = mean(&series[began..(began + b).min(series.len()).max(i + 1)]);
+            out.push(json!({ "index": i, "began": began, "direction": dir, "new_level": r(mu) }));
+            hi = 0.0;
+            lo = 0.0;
+        }
+    }
+    Ok(json!({ "baseline_mean": r(base), "baseline_sd": r(s), "shifts": out }))
+}

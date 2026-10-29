@@ -1,0 +1,374 @@
+//! ISO 20022 banking files: camt.053 statements (and camt.052 and camt.054 reports) read into balances and entries with their counterparties and references, and pain.001 SEPA credit transfer files built and checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! roxmltree = "0.20"
+
+use roxmltree::{Document, Node};
+use serde_json::{json, Value};
+
+const MAX: usize = 64 * 1024 * 1024;
+
+fn kid<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
+    n.children().find(|c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn kids<'a, 'i>(n: Node<'a, 'i>, name: &'a str) -> impl Iterator<Item = Node<'a, 'i>> + 'a {
+    n.children().filter(move |c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn at<'a, 'i>(n: Node<'a, 'i>, path: &str) -> Option<Node<'a, 'i>> {
+    path.split('/').try_fold(n, |n, p| kid(n, p))
+}
+
+fn text(n: Node, path: &str) -> Option<String> {
+    at(n, path).and_then(|x| x.text()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+fn first(n: Node, paths: &[&str]) -> Value {
+    paths.iter().find_map(|p| text(n, p)).map(Value::String).unwrap_or(Value::Null)
+}
+
+/// "1234.5" in cents: 123450. Up to two decimals; more is an error.
+fn cents(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let (w, f) = s.split_once('.').unwrap_or((s, ""));
+    if w.is_empty() || !w.bytes().all(|b| b.is_ascii_digit()) || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let c = w.parse::<i64>().ok()? * 100 + format!("{:0<2}", f).parse::<i64>().ok()?;
+    Some(if neg { -c } else { c })
+}
+
+fn money(c: i64) -> String {
+    format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
+}
+
+/// An amount with its sign from CdtDbtInd: `(text, signed cents, currency)`.
+fn amount(n: Node) -> (Value, Value, Value) {
+    let amt = kid(n, "Amt");
+    let t = amt.and_then(|a| a.text()).map(|t| t.trim().to_string());
+    let ccy = amt.and_then(|a| a.attribute("Ccy")).map(|c| Value::String(c.into())).unwrap_or(Value::Null);
+    let debit = text(n, "CdtDbtInd").as_deref() == Some("DBIT");
+    match t.as_deref().and_then(cents) {
+        Some(c) => (Value::String(t.unwrap()), Value::from(if debit { -c } else { c }), ccy),
+        None => (t.map(Value::String).unwrap_or(Value::Null), Value::Null, ccy),
+    }
+}
+
+fn date_of(n: Node, path: &str) -> Value {
+    first(n, &[&format!("{}/Dt", path), &format!("{}/DtTm", path)])
+}
+
+fn party_name(p: Node, who: &str) -> Value {
+    first(p, &[&format!("{}/Nm", who), &format!("{}/Pty/Nm", who)])
+}
+
+fn party_account(p: Node, who: &str) -> Value {
+    first(p, &[&format!("{}Acct/Id/IBAN", who), &format!("{}Acct/Id/Othr/Id", who)])
+}
+
+fn details(tx: Node, credit: bool) -> Value {
+    let p = kid(tx, "RltdPties");
+    // The other side: who paid a credit, who was paid for a debit.
+    let (who, name, account) = match p {
+        Some(p) if credit => ("debtor", party_name(p, "Dbtr"), party_account(p, "Dbtr")),
+        Some(p) => ("creditor", party_name(p, "Cdtr"), party_account(p, "Cdtr")),
+        None => ("", Value::Null, Value::Null),
+    };
+    let ustrd: Vec<String> = kid(tx, "RmtInf").map(|r| kids(r, "Ustrd").filter_map(|u| u.text()).map(|t| t.trim().to_string()).collect()).unwrap_or_default();
+    let (amt, c, ccy) = match at(tx, "AmtDtls/TxAmt") {
+        Some(a) => amount(a),
+        None => amount(tx),
+    };
+    json!({
+        "end_to_end_id": first(tx, &["Refs/EndToEndId"]).as_str().filter(|s| *s != "NOTPROVIDED").map(|s| Value::String(s.into())).unwrap_or(Value::Null),
+        "instruction_id": first(tx, &["Refs/InstrId"]),
+        "mandate_id": first(tx, &["Refs/MndtId"]),
+        "amount": amt, "cents": c, "currency": ccy,
+        "counterparty": { "side": who, "name": name, "iban": account, "bic": first(tx, &[if credit { "RltdAgts/DbtrAgt/FinInstnId/BIC" } else { "RltdAgts/CdtrAgt/FinInstnId/BIC" }, if credit { "RltdAgts/DbtrAgt/FinInstnId/BICFI" } else { "RltdAgts/CdtrAgt/FinInstnId/BICFI" }]) },
+        "remittance": if ustrd.is_empty() { Value::Null } else { Value::String(ustrd.join(" ")) },
+        "reference": first(tx, &["RmtInf/Strd/CdtrRefInf/Ref"]),
+        "purpose": first(tx, &["Purp/Cd"]),
+    })
+}
+
+fn entry(e: Node) -> Value {
+    let (amt, c, ccy) = amount(e);
+    let credit = text(e, "CdtDbtInd").as_deref() != Some("DBIT");
+    let txs: Vec<Value> = kids(e, "NtryDtls").flat_map(|d| kids(d, "TxDtls").map(|t| details(t, credit)).collect::<Vec<_>>()).collect();
+    let code = match (text(e, "BkTxCd/Domn/Cd"), text(e, "BkTxCd/Domn/Fmly/Cd"), text(e, "BkTxCd/Domn/Fmly/SubFmlyCd")) {
+        (Some(a), Some(b), Some(c)) => Value::String(format!("{}/{}/{}", a, b, c)),
+        _ => first(e, &["BkTxCd/Prtry/Cd"]),
+    };
+    json!({
+        "ref": first(e, &["NtryRef"]),
+        "amount": amt, "cents": c, "currency": ccy, "credit": credit,
+        "status": first(e, &["Sts/Cd", "Sts"]),
+        "booked": date_of(e, "BookgDt"),
+        "value_date": date_of(e, "ValDt"),
+        "bank_ref": first(e, &["AcctSvcrRef"]),
+        "code": code,
+        "reversal": text(e, "RvslInd").as_deref() == Some("true"),
+        "info": first(e, &["AddtlNtryInf"]),
+        "transactions": txs,
+    })
+}
+
+fn statement(s: Node) -> Value {
+    let balances: Vec<Value> = kids(s, "Bal").map(|b| {
+        let (amt, c, ccy) = amount(b);
+        json!({ "type": first(b, &["Tp/CdOrPrtry/Cd", "Tp/CdOrPrtry/Prtry"]), "amount": amt, "cents": c, "currency": ccy, "date": date_of(b, "Dt") })
+    }).collect();
+    let bal = |t: &str| balances.iter().find(|b| b["type"] == t).cloned().unwrap_or(Value::Null);
+    let (opening, closing) = (bal("OPBD").as_object().map(|_| bal("OPBD")).unwrap_or_else(|| bal("PRCD")), bal("CLBD"));
+    let entries: Vec<Value> = kids(s, "Ntry").map(entry).collect();
+    let total: i64 = entries.iter().filter_map(|e| e["cents"].as_i64()).sum();
+    let adds_up = match (opening["cents"].as_i64(), closing["cents"].as_i64()) {
+        (Some(o), Some(c)) => Value::Bool(o + total == c),
+        _ => Value::Null,
+    };
+    json!({
+        "id": first(s, &["Id"]),
+        "sequence": first(s, &["ElctrncSeqNb", "LglSeqNb"]),
+        "created": first(s, &["CreDtTm"]),
+        "from": first(s, &["FrToDt/FrDtTm"]),
+        "to": first(s, &["FrToDt/ToDtTm"]),
+        "iban": first(s, &["Acct/Id/IBAN"]),
+        "account": first(s, &["Acct/Id/IBAN", "Acct/Id/Othr/Id"]),
+        "currency": first(s, &["Acct/Ccy"]),
+        "owner": first(s, &["Acct/Ownr/Nm"]),
+        "bic": first(s, &["Acct/Svcr/FinInstnId/BIC", "Acct/Svcr/FinInstnId/BICFI"]),
+        "balances": balances,
+        "opening": opening,
+        "closing": closing,
+        "adds_up": adds_up,
+        "entries": entries,
+    })
+}
+
+fn camt(text: &str) -> Result<Vec<Value>, String> {
+    if text.len() > MAX {
+        return Err("the file is over 64 MB".into());
+    }
+    let doc = Document::parse(text).map_err(|e| format!("not XML: {}", e))?;
+    let root = doc.root_element();
+    let body = root.children().find(|c| c.is_element()).ok_or("an empty Document")?;
+    let kind = match body.tag_name().name() {
+        "BkToCstmrStmt" => "Stmt",
+        "BkToCstmrAcctRpt" => "Rpt",
+        "BkToCstmrDbtCdtNtfctn" => "Ntfctn",
+        other => return Err(format!("not a camt.052, 053 or 054 file: its message is {}", other)),
+    };
+    Ok(kids(body, kind).map(statement).collect())
+}
+
+/// The statements of a camt.053 file (camt.052 reports and camt.054 notifications too): `[{ id, sequence, created,
+/// iban, account, currency, owner, bic, balances, opening, closing, adds_up, entries }]`. Balances are `{ type, amount,
+/// cents, currency, date }` (`type` OPBD, CLBD, CLAV...), cents signed; `adds_up` says whether opening plus the entries
+/// is the closing balance. Each entry `{ ref, amount, cents, currency, credit, status, booked, value_date, bank_ref,
+/// code, reversal, info, transactions }` and each transaction `{ end_to_end_id, amount, cents, counterparty: { side,
+/// name, iban, bic }, remittance, reference, purpose }`: the counterparty is the payer of a credit, the payee of a debit.
+pub fn camt_parse(text: &str) -> Result<Vec<Value>, String> {
+    camt(text)
+}
+
+/// `camt_parse` of a file (.xml).
+pub fn camt_read_file(path: &str) -> Result<Vec<Value>, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    camt(&t)
+}
+
+/// Every transaction of every statement in a camt file, one row each, ready to match against invoices: `{ account,
+/// booked, value_date, cents, amount, currency, name, iban, remittance, reference, end_to_end_id, bank_ref }`. An entry
+/// without details (a fee, a batch the bank does not split) is one row with what the entry says.
+pub fn camt_transactions(path: &str) -> Result<Vec<Value>, String> {
+    let mut rows = vec![];
+    for s in camt_read_file(path)? {
+        for e in s["entries"].as_array().into_iter().flatten() {
+            let row = |t: &Value| json!({
+                "account": s["account"], "booked": e["booked"], "value_date": e["value_date"],
+                "cents": if t.is_null() || t["cents"].is_null() { e["cents"].clone() } else if e["credit"] == false { json!(-t["cents"].as_i64().unwrap_or(0).abs()) } else { t["cents"].clone() },
+                "amount": if t.is_null() { e["amount"].clone() } else { t["amount"].clone() },
+                "currency": e["currency"],
+                "name": t["counterparty"]["name"], "iban": t["counterparty"]["iban"],
+                "remittance": if t.is_null() { e["info"].clone() } else { t["remittance"].clone() },
+                "reference": t["reference"], "end_to_end_id": t["end_to_end_id"], "bank_ref": e["bank_ref"],
+            });
+            let txs = e["transactions"].as_array().cloned().unwrap_or_default();
+            if txs.is_empty() {
+                rows.push(row(&Value::Null));
+            } else {
+                rows.extend(txs.iter().map(row));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+fn iban_ok(iban: &str) -> bool {
+    let s: String = iban.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+    if s.len() < 15 || s.len() > 34 || !s.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let r = format!("{}{}", &s[4..], &s[..4]);
+    let mut m: u32 = 0;
+    for c in r.chars() {
+        let v = c.to_digit(36).unwrap();
+        m = if v >= 10 { (m * 100 + v) % 97 } else { (m * 10 + v) % 97 };
+    }
+    m == 1
+}
+
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let z = secs.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let s = secs.rem_euclid(86400);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, s / 3600, s / 60 % 60, s % 60)
+}
+
+fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+    v[k].as_str().map(str::trim).filter(|x| !x.is_empty())
+}
+
+fn amount_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(t) => Some(t.trim().to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// A SEPA credit transfer file (pain.001) for the bank: `batch` is `{ message_id, debtor: { name, iban, bic },
+/// execution_date: "2026-11-02", payments: [{ amount, name, iban, bic, remittance, end_to_end_id, reference }] }`, and
+/// may add `version` ("03", the default most banks take, or "09"), `created` (else now, UTC), `initiator` (else the
+/// debtor's name), `batch_booking` (true: one line on the statement). Amounts are text or numbers in euros, two decimals
+/// at most; `bic` may be left out (SEPA does not need it); `reference` is a structured creditor reference (RF...) used in
+/// place of `remittance`. IBANs are checked; NbOfTxs and CtrlSum are worked out exactly.
+pub fn pain001_build(batch: serde_json::Value) -> Result<String, String> {
+    let v09 = match s(&batch, "version").unwrap_or("03") {
+        "03" | "pain.001.001.03" => false,
+        "09" | "pain.001.001.09" => true,
+        other => return Err(format!("version `{}`: \"03\" or \"09\"", other)),
+    };
+    let msg = s(&batch, "message_id").ok_or("the batch needs a `message_id` (unique, 35 characters at most)")?;
+    if msg.len() > 35 {
+        return Err("`message_id` is 35 characters at most".into());
+    }
+    let debtor = &batch["debtor"];
+    let dname = s(debtor, "name").ok_or("the batch needs `debtor.name`")?;
+    let diban: String = s(debtor, "iban").ok_or("the batch needs `debtor.iban`")?.replace(' ', "").to_uppercase();
+    if !iban_ok(&diban) {
+        return Err(format!("the debtor's IBAN {} is not valid", diban));
+    }
+    let date = s(&batch, "execution_date").ok_or("the batch needs an `execution_date`, \"2026-11-02\"")?;
+    if date.len() != 10 || date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
+        return Err(format!("execution_date `{}` is not YYYY-MM-DD", date));
+    }
+    let pays = batch["payments"].as_array().filter(|p| !p.is_empty()).ok_or("the batch needs `payments`, a list of at least one")?;
+    let bic_tag = if v09 { "BICFI" } else { "BIC" };
+    let mut txs = String::new();
+    let mut sum = 0i64;
+    for (i, p) in pays.iter().enumerate() {
+        let n = i + 1;
+        let amt = amount_text(&p["amount"]).ok_or(format!("payment {}: no `amount`", n))?;
+        let c = cents(&amt).filter(|c| *c > 0).ok_or(format!("payment {}: `{}` is not an amount over 0 with two decimals at most", n, amt))?;
+        if c > 99_999_999_999 {
+            return Err(format!("payment {}: over 999,999,999.99", n));
+        }
+        sum += c;
+        let name = s(p, "name").ok_or(format!("payment {}: no `name`", n))?;
+        let iban: String = s(p, "iban").ok_or(format!("payment {}: no `iban`", n))?.replace(' ', "").to_uppercase();
+        if !iban_ok(&iban) {
+            return Err(format!("payment {}: the IBAN {} is not valid", n, iban));
+        }
+        let e2e = s(p, "end_to_end_id").unwrap_or("NOTPROVIDED");
+        let agent = match s(p, "bic") {
+            Some(b) => format!("<CdtrAgt><FinInstnId><{t}>{}</{t}></FinInstnId></CdtrAgt>", esc(b), t = bic_tag),
+            None => String::new(),
+        };
+        let rmt = match (s(p, "reference"), s(p, "remittance")) {
+            (Some(r), _) => format!("<RmtInf><Strd><CdtrRefInf><Tp><CdOrPrtry><Cd>SCOR</Cd></CdOrPrtry></Tp><Ref>{}</Ref></CdtrRefInf></Strd></RmtInf>", esc(r)),
+            (None, Some(u)) => format!("<RmtInf><Ustrd>{}</Ustrd></RmtInf>", esc(&u.chars().take(140).collect::<String>())),
+            _ => String::new(),
+        };
+        txs.push_str(&format!(
+            "\n      <CdtTrfTxInf><PmtId><InstrId>{msg}-{n}</InstrId><EndToEndId>{e2e}</EndToEndId></PmtId><Amt><InstdAmt Ccy=\"EUR\">{amt}</InstdAmt></Amt>{agent}<Cdtr><Nm>{name}</Nm></Cdtr><CdtrAcct><Id><IBAN>{iban}</IBAN></Id></CdtrAcct>{rmt}</CdtTrfTxInf>",
+            msg = esc(msg), n = n, e2e = esc(e2e), amt = money(c), agent = agent, name = esc(&name.chars().take(70).collect::<String>()), iban = iban, rmt = rmt
+        ));
+    }
+    let created = s(&batch, "created").map(|x| x.to_string()).unwrap_or_else(now_iso);
+    let initiator = s(&batch, "initiator").unwrap_or(dname);
+    let dagent = match s(debtor, "bic") {
+        Some(b) => format!("<{t}>{}</{t}>", esc(b), t = bic_tag),
+        None => "<Othr><Id>NOTPROVIDED</Id></Othr>".into(),
+    };
+    let ns = if v09 { "urn:iso:std:iso:20022:tech:xsd:pain.001.001.09" } else { "urn:iso:std:iso:20022:tech:xsd:pain.001.001.03" };
+    let exec = if v09 { format!("<ReqdExctnDt><Dt>{}</Dt></ReqdExctnDt>", date) } else { format!("<ReqdExctnDt>{}</ReqdExctnDt>", date) };
+    let (count, total) = (pays.len(), money(sum));
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Document xmlns=\"{ns}\">\n  <CstmrCdtTrfInitn>\n    <GrpHdr><MsgId>{msg}</MsgId><CreDtTm>{created}</CreDtTm><NbOfTxs>{count}</NbOfTxs><CtrlSum>{total}</CtrlSum><InitgPty><Nm>{init}</Nm></InitgPty></GrpHdr>\n    <PmtInf><PmtInfId>{msg}-1</PmtInfId><PmtMtd>TRF</PmtMtd><BtchBookg>{bb}</BtchBookg><NbOfTxs>{count}</NbOfTxs><CtrlSum>{total}</CtrlSum><PmtTpInf><SvcLvl><Cd>SEPA</Cd></SvcLvl></PmtTpInf>{exec}<Dbtr><Nm>{dname}</Nm></Dbtr><DbtrAcct><Id><IBAN>{diban}</IBAN></Id></DbtrAcct><DbtrAgt><FinInstnId>{dagent}</FinInstnId></DbtrAgt><ChrgBr>SLEV</ChrgBr>{txs}\n    </PmtInf>\n  </CstmrCdtTrfInitn>\n</Document>\n",
+        ns = ns, msg = esc(msg), created = esc(&created), count = count, total = total, init = esc(initiator),
+        bb = batch["batch_booking"].as_bool().unwrap_or(true), exec = exec, dname = esc(dname), diban = diban, dagent = dagent, txs = txs
+    ))
+}
+
+/// A pain.001 file read back, to check one before it goes to the bank: `{ version, message_id, created, count,
+/// control_sum, adds_up, debtor_iban, execution_date, payments: [{ amount, cents, name, iban, bic, end_to_end_id,
+/// remittance, reference }] }`; `adds_up` says whether NbOfTxs and CtrlSum match the payments.
+pub fn pain001_parse(xml: &str) -> Result<Value, String> {
+    if xml.len() > MAX {
+        return Err("the file is over 64 MB".into());
+    }
+    let doc = Document::parse(xml).map_err(|e| format!("not XML: {}", e))?;
+    let root = doc.root_element();
+    let init = kid(root, "CstmrCdtTrfInitn").ok_or("not a pain.001 file: no CstmrCdtTrfInitn")?;
+    let mut pays = vec![];
+    let mut sum = 0i64;
+    let mut first_info: Option<Node> = None;
+    for pi in kids(init, "PmtInf") {
+        first_info.get_or_insert(pi);
+        for t in kids(pi, "CdtTrfTxInf") {
+            let amt = text(t, "Amt/InstdAmt");
+            let c = amt.as_deref().and_then(cents);
+            sum += c.unwrap_or(0);
+            pays.push(json!({
+                "amount": amt, "cents": c, "name": first(t, &["Cdtr/Nm"]), "iban": first(t, &["CdtrAcct/Id/IBAN"]),
+                "bic": first(t, &["CdtrAgt/FinInstnId/BIC", "CdtrAgt/FinInstnId/BICFI"]), "end_to_end_id": first(t, &["PmtId/EndToEndId"]),
+                "remittance": first(t, &["RmtInf/Ustrd"]), "reference": first(t, &["RmtInf/Strd/CdtrRefInf/Ref"]),
+            }));
+        }
+    }
+    let count = text(init, "GrpHdr/NbOfTxs").and_then(|n| n.parse::<usize>().ok());
+    let ctrl = text(init, "GrpHdr/CtrlSum");
+    let adds_up = count == Some(pays.len()) && ctrl.as_deref().and_then(cents).map_or(true, |c| c == sum);
+    let ns = root.tag_name().namespace().unwrap_or("");
+    Ok(json!({
+        "version": ns.rsplit(':').next().unwrap_or(""),
+        "message_id": first(init, &["GrpHdr/MsgId"]),
+        "created": first(init, &["GrpHdr/CreDtTm"]),
+        "count": count,
+        "control_sum": ctrl,
+        "total": money(sum),
+        "adds_up": adds_up,
+        "debtor_iban": first_info.map(|p| first(p, &["DbtrAcct/Id/IBAN"])).unwrap_or(Value::Null),
+        "execution_date": first_info.map(|p| first(p, &["ReqdExctnDt/Dt", "ReqdExctnDt"])).unwrap_or(Value::Null),
+        "payments": pays,
+    }))
+}

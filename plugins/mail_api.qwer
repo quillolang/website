@@ -1,0 +1,204 @@
+//! Email sent through Resend, Postmark, SendGrid or Mailgun's HTTP APIs with one call and one message shape (from, to, cc, bcc, reply-to, subject, text, HTML, tags, headers, attachments), the provider picked by a word; and the request shown before it is sent.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde_json::{json, Map, Value};
+
+struct Request {
+    method: &'static str,
+    url: String,
+    headers: Vec<(String, String)>,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn conf(config: &Value, key: &str, env_key: &str) -> Option<String> {
+    config[key].as_str().map(str::to_string).filter(|s| !s.is_empty()).or_else(|| env(env_key))
+}
+
+fn list(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => vec![],
+    }
+}
+
+/// `Name <a@b.c>` split into the address and the name.
+fn mailbox(s: &str) -> (String, Option<String>) {
+    match (s.rfind('<'), s.rfind('>')) {
+        (Some(i), Some(j)) if j > i => (s[i + 1..j].trim().to_string(), Some(s[..i].trim().trim_matches('"').to_string()).filter(|n| !n.is_empty())),
+        _ => (s.trim().to_string(), None),
+    }
+}
+
+struct Attachment {
+    filename: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+fn attachments(m: &Value) -> Result<Vec<Attachment>, String> {
+    let mut out = vec![];
+    for a in m["attachments"].as_array().into_iter().flatten() {
+        let bytes = if let Some(p) = a["path"].as_str() {
+            std::fs::read(p).map_err(|e| format!("attachment {}: {}", p, e))?
+        } else if let Some(c) = a["content"].as_str() {
+            STANDARD.decode(c).map_err(|_| "an attachment's content is base64".to_string())?
+        } else {
+            return Err("an attachment has a path, or content in base64".into());
+        };
+        let filename = a["filename"].as_str().map(str::to_string).or_else(|| a["path"].as_str().and_then(|p| p.rsplit('/').next()).map(str::to_string)).unwrap_or_else(|| "attachment".into());
+        let content_type = a["content_type"].as_str().unwrap_or("application/octet-stream").to_string();
+        out.push(Attachment { filename, content_type, bytes });
+    }
+    Ok(out)
+}
+
+fn form(pairs: &[(String, String)]) -> Vec<u8> {
+    let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect::<String>();
+    pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&").into_bytes()
+}
+
+fn multipart(pairs: &[(String, String)], files: &[Attachment]) -> (String, Vec<u8>) {
+    let boundary = format!("quillo-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    let mut b = Vec::new();
+    for (k, v) in pairs {
+        b.extend(format!("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n", boundary, k, v).as_bytes());
+    }
+    for f in files {
+        b.extend(format!("--{}\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", boundary, f.filename.replace('"', ""), f.content_type).as_bytes());
+        b.extend(&f.bytes);
+        b.extend(b"\r\n");
+    }
+    b.extend(format!("--{}--\r\n", boundary).as_bytes());
+    (format!("multipart/form-data; boundary={}", boundary), b)
+}
+
+fn build(provider: &str, config: &Value, m: &Value) -> Result<Request, String> {
+    let from = m["from"].as_str().map(str::to_string).or_else(|| env("MAIL_FROM")).ok_or("the message needs a from (or MAIL_FROM)")?;
+    let to = list(&m["to"]);
+    if to.is_empty() {
+        return Err("the message needs a to".into());
+    }
+    let (cc, bcc) = (list(&m["cc"]), list(&m["bcc"]));
+    let subject = m["subject"].as_str().ok_or("the message needs a subject")?;
+    let (text, html) = (m["text"].as_str(), m["html"].as_str());
+    if text.is_none() && html.is_none() {
+        return Err("the message needs text or html".into());
+    }
+    let reply_to = m["reply_to"].as_str();
+    let headers: Map<String, Value> = m["headers"].as_object().cloned().unwrap_or_default();
+    let tags: Vec<String> = list(&m["tags"]);
+    let files = attachments(m)?;
+    let key = |k: &str, e: &str| conf(config, "api_key", e).ok_or_else(|| format!("{} needs an api_key (or {})", k, e));
+    let base = |default: &str| conf(config, "base_url", "MAIL_API_URL").unwrap_or_else(|| default.to_string()).trim_end_matches('/').to_string();
+    let json_req = |url: String, headers: Vec<(String, String)>, body: Value| Request { method: "POST", url, headers, content_type: "application/json".into(), body: serde_json::to_vec(&body).unwrap_or_default() };
+    Ok(match provider.to_lowercase().as_str() {
+        "resend" => {
+            let mut b = json!({ "from": from, "to": to, "subject": subject });
+            if !cc.is_empty() { b["cc"] = json!(cc); }
+            if !bcc.is_empty() { b["bcc"] = json!(bcc); }
+            if let Some(r) = reply_to { b["reply_to"] = json!(r); }
+            if let Some(t) = text { b["text"] = json!(t); }
+            if let Some(h) = html { b["html"] = json!(h); }
+            if !headers.is_empty() { b["headers"] = Value::Object(headers); }
+            if !tags.is_empty() { b["tags"] = json!(tags.iter().map(|t| json!({ "name": "category", "value": t })).collect::<Vec<_>>()); }
+            if !files.is_empty() { b["attachments"] = json!(files.iter().map(|f| json!({ "filename": f.filename, "content": STANDARD.encode(&f.bytes), "content_type": f.content_type })).collect::<Vec<_>>()); }
+            json_req(format!("{}/emails", base("https://api.resend.com")), vec![("Authorization".into(), format!("Bearer {}", key("Resend", "RESEND_API_KEY")?))], b)
+        }
+        "postmark" => {
+            let mut b = json!({ "From": from, "To": to.join(", "), "Subject": subject, "MessageStream": config["stream"].as_str().unwrap_or("outbound") });
+            if !cc.is_empty() { b["Cc"] = json!(cc.join(", ")); }
+            if !bcc.is_empty() { b["Bcc"] = json!(bcc.join(", ")); }
+            if let Some(r) = reply_to { b["ReplyTo"] = json!(r); }
+            if let Some(t) = text { b["TextBody"] = json!(t); }
+            if let Some(h) = html { b["HtmlBody"] = json!(h); }
+            if let Some(t) = tags.first() { b["Tag"] = json!(t); }
+            if !headers.is_empty() { b["Headers"] = json!(headers.iter().map(|(k, v)| json!({ "Name": k, "Value": v })).collect::<Vec<_>>()); }
+            if !files.is_empty() { b["Attachments"] = json!(files.iter().map(|f| json!({ "Name": f.filename, "Content": STANDARD.encode(&f.bytes), "ContentType": f.content_type })).collect::<Vec<_>>()); }
+            json_req(format!("{}/email", base("https://api.postmarkapp.com")), vec![("X-Postmark-Server-Token".into(), key("Postmark", "POSTMARK_SERVER_TOKEN")?), ("Accept".into(), "application/json".into())], b)
+        }
+        "sendgrid" => {
+            let addr = |s: &str| { let (e, n) = mailbox(s); match n { Some(n) => json!({ "email": e, "name": n }), None => json!({ "email": e }) } };
+            let mut p = json!({ "to": to.iter().map(|t| addr(t)).collect::<Vec<_>>() });
+            if !cc.is_empty() { p["cc"] = json!(cc.iter().map(|t| addr(t)).collect::<Vec<_>>()); }
+            if !bcc.is_empty() { p["bcc"] = json!(bcc.iter().map(|t| addr(t)).collect::<Vec<_>>()); }
+            let mut content = vec![];
+            if let Some(t) = text { content.push(json!({ "type": "text/plain", "value": t })); }
+            if let Some(h) = html { content.push(json!({ "type": "text/html", "value": h })); }
+            let mut b = json!({ "personalizations": [p], "from": addr(&from), "subject": subject, "content": content });
+            if let Some(r) = reply_to { b["reply_to"] = addr(r); }
+            if !tags.is_empty() { b["categories"] = json!(tags); }
+            if !headers.is_empty() { b["headers"] = Value::Object(headers); }
+            if !files.is_empty() { b["attachments"] = json!(files.iter().map(|f| json!({ "filename": f.filename, "content": STANDARD.encode(&f.bytes), "type": f.content_type, "disposition": "attachment" })).collect::<Vec<_>>()); }
+            json_req(format!("{}/v3/mail/send", base("https://api.sendgrid.com")), vec![("Authorization".into(), format!("Bearer {}", key("SendGrid", "SENDGRID_API_KEY")?))], b)
+        }
+        "mailgun" => {
+            let domain = conf(config, "domain", "MAILGUN_DOMAIN").ok_or("Mailgun needs a domain (or MAILGUN_DOMAIN)")?;
+            let default = if config["region"].as_str() == Some("eu") { "https://api.eu.mailgun.net" } else { "https://api.mailgun.net" };
+            let mut pairs: Vec<(String, String)> = vec![("from".into(), from.clone()), ("subject".into(), subject.into())];
+            pairs.extend(to.iter().map(|t| ("to".to_string(), t.clone())));
+            pairs.extend(cc.iter().map(|t| ("cc".to_string(), t.clone())));
+            pairs.extend(bcc.iter().map(|t| ("bcc".to_string(), t.clone())));
+            if let Some(t) = text { pairs.push(("text".into(), t.into())); }
+            if let Some(h) = html { pairs.push(("html".into(), h.into())); }
+            if let Some(r) = reply_to { pairs.push(("h:Reply-To".into(), r.into())); }
+            pairs.extend(tags.iter().map(|t| ("o:tag".to_string(), t.clone())));
+            pairs.extend(headers.iter().map(|(k, v)| (format!("h:{}", k), v.as_str().unwrap_or("").to_string())));
+            let auth = format!("Basic {}", STANDARD.encode(format!("api:{}", key("Mailgun", "MAILGUN_API_KEY")?)));
+            let url = format!("{}/v3/{}/messages", base(default), domain);
+            if files.is_empty() {
+                Request { method: "POST", url, headers: vec![("Authorization".into(), auth)], content_type: "application/x-www-form-urlencoded".into(), body: form(&pairs) }
+            } else {
+                let (ct, body) = multipart(&pairs, &files);
+                Request { method: "POST", url, headers: vec![("Authorization".into(), auth)], content_type: ct, body }
+            }
+        }
+        other => return Err(format!("unknown provider `{}`: resend, postmark, sendgrid or mailgun", other)),
+    })
+}
+
+/// Sends `message` through `provider` ("resend", "postmark", "sendgrid" or "mailgun"). `message` holds `from` (or MAIL_FROM), `to`
+/// (one address, a comma-separated list or a list), `subject`, `text` and/or `html`, and maybe `cc`, `bcc`, `reply_to`, `tags`,
+/// `headers` and `attachments` (`[{ path }]` or `[{ filename, content (base64), content_type }]`). `config` may hold `api_key`
+/// (else RESEND_API_KEY, POSTMARK_SERVER_TOKEN, SENDGRID_API_KEY or MAILGUN_API_KEY), `base_url` (else MAIL_API_URL, else the
+/// provider's), and Mailgun's `domain` (MAILGUN_DOMAIN) and `region` ("eu"). Gives `{ ok, status, id, error }`.
+pub fn mailapi_send(provider: &str, config: serde_json::Value, message: serde_json::Value) -> Result<Value, String> {
+    let r = build(provider, &config, &message)?;
+    let mut req = ureq::request(r.method, &r.url).timeout(std::time::Duration::from_secs(20)).set("Content-Type", &r.content_type).set("User-Agent", "quillo-mail-api/1.0");
+    for (k, v) in &r.headers {
+        req = req.set(k, v);
+    }
+    let (status, body) = match req.send_bytes(&r.body) {
+        Ok(res) => (res.status(), res.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, res)) => (code, res.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("{}: {}", provider, e)),
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let id = v["id"].as_str().or(v["MessageID"].as_str()).map(str::to_string);
+    let error = if (200..300).contains(&status) { None } else { v["message"].as_str().or(v["Message"].as_str()).or(v["errors"][0]["message"].as_str()).map(str::to_string).or(Some(body.chars().take(300).collect())) };
+    Ok(json!({ "ok": (200..300).contains(&status), "status": status, "id": id, "error": error, "provider": provider.to_lowercase() }))
+}
+
+/// The HTTP request `mailapi_send` would make, without sending it: `{ method, url, headers, content_type, body }`, the key in the
+/// headers masked. For tests, logs, and seeing how each provider wants the message.
+pub fn mailapi_request(provider: &str, config: serde_json::Value, message: serde_json::Value) -> Result<Value, String> {
+    let r = build(provider, &config, &message)?;
+    let headers: Map<String, Value> = r.headers.iter().map(|(k, v)| {
+        let masked = if k.eq_ignore_ascii_case("authorization") || k.to_lowercase().contains("token") { format!("{}…", v.chars().take(10).collect::<String>()) } else { v.clone() };
+        (k.clone(), json!(masked))
+    }).collect();
+    let body = if r.content_type == "application/json" { serde_json::from_slice(&r.body).unwrap_or(Value::Null) } else { json!(String::from_utf8_lossy(&r.body)) };
+    Ok(json!({ "method": r.method, "url": r.url, "headers": headers, "content_type": r.content_type, "body": body }))
+}

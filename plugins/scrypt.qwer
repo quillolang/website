@@ -1,0 +1,104 @@
+//! Scrypt password hashes: PHC strings made, checked and marked for a rehash, the raw key derivation Node's crypto.scrypt makes, and Firebase Authentication's modified scrypt, to sign in users exported from Firebase.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! scrypt = "0.11"
+//! rand_core = { version = "0.6", features = ["getrandom"] }
+//! base64 = "0.22"
+//! aes = "0.8"
+//! ctr = "0.9"
+
+use aes::cipher::{KeyIvInit, StreamCipher};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use rand_core::OsRng;
+use scrypt::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use scrypt::{Params, Scrypt};
+use serde_json::{json, Value};
+
+fn params(log_n: i64, r: i64, p: i64, len: usize) -> Result<Params, String> {
+    if !(1..=24).contains(&log_n) || !(1..=64).contains(&r) || !(1..=64).contains(&p) {
+        return Err("log_n is 1 to 24 (N = 2^log_n), r and p 1 to 64".into());
+    }
+    if (128u64 << log_n) * r as u64 > 2 << 30 {
+        return Err("those parameters need more than 2 GiB of memory".into());
+    }
+    Params::new(log_n as u8, r as u32, p as u32, len).map_err(|e| e.to_string())
+}
+
+fn b64(s: &str, what: &str) -> Result<Vec<u8>, String> {
+    STANDARD.decode(s.trim()).map_err(|_| format!("{} is not base64", what))
+}
+
+/// `password` hashed with scrypt and a random salt, as a PHC string (`$scrypt$ln=17,r=8,p=1$salt$hash`).
+/// N is 2^`log_n`: 17 with r 8 and p 1 is OWASP's choice (128 MiB); 15 for 32 MiB.
+pub fn scrypt_hash(password: &str, log_n: i64, r: i64, p: i64) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Scrypt
+        .hash_password_customized(password.as_bytes(), None, None, params(log_n, r, p, 32)?, &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Whether `password` matches a `$scrypt$` PHC hash; false for a wrong password or any other kind of hash.
+pub fn scrypt_verify(password: &str, hash: &str) -> bool {
+    match PasswordHash::new(hash.trim()) {
+        Ok(h) if h.algorithm.as_str() == "scrypt" => Scrypt.verify_password(password.as_bytes(), &h).is_ok(),
+        _ => false,
+    }
+}
+
+/// A `$scrypt$` hash's cost: `{ log_n, n, r, p, memory_kib }`.
+pub fn scrypt_params(hash: &str) -> Result<Value, String> {
+    let h = PasswordHash::new(hash.trim()).map_err(|e| format!("not a PHC hash string: {}", e))?;
+    if h.algorithm.as_str() != "scrypt" {
+        return Err(format!("a {} hash, not scrypt", h.algorithm));
+    }
+    let get = |k: &str| h.params.get_decimal(k).map(|v| v as i64).unwrap_or(0);
+    let (ln, r) = (get("ln"), get("r"));
+    Ok(json!({ "log_n": ln, "n": 1i64 << ln, "r": r, "p": get("p"), "memory_kib": (128i64 << ln) * r / 1024 }))
+}
+
+/// Whether a stored hash should be made again with these parameters: true when it is not scrypt, or costs less than asked.
+pub fn scrypt_needs_rehash(hash: &str, log_n: i64, r: i64, p: i64) -> bool {
+    match scrypt_params(hash) {
+        Ok(v) => v["log_n"].as_i64().unwrap_or(0) < log_n || v["r"].as_i64().unwrap_or(0) < r || v["p"].as_i64().unwrap_or(0) < p,
+        Err(_) => true,
+    }
+}
+
+/// The raw scrypt key for `password` and `salt` (both as text), `length` bytes in hex: what Node's
+/// `crypto.scrypt(password, salt, length)` gives with log_n 14, r 8, p 1, and what RFC 7914's test vectors list.
+pub fn scrypt_derive(password: &str, salt: &str, log_n: i64, r: i64, p: i64, length: i64) -> Result<String, String> {
+    if !(10..=256).contains(&length) {
+        return Err("length is 10 to 256 bytes".into());
+    }
+    let mut out = vec![0u8; length as usize];
+    scrypt::scrypt(password.as_bytes(), salt.as_bytes(), &params(log_n, r, p, length as usize)?, &mut out).map_err(|e| e.to_string())?;
+    Ok(out.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+fn firebase(password: &str, salt: &str, separator: &str, signer_key: &str, rounds: i64, mem_cost: i64) -> Result<Vec<u8>, String> {
+    let mut s = b64(salt, "salt")?;
+    s.extend(b64(separator, "salt_separator")?);
+    let mut key = [0u8; 32];
+    scrypt::scrypt(password.as_bytes(), &s, &params(mem_cost, rounds, 1, 32)?, &mut key).map_err(|e| e.to_string())?;
+    let mut data = b64(signer_key, "signer_key")?;
+    let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new(&key.into(), &[0u8; 16].into());
+    cipher.apply_keystream(&mut data);
+    Ok(data)
+}
+
+/// Whether `password` matches a user exported from Firebase Authentication (`firebase auth:export`): `password_hash` and
+/// `salt` are the user's (base64), `salt_separator`, `signer_key`, `rounds` and `mem_cost` the project's hash parameters
+/// (Authentication, Users, "Password hash parameters").
+pub fn scrypt_firebase_verify(password: &str, password_hash: &str, salt: &str, salt_separator: &str, signer_key: &str, rounds: i64, mem_cost: i64) -> Result<bool, String> {
+    let made = firebase(password, salt, salt_separator, signer_key, rounds, mem_cost)?;
+    let want = b64(password_hash, "password_hash")?;
+    Ok(made.len() == want.len() && made.iter().zip(&want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0)
+}
+
+/// The hash Firebase Authentication would store for `password` with this salt and the project's parameters (base64), for tests of an import.
+pub fn scrypt_firebase_hash(password: &str, salt: &str, salt_separator: &str, signer_key: &str, rounds: i64, mem_cost: i64) -> Result<String, String> {
+    Ok(STANDARD.encode(firebase(password, salt, salt_separator, signer_key, rounds, mem_cost)?))
+}

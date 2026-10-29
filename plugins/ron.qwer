@@ -1,0 +1,625 @@
+//! RON (Rusty Object Notation), the config format of Rust games and tools such as Bevy: read into values with enums kept as names, and written back as structs, tuples and maps.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+/// Deeper than this, a document is refused rather than read.
+const MAX_DEPTH: usize = 128;
+
+struct P<'a> {
+    s: &'a [u8],
+    i: usize,
+    depth: usize,
+    /// Where the parser is, as field names and list indexes, and the path whose value's span is wanted.
+    path: Vec<String>,
+    want: Option<Vec<String>>,
+    found: Option<(usize, usize)>,
+}
+
+impl<'a> P<'a> {
+    fn err<T>(&self, what: &str) -> Result<T, String> {
+        let before = &self.s[..self.i.min(self.s.len())];
+        let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+        let col = before.iter().rev().take_while(|&&b| b != b'\n').count() + 1;
+        Err(format!("line {}, column {}: {}", line, col, what))
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+
+    fn ws(&mut self) -> Result<(), String> {
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => self.i += 1,
+                Some(b'/') if self.s.get(self.i + 1) == Some(&b'/') => {
+                    while self.peek().is_some_and(|b| b != b'\n') {
+                        self.i += 1;
+                    }
+                }
+                Some(b'/') if self.s.get(self.i + 1) == Some(&b'*') => {
+                    self.i += 2;
+                    let mut level = 1;
+                    while level > 0 {
+                        match (self.peek(), self.s.get(self.i + 1)) {
+                            (None, _) => return self.err("a /* comment is not closed"),
+                            (Some(b'*'), Some(b'/')) => { level -= 1; self.i += 2; }
+                            (Some(b'/'), Some(b'*')) => { level += 1; self.i += 2; }
+                            _ => self.i += 1,
+                        }
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> Result<bool, String> {
+        self.ws()?;
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn ident(&mut self) -> Option<String> {
+        let start = self.i;
+        if self.s[self.i..].starts_with(b"r#") {
+            self.i += 2;
+        }
+        let first = self.i;
+        while self.peek().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            self.i += 1;
+        }
+        if self.i == first || self.s[first].is_ascii_digit() {
+            self.i = start;
+            return None;
+        }
+        Some(String::from_utf8_lossy(&self.s[first..self.i]).into_owned())
+    }
+
+    /// `#![enable(...)]` lines at the top: allowed and passed over.
+    fn extensions(&mut self) -> Result<(), String> {
+        loop {
+            self.ws()?;
+            if !self.s[self.i..].starts_with(b"#!") {
+                return Ok(());
+            }
+            while self.peek().is_some_and(|b| b != b']') {
+                self.i += 1;
+            }
+            if !self.eat(b']')? {
+                return self.err("an extension `#![...]` is not closed");
+            }
+        }
+    }
+
+    fn value(&mut self) -> Result<Value, String> {
+        self.ws()?;
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return self.err("nested more than 128 deep");
+        }
+        let start = self.i;
+        let v = self.value_inner();
+        self.depth -= 1;
+        if v.is_ok() && self.found.is_none() && self.want.as_ref() == Some(&self.path) {
+            self.found = Some((start, self.i));
+        }
+        v
+    }
+
+    fn value_inner(&mut self) -> Result<Value, String> {
+        match self.peek() {
+            None => self.err("a value was expected, the text ended"),
+            Some(b'"') => self.string().map(Value::String),
+            Some(b'\'') => self.char_lit(),
+            Some(b'[') => {
+                self.i += 1;
+                let mut a = vec![];
+                loop {
+                    if self.eat(b']')? {
+                        return Ok(Value::Array(a));
+                    }
+                    self.path.push(a.len().to_string());
+                    let v = self.value();
+                    self.path.pop();
+                    a.push(v?);
+                    if !self.eat(b',')? {
+                        if self.eat(b']')? {
+                            return Ok(Value::Array(a));
+                        }
+                        return self.err("`,` or `]` expected in a list");
+                    }
+                }
+            }
+            Some(b'{') => {
+                self.i += 1;
+                let mut m = Map::new();
+                loop {
+                    if self.eat(b'}')? {
+                        return Ok(Value::Object(m));
+                    }
+                    let k = match self.value()? {
+                        Value::String(s) => s,
+                        Value::Null => "null".into(),
+                        other => other.to_string(),
+                    };
+                    if !self.eat(b':')? {
+                        return self.err("`:` expected after a map's key");
+                    }
+                    self.path.push(k.clone());
+                    let v = self.value();
+                    self.path.pop();
+                    m.insert(k, v?);
+                    if !self.eat(b',')? {
+                        if self.eat(b'}')? {
+                            return Ok(Value::Object(m));
+                        }
+                        return self.err("`,` or `}` expected in a map");
+                    }
+                }
+            }
+            Some(b'(') => self.parens(),
+            Some(b'b') if self.s.get(self.i + 1) == Some(&b'"') => {
+                self.i += 1;
+                self.string().map(Value::String)
+            }
+            Some(b'r') if matches!(self.s.get(self.i + 1), Some(b'"') | Some(b'#')) && self.raw_ahead() => self.raw_string().map(Value::String),
+            Some(b'b') if self.s.get(self.i + 1) == Some(&b'r') && matches!(self.s.get(self.i + 2), Some(b'"') | Some(b'#')) => {
+                self.i += 1;
+                self.raw_string().map(Value::String)
+            }
+            Some(c) if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => self.number(),
+            Some(_) => {
+                let Some(name) = self.ident() else { return self.err("a value was expected") };
+                match name.as_str() {
+                    "true" => return Ok(Value::Bool(true)),
+                    "false" => return Ok(Value::Bool(false)),
+                    "None" => return Ok(Value::Null),
+                    "inf" | "NaN" => return Ok(Value::Null),
+                    _ => {}
+                }
+                self.ws()?;
+                if self.peek() != Some(b'(') {
+                    // A unit enum variant (or a unit struct): its name.
+                    return Ok(Value::String(name));
+                }
+                // A variant's content is under its name, as in the value given back; `Some(x)` and the
+                // document's own named struct are not.
+                let root_struct = self.depth == 1 && self.named_ahead()?;
+                let under = name != "Some" && !root_struct;
+                if under {
+                    self.path.push(name.clone());
+                }
+                let inner = self.parens();
+                if under {
+                    self.path.pop();
+                }
+                let inner = inner?;
+                if name == "Some" {
+                    // `Some(x)` is x itself: JSON has no Option.
+                    return Ok(match inner {
+                        Value::Array(mut a) if a.len() == 1 => a.remove(0),
+                        other => other,
+                    });
+                }
+                // The document's own `Name(field: ...)` is a struct written with its name: the fields alone.
+                if self.depth == 1 && inner.is_object() {
+                    return Ok(inner);
+                }
+                // `Variant(...)`: serde's externally tagged form, { "Variant": content }.
+                let content = match inner {
+                    Value::Array(mut a) if a.len() == 1 => a.remove(0),
+                    other => other,
+                };
+                Ok(json!({ name: content }))
+            }
+        }
+    }
+
+    fn raw_ahead(&self) -> bool {
+        let mut j = self.i + 1;
+        while self.s.get(j) == Some(&b'#') {
+            j += 1;
+        }
+        self.s.get(j) == Some(&b'"')
+    }
+
+    /// Whether the `(` here opens named fields: an identifier and a `:` (not `::`) come first.
+    fn named_ahead(&mut self) -> Result<bool, String> {
+        let save = self.i;
+        let named = self.eat(b'(')? && {
+            self.ws()?;
+            self.ident().is_some() && self.eat(b':')? && self.peek() != Some(b':')
+        };
+        self.i = save;
+        Ok(named)
+    }
+
+    /// `( ... )`: a struct `(a: 1)` as a map, a tuple `(1, 2)` as a list, `()` as null.
+    fn parens(&mut self) -> Result<Value, String> {
+        let named = self.named_ahead()?;
+        self.i += 1;
+        if self.eat(b')')? {
+            return Ok(Value::Null);
+        }
+        if named {
+            let mut m = Map::new();
+            loop {
+                if self.eat(b')')? {
+                    return Ok(Value::Object(m));
+                }
+                self.ws()?;
+                let Some(k) = self.ident() else { return self.err("a field name was expected") };
+                if !self.eat(b':')? {
+                    return self.err("`:` expected after a field name");
+                }
+                self.path.push(k.clone());
+                let v = self.value();
+                self.path.pop();
+                m.insert(k, v?);
+                if !self.eat(b',')? {
+                    if self.eat(b')')? {
+                        return Ok(Value::Object(m));
+                    }
+                    return self.err("`,` or `)` expected in a struct");
+                }
+            }
+        }
+        let mut a = vec![];
+        loop {
+            if self.eat(b')')? {
+                return Ok(Value::Array(a));
+            }
+            self.path.push(a.len().to_string());
+            let v = self.value();
+            self.path.pop();
+            a.push(v?);
+            if !self.eat(b',')? {
+                if self.eat(b')')? {
+                    return Ok(Value::Array(a));
+                }
+                return self.err("`,` or `)` expected in a tuple");
+            }
+        }
+    }
+
+    fn escape(&mut self, out: &mut String) -> Result<(), String> {
+        let Some(c) = self.peek() else { return self.err("the text ended in an escape") };
+        self.i += 1;
+        match c {
+            b'n' => out.push('\n'),
+            b't' => out.push('\t'),
+            b'r' => out.push('\r'),
+            b'0' => out.push('\0'),
+            b'\\' => out.push('\\'),
+            b'"' => out.push('"'),
+            b'\'' => out.push('\''),
+            b'/' => out.push('/'),
+            b'b' => out.push('\u{8}'),
+            b'f' => out.push('\u{c}'),
+            b'x' => {
+                let h = std::str::from_utf8(self.s.get(self.i..self.i + 2).unwrap_or_default()).unwrap_or("");
+                let n = u8::from_str_radix(h, 16).or_else(|_| self.err("a bad \\x escape"))?;
+                self.i += 2;
+                out.push(n as char);
+            }
+            b'u' => {
+                let code = if self.peek() == Some(b'{') {
+                    let end = self.s[self.i..].iter().position(|&b| b == b'}').ok_or("a \\u{ escape is not closed")?;
+                    let h = String::from_utf8_lossy(&self.s[self.i + 1..self.i + end]).into_owned();
+                    self.i += end + 1;
+                    u32::from_str_radix(&h, 16).or_else(|_| self.err("a bad \\u escape"))?
+                } else {
+                    let h = std::str::from_utf8(self.s.get(self.i..self.i + 4).unwrap_or_default()).unwrap_or("");
+                    self.i += 4;
+                    u32::from_str_radix(h, 16).or_else(|_| self.err("a bad \\u escape"))?
+                };
+                out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+            }
+            b'\n' => {
+                while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                    self.i += 1;
+                }
+            }
+            _ => return self.err("an unknown escape"),
+        }
+        Ok(())
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut out = String::new();
+        let mut start = self.i;
+        loop {
+            match self.peek() {
+                None => return self.err("a string is not closed"),
+                Some(b'"') => {
+                    out.push_str(&String::from_utf8_lossy(&self.s[start..self.i]));
+                    self.i += 1;
+                    return Ok(out);
+                }
+                Some(b'\\') => {
+                    out.push_str(&String::from_utf8_lossy(&self.s[start..self.i]));
+                    self.i += 1;
+                    self.escape(&mut out)?;
+                    start = self.i;
+                }
+                _ => self.i += 1,
+            }
+        }
+    }
+
+    fn raw_string(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut hashes = 0;
+        while self.peek() == Some(b'#') {
+            hashes += 1;
+            self.i += 1;
+        }
+        self.i += 1;
+        let close: Vec<u8> = std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+        let rest = &self.s[self.i..];
+        let end = rest.windows(close.len()).position(|w| w == close.as_slice()).ok_or("a raw string is not closed")?;
+        let out = String::from_utf8_lossy(&rest[..end]).into_owned();
+        self.i += end + close.len();
+        Ok(out)
+    }
+
+    fn char_lit(&mut self) -> Result<Value, String> {
+        self.i += 1;
+        let mut out = String::new();
+        if self.peek() == Some(b'\\') {
+            self.i += 1;
+            self.escape(&mut out)?;
+        } else {
+            let rest = std::str::from_utf8(&self.s[self.i..]).map_err(|_| "not UTF-8".to_string())?;
+            let c = rest.chars().next().ok_or("a char is not closed")?;
+            out.push(c);
+            self.i += c.len_utf8();
+        }
+        if self.peek() != Some(b'\'') {
+            return self.err("a char is not closed");
+        }
+        self.i += 1;
+        Ok(Value::String(out))
+    }
+
+    fn number(&mut self) -> Result<Value, String> {
+        let start = self.i;
+        let neg = self.peek() == Some(b'-');
+        if matches!(self.peek(), Some(b'-' | b'+')) {
+            self.i += 1;
+        }
+        if self.s[self.i..].starts_with(b"inf") || self.s[self.i..].starts_with(b"NaN") {
+            self.i += 3;
+            return Ok(Value::Null);
+        }
+        let radix = match (self.peek(), self.s.get(self.i + 1)) {
+            (Some(b'0'), Some(b'x')) => 16,
+            (Some(b'0'), Some(b'b')) => 2,
+            (Some(b'0'), Some(b'o')) => 8,
+            _ => 10,
+        };
+        if radix != 10 {
+            self.i += 2;
+            let d0 = self.i;
+            while self.peek().is_some_and(|b| b.is_ascii_hexdigit() || b == b'_') {
+                self.i += 1;
+            }
+            let digits: String = String::from_utf8_lossy(&self.s[d0..self.i]).replace('_', "");
+            self.suffix();
+            let n = i64::from_str_radix(&digits, radix).or_else(|_| self.err("a bad number"))?;
+            return Ok(json!(if neg { -n } else { n }));
+        }
+        let mut float = false;
+        while let Some(b) = self.peek() {
+            match b {
+                b'0'..=b'9' | b'_' => {}
+                b'.' if !float => float = true,
+                b'e' | b'E' => {
+                    float = true;
+                    if matches!(self.s.get(self.i + 1), Some(b'-' | b'+')) {
+                        self.i += 1;
+                    }
+                }
+                _ => break,
+            }
+            self.i += 1;
+        }
+        let text: String = String::from_utf8_lossy(&self.s[start..self.i]).replace('_', "");
+        let float = float || self.s[self.i..].starts_with(b"f32") || self.s[self.i..].starts_with(b"f64");
+        self.suffix();
+        if !float {
+            if let Ok(n) = text.parse::<i64>() {
+                return Ok(json!(n));
+            }
+            if let Ok(n) = text.parse::<u64>() {
+                return Ok(json!(n));
+            }
+        }
+        match text.trim_end_matches('.').parse::<f64>() {
+            Ok(f) => Ok(json!(f)),
+            Err(_) => self.err("a bad number"),
+        }
+    }
+
+    /// A type suffix, `1u8` or `2.5f32`: passed over.
+    fn suffix(&mut self) {
+        for s in ["u128", "i128", "usize", "isize", "u64", "i64", "u32", "i32", "u16", "i16", "f32", "f64", "u8", "i8"] {
+            if self.s[self.i..].starts_with(s.as_bytes()) {
+                self.i += s.len();
+                return;
+            }
+        }
+    }
+}
+
+fn parse(text: &str) -> Result<Value, String> {
+    parse_at(text, None).map(|(v, _)| v)
+}
+
+fn parse_at(text: &str, want: Option<Vec<String>>) -> Result<(Value, Option<(usize, usize)>), String> {
+    let mut p = P { s: text.as_bytes(), i: 0, depth: 0, path: vec![], want, found: None };
+    if text.starts_with('\u{feff}') {
+        p.i = 3;
+    }
+    p.extensions()?;
+    let v = p.value()?;
+    p.ws()?;
+    if p.i < p.s.len() {
+        return p.err("text after the value");
+    }
+    Ok((v, p.found))
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+fn quote(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn write(v: &Value, structs: bool, indent: Option<usize>, level: usize, out: &mut String) {
+    let pad = |n: usize| indent.map(|w| " ".repeat(w * n)).unwrap_or_default();
+    let nl = if indent.is_some() { "\n" } else { "" };
+    let sep = if indent.is_some() { ",\n" } else { ", " };
+    match v {
+        Value::Null => out.push_str("None"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            let t = n.to_string();
+            out.push_str(&t);
+            if n.is_f64() && !t.contains(['.', 'e', 'E']) {
+                out.push_str(".0");
+            }
+        }
+        Value::String(s) => out.push_str(&quote(s)),
+        Value::Array(a) if a.is_empty() => out.push_str("[]"),
+        Value::Array(a) => {
+            out.push('[');
+            out.push_str(nl);
+            for (k, x) in a.iter().enumerate() {
+                out.push_str(&pad(level + 1));
+                write(x, structs, indent, level + 1, out);
+                if k + 1 < a.len() || indent.is_some() {
+                    out.push_str(if indent.is_some() { sep } else { ", " });
+                }
+            }
+            out.push_str(&pad(level));
+            out.push(']');
+        }
+        Value::Object(m) => {
+            let as_struct = structs && m.keys().all(|k| is_ident(k));
+            if m.is_empty() {
+                out.push_str(if as_struct { "()" } else { "{}" });
+                return;
+            }
+            out.push(if as_struct { '(' } else { '{' });
+            out.push_str(nl);
+            for (k, (key, x)) in m.iter().enumerate() {
+                out.push_str(&pad(level + 1));
+                if as_struct {
+                    out.push_str(key);
+                } else {
+                    out.push_str(&quote(key));
+                }
+                out.push_str(": ");
+                write(x, structs, indent, level + 1, out);
+                if k + 1 < m.len() || indent.is_some() {
+                    out.push_str(if indent.is_some() { sep } else { ", " });
+                }
+            }
+            out.push_str(&pad(level));
+            out.push(if as_struct { ')' } else { '}' });
+        }
+    }
+}
+
+/// The value of a RON document. Structs `(a: 1)` are maps, tuples `(1, 2)` lists, `Some(x)` is x and `None` null,
+/// chars are text; an enum variant is its name ("Fullscreen"), or `{ Variant: content }` when it holds something
+/// (`Circle(2.0)` is `{ Circle: 2.0 }`, as serde writes enums in JSON); the document's own `Config(a: 1)` is just its fields.
+/// Comments and `#![enable(...)]` lines are allowed.
+pub fn ron_parse(text: &str) -> Result<Value, String> {
+    parse(text)
+}
+
+/// The value of the RON file at `path` (up to 64 MiB).
+pub fn ron_read_file(path: &str) -> Result<Value, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(format!("{} is over 64 MiB", path));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    parse(&text).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// `value` as RON: maps whose keys are all names are written as structs `(a: 1)` (what a Rust struct reads), others as
+/// maps `{"a b": 1}`; null is `None`. `indent` spaces per level (0: all on one line).
+pub fn ron_write(value: serde_json::Value, indent: i64) -> String {
+    let mut out = String::new();
+    let indent = if indent > 0 { Some(indent.min(16) as usize) } else { None };
+    write(&value, true, indent, 0, &mut out);
+    out
+}
+
+/// `value` as RON with every map written as a map `{"key": value}`, for a Rust `HashMap`; `indent` as in `ron_write`.
+pub fn ron_write_maps(value: serde_json::Value, indent: i64) -> String {
+    let mut out = String::new();
+    let indent = if indent > 0 { Some(indent.min(16) as usize) } else { None };
+    write(&value, false, indent, 0, &mut out);
+    out
+}
+
+/// Whether `text` is RON: `{ ok, error }`, `error` with its line and column, null when it reads.
+pub fn ron_check(text: &str) -> Value {
+    match parse(text) {
+        Ok(_) => json!({ "ok": true, "error": null }),
+        Err(e) => json!({ "ok": false, "error": e }),
+    }
+}
+
+fn set(text: &str, path: &str, ron: &str) -> Result<String, String> {
+    let want: Vec<String> = path.split('.').filter(|p| !p.is_empty()).map(String::from).collect();
+    if want.is_empty() {
+        return Err("the path is empty: name a field, as \"audio.music\" or \"spawn.0\"".into());
+    }
+    let (_, found) = parse_at(text, Some(want))?;
+    let (a, b) = found.ok_or_else(|| format!("no value at `{}`", path))?;
+    let out = format!("{}{}{}", &text[..a], ron, &text[b..]);
+    parse(&out).map_err(|e| format!("the new value does not read: {}", e))?;
+    Ok(out)
+}
+
+/// The RON text with one value changed and everything else, comments and layout included, as it was: `path` names it
+/// with dots, as in the value `ron_parse` gives ("audio.music", "spawn.0.Ship.hull"), and `value` is written as
+/// `ron_write` writes it. A path that is not there is an error. For a settings screen that saves a hand-written file.
+pub fn ron_set(text: &str, path: &str, value: serde_json::Value) -> Result<String, String> {
+    set(text, path, &ron_write(value, 0))
+}
+
+/// As `ron_set`, with the new value given as RON text itself: an enum variant (`Windowed`), a tuple (`(1280, 720)`), a char (`'J'`).
+pub fn ron_set_raw(text: &str, path: &str, ron: &str) -> Result<String, String> {
+    set(text, path, ron.trim())
+}

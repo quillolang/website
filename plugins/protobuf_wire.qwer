@@ -1,0 +1,421 @@
+//! Protocol Buffers on the wire, without generated code: any message decoded field by field with no schema, and decoded or encoded by name with the field numbers and types given.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+const MAX: usize = 64 * 1024 * 1024;
+
+fn unb64(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    let b = STANDARD.decode(s).or_else(|_| URL_SAFE.decode(s)).or_else(|_| {
+        let t = s.trim_end_matches('=');
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(t).or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t))
+    });
+    let b = b.map_err(|_| "not base64".to_string())?;
+    if b.len() > MAX { Err("a message over 64 MiB".into()) } else { Ok(b) }
+}
+
+fn varint(b: &[u8], i: &mut usize) -> Result<u64, String> {
+    let mut v = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *b.get(*i).ok_or_else(|| format!("byte {}: the message ended inside a varint", *i))?;
+        *i += 1;
+        if shift == 63 && byte > 1 {
+            return Err(format!("byte {}: a varint longer than 64 bits", *i - 1));
+        }
+        v |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(v);
+        }
+    }
+    Err(format!("byte {}: a varint longer than 10 bytes", *i))
+}
+
+fn put_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// One field as read: its number and its raw value.
+enum Raw<'a> {
+    Varint(u64),
+    Fixed64(u64),
+    Len(&'a [u8]),
+    Fixed32(u32),
+}
+
+fn fields(b: &[u8]) -> Result<Vec<(u64, Raw<'_>)>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let at = i;
+        let tag = varint(b, &mut i)?;
+        let (num, wire) = (tag >> 3, tag & 7);
+        if num == 0 || num > 536_870_911 {
+            return Err(format!("byte {}: field number {} is out of range", at, num));
+        }
+        let raw = match wire {
+            0 => Raw::Varint(varint(b, &mut i)?),
+            1 => {
+                let x = b.get(i..i + 8).ok_or_else(|| format!("byte {}: the message ended inside a 64-bit field", i))?;
+                i += 8;
+                Raw::Fixed64(u64::from_le_bytes(x.try_into().unwrap()))
+            }
+            2 => {
+                let n = varint(b, &mut i)? as usize;
+                let x = b.get(i..i.checked_add(n).unwrap_or(usize::MAX)).ok_or_else(|| format!("byte {}: a field of {} bytes runs past the end", i, n))?;
+                i += n;
+                Raw::Len(x)
+            }
+            5 => {
+                let x = b.get(i..i + 4).ok_or_else(|| format!("byte {}: the message ended inside a 32-bit field", i))?;
+                i += 4;
+                Raw::Fixed32(u32::from_le_bytes(x.try_into().unwrap()))
+            }
+            3 | 4 => return Err(format!("byte {}: groups (wire types 3 and 4, from proto2) are not read", at)),
+            w => return Err(format!("byte {}: wire type {} does not exist", at, w)),
+        };
+        out.push((num, raw));
+    }
+    Ok(out)
+}
+
+fn big(v: u64) -> Value {
+    if v <= i64::MAX as u64 { json!(v as i64) } else { json!(v.to_string()) }
+}
+
+fn printable(s: &str) -> bool {
+    s.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+}
+
+fn guess(b: &[u8], depth: usize) -> Vec<Value> {
+    match fields(b) {
+        Ok(f) => f.into_iter().map(|(n, r)| raw_json(n, r, depth)).collect(),
+        Err(_) => vec![],
+    }
+}
+
+fn raw_json(num: u64, r: Raw, depth: usize) -> Value {
+    match r {
+        Raw::Varint(v) => {
+            let zz = ((v >> 1) as i64) ^ -((v & 1) as i64);
+            json!({ "field": num, "wire": "varint", "value": v as i64, "zigzag": zz })
+        }
+        Raw::Fixed64(v) => json!({ "field": num, "wire": "fixed64", "value": v as i64, "double": f64::from_bits(v) }),
+        Raw::Fixed32(v) => json!({ "field": num, "wire": "fixed32", "value": v as i32, "float": f32::from_bits(v) as f64 }),
+        Raw::Len(b) => {
+            let mut o = Map::new();
+            o.insert("field".into(), json!(num));
+            o.insert("wire".into(), json!("len"));
+            o.insert("size".into(), json!(b.len()));
+            if let Ok(s) = std::str::from_utf8(b) {
+                if printable(s) {
+                    o.insert("text".into(), json!(s));
+                }
+            }
+            if depth < 32 && !b.is_empty() {
+                let inner = guess(b, depth + 1);
+                if !inner.is_empty() {
+                    o.insert("message".into(), Value::Array(inner));
+                }
+            }
+            o.insert("base64".into(), json!(STANDARD.encode(b)));
+            Value::Object(o)
+        }
+    }
+}
+
+/// A field's type as given: its name, its type, whether it repeats, and the fields of a nested message.
+struct Spec {
+    name: String,
+    ty: String,
+    repeated: bool,
+    fields: Option<Schema>,
+}
+
+type Schema = HashMap<u64, Spec>;
+
+const TYPES: &[&str] = &["int32", "int64", "uint32", "uint64", "sint32", "sint64", "bool", "enum", "fixed32", "fixed64", "sfixed32", "sfixed64", "float", "double", "string", "bytes"];
+
+fn schema(v: &Value) -> Result<Schema, String> {
+    let m = v.as_object().ok_or("a schema is a map of field numbers to \"name type\"")?;
+    let mut out = HashMap::new();
+    for (k, s) in m {
+        let num: u64 = k.trim().parse().map_err(|_| format!("`{}` is not a field number", k))?;
+        let spec = match s {
+            Value::String(t) => {
+                let words: Vec<&str> = t.split_whitespace().collect();
+                let (repeated, words) = match words.first() {
+                    Some(&"repeated") => (true, &words[1..]),
+                    _ => (false, &words[..]),
+                };
+                let [name, ty] = words else { return Err(format!("field {}: write \"name type\" or \"name repeated type\", not `{}`", k, t)) };
+                let (repeated, ty) = if *ty == "repeated" { return Err(format!("field {}: `repeated` comes first", k)) } else { (repeated, *ty) };
+                if !TYPES.contains(&ty) {
+                    return Err(format!("field {}: `{}` is not a protobuf type ({}; a message is a map)", k, ty, TYPES.join(", ")));
+                }
+                Spec { name: name.to_string(), ty: ty.to_string(), repeated, fields: None }
+            }
+            Value::Object(o) => {
+                let name = o.get("name").and_then(Value::as_str).ok_or_else(|| format!("field {}: a message's spec has a `name`", k))?;
+                let f = o.get("fields").ok_or_else(|| format!("field {}: a message's spec has `fields`", k))?;
+                Spec { name: name.into(), ty: "message".into(), repeated: o.get("repeated").and_then(Value::as_bool).unwrap_or(false), fields: Some(schema(f)?) }
+            }
+            _ => return Err(format!("field {}: \"name type\" text, or {{ name, fields, repeated }} for a message", k)),
+        };
+        out.insert(num, spec);
+    }
+    Ok(out)
+}
+
+fn scalar_varint(ty: &str, v: u64) -> Value {
+    match ty {
+        "int32" | "enum" => json!(v as i64 as i32),
+        "int64" => json!(v as i64),
+        "uint32" => json!(v as u32),
+        "uint64" => big(v),
+        "sint32" | "sint64" => json!(((v >> 1) as i64) ^ -((v & 1) as i64)),
+        "bool" => json!(v != 0),
+        _ => json!(v as i64),
+    }
+}
+
+fn typed(spec: &Spec, r: Raw, out: &mut Vec<Value>) -> Result<(), String> {
+    let ty = spec.ty.as_str();
+    let bad = |w: &str| Err(format!("`{}` is {}, but came as {}", spec.name, ty, w));
+    match r {
+        Raw::Varint(v) => match ty {
+            "int32" | "int64" | "uint32" | "uint64" | "sint32" | "sint64" | "bool" | "enum" => out.push(scalar_varint(ty, v)),
+            _ => return bad("a varint"),
+        },
+        Raw::Fixed64(v) => match ty {
+            "fixed64" => out.push(big(v)),
+            "sfixed64" => out.push(json!(v as i64)),
+            "double" => out.push(json!(f64::from_bits(v))),
+            _ => return bad("64 bits"),
+        },
+        Raw::Fixed32(v) => match ty {
+            "fixed32" => out.push(json!(v)),
+            "sfixed32" => out.push(json!(v as i32)),
+            "float" => out.push(json!(f32::from_bits(v) as f64)),
+            _ => return bad("32 bits"),
+        },
+        Raw::Len(b) => match ty {
+            "string" => out.push(json!(String::from_utf8_lossy(b))),
+            "bytes" => out.push(json!(STANDARD.encode(b))),
+            "message" => out.push(decode_with(b, spec.fields.as_ref().unwrap())?),
+            // Packed numbers: proto3's way for repeated scalars.
+            "double" | "fixed64" | "sfixed64" => {
+                for c in b.chunks(8) {
+                    let c: [u8; 8] = c.try_into().map_err(|_| format!("`{}`: packed 64-bit values of a bad length", spec.name))?;
+                    typed(spec, Raw::Fixed64(u64::from_le_bytes(c)), out)?;
+                }
+            }
+            "float" | "fixed32" | "sfixed32" => {
+                for c in b.chunks(4) {
+                    let c: [u8; 4] = c.try_into().map_err(|_| format!("`{}`: packed 32-bit values of a bad length", spec.name))?;
+                    typed(spec, Raw::Fixed32(u32::from_le_bytes(c)), out)?;
+                }
+            }
+            _ => {
+                let mut i = 0;
+                while i < b.len() {
+                    out.push(scalar_varint(ty, varint(b, &mut i)?));
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+fn decode_with(b: &[u8], s: &Schema) -> Result<Value, String> {
+    let mut obj = Map::new();
+    let mut unknown = vec![];
+    let mut nums: Vec<&u64> = s.keys().collect();
+    nums.sort();
+    let mut got: HashMap<u64, Vec<Value>> = HashMap::new();
+    for (n, r) in fields(b)? {
+        match s.get(&n) {
+            Some(spec) => typed(spec, r, got.entry(n).or_default())?,
+            None => unknown.push(raw_json(n, r, 32)),
+        }
+    }
+    for n in nums {
+        let spec = &s[n];
+        if let Some(mut vals) = got.remove(n) {
+            // A field that repeats where it should not: the last one wins, as protobuf says.
+            let v = if spec.repeated { Value::Array(vals) } else { vals.pop().unwrap_or(Value::Null) };
+            obj.insert(spec.name.clone(), v);
+        }
+    }
+    if !unknown.is_empty() {
+        obj.insert("_unknown".into(), Value::Array(unknown));
+    }
+    Ok(Value::Object(obj))
+}
+
+fn as_i64(v: &Value, name: &str) -> Result<i64, String> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_u64().map(|u| u as i64)).ok_or_else(|| format!("`{}` must be a whole number", name)),
+        Value::String(s) => s.parse::<i64>().or_else(|_| s.parse::<u64>().map(|u| u as i64)).map_err(|_| format!("`{}` must be a whole number", name)),
+        Value::Bool(b) => Ok(*b as i64),
+        _ => Err(format!("`{}` must be a whole number", name)),
+    }
+}
+
+fn as_f64(v: &Value, name: &str) -> Result<f64, String> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).ok_or_else(|| format!("`{}` must be a number", name))
+}
+
+fn wire_of(ty: &str) -> u64 {
+    match ty {
+        "fixed64" | "sfixed64" | "double" => 1,
+        "fixed32" | "sfixed32" | "float" => 5,
+        "string" | "bytes" | "message" => 2,
+        _ => 0,
+    }
+}
+
+fn encode_scalar(spec: &Spec, v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+    let n = &spec.name;
+    match spec.ty.as_str() {
+        "bool" => put_varint(match v { Value::Bool(b) => *b as u64, _ => (as_i64(v, n)? != 0) as u64 }, out),
+        "int32" | "enum" => put_varint(as_i64(v, n)? as i32 as i64 as u64, out),
+        "int64" | "uint64" => put_varint(as_i64(v, n)? as u64, out),
+        "uint32" => put_varint(as_i64(v, n)? as u32 as u64, out),
+        "sint32" | "sint64" => {
+            let x = as_i64(v, n)?;
+            put_varint(((x << 1) ^ (x >> 63)) as u64, out)
+        }
+        "fixed64" | "sfixed64" => out.extend((as_i64(v, n)? as u64).to_le_bytes()),
+        "double" => out.extend(as_f64(v, n)?.to_le_bytes()),
+        "fixed32" | "sfixed32" => out.extend((as_i64(v, n)? as u32).to_le_bytes()),
+        "float" => out.extend((as_f64(v, n)? as f32).to_le_bytes()),
+        "string" => {
+            let s = v.as_str().ok_or_else(|| format!("`{}` must be text", n))?;
+            put_varint(s.len() as u64, out);
+            out.extend(s.as_bytes());
+        }
+        "bytes" => {
+            let b = unb64(v.as_str().ok_or_else(|| format!("`{}` must be base64 text", n))?)?;
+            put_varint(b.len() as u64, out);
+            out.extend(b);
+        }
+        "message" => {
+            let b = encode_with(v, spec.fields.as_ref().unwrap())?;
+            put_varint(b.len() as u64, out);
+            out.extend(b);
+        }
+        t => return Err(format!("unknown type {}", t)),
+    }
+    Ok(())
+}
+
+fn encode_with(v: &Value, s: &Schema) -> Result<Vec<u8>, String> {
+    let m = v.as_object().ok_or("a message is a map")?;
+    let mut nums: Vec<&u64> = s.keys().collect();
+    nums.sort();
+    for k in m.keys() {
+        if !s.values().any(|sp| &sp.name == k) {
+            return Err(format!("`{}` is not in the schema", k));
+        }
+    }
+    let mut out = vec![];
+    for n in nums {
+        let spec = &s[n];
+        let Some(v) = m.get(&spec.name) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        let wire = wire_of(&spec.ty);
+        if spec.repeated {
+            let items = v.as_array().ok_or_else(|| format!("`{}` is repeated: give a list", spec.name))?;
+            if wire != 2 {
+                // Scalars packed, as proto3 does.
+                let mut packed = vec![];
+                for x in items {
+                    encode_scalar(spec, x, &mut packed)?;
+                }
+                if !items.is_empty() {
+                    put_varint((n << 3) | 2, &mut out);
+                    put_varint(packed.len() as u64, &mut out);
+                    out.extend(packed);
+                }
+            } else {
+                for x in items {
+                    put_varint((n << 3) | wire, &mut out);
+                    encode_scalar(spec, x, &mut out)?;
+                }
+            }
+        } else {
+            put_varint((n << 3) | wire, &mut out);
+            encode_scalar(spec, v, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// A message's fields as they are on the wire, with no schema, in order: `[{ field, wire, ... }]`. A varint has `value`
+/// and `zigzag` (for sint types); fixed64 `value` and `double`; fixed32 `value` and `float`; a length-delimited field
+/// has `size`, `base64`, `text` when it is readable text and `message` when it reads as a nested message (both may be
+/// there: only the schema knows). `base64` is the message (standard or URL-safe).
+pub fn protobuf_decode(base64: &str) -> Result<Vec<Value>, String> {
+    let b = unb64(base64)?;
+    Ok(fields(&b)?.into_iter().map(|(n, r)| raw_json(n, r, 0)).collect())
+}
+
+/// A message as a map by field name, given its schema: `{ "1": "id int64", "2": "name string", "3": "repeated tags
+/// string", "4": { name: "address", fields: { "1": "city string" } } }` (a nested message is a map, with `repeated:
+/// true` for a list of them). Types: int32 int64 uint32 uint64 sint32 sint64 bool enum fixed32 fixed64 sfixed32
+/// sfixed64 float double string bytes (as base64). uint64 past 2^63 comes as text; packed lists are read;
+/// fields missing from the message are left out, and those the schema lacks are listed under `_unknown`.
+pub fn protobuf_decode_with(base64: &str, schema_map: serde_json::Value) -> Result<Value, String> {
+    decode_with(&unb64(base64)?, &schema(&schema_map)?)
+}
+
+/// `value`, a map by field name, as a message in base64, by the same schema as `protobuf_decode_with`: fields in
+/// number order, repeated numbers packed (proto3), null fields left out. A name the schema lacks is an error.
+pub fn protobuf_encode_with(value: serde_json::Value, schema_map: serde_json::Value) -> Result<String, String> {
+    Ok(STANDARD.encode(encode_with(&value, &schema(&schema_map)?)?))
+}
+
+/// The messages of a length-delimited stream (each after its size as a varint: Java's `writeDelimitedTo`, gRPC logs,
+/// many `.pb` files), each in base64; at most 100,000.
+pub fn protobuf_split_delimited(base64: &str) -> Result<Vec<String>, String> {
+    let b = unb64(base64)?;
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let n = varint(&b, &mut i)? as usize;
+        let m = b.get(i..i.checked_add(n).unwrap_or(usize::MAX)).ok_or_else(|| format!("byte {}: a message of {} bytes runs past the end", i, n))?;
+        out.push(STANDARD.encode(m));
+        i += n;
+        if out.len() > 100_000 {
+            return Err("more than 100,000 messages".into());
+        }
+    }
+    Ok(out)
+}
+
+/// The file at `path` in base64, to pass to the other functions (up to 64 MiB).
+pub fn protobuf_read_file(path: &str) -> Result<String, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    if b.len() > MAX {
+        return Err(format!("{} is over 64 MiB", path));
+    }
+    Ok(STANDARD.encode(b))
+}

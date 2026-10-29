@@ -1,0 +1,156 @@
+//! DNS from the server: A, AAAA, MX, TXT, CNAME, NS, SOA, SRV, CAA and PTR records looked up through the system's resolver or one you name (1.1.1.1, 8.8.8.8), host names resolved, and record text and whole zone files read into fields.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hickory-resolver = "0.24"
+//! hickory-proto = { version = "0.24", features = ["text-parsing"] }
+
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::serialize::txt::{Parser, RDataParser};
+use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+use hickory_resolver::Resolver;
+use serde_json::{json, Value};
+use std::net::{IpAddr, ToSocketAddrs};
+use std::str::FromStr;
+use std::time::Duration;
+
+fn rtype(t: &str) -> Result<RecordType, String> {
+    RecordType::from_str(&t.trim().to_uppercase()).map_err(|_| format!("unknown record type `{}`", t))
+}
+
+fn fields(r: &RData) -> Value {
+    match r {
+        RData::A(a) => json!({ "address": a.to_string() }),
+        RData::AAAA(a) => json!({ "address": a.to_string() }),
+        RData::CNAME(n) => json!({ "target": n.to_string() }),
+        RData::NS(n) => json!({ "host": n.to_string() }),
+        RData::PTR(n) => json!({ "name": n.to_string() }),
+        RData::MX(m) => json!({ "preference": m.preference(), "exchange": m.exchange().to_string() }),
+        RData::SRV(s) => json!({ "priority": s.priority(), "weight": s.weight(), "port": s.port(), "target": s.target().to_string() }),
+        RData::SOA(s) => json!({ "mname": s.mname().to_string(), "rname": s.rname().to_string(), "serial": s.serial(), "refresh": s.refresh(), "retry": s.retry(), "expire": s.expire(), "minimum": s.minimum() }),
+        RData::TXT(t) => {
+            let parts: Vec<String> = t.txt_data().iter().map(|b| String::from_utf8_lossy(b).to_string()).collect();
+            json!({ "text": parts.concat(), "strings": parts })
+        }
+        RData::CAA(c) => json!({ "critical": c.issuer_critical(), "tag": c.tag().as_str(), "caa_value": c.value().to_string().trim_matches('"').to_string() }),
+        _ => json!({}),
+    }
+}
+
+fn record(r: &Record) -> Value {
+    let mut v = json!({ "name": r.name().to_string(), "type": r.record_type().to_string(), "ttl": r.ttl() });
+    if let Some(d) = r.data() {
+        v["value"] = json!(d.to_string());
+        if let Value::Object(f) = fields(d) {
+            v.as_object_mut().unwrap().extend(f);
+        }
+    }
+    v
+}
+
+fn resolver(server: &str, timeout_ms: i64) -> Result<Resolver, String> {
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
+    opts.attempts = 2;
+    let config = match server.trim() {
+        "" | "system" => return Resolver::from_system_conf().map_err(|e| format!("the system's DNS settings: {}", e)),
+        "cloudflare" => ResolverConfig::cloudflare(),
+        "google" => ResolverConfig::google(),
+        "quad9" => ResolverConfig::quad9(),
+        s => {
+            let (ip, port) = match s.parse::<std::net::SocketAddr>() {
+                Ok(a) => (a.ip(), a.port()),
+                Err(_) => (s.parse::<IpAddr>().map_err(|_| format!("server `{}` is not an IP, ip:port, system, cloudflare, google or quad9", s))?, 53),
+            };
+            ResolverConfig::from_parts(None, vec![], NameServerConfigGroup::from_ips_clear(&[ip], port, true))
+        }
+    };
+    Resolver::new(config, opts).map_err(|e| e.to_string())
+}
+
+/// The `record_type` records ("A", "AAAA", "MX", "TXT", "CNAME", "NS", "SOA", "SRV", "CAA", "PTR"...) of `name`, asked of
+/// `server`: "" for the system's resolver, "cloudflare", "google", "quad9", or an IP (with `:port`). Each record is
+/// `{ name, type, ttl, value }` plus its fields (`preference` and `exchange` for MX, `text` for TXT...). No records is an empty list.
+pub fn dns_lookup(name: &str, record_type: &str, server: &str, timeout_ms: i64) -> Result<Vec<Value>, String> {
+    let t = rtype(record_type)?;
+    let r = resolver(server, timeout_ms)?;
+    match r.lookup(name.trim(), t) {
+        Ok(l) => Ok(l.records().iter().filter(|r| r.record_type() == t || t == RecordType::ANY).map(record).collect()),
+        Err(e) if matches!(e.kind(), hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. }) => Ok(vec![]),
+        Err(e) => Err(format!("{} {}: {}", name, record_type, e)),
+    }
+}
+
+/// The name an IP address points back to (its PTR record), or null when it has none.
+pub fn dns_reverse(ip: &str, server: &str, timeout_ms: i64) -> Result<Option<String>, String> {
+    let addr: IpAddr = ip.trim().parse().map_err(|_| format!("`{}` is not an IP address", ip))?;
+    let r = resolver(server, timeout_ms)?;
+    match r.reverse_lookup(addr) {
+        Ok(l) => Ok(l.iter().next().map(|n| n.to_string().trim_end_matches('.').to_string())),
+        Err(e) if matches!(e.kind(), hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. }) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The addresses `host` resolves to as the operating system resolves it (`/etc/hosts` first, so "localhost" works offline),
+/// IPv4 ones first, each once.
+pub fn dns_resolve(host: &str) -> Result<Vec<String>, String> {
+    let mut ips: Vec<IpAddr> = (host.trim(), 0).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.map(|a| a.ip()).collect();
+    ips.sort_by_key(|ip| (ip.is_ipv6(), *ip));
+    ips.dedup();
+    Ok(ips.iter().map(|i| i.to_string()).collect())
+}
+
+/// A record's text as a zone file writes it (`10 mail.example.com.` for MX, `0 issue "letsencrypt.org"` for CAA, its `tag` and `caa_value`) read into its
+/// fields, as `dns_lookup` gives them; names without a final dot are taken relative to `origin` (empty: the root).
+pub fn dns_parse_record(record_type: &str, text: &str, origin: &str) -> Result<Value, String> {
+    let t = rtype(record_type)?;
+    let o = if origin.trim().is_empty() { None } else { Some(Name::from_str(origin.trim()).map_err(|e| e.to_string())?) };
+    let tokens: Vec<String> = tokenize(text);
+    let rd = RData::parse(t, tokens.iter().map(|s| s.as_str()), o.as_ref()).map_err(|e| format!("{} `{}`: {}", record_type, text, e))?;
+    let mut v = json!({ "type": t.to_string(), "value": rd.to_string() });
+    if let Value::Object(f) = fields(&rd) {
+        v.as_object_mut().unwrap().extend(f);
+    }
+    Ok(v)
+}
+
+/// Splits record text as a zone file does: on spaces, keeping "quoted strings" together without their quotes.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let (mut quoted, mut had) = (false, false);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if quoted => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                had = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() || had {
+                    out.push(std::mem::take(&mut cur));
+                }
+                had = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() || had {
+        out.push(cur);
+    }
+    out
+}
+
+/// A zone file (BIND format: `$ORIGIN`, `$TTL`, `@`, parentheses) read into its records, each as `dns_lookup` gives them, sorted
+/// by name and type. `origin` is used when the file has no `$ORIGIN`.
+pub fn dns_zone_parse(zone: &str, origin: &str) -> Result<Vec<Value>, String> {
+    let o = if origin.trim().is_empty() { None } else { Some(Name::from_str(origin.trim()).map_err(|e| e.to_string())?) };
+    let (_, sets) = Parser::new(zone, None, o).parse().map_err(|e| format!("the zone: {}", e))?;
+    Ok(sets.values().flat_map(|s| s.records_without_rrsigs().map(record).collect::<Vec<_>>()).collect())
+}

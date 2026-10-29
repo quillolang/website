@@ -1,0 +1,102 @@
+//! Biscuit authorization tokens: issued with Datalog facts and checks signed by your key, narrowed by whoever holds one (read-only, one tenant, an hour) without asking the issuer, and authorized offline against each request's policies.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! biscuit-auth = "6"
+
+use biscuit_auth::builder::{AuthorizerBuilder, BlockBuilder, Term};
+use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey, UnverifiedBiscuit};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::str::FromStr;
+
+fn params(p: &HashMap<String, Value>) -> Result<HashMap<String, Term>, String> {
+    p.iter()
+        .map(|(k, v)| {
+            let t = match v {
+                Value::String(s) if s.len() == 20 && s.ends_with('Z') && s.as_bytes()[10] == b'T' => date(s).map(Term::Date).unwrap_or_else(|| Term::Str(s.clone())),
+                other => Term::try_from(other.clone()).map_err(|e| format!("parameter `{}`: {}", k, e))?,
+            };
+            Ok((k.clone(), t))
+        })
+        .collect()
+}
+
+/// `2026-11-01T12:00:00Z` as Unix seconds.
+fn date(s: &str) -> Option<u64> {
+    let n = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
+    let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+fn private(key: &str) -> Result<KeyPair, String> {
+    let k = PrivateKey::from_str(key.trim()).map_err(|e| format!("the private key: {} (it looks like ed25519-private/<hex>)", e))?;
+    Ok(KeyPair::from(&k))
+}
+
+fn public(key: &str) -> Result<PublicKey, String> {
+    PublicKey::from_str(key.trim()).map_err(|e| format!("the public key: {} (it looks like ed25519/<hex>)", e))
+}
+
+fn err(e: biscuit_auth::error::Token) -> String {
+    e.to_string()
+}
+
+/// A new root key pair: `{ private, public }`, as `ed25519-private/<hex>` and `ed25519/<hex>`. Keep the private key on the server
+/// that issues tokens; give the public one to every service that checks them.
+pub fn biscuit_keypair() -> Value {
+    let kp = KeyPair::new();
+    json!({ "private": kp.private().to_prefixed_string(), "public": kp.public().to_string() })
+}
+
+/// The public key of a private one.
+pub fn biscuit_public_key(private_key: &str) -> Result<String, String> {
+    Ok(private(private_key)?.public().to_string())
+}
+
+/// A token signed with `private_key` holding `code`, Datalog facts, rules and checks (`user({id}); right("invoices", "read");
+/// check if time($t), $t < {expires};`). `{name}` in the code is filled from `params`, safely quoted: strings, numbers, booleans,
+/// and dates written `2026-11-01T12:00:00Z`. Gives the token in URL-safe base64.
+pub fn biscuit_issue(private_key: &str, code: &str, params: std::collections::HashMap<String, serde_json::Value>) -> Result<String, String> {
+    let kp = private(private_key)?;
+    Biscuit::builder()
+        .code_with_params(code, self::params(&params)?, HashMap::new())
+        .map_err(err)?
+        .build(&kp)
+        .map_err(err)?
+        .to_base64()
+        .map_err(err)
+}
+
+/// `token` narrowed by a block of checks (`check if operation("read");`), with `{name}` filled from `params`. Anyone holding
+/// a token can do this, without the issuer's key: a narrowed token can only do less.
+pub fn biscuit_attenuate(token: &str, code: &str, params: std::collections::HashMap<String, serde_json::Value>) -> Result<String, String> {
+    let t = UnverifiedBiscuit::from_base64(token.trim()).map_err(err)?;
+    let block = BlockBuilder::new().code_with_params(code, self::params(&params)?, HashMap::new()).map_err(err)?;
+    t.append(block).map_err(err)?.to_base64().map_err(err)
+}
+
+/// Checks `token` against `public_key` and an authorizer's `code`: the request's facts (`resource({id}); operation("read");`)
+/// and policies (`allow if right({id}, "read");`), `{name}` filled from `params`, the current time added as `time(...)`.
+/// Gives `{ allowed: true, policy }` (the index of the allow policy that matched), or an error value naming the checks that failed.
+pub fn biscuit_authorize(token: &str, public_key: &str, code: &str, params: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let t = Biscuit::from_base64(token.trim(), public(public_key)?).map_err(err)?;
+    let mut a = AuthorizerBuilder::new().code_with_params(code, self::params(&params)?, HashMap::new()).map_err(err)?.time().build(&t).map_err(err)?;
+    let policy = a.authorize().map_err(err)?;
+    Ok(json!({ "allowed": true, "policy": policy }))
+}
+
+/// What a token holds, without checking its signature: `{ blocks: [<Datalog source of each block>], revocation_ids }`.
+/// `revocation_ids` (hex, one per block) go in a deny list to revoke a token and every token narrowed from it.
+pub fn biscuit_inspect(token: &str) -> Result<Value, String> {
+    let t = UnverifiedBiscuit::from_base64(token.trim()).map_err(err)?;
+    let blocks: Result<Vec<String>, String> = (0..t.block_count()).map(|i| t.print_block_source(i).map_err(err)).collect();
+    let ids: Vec<String> = t.revocation_identifiers().iter().map(|b| b.iter().map(|x| format!("{:02x}", x)).collect()).collect();
+    Ok(json!({ "blocks": blocks?, "revocation_ids": ids }))
+}

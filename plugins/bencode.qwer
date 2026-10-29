@@ -1,0 +1,339 @@
+//! Bencode, BitTorrent's format: values encoded and decoded, .torrent files read (name, files, sizes, trackers, info hash, magnet link) and made from a file.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha1 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use sha1::{Digest, Sha1};
+use std::collections::BTreeMap;
+
+const MAX: usize = 64 * 1024 * 1024;
+const BYTES_KEY: &str = "$base64";
+
+/// A decoded value, with byte strings kept as bytes.
+#[derive(Clone)]
+enum B {
+    Int(i64),
+    Bytes(Vec<u8>),
+    List(Vec<B>),
+    Dict(Vec<(Vec<u8>, B)>),
+}
+
+struct P<'a> {
+    s: &'a [u8],
+    i: usize,
+    depth: usize,
+    /// The span of the top-level dictionary's `info` value: what the info hash is taken of.
+    info: Option<(usize, usize)>,
+}
+
+impl<'a> P<'a> {
+    fn err<T>(&self, what: &str) -> Result<T, String> {
+        Err(format!("byte {}: {}", self.i, what))
+    }
+
+    fn num_until(&mut self, end: u8) -> Result<i64, String> {
+        let start = self.i;
+        while self.s.get(self.i).is_some_and(|&b| b != end) {
+            self.i += 1;
+        }
+        if self.i >= self.s.len() {
+            return self.err("the data ended inside a number");
+        }
+        let t = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
+        self.i += 1;
+        if t.is_empty() || (t.len() > 1 && (t.starts_with('0') || t.starts_with("-0"))) {
+            return Err(format!("byte {}: `{}` is not a bencode number", start, t));
+        }
+        t.parse().map_err(|_| format!("byte {}: `{}` is not a number", start, t))
+    }
+
+    fn value(&mut self) -> Result<B, String> {
+        self.depth += 1;
+        if self.depth > 256 {
+            return self.err("nested more than 256 deep");
+        }
+        let v = match self.s.get(self.i) {
+            None => self.err("the data ended where a value was expected"),
+            Some(b'i') => {
+                self.i += 1;
+                self.num_until(b'e').map(B::Int)
+            }
+            Some(b'l') => {
+                self.i += 1;
+                let mut a = vec![];
+                while self.s.get(self.i) != Some(&b'e') {
+                    a.push(self.value()?);
+                }
+                self.i += 1;
+                Ok(B::List(a))
+            }
+            Some(b'd') => {
+                self.i += 1;
+                let mut d = vec![];
+                while self.s.get(self.i) != Some(&b'e') {
+                    let B::Bytes(k) = self.value()? else { return self.err("a dictionary's key is not a string") };
+                    let start = self.i;
+                    let v = self.value()?;
+                    if self.depth == 1 && k == b"info" {
+                        self.info = Some((start, self.i));
+                    }
+                    d.push((k, v));
+                }
+                self.i += 1;
+                Ok(B::Dict(d))
+            }
+            Some(b'0'..=b'9') => {
+                let n = self.num_until(b':')? as usize;
+                if self.i + n > self.s.len() {
+                    return self.err("a string runs past the end");
+                }
+                let b = self.s[self.i..self.i + n].to_vec();
+                self.i += n;
+                Ok(B::Bytes(b))
+            }
+            Some(c) => self.err(&format!("`{}` does not start a bencode value", *c as char)),
+        };
+        self.depth -= 1;
+        v
+    }
+}
+
+fn decode(bytes: &[u8]) -> Result<(B, Option<(usize, usize)>), String> {
+    if bytes.len() > MAX {
+        return Err("bencode over 64 MiB".into());
+    }
+    let mut p = P { s: bytes, i: 0, depth: 0, info: None };
+    let v = p.value()?;
+    if p.i != bytes.len() {
+        return p.err("data after the value");
+    }
+    Ok((v, p.info))
+}
+
+fn text(b: &[u8]) -> Value {
+    match std::str::from_utf8(b) {
+        Ok(s) => Value::String(s.to_string()),
+        Err(_) => json!({ BYTES_KEY: STANDARD.encode(b) }),
+    }
+}
+
+fn to_json(v: &B) -> Value {
+    match v {
+        B::Int(n) => json!(n),
+        B::Bytes(b) => text(b),
+        B::List(a) => Value::Array(a.iter().map(to_json).collect()),
+        B::Dict(d) => {
+            let mut m = Map::new();
+            for (k, v) in d {
+                m.insert(String::from_utf8_lossy(k).into_owned(), to_json(v));
+            }
+            Value::Object(m)
+        }
+    }
+}
+
+fn encode(v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+    match v {
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => out.extend(format!("i{}e", i).into_bytes()),
+            None => return Err(format!("bencode has only whole numbers: {}", n)),
+        },
+        Value::Bool(b) => out.extend(if *b { b"i1e" } else { b"i0e" }),
+        Value::String(s) => {
+            out.extend(format!("{}:", s.len()).into_bytes());
+            out.extend(s.as_bytes());
+        }
+        Value::Array(a) => {
+            out.push(b'l');
+            for x in a {
+                encode(x, out)?;
+            }
+            out.push(b'e');
+        }
+        Value::Object(m) => {
+            if m.len() == 1 {
+                if let Some(Value::String(b)) = m.get(BYTES_KEY) {
+                    let b = STANDARD.decode(b).map_err(|_| format!("`{}` holds base64", BYTES_KEY))?;
+                    out.extend(format!("{}:", b.len()).into_bytes());
+                    out.extend(b);
+                    return Ok(());
+                }
+            }
+            // Keys sorted by their bytes, as bencode requires.
+            let sorted: BTreeMap<&[u8], &Value> = m.iter().map(|(k, v)| (k.as_bytes(), v)).collect();
+            out.push(b'd');
+            for (k, x) in sorted {
+                out.extend(format!("{}:", k.len()).into_bytes());
+                out.extend(k);
+                encode(x, out)?;
+            }
+            out.push(b'e');
+        }
+        Value::Null => return Err("bencode has no null: leave the key out".into()),
+    }
+    Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn get<'a>(d: &'a B, key: &str) -> Option<&'a B> {
+    match d {
+        B::Dict(d) => d.iter().find(|(k, _)| k == key.as_bytes()).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+fn s(b: Option<&B>) -> Option<String> {
+    match b {
+        Some(B::Bytes(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }
+}
+
+fn int(b: Option<&B>) -> Option<i64> {
+    match b {
+        Some(B::Int(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+fn url_enc(t: &str) -> String {
+    t.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// `value` as bencode, in base64: strings, whole numbers (true and false as 1 and 0), lists and maps (keys sorted, as
+/// bencode wants). Floats and null are refused. `{ "$base64": "..." }` is a byte string given as base64.
+pub fn bencode_encode(value: serde_json::Value) -> Result<String, String> {
+    let mut out = vec![];
+    encode(&value, &mut out)?;
+    Ok(STANDARD.encode(out))
+}
+
+/// The value of bencode given as base64. Byte strings that are not UTF-8 text come back as `{ "$base64": "..." }`.
+pub fn bencode_decode(base64: &str) -> Result<Value, String> {
+    let bytes = STANDARD.decode(base64.trim()).map_err(|_| "not base64".to_string())?;
+    Ok(to_json(&decode(&bytes)?.0))
+}
+
+/// The value of a bencoded file (a .torrent, a resume file), byte strings as in `bencode_decode`.
+pub fn bencode_read_file(path: &str) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(to_json(&decode(&bytes)?.0))
+}
+
+/// What a .torrent file holds: `{ name, info_hash, magnet, size, piece_length, pieces, files, trackers, comment,
+/// created_by, created, private }`. `info_hash` is the SHA-1 hex (BitTorrent v1); `files` is `[{ path, size }]`,
+/// one entry for a single-file torrent; `created` in seconds since 1970, or null.
+pub fn bencode_torrent_info(path: &str) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let (root, span) = decode(&bytes)?;
+    let (a, b) = span.ok_or("not a torrent: no `info` dictionary")?;
+    let info = get(&root, "info").ok_or("not a torrent: no `info` dictionary")?;
+    let info_hash = hex(&Sha1::digest(&bytes[a..b]));
+    let name = s(get(info, "name.utf-8")).or_else(|| s(get(info, "name"))).unwrap_or_default();
+    let files: Vec<Value> = match get(info, "files") {
+        Some(B::List(list)) => list
+            .iter()
+            .map(|f| {
+                let parts: Vec<String> = match get(f, "path.utf-8").or_else(|| get(f, "path")) {
+                    Some(B::List(p)) => p.iter().filter_map(|x| s(Some(x))).collect(),
+                    _ => vec![],
+                };
+                json!({ "path": format!("{}/{}", name, parts.join("/")), "size": int(get(f, "length")).unwrap_or(0) })
+            })
+            .collect(),
+        _ => vec![json!({ "path": name, "size": int(get(info, "length")).unwrap_or(0) })],
+    };
+    let size: i64 = files.iter().filter_map(|f| f["size"].as_i64()).sum();
+    let mut trackers: Vec<String> = vec![];
+    if let Some(B::List(tiers)) = get(&root, "announce-list") {
+        for t in tiers {
+            if let B::List(urls) = t {
+                for u in urls.iter().filter_map(|u| s(Some(u))) {
+                    if !trackers.contains(&u) {
+                        trackers.push(u);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(a) = s(get(&root, "announce")) {
+        if !trackers.contains(&a) {
+            trackers.insert(0, a);
+        }
+    }
+    let pieces = match get(info, "pieces") {
+        Some(B::Bytes(p)) => (p.len() / 20) as i64,
+        _ => 0,
+    };
+    let mut magnet = format!("magnet:?xt=urn:btih:{}&dn={}", info_hash, url_enc(&name));
+    for t in &trackers {
+        magnet.push_str(&format!("&tr={}", url_enc(t)));
+    }
+    Ok(json!({
+        "name": name,
+        "info_hash": info_hash,
+        "magnet": magnet,
+        "size": size,
+        "piece_length": int(get(info, "piece length")),
+        "pieces": pieces,
+        "files": files,
+        "trackers": trackers,
+        "comment": s(get(&root, "comment")),
+        "created_by": s(get(&root, "created by")),
+        "created": int(get(&root, "creation date")),
+        "private": int(get(info, "private")) == Some(1),
+    }))
+}
+
+/// Makes a single-file .torrent at `out` for the file at `path`, announced to `tracker` ("" for none), with pieces
+/// of `piece_kib` KiB (16 to 16,384; 256 is usual): its info hash. Reads the file once, a piece at a time.
+pub fn bencode_torrent_create(path: &str, tracker: &str, piece_kib: i64, out: &str) -> Result<String, String> {
+    use std::io::Read;
+    let piece = (piece_kib.clamp(16, 16_384) * 1024) as usize;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut pieces = vec![];
+    let mut buf = vec![0u8; piece];
+    let mut length = 0i64;
+    loop {
+        let mut got = 0;
+        while got < piece {
+            let n = f.read(&mut buf[got..]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        if got == 0 {
+            break;
+        }
+        length += got as i64;
+        pieces.extend_from_slice(&Sha1::digest(&buf[..got]));
+        if got < piece {
+            break;
+        }
+    }
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let info = json!({ "length": length, "name": name, "piece length": piece, "pieces": { BYTES_KEY: STANDARD.encode(&pieces) } });
+    let mut info_bytes = vec![];
+    encode(&info, &mut info_bytes)?;
+    let mut root = json!({ "created by": "Quillo", "info": info });
+    if !tracker.is_empty() {
+        root["announce"] = json!(tracker);
+    }
+    let mut bytes = vec![];
+    encode(&root, &mut bytes)?;
+    if let Some(dir) = std::path::Path::new(out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    std::fs::write(out, bytes).map_err(|e| format!("{}: {}", out, e))?;
+    Ok(hex(&Sha1::digest(&info_bytes)))
+}

@@ -1,0 +1,259 @@
+//! An R-tree of places kept in memory by name: the nearest shops to a customer, everything within 5 km, what is in the map's view, and markers clustered for it, in microseconds among millions.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rstar = "0.12"
+
+use rstar::primitives::GeomWithData;
+use rstar::{RTree, AABB};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+const R_KM: f64 = 6371.0088;
+
+type P3 = GeomWithData<[f64; 3], String>;
+type P2 = GeomWithData<[f64; 2], String>;
+
+#[derive(Default)]
+struct Index {
+    /// Points on the unit sphere: straight-line distance there orders places as distance on the Earth does.
+    sphere: RTree<P3>,
+    /// Longitude and latitude, for boxes.
+    flat: RTree<P2>,
+    items: HashMap<String, (f64, f64, Value)>,
+}
+
+static INDEXES: Mutex<Option<HashMap<String, Index>>> = Mutex::new(None);
+
+fn unit(lat: f64, lon: f64) -> [f64; 3] {
+    let (la, lo) = (lat.to_radians(), lon.to_radians());
+    [la.cos() * lo.cos(), la.cos() * lo.sin(), la.sin()]
+}
+
+/// Kilometres along the Earth for a squared straight-line distance between unit vectors.
+fn km_of_chord2(c2: f64) -> f64 {
+    2.0 * R_KM * (c2.sqrt() / 2.0).min(1.0).asin()
+}
+
+fn chord2_of_km(km: f64) -> f64 {
+    let c = 2.0 * (km.min(std::f64::consts::PI * R_KM) / (2.0 * R_KM)).sin();
+    c * c
+}
+
+fn check_point(lat: f64, lon: f64) -> Result<(), String> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(format!("({}, {}) is not a place: latitude is from -90 to 90, longitude from -180 to 180", lat, lon));
+    }
+    Ok(())
+}
+
+fn id_of(item: &Value, i: usize) -> Result<String, String> {
+    match item.get("id") {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Number(n)) => Ok(n.to_string()),
+        _ => Err(format!("item {} has no `id` (text or a number)", i)),
+    }
+}
+
+fn num(item: &Value, k: &str, i: usize) -> Result<f64, String> {
+    item.get(k).and_then(|x| x.as_f64()).ok_or_else(|| format!("item {} has no `{}` (a number)", i, k))
+}
+
+fn with_km(item: &Value, km: f64) -> Value {
+    let mut it = item.clone();
+    if let Value::Object(m) = &mut it {
+        m.insert("km".into(), json!((km * 1000.0).round() / 1000.0));
+    }
+    it
+}
+
+fn remove_id(idx: &mut Index, id: &str) -> bool {
+    if let Some((lat, lon, _)) = idx.items.remove(id) {
+        idx.sphere.remove(&GeomWithData::new(unit(lat, lon), id.to_string()));
+        idx.flat.remove(&GeomWithData::new([lon, lat], id.to_string()));
+        true
+    } else {
+        false
+    }
+}
+
+fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<String, Index>>> {
+    INDEXES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Adds places to the index `name`, made on first use (up to 1,000 indexes and 10 million places each): each a map with `id`,
+/// `lat` and `lon` (degrees), and anything else, which comes back with it. A place with an id already there is moved. Gives the
+/// index's size.
+pub fn spatial_add(name: &str, items: Vec<serde_json::Value>) -> Result<i64, String> {
+    let mut parsed = Vec::with_capacity(items.len());
+    for (i, it) in items.into_iter().enumerate() {
+        let (id, lat, lon) = (id_of(&it, i)?, num(&it, "lat", i)?, num(&it, "lon", i)?);
+        check_point(lat, lon)?;
+        parsed.push((id, lat, lon, it));
+    }
+    let mut g = lock();
+    let all = g.get_or_insert_with(HashMap::new);
+    if !all.contains_key(name) && all.len() >= 1000 {
+        return Err("up to 1,000 indexes: spatial_clear old ones".into());
+    }
+    let idx = all.entry(name.to_string()).or_default();
+    if idx.items.is_empty() && parsed.len() > 1000 {
+        // A new index loads faster in one go, and its tree comes out better.
+        let mut seen = HashMap::new();
+        for (k, p) in parsed.iter().enumerate() {
+            seen.insert(p.0.clone(), k);
+        }
+        let keep: Vec<_> = parsed.into_iter().enumerate().filter(|(k, p)| seen[&p.0] == *k).map(|(_, p)| p).collect();
+        if keep.len() > 10_000_000 {
+            return Err("up to 10 million places an index".into());
+        }
+        idx.sphere = RTree::bulk_load(keep.iter().map(|p| GeomWithData::new(unit(p.1, p.2), p.0.clone())).collect());
+        idx.flat = RTree::bulk_load(keep.iter().map(|p| GeomWithData::new([p.2, p.1], p.0.clone())).collect());
+        idx.items = keep.into_iter().map(|p| (p.0, (p.1, p.2, p.3))).collect();
+        return Ok(idx.items.len() as i64);
+    }
+    for (id, lat, lon, it) in parsed {
+        remove_id(idx, &id);
+        if idx.items.len() >= 10_000_000 {
+            return Err("up to 10 million places an index".into());
+        }
+        idx.sphere.insert(GeomWithData::new(unit(lat, lon), id.clone()));
+        idx.flat.insert(GeomWithData::new([lon, lat], id.clone()));
+        idx.items.insert(id, (lat, lon, it));
+    }
+    Ok(idx.items.len() as i64)
+}
+
+/// Takes the places with these ids out of the index `name`: how many were there.
+pub fn spatial_remove(name: &str, ids: Vec<serde_json::Value>) -> i64 {
+    let mut g = lock();
+    let Some(idx) = g.as_mut().and_then(|a| a.get_mut(name)) else { return 0 };
+    ids.into_iter()
+        .filter(|v| {
+            let id = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            remove_id(idx, &id)
+        })
+        .count() as i64
+}
+
+/// The `k` places (up to 10,000) nearest to `lat`, `lon`, nearest first, each with `km`, its distance along the Earth's
+/// surface; only those within `max_km` (0 for no limit).
+pub fn spatial_nearest(name: &str, lat: f64, lon: f64, k: i64, max_km: f64) -> Result<Vec<Value>, String> {
+    check_point(lat, lon)?;
+    if !(1..=10_000).contains(&k) {
+        return Err("k is from 1 to 10,000".into());
+    }
+    let g = lock();
+    let Some(idx) = g.as_ref().and_then(|a| a.get(name)) else { return Ok(vec![]) };
+    let q = unit(lat, lon);
+    let mut out = Vec::new();
+    for (p, d2) in idx.sphere.nearest_neighbor_iter_with_distance_2(&q) {
+        let km = km_of_chord2(d2);
+        if (max_km > 0.0 && km > max_km) || out.len() as i64 >= k {
+            break;
+        }
+        out.push(with_km(&idx.items[&p.data].2, km));
+    }
+    Ok(out)
+}
+
+/// Every place within `km` of `lat`, `lon` (up to 100,000 of them), nearest first, each with `km`.
+pub fn spatial_within_km(name: &str, lat: f64, lon: f64, km: f64) -> Result<Vec<Value>, String> {
+    check_point(lat, lon)?;
+    if !(km > 0.0) {
+        return Err("km is more than 0".into());
+    }
+    let g = lock();
+    let Some(idx) = g.as_ref().and_then(|a| a.get(name)) else { return Ok(vec![]) };
+    let q = unit(lat, lon);
+    let mut hits: Vec<(f64, &String)> = idx.sphere.locate_within_distance(q, chord2_of_km(km) * (1.0 + 1e-12)).map(|p| {
+        let d = [p.geom()[0] - q[0], p.geom()[1] - q[1], p.geom()[2] - q[2]];
+        (km_of_chord2(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), &p.data)
+    }).filter(|h| h.0 <= km).collect();
+    if hits.len() > 100_000 {
+        return Err("more than 100,000 places: take a smaller distance".into());
+    }
+    hits.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    Ok(hits.into_iter().map(|(d, id)| with_km(&idx.items[id].2, d)).collect())
+}
+
+fn boxes(south: f64, west: f64, north: f64, east: f64) -> Result<Vec<AABB<[f64; 2]>>, String> {
+    check_point(south, west)?;
+    check_point(north, east)?;
+    if south > north {
+        return Err("south is below north".into());
+    }
+    // A view across the 180th meridian (west east of east) is two boxes.
+    Ok(if west <= east {
+        vec![AABB::from_corners([west, south], [east, north])]
+    } else {
+        vec![AABB::from_corners([west, south], [180.0, north]), AABB::from_corners([-180.0, south], [east, north])]
+    })
+}
+
+/// The places in the box from `south`, `west` to `north`, `east` (a map's view; across the 180th meridian when `west` is more
+/// than `east`), up to `limit` (1 to 100,000), in no set order.
+pub fn spatial_in_box(name: &str, south: f64, west: f64, north: f64, east: f64, limit: i64) -> Result<Vec<Value>, String> {
+    if !(1..=100_000).contains(&limit) {
+        return Err("limit is from 1 to 100,000".into());
+    }
+    let bs = boxes(south, west, north, east)?;
+    let g = lock();
+    let Some(idx) = g.as_ref().and_then(|a| a.get(name)) else { return Ok(vec![]) };
+    let mut ids: Vec<&String> = bs.iter().flat_map(|b| idx.flat.locate_in_envelope(b).map(|p| &p.data)).collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids.into_iter().take(limit as usize).map(|id| idx.items[id].2.clone()).collect())
+}
+
+/// Markers for a map's view: the places in the box cut into a grid of `columns` by `rows` cells (each 1 to 100), and for each
+/// cell with places `{ lat, lon, count, item }`, at the places' average position; `item` is the place itself when it is alone,
+/// else null. Draw a number for a cluster and zoom in on a click.
+pub fn spatial_clusters(name: &str, south: f64, west: f64, north: f64, east: f64, columns: i64, rows: i64) -> Result<Vec<Value>, String> {
+    if !(1..=100).contains(&columns) || !(1..=100).contains(&rows) {
+        return Err("columns and rows are from 1 to 100".into());
+    }
+    let bs = boxes(south, west, north, east)?;
+    let width = if west <= east { east - west } else { 360.0 - west + east };
+    let height = (north - south).max(1e-12);
+    let g = lock();
+    let Some(idx) = g.as_ref().and_then(|a| a.get(name)) else { return Ok(vec![]) };
+    let mut cells: std::collections::BTreeMap<(i64, i64), (f64, f64, i64, Option<&String>)> = Default::default();
+    for b in &bs {
+        for p in idx.flat.locate_in_envelope(b) {
+            let [lon, lat] = *p.geom();
+            let dx = if lon >= west { lon - west } else { lon + 360.0 - west };
+            let cx = ((dx / width.max(1e-12)) * columns as f64).floor().clamp(0.0, (columns - 1) as f64) as i64;
+            let cy = (((north - lat) / height) * rows as f64).floor().clamp(0.0, (rows - 1) as f64) as i64;
+            let c = cells.entry((cy, cx)).or_insert((0.0, 0.0, 0, None));
+            c.0 += lat;
+            c.1 += lon;
+            c.2 += 1;
+            c.3 = Some(&p.data);
+        }
+    }
+    let r = |x: f64| (x * 1e6).round() / 1e6;
+    Ok(cells
+        .into_values()
+        .map(|(la, lo, n, last)| json!({
+            "lat": r(la / n as f64),
+            "lon": r(lo / n as f64),
+            "count": n,
+            "item": if n == 1 { last.map_or(Value::Null, |id| idx.items[id].2.clone()) } else { Value::Null },
+        }))
+        .collect())
+}
+
+/// How many places the index `name` holds (0 when there is none).
+pub fn spatial_count(name: &str) -> i64 {
+    lock().as_ref().and_then(|a| a.get(name)).map_or(0, |i| i.items.len() as i64)
+}
+
+/// Forgets the index `name`: true when there was one.
+pub fn spatial_clear(name: &str) -> bool {
+    lock().as_mut().is_some_and(|a| a.remove(name).is_some())
+}

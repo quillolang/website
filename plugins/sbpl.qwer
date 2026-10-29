@@ -1,0 +1,474 @@
+//! SATO SBPL labels (CL4NX, CL6NX, CT4-LX, WS4, GL4e and other SATO printers) built from fields in millimetres: text in the XU, XS, XM and XL fonts with expansion, Code 128 and GS1-128 (start codes and FNC1 written as SATO's >H, >I, >C, >D, >F), Code 39, EAN-13, UPC-A, ITF and QR, ruled lines and grids, rotation, speed, darkness and quantity; sent to port 9100.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! image = { version = "0.25", default-features = false, features = ["png"] }
+
+use serde_json::Value;
+
+const ESC: u8 = 0x1b;
+
+fn ascii(s: &str) -> String {
+    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect()
+}
+
+/// The font and expansion (horizontal, vertical) nearest to `target` dots high: XU 9, XS 17, XM 24, XL 48 dots.
+fn font_for(target: i64) -> (&'static str, i64) {
+    let fonts = [("XU", 9), ("XS", 17), ("XM", 24), ("XL", 48)];
+    let mut best = ("XM", 1, i64::MAX);
+    for (f, h) in fonts {
+        for m in 1..=12 {
+            let d = (h * m - target).abs() + (m - 1) * 2;
+            if d < best.2 {
+                best = (f, m, d);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
+fn gs1_fixed(ai2: &str) -> Option<usize> {
+    Some(match ai2 {
+        "00" => 20,
+        "01" | "02" | "03" => 16,
+        "04" => 18,
+        "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" => 8,
+        "20" => 4,
+        "31" | "32" | "33" | "34" | "35" | "36" => 10,
+        "41" => 16,
+        _ => return None,
+    })
+}
+
+/// Code 128 data in SATO's notation: `>I` start C, `>H` start B, `>C` to C, `>D` (in C) to B, `>F` FNC1; digit runs of 4 or more in C. None in `tokens` is FNC1.
+fn code128(tokens: &[Option<char>], gs1: bool) -> Result<String, String> {
+    let digit = |t: &Option<char>| matches!(t, Some(c) if c.is_ascii_digit());
+    let run = |i: usize| tokens[i..].iter().take_while(|t| digit(t)).count();
+    let first = run(0);
+    let mut in_c = gs1 || first >= 4 || (first == tokens.len() && first % 2 == 0 && first >= 2);
+    let mut out = String::from(if in_c { ">I" } else { ">H" });
+    if gs1 {
+        out.push_str(">F");
+    }
+    let mut i = 0;
+    while i < tokens.len() {
+        let r = run(i);
+        if in_c {
+            if r >= 2 {
+                out.push(tokens[i].unwrap());
+                out.push(tokens[i + 1].unwrap());
+                i += 2;
+            } else if tokens[i].is_none() {
+                out.push_str(">F");
+                i += 1;
+            } else {
+                out.push_str(">D");
+                in_c = false;
+            }
+            continue;
+        }
+        if r >= 4 && r % 2 == 0 {
+            out.push_str(">C");
+            in_c = true;
+            continue;
+        }
+        match tokens[i] {
+            None => out.push_str(">F"),
+            Some('>') => return Err("SATO's Code 128 cannot hold > (it starts its control codes)".into()),
+            Some(c) if (' '..='~').contains(&c) => out.push(c),
+            Some(c) => return Err(format!("Code 128 takes printable ASCII, not {:?}", c)),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn gs1_tokens(s: &str) -> Result<Vec<Option<char>>, String> {
+    let mut t = vec![];
+    let mut rest = s.trim();
+    if !rest.starts_with('(') {
+        return Err("GS1 data is written with its AIs in brackets: (01)09501101530003(10)LOT7".into());
+    }
+    while let Some(r) = rest.strip_prefix('(') {
+        let end = r.find(')').ok_or("a ( without its )")?;
+        let ai = &r[..end];
+        if ai.len() < 2 || !ai.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("({}) is not an application identifier", ai));
+        }
+        let r = &r[end + 1..];
+        let next = r.find('(').unwrap_or(r.len());
+        let data = &r[..next];
+        if let Some(total) = gs1_fixed(&ai[..2]) {
+            if ai.len() + data.len() != total {
+                return Err(format!("({}) takes {} characters, not {}", ai, total - ai.len(), data.len()));
+            }
+        }
+        t.extend(ai.chars().map(Some));
+        t.extend(data.chars().map(Some));
+        rest = &r[next..];
+        if gs1_fixed(&ai[..2]).is_none() && !rest.is_empty() {
+            t.push(None);
+        }
+    }
+    Ok(t)
+}
+
+fn build(fields: &[Value], options: &Value) -> Result<Out, String> {
+    if fields.len() > 2000 {
+        return Err("at most 2,000 fields on a label".into());
+    }
+    let dpi = options["dpi"].as_i64().unwrap_or(203);
+    let dpmm = dots_per_mm(dpi);
+    let units = options["units"].as_str().unwrap_or("mm").to_string();
+    let d = |v: &Value, def: f64| to_dots(v, def, dpmm, &units);
+    let mut o = Out::new();
+    let esc = |o: &mut Out, cmd: &str| {
+        o.b(&[ESC]);
+        o.s(cmd);
+    };
+    esc(&mut o, "A");
+    if !options["width"].is_null() || !options["height"].is_null() {
+        esc(&mut o, &format!("A1V{:05}H{:04}", d(&options["height"], 50.0), d(&options["width"], 100.0)));
+    }
+    if let Some(s) = options["speed"].as_i64() {
+        esc(&mut o, &format!("CS{}", s.clamp(1, 14)));
+    }
+    if let Some(dk) = options["darkness"].as_i64() {
+        esc(&mut o, &format!("#E{}A", dk.clamp(1, 5)));
+    }
+    o.note("\n");
+    for f in fields {
+        if let Some(raw) = f["raw"].as_str() {
+            o.s(&ascii(raw));
+            o.note("\n");
+            continue;
+        }
+        let x = d(&f["x"], 0.0);
+        let y = d(&f["y"], 0.0);
+        let rot = match f["rotate"].as_i64().unwrap_or(0).rem_euclid(360) {
+            // SATO turns counterclockwise.
+            90 => 3,
+            180 => 2,
+            270 => 1,
+            _ => 0,
+        };
+        esc(&mut o, &format!("V{}", y));
+        esc(&mut o, &format!("H{}", x));
+        if rot != 0 {
+            esc(&mut o, &format!("%{}", rot));
+        }
+        if !f["text"].is_null() {
+            let text = ascii(&text_of(&f["text"]));
+            let (font, m) = match f["font"].as_str() {
+                Some(fnt) => (fnt.to_string(), f["multiply"].as_i64().unwrap_or(1).clamp(1, 36)),
+                None => {
+                    let (f, m) = font_for(d(&f["size"], 3.0).max(1));
+                    (f.to_string(), m)
+                }
+            };
+            esc(&mut o, &format!("L{:02}{:02}", m, m));
+            if f["reverse"] == true {
+                esc(&mut o, "(");
+            }
+            esc(&mut o, &format!("{}{}", font, text));
+        } else if let Some(kind) = f["barcode"].as_str() {
+            let data = ascii(&text_of(&f["data"]));
+            if data.is_empty() {
+                return Err("a barcode needs its `data`".into());
+            }
+            let h = d(&f["height"], 15.0).clamp(1, 999);
+            let narrow = f["module"].as_i64().unwrap_or(2).clamp(1, 36);
+            let digits = data.chars().all(|c| c.is_ascii_digit());
+            match kind {
+                "code128" => {
+                    let tokens: Vec<Option<char>> = data.chars().map(Some).collect();
+                    esc(&mut o, &format!("BG{:02}{:03}{}", narrow, h, code128(&tokens, false)?));
+                }
+                "gs1_128" => esc(&mut o, &format!("BG{:02}{:03}{}", narrow, h, code128(&gs1_tokens(&data)?, true)?)),
+                "code39" => {
+                    if !data.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || " -.$/+%".contains(c)) {
+                        return Err("Code 39 takes A-Z, 0-9, space and - . $ / + %".into());
+                    }
+                    esc(&mut o, &format!("B1{:02}{:03}*{}*", narrow, h, data));
+                }
+                "ean13" if digits && (data.len() == 12 || data.len() == 13) => esc(&mut o, &format!("B3{:02}{:03}{}", narrow, h, &data[..12])),
+                "upca" if digits && (data.len() == 11 || data.len() == 12) => esc(&mut o, &format!("BH{:02}{:03}{}", narrow, h, &data[..11])),
+                "itf" if digits && data.len() % 2 == 0 => esc(&mut o, &format!("B2{:02}{:03}{}", narrow, h, data)),
+                "ean13" | "upca" | "itf" => return Err(format!("{}: {:?} has the wrong digits", kind, data)),
+                "qr" => {
+                    let ecc = match f["ecc"].as_str().unwrap_or("M") {
+                        "L" => "L",
+                        "Q" => "Q",
+                        "H" => "H",
+                        _ => "M",
+                    };
+                    let cell = f["magnification"].as_i64().unwrap_or(5).clamp(1, 99);
+                    // Automatic data setup: the data's byte count, then the data.
+                    esc(&mut o, &format!("2D30,{},{:02},1,0", ecc, cell));
+                    esc(&mut o, &format!("DN{:04},{}", data.len(), data));
+                }
+                other => return Err(format!("unknown barcode {:?}: code128, gs1_128, code39, ean13, upca, itf or qr", other)),
+            }
+            // Text under a linear barcode, in the XS font, when wanted.
+            if kind != "qr" && f["readable"] != false {
+                esc(&mut o, &format!("V{}", y + h + 4));
+                esc(&mut o, &format!("H{}", x));
+                esc(&mut o, "L0101");
+                esc(&mut o, &format!("XS{}", data));
+            }
+        } else if f["box"] == true {
+            let t = d(&f["thickness"], 0.3).clamp(2, 99);
+            esc(&mut o, &format!("FW{:02}{:02}V{}H{}", t, t, d(&f["height"], 10.0).max(1), d(&f["width"], 10.0).max(1)));
+        } else if f["line"] == true {
+            let t = d(&f["thickness"], 0.3).clamp(2, 99);
+            if f["vertical"] == true {
+                esc(&mut o, &format!("FW{:02}V{}", t, d(&f["height"], 10.0).max(1)));
+            } else {
+                esc(&mut o, &format!("FW{:02}H{}", t, d(&f["width"], 10.0).max(1)));
+            }
+        } else {
+            return Err(format!("a field is text, barcode, box, line or raw: {}", f));
+        }
+        if rot != 0 {
+            esc(&mut o, "%0");
+        }
+        o.note("\n");
+    }
+    esc(&mut o, &format!("Q{}", options["quantity"].as_i64().unwrap_or(1).clamp(1, 999_999)));
+    esc(&mut o, "Z");
+    o.note("\n");
+    Ok(o)
+}
+
+/// A label as SBPL, written for people (`<ESC>` shown, a line break between fields for reading only). Each field is a map at `x`, `y` in millimetres from the top left (or `units: "dots"`):
+/// `{ text (ASCII), size: 3 (mm: the nearest of XU, XS, XM and XL with expansion) or font: "XM" with multiply, rotate: 90, reverse }`,
+/// `{ barcode: "code128" | "gs1_128" | "code39" | "ean13" | "upca" | "itf" | "qr", data, height, module, readable, ecc, magnification }`,
+/// `{ box: true, width, height, thickness }`, `{ line: true, width, thickness, vertical }` or `{ raw: "..." }`.
+/// `options`: `{ dpi: 203, width, height (the label's size), speed, darkness: 1-5, quantity }`.
+pub fn sbpl_label(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(build(&fields, &options)?.text)
+}
+
+/// The label's bytes in base64.
+pub fn sbpl_job(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(b64(&build(&fields, &options)?.bytes))
+}
+
+/// Writes the label to a file or a USB printer's device. Gives the bytes written.
+pub fn sbpl_write(fields: Vec<serde_json::Value>, options: serde_json::Value, path: &str) -> Result<i64, String> {
+    write_bytes(&build(&fields, &options)?.bytes, path)
+}
+
+/// Sends the label to a printer's raw port (`host` or `host:port`, 9100 when not given). Gives the bytes sent.
+pub fn sbpl_send(fields: Vec<serde_json::Value>, options: serde_json::Value, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    send_bytes(&build(&fields, &options)?.bytes, host, timeout_ms)
+}
+
+// ---- Shared by the printer plugins: the job's bytes and a readable copy, pictures as bits, the network.
+
+/// A job's bytes, and the same job written for people: control bytes as `<ESC>`, graphics as `<N bytes>`.
+struct Out {
+    bytes: Vec<u8>,
+    text: String,
+}
+
+fn control_name(c: u8) -> String {
+    match c {
+        0x00 => "<NUL>".into(),
+        0x02 => "<STX>".into(),
+        0x03 => "<ETX>".into(),
+        0x0a => "\n".into(),
+        0x0c => "<FF>".into(),
+        0x0d => "<CR>".into(),
+        0x17 => "<ETB>".into(),
+        0x18 => "<CAN>".into(),
+        0x1b => "<ESC>".into(),
+        0x1e => "<RS>".into(),
+        c if c < 0x20 || c == 0x7f => format!("<{:02X}>", c),
+        c => (c as char).to_string(),
+    }
+}
+
+impl Out {
+    fn new() -> Out {
+        Out { bytes: vec![], text: String::new() }
+    }
+    /// Command bytes, shown as they are with control bytes named.
+    fn b(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        for c in data {
+            self.text.push_str(&control_name(*c));
+        }
+    }
+    /// ASCII command text.
+    fn s(&mut self, s: &str) {
+        self.b(s.as_bytes());
+    }
+    /// Text already encoded for the printer (`enc`), shown as written.
+    fn t(&mut self, shown: &str, enc: &[u8]) {
+        self.bytes.extend_from_slice(enc);
+        for c in shown.chars() {
+            if (c as u32) < 0x20 {
+                self.text.push_str(&control_name(c as u8));
+            } else {
+                self.text.push(c);
+            }
+        }
+    }
+    /// Text for the readable copy only (a line break between commands), not sent.
+    fn note(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+    /// The job for people: CR LF line ends shown as plain line breaks.
+    fn view(&self) -> String {
+        self.text.replace("<CR>\n", "\n")
+    }
+    /// Binary data (a picture), shown by its size.
+    fn blob(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        self.text.push_str(&format!("<{} bytes>", data.len()));
+    }
+}
+
+/// Dots per millimetre for a resolution in dpi.
+fn dots_per_mm(dpi: i64) -> f64 {
+    dpi.clamp(100, 1200) as f64 / 25.4
+}
+
+/// A length given in `units` ("mm", the default, "in" or "dots") as dots.
+fn to_dots(v: &Value, default: f64, dpmm: f64, units: &str) -> i64 {
+    let x = v.as_f64().unwrap_or(default);
+    let d = match units {
+        "dots" => x,
+        "in" | "inch" | "inches" => x * 25.4 * dpmm,
+        _ => x * dpmm,
+    };
+    d.round().max(0.0) as i64
+}
+
+/// A picture as rows of bits, true for black: scaled to `width` dots when given, dithered or cut at a threshold, transparency as white.
+fn bitmap(path: &str, width: Option<u32>, threshold: u8, dither: bool) -> Result<(usize, usize, Vec<Vec<bool>>), String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let img = match width {
+        Some(w) if w > 0 && w != img.width() => {
+            let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+            img.resize_exact(w, h, image::imageops::FilterType::Triangle)
+        }
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w * h > 8_000_000 {
+        return Err("the picture is over 8 million dots: give a width".into());
+    }
+    let mut lum: Vec<f32> = rgba
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold as f32;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                for (dx, dy, f) in [(1isize, 0usize, 7.0f32 / 16.0), (-1, 1, 3.0 / 16.0), (0, 1, 5.0 / 16.0), (1, 1, 1.0 / 16.0)] {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                }
+            }
+        }
+    }
+    Ok((w, h, rows))
+}
+
+/// Rows of bits packed 8 dots to a byte, the first dot in the high bit; `black_is_one` false for printers where 0 prints.
+fn pack_rows(w: usize, rows: &[Vec<bool>], black_is_one: bool) -> (usize, Vec<u8>) {
+    let bpr = (w + 7) / 8;
+    let mut out = Vec::with_capacity(bpr * rows.len());
+    for r in rows {
+        for b in 0..bpr {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = b * 8 + bit;
+                let black = x < w && r[x];
+                if black == black_is_one {
+                    byte |= 0x80 >> bit;
+                }
+            }
+            out.push(byte);
+        }
+    }
+    (bpr, out)
+}
+
+/// `host`, `host:port` or `[v6]:port` as an address; `port` when none is written.
+fn printer_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64);
+    let addr = printer_addr(host, 9100)?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", addr, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends bytes to a printer's raw port and closes it.
+fn send_bytes(bytes: &[u8], host: &str, timeout_ms: i64) -> Result<i64, String> {
+    use std::io::Write;
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(bytes).map_err(|e| format!("sending to the printer: {}", e))?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(bytes.len() as i64)
+}
+
+/// Writes bytes to a file or a device (`/dev/usb/lp0`), folders made for a file.
+fn write_bytes(bytes: &[u8], path: &str) -> Result<i64, String> {
+    use std::io::Write;
+    let p = std::path::Path::new(path);
+    let device = path.starts_with("/dev/");
+    if !device {
+        if let Some(dir) = p.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(!device).truncate(!device).open(p).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(bytes).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(bytes.len() as i64)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}

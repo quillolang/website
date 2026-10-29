@@ -1,0 +1,265 @@
+//! A server's TLS certificate chain fetched from host:port and checked as browsers check it: trusted by Mozilla's roots (or yours), in order, covering the name, and how many days until the first certificate in it expires; for expiry alerts and status pages.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+//! x509-parser = "0.16"
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use serde_json::{json, Value};
+use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::Duration;
+use x509_parser::extensions::GeneralName;
+use x509_parser::pem::Pem;
+use x509_parser::prelude::{FromDer, X509Certificate};
+
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Takes whatever the server sends, so expired and untrusted chains can be looked at too; the real check is `report`.
+#[derive(Debug)]
+struct Accept(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for Accept {
+    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn iso(t: i64) -> String {
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, secs / 3600, secs % 3600 / 60, secs % 60)
+}
+
+fn pem_of(der: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for chunk in der.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            s.push(if i <= chunk.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    let lines: Vec<&str> = s.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+}
+
+fn ders(pem: &str) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = vec![];
+    for p in Pem::iter_from_buffer(pem.as_bytes()) {
+        let p = p.map_err(|e| format!("not PEM: {}", e))?;
+        if p.label == "CERTIFICATE" {
+            out.push(p.contents);
+        }
+    }
+    if out.is_empty() {
+        return Err("no `-----BEGIN CERTIFICATE-----` in the text".into());
+    }
+    Ok(out)
+}
+
+fn cn(name: &x509_parser::x509::X509Name) -> String {
+    name.iter_common_name().next().and_then(|c| c.as_str().ok()).map(str::to_string).unwrap_or_else(|| name.to_string())
+}
+
+fn dns_names(c: &X509Certificate) -> Vec<String> {
+    let mut out = vec![];
+    if let Ok(Some(san)) = c.subject_alternative_name() {
+        for n in &san.value.general_names {
+            match n {
+                GeneralName::DNSName(s) => out.push(s.to_string()),
+                GeneralName::IPAddress(b) if b.len() == 4 => out.push(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn covers(names: &[String], host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    names.iter().any(|n| {
+        let n = n.to_lowercase();
+        match n.strip_prefix("*.") {
+            Some(rest) => host.split_once('.').is_some_and(|(first, tail)| !first.is_empty() && tail == rest),
+            None => n == host,
+        }
+    })
+}
+
+fn roots(roots_pem: &str) -> Result<RootCertStore, String> {
+    let mut store = RootCertStore::empty();
+    if roots_pem.trim().is_empty() {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    } else {
+        for d in ders(roots_pem)? {
+            store.add(CertificateDer::from(d)).map_err(|e| format!("a root is not usable: {}", e))?;
+        }
+    }
+    Ok(store)
+}
+
+fn trust_message(e: &rustls::Error) -> String {
+    use rustls::CertificateError as C;
+    match e {
+        rustls::Error::InvalidCertificate(c) => match c {
+            C::Expired | C::ExpiredContext { .. } => "a certificate in the chain has expired".into(),
+            C::NotValidYet | C::NotValidYetContext { .. } => "a certificate in the chain is not valid yet".into(),
+            C::UnknownIssuer => "the chain does not lead to a trusted root: an intermediate is missing, or the root is private or self-signed".into(),
+            C::NotValidForName | C::NotValidForNameContext { .. } => "the certificate does not cover this host name".into(),
+            C::BadSignature => "a signature in the chain does not verify".into(),
+            C::Revoked => "the certificate was revoked".into(),
+            other => format!("{:?}", other),
+        },
+        other => other.to_string(),
+    }
+}
+
+/// Reads a chain (PEM, leaf first, as a server sends it) and checks it for `host`: `{ host, trusted, trust_error, covers_host,
+/// in_order, days_left, expires, expiring_cert, certs: [{ subject, issuer, names, not_before, not_after, days_left, is_ca }], problems }`.
+/// Trust is checked against Mozilla's roots, or against `roots_pem` when it is not empty (a private CA). `days_left` is for the
+/// certificate in the chain that expires first.
+pub fn tls_report(pem: &str, host: &str, roots_pem: &str) -> Result<Value, String> {
+    let chain = ders(pem)?;
+    let mut certs = vec![];
+    let mut problems: Vec<String> = vec![];
+    let mut parsed = vec![];
+    for d in &chain {
+        let (_, c) = X509Certificate::from_der(d).map_err(|e| format!("not a certificate: {}", e))?;
+        parsed.push(c);
+    }
+    let t = now();
+    let mut first_end = (i64::MAX, String::new());
+    for c in &parsed {
+        let v = c.validity();
+        let (start, end) = (v.not_before.timestamp(), v.not_after.timestamp());
+        if end < first_end.0 {
+            first_end = (end, cn(c.subject()));
+        }
+        if end < t {
+            problems.push(format!("`{}` expired on {}", cn(c.subject()), &iso(end)[..10]));
+        } else if start > t {
+            problems.push(format!("`{}` is not valid until {}", cn(c.subject()), &iso(start)[..10]));
+        }
+        certs.push(json!({
+            "subject": cn(c.subject()),
+            "issuer": cn(c.issuer()),
+            "names": dns_names(c),
+            "not_before": iso(start),
+            "not_after": iso(end),
+            "days_left": (end - t).div_euclid(86400),
+            "is_ca": c.is_ca(),
+        }));
+    }
+    let in_order = parsed.windows(2).all(|w| w[0].issuer().as_raw() == w[1].subject().as_raw());
+    if !in_order {
+        problems.push("the chain is not in order: each certificate should be followed by its issuer's".into());
+    }
+    let leaf_names = dns_names(&parsed[0]);
+    let covers_host = covers(&leaf_names, host);
+    if !covers_host {
+        problems.push(format!("the certificate names {}, not {}", leaf_names.join(", "), host));
+    }
+    if parsed.len() > 1 && parsed.last().is_some_and(|c| c.subject().as_raw() == c.issuer().as_raw()) {
+        problems.push("the root is sent too: harmless, but extra bytes on every connection".into());
+    }
+
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots(roots_pem)?), provider()).build().map_err(|e| e.to_string())?;
+    let name = ServerName::try_from(host.trim().to_string()).map_err(|_| format!("`{}` is not a host name", host))?;
+    let leaf = CertificateDer::from(chain[0].clone());
+    let rest: Vec<CertificateDer> = chain[1..].iter().map(|d| CertificateDer::from(d.clone())).collect();
+    let when = UnixTime::since_unix_epoch(Duration::from_secs(t.max(0) as u64));
+    let trust = verifier.verify_server_cert(&leaf, &rest, &name, &[], when);
+    let trust_error = trust.as_ref().err().map(trust_message);
+    if let Some(e) = &trust_error {
+        let said = (e.contains("expired") && problems.iter().any(|p| p.contains("expired"))) || (e.contains("cover") && !covers_host);
+        if !said {
+            problems.push(e.clone());
+        }
+    }
+    Ok(json!({
+        "host": host,
+        "trusted": trust.is_ok(),
+        "trust_error": trust_error,
+        "covers_host": covers_host,
+        "in_order": in_order,
+        "days_left": (first_end.0 - t).div_euclid(86400),
+        "expires": iso(first_end.0),
+        "expiring_cert": first_end.1,
+        "certs": certs,
+        "problems": problems,
+    }))
+}
+
+/// The chain `host` sends on `port` (443 for HTTPS), as PEM text, leaf first: fetched with a TLS handshake that accepts any
+/// certificate, so an expired or untrusted one can be read too. `timeout_ms` limits the connection and the handshake.
+pub fn tls_fetch(host: &str, port: i64, timeout_ms: i64) -> Result<String, String> {
+    Ok(handshake(host, port, timeout_ms)?.0)
+}
+
+fn handshake(host: &str, port: i64, timeout_ms: i64) -> Result<(String, String, String), String> {
+    let timeout = Duration::from_millis(timeout_ms.clamp(100, 60_000) as u64);
+    let addr = (host, port as u16).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    let mut sock = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("{}:{}: {}", host, port, e))?;
+    sock.set_read_timeout(Some(timeout)).ok();
+    sock.set_write_timeout(Some(timeout)).ok();
+    let p = provider();
+    let config = ClientConfig::builder_with_provider(p.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Accept(p)))
+        .with_no_client_auth();
+    let name = ServerName::try_from(host.to_string()).map_err(|_| format!("`{}` is not a host name", host))?;
+    let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).map_err(|e| format!("TLS handshake with {}:{}: {}", host, port, e))?;
+    }
+    let pem: String = conn.peer_certificates().unwrap_or(&[]).iter().map(|c| pem_of(c.as_ref())).collect();
+    let version = conn.protocol_version().map(|v| format!("{:?}", v).replace('_', ".").replace("TLSv1.", "TLS 1.")).unwrap_or_default();
+    let suite = conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())).unwrap_or_default();
+    conn.send_close_notify();
+    let _ = conn.write_tls(&mut sock);
+    let _ = sock.flush();
+    Ok((pem, version, suite))
+}
+
+/// Fetches `host`'s chain on `port` and checks it as `tls_report` does, adding the `protocol` and `cipher` agreed:
+/// one call for an expiry alert (`days_left < 14`) or a status page.
+pub fn tls_check(host: &str, port: i64, timeout_ms: i64) -> Result<Value, String> {
+    let (pem, protocol, cipher) = handshake(host, port, timeout_ms)?;
+    let mut r = tls_report(&pem, host, "")?;
+    r["port"] = json!(port);
+    r["protocol"] = json!(protocol);
+    r["cipher"] = json!(cipher);
+    Ok(r)
+}

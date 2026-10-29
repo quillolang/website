@@ -1,0 +1,159 @@
+//! Stripe's API without an SDK: Checkout sessions and PaymentIntents made, any endpoint called with Stripe's nested form encoding and idempotency keys, amounts turned into the minor units each currency uses (yen has none, dinars three), and webhook events verified and read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+
+const ZERO_DECIMAL: &[&str] = &["bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"];
+const THREE_DECIMAL: &[&str] = &["bhd", "jod", "kwd", "omr", "tnd"];
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{}[{}]", prefix, k) };
+                flatten(&key, x, out);
+            }
+        }
+        Value::Array(a) => {
+            if a.is_empty() {
+                out.push((prefix.to_string(), String::new()));
+            }
+            for (i, x) in a.iter().enumerate() {
+                flatten(&format!("{}[{}]", prefix, i), x, out);
+            }
+        }
+        Value::Null => {}
+        Value::String(s) => out.push((prefix.to_string(), s.clone())),
+        other => out.push((prefix.to_string(), other.to_string())),
+    }
+}
+
+/// Parameters as Stripe's API wants them: nested maps and lists in brackets, `line_items[0][price_data][currency]=eur`, each
+/// part percent-encoded. Nulls are left out.
+pub fn stripe_form(params: serde_json::Value) -> String {
+    let mut pairs = vec![];
+    flatten("", &params, &mut pairs);
+    pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+/// An amount in a currency's minor units, as Stripe counts it: `stripe_amount("19.99", "eur")` is 1999, `("1500", "jpy")` 1500,
+/// `("1.250", "kwd")` 1250. Takes text so no float rounding creeps in; an error value for more decimals than the currency has.
+pub fn stripe_amount(amount: &str, currency: &str) -> Result<i64, String> {
+    let c = currency.to_lowercase();
+    let places = if ZERO_DECIMAL.contains(&c.as_str()) { 0 } else if THREE_DECIMAL.contains(&c.as_str()) { 3 } else { 2 };
+    let a = amount.trim();
+    let (neg, a) = a.strip_prefix('-').map_or((false, a), |r| (true, r));
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > places {
+        return Err(format!("{} has {} decimals; {} has {}", amount, frac.len(), currency.to_uppercase(), places));
+    }
+    let digits = format!("{}{}{}", whole, frac, "0".repeat(places - frac.len()));
+    let n: i64 = digits.parse().map_err(|_| format!("`{}` is too large", amount))?;
+    Ok(if neg { -n } else { n })
+}
+
+/// Calls the API: `method` "GET", "POST" or "DELETE", `path` like "/v1/customers", `params` a map (form-encoded for POST, the
+/// query for GET). `options` may hold `api_key` (else STRIPE_SECRET_KEY), `idempotency_key` (a retried POST then happens once),
+/// `stripe_account` (Connect), `stripe_version` and `base_url` (else STRIPE_API_URL, else Stripe's: stripe-mock, a test). Gives
+/// `{ ok, status, body, error }`, `error` being Stripe's `{ type, code, message, param }`.
+pub fn stripe_request(method: &str, path: &str, params: serde_json::Value, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let o = |k: &str| options.get(k).and_then(|v| v.as_str()).map(str::to_string).filter(|v| !v.is_empty());
+    let key = o("api_key").or_else(|| std::env::var("STRIPE_SECRET_KEY").ok()).filter(|k| !k.is_empty()).ok_or("no api_key, and STRIPE_SECRET_KEY is not set")?;
+    if !(key.starts_with("sk_") || key.starts_with("rk_")) {
+        return Err("a Stripe secret key starts with sk_ or rk_ (never use a publishable pk_ key on the server)".into());
+    }
+    let base = o("base_url").or_else(|| std::env::var("STRIPE_API_URL").ok().filter(|u| !u.is_empty())).unwrap_or_else(|| "https://api.stripe.com".into());
+    let form = if params.is_null() { String::new() } else { stripe_form(params) };
+    let m = method.to_uppercase();
+    let mut url = format!("{}{}", base.trim_end_matches('/'), if path.starts_with('/') { path.to_string() } else { format!("/{}", path) });
+    if m != "POST" && !form.is_empty() {
+        url = format!("{}{}{}", url, if url.contains('?') { "&" } else { "?" }, form);
+    }
+    let mut req = ureq::request(&m, &url).timeout(std::time::Duration::from_secs(30)).set("Authorization", &format!("Bearer {}", key)).set("User-Agent", "quillo-stripe/1.0");
+    if let Some(i) = o("idempotency_key") { req = req.set("Idempotency-Key", &i); }
+    if let Some(a) = o("stripe_account") { req = req.set("Stripe-Account", &a); }
+    if let Some(v) = o("stripe_version") { req = req.set("Stripe-Version", &v); }
+    let res = if m == "POST" { req.set("Content-Type", "application/x-www-form-urlencoded").send_string(&form) } else { req.call() };
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("Stripe: {}", e)),
+    };
+    let body: Value = serde_json::from_str(&text).unwrap_or(json!(text));
+    let ok = (200..300).contains(&status);
+    Ok(json!({ "ok": ok, "status": status, "body": body, "error": if ok { Value::Null } else { body["error"].clone() } }))
+}
+
+/// A Checkout session (POST /v1/checkout/sessions): `params` as Stripe documents them (`mode`, `line_items`, `success_url`,
+/// `cancel_url`, `customer_email`, `metadata`...), "payment" mode by default; `options` as for `stripe_request`. Gives
+/// `{ ok, id, url, error }`: send the customer to `url`.
+pub fn stripe_checkout(params: serde_json::Value, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let mut p = params;
+    if p.get("mode").is_none() {
+        p["mode"] = json!("payment");
+    }
+    let r = stripe_request("POST", "/v1/checkout/sessions", p, options)?;
+    Ok(json!({ "ok": r["ok"], "status": r["status"], "id": r["body"]["id"], "url": r["body"]["url"], "error": r["error"] }))
+}
+
+/// A PaymentIntent (POST /v1/payment_intents) for `amount` in minor units of `currency`, `params` adding `customer`, `metadata`,
+/// `automatic_payment_methods`..., `options` as for `stripe_request`. Gives `{ ok, id, client_secret, intent_status, error }`:
+/// the page confirms it with `client_secret`.
+pub fn stripe_payment_intent(amount: i64, currency: &str, params: serde_json::Value, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    if amount <= 0 {
+        return Err("the amount is in minor units and more than 0 (see stripe_amount)".into());
+    }
+    let mut p = if params.is_object() { params } else { json!({}) };
+    p["amount"] = json!(amount);
+    p["currency"] = json!(currency.to_lowercase());
+    if p.get("automatic_payment_methods").is_none() && p.get("payment_method_types").is_none() {
+        p["automatic_payment_methods"] = json!({ "enabled": true });
+    }
+    let r = stripe_request("POST", "/v1/payment_intents", p, options)?;
+    Ok(json!({ "ok": r["ok"], "status": r["status"], "id": r["body"]["id"], "client_secret": r["body"]["client_secret"], "intent_status": r["body"]["status"], "error": r["error"] }))
+}
+
+/// A webhook event checked and read: `payload` the raw body, `signature` the `Stripe-Signature` header, `secret` the endpoint's
+/// `whsec_...`, refused when signed more than `tolerance_seconds` ago (300 is Stripe's). Gives the event (`{ id, type, data:
+/// { object } ... }`), or an error value saying why it is refused.
+pub fn stripe_event(payload: &str, signature: &str, secret: &str, tolerance_seconds: i64) -> Result<Value, String> {
+    let mut t = None;
+    let mut sigs = vec![];
+    for part in signature.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", v)) => t = v.parse::<i64>().ok(),
+            Some(("v1", v)) => sigs.push(v.to_string()),
+            _ => {}
+        }
+    }
+    let t = t.ok_or("the Stripe-Signature header has no t=")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if tolerance_seconds > 0 && (now - t).abs() > tolerance_seconds {
+        return Err(format!("the event was signed {} s ago, more than the {} s allowed", (now - t).abs(), tolerance_seconds));
+    }
+    let ok = sigs.iter().any(|s| {
+        let Some(bytes) = (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect::<Option<Vec<u8>>>() else { return false };
+        let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+        m.update(format!("{}.{}", t, payload).as_bytes());
+        m.verify_slice(&bytes).is_ok()
+    });
+    if !ok {
+        return Err("the signature does not match: a wrong endpoint secret, or the body was changed (use the raw body)".into());
+    }
+    serde_json::from_str(payload).map_err(|e| format!("the event is not JSON: {}", e))
+}

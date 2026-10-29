@@ -1,0 +1,146 @@
+//! jq filters over JSON, with jaq: pick, reshape, filter and sum API answers, webhook bodies and JSON lines with the language people already write in jq.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! jaq-core = "=2.2.1"
+//! jaq-std = "=2.1.2"
+//! jaq-json = { version = "=1.1.3", features = ["serde_json"] }
+
+use jaq_core::load::{Arena, File, Loader};
+use jaq_core::{Compiler, Ctx, RcIter};
+use jaq_json::Val;
+use serde_json::Value;
+
+const MAX_OUT: usize = 100_000;
+
+fn position(code: &str, rest: &str) -> String {
+    let at = code.len().saturating_sub(rest.len());
+    let col = code[..at].chars().count() + 1;
+    let near: String = rest.chars().take(12).collect();
+    if near.is_empty() { format!("at the end (column {})", col) } else { format!("at column {} (`{}`)", col, near) }
+}
+
+/// Runs `filter` over each of `inputs` with `$name` variables from `vars`, at most MAX_OUT values in all.
+fn run(filter: &str, inputs: Vec<Value>, vars: serde_json::Map<String, Value>) -> Result<Vec<Value>, String> {
+    let program = File { code: filter, path: () };
+    let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+    let arena = Arena::default();
+    let modules = loader.load(&arena, program).map_err(|errs| {
+        let mut msgs = vec![];
+        for (_, e) in errs {
+            match e {
+                jaq_core::load::Error::Io(v) => msgs.extend(v.into_iter().map(|(p, m)| format!("{}: {}", p, m))),
+                jaq_core::load::Error::Lex(v) => msgs.extend(v.into_iter().map(|(exp, rest)| format!("expected a {} {}", exp.as_str(), position(filter, rest)))),
+                jaq_core::load::Error::Parse(v) => msgs.extend(v.into_iter().map(|(exp, rest)| format!("expected {} {}", exp.as_str(), position(filter, rest)))),
+            }
+        }
+        format!("the filter does not read: {}", msgs.join("; "))
+    })?;
+    let names: Vec<String> = vars.keys().map(|k| format!("${}", k.trim_start_matches('$'))).collect();
+    let compiled = Compiler::default()
+        .with_funs(jaq_std::funs().chain(jaq_json::funs()))
+        .with_global_vars(names.iter().map(|s| s.as_str()))
+        .compile(modules)
+        .map_err(|errs| {
+            let msgs: Vec<String> = errs
+                .into_iter()
+                .flat_map(|(_, es)| {
+                    es.into_iter().map(|(name, what)| match what {
+                        jaq_core::compile::Undefined::Filter(n) => format!("no filter `{}` taking {} argument{}", name, n, if n == 1 { "" } else { "s" }),
+                        jaq_core::compile::Undefined::Var => format!("no variable `{}`", name),
+                        other => format!("`{}` is not defined ({:?})", name, other),
+                    })
+                })
+                .collect();
+            msgs.join("; ")
+        })?;
+    let mut out = vec![];
+    let empty = RcIter::new(core::iter::empty());
+    for input in inputs {
+        let ctx = Ctx::new(vars.values().cloned().map(Val::from), &empty);
+        for r in compiled.run((ctx, Val::from(input))) {
+            match r {
+                Ok(v) => out.push(Value::from(v)),
+                Err(e) => return Err(format!("the filter failed: {}", e)),
+            }
+            if out.len() > MAX_OUT {
+                return Err(format!("the filter gave more than {} values", MAX_OUT));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every value `filter` gives for `input`, as a list: `jq_run(".items[] | select(.qty > 1) | .sku", order)`. jq's language as
+/// jaq has it: paths, pipes, `select`, `map`, `group_by`, `reduce`, `to_entries`, string interpolation, `@csv`, `@base64`...
+/// An error value says where a filter does not read, or what failed while it ran.
+pub fn jq_run(filter: &str, input: serde_json::Value) -> Result<Vec<Value>, String> {
+    run(filter, vec![input], serde_json::Map::new())
+}
+
+/// The first value `filter` gives for `input`, or null when it gives none: for a filter that makes one answer.
+pub fn jq_first(filter: &str, input: serde_json::Value) -> Result<Value, String> {
+    Ok(run(filter, vec![input], serde_json::Map::new())?.into_iter().next().unwrap_or(Value::Null))
+}
+
+/// `jq_run` with variables: each key of `vars` is `$key` in the filter, as `jq --argjson key value` gives:
+/// `jq_with(".[] | select(.price < $max)", items, { max: 20 })`. Keeps filters free of values pasted into their text.
+pub fn jq_with(filter: &str, input: serde_json::Value, vars: std::collections::HashMap<String, serde_json::Value>) -> Result<Vec<Value>, String> {
+    let mut keys: Vec<_> = vars.into_iter().collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    run(filter, vec![input], keys.into_iter().collect())
+}
+
+/// `filter` run over each JSON value in `text` (JSON lines, or values one after another, as `jq` reads a stream): every value given,
+/// in order. With `slurp` true the values are put in one list first, as `jq -s` does.
+pub fn jq_stream(filter: &str, text: &str, slurp: bool) -> Result<Vec<Value>, String> {
+    let mut inputs = vec![];
+    for (i, v) in serde_json::Deserializer::from_str(text).into_iter::<Value>().enumerate() {
+        inputs.push(v.map_err(|e| format!("value {} is not JSON: {}", i + 1, e))?);
+    }
+    if slurp {
+        inputs = vec![Value::Array(inputs)];
+    }
+    run(filter, inputs, serde_json::Map::new())
+}
+
+/// Whether `filter` reads and every name in it is defined: null when it does, else the error, for filters people type in a form.
+pub fn jq_check(filter: &str) -> Option<String> {
+    let names = jq_free_vars(filter);
+    let vars: serde_json::Map<String, Value> = names.into_iter().map(|n| (n, Value::Null)).collect();
+    match run(filter, vec![], vars) {
+        Ok(_) => None,
+        Err(e) => Some(e),
+    }
+}
+
+/// `$names` used in a filter (outside strings), so a checked filter may use variables given later.
+fn jq_free_vars(filter: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut in_str = false;
+    let mut chars = filter.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '\\' if in_str => {
+                chars.next();
+            }
+            '"' => in_str = !in_str,
+            '$' if !in_str => {
+                let mut name = String::new();
+                while let Some(&(_, n)) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' {
+                        name.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !name.is_empty() && name != "__loc__" && !out.contains(&name) && !filter.contains(&format!("as ${}", name)) {
+                    out.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}

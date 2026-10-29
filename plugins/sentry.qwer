@@ -1,0 +1,140 @@
+//! Errors and messages sent to Sentry (or GlitchTip, or any Sentry-compatible server) as envelope events from a DSN: level, tags, user, request, release, environment, breadcrumbs and a stack trace, without an SDK.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! rand = "0.8"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use rand::RngCore;
+use serde_json::{json, Map, Value};
+
+fn now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+fn event_id() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn dsn_or_env(dsn: &str) -> Result<String, String> {
+    if !dsn.trim().is_empty() {
+        return Ok(dsn.trim().to_string());
+    }
+    std::env::var("SENTRY_DSN").ok().filter(|d| !d.is_empty()).ok_or_else(|| "no DSN, and SENTRY_DSN is not set".into())
+}
+
+/// A DSN taken apart: `{ scheme, public_key, host, path, project_id, envelope_url }` (`https://<key>@o1.ingest.sentry.io/42`).
+pub fn sentry_dsn(dsn: &str) -> Result<Value, String> {
+    let d = dsn_or_env(dsn)?;
+    let (scheme, rest) = d.split_once("://").ok_or("a DSN looks like https://<key>@<host>/<project>")?;
+    let (key, rest) = rest.split_once('@').ok_or("a DSN has the public key before @")?;
+    let key = key.split(':').next().unwrap_or(key);
+    let (host_path, project) = rest.rsplit_once('/').ok_or("a DSN ends with /<project id>")?;
+    let (host, path) = host_path.split_once('/').map_or((host_path, String::new()), |(h, p)| (h, format!("/{}", p)));
+    if project.is_empty() || key.is_empty() {
+        return Err("a DSN needs a public key and a project id".into());
+    }
+    Ok(json!({
+        "scheme": scheme, "public_key": key, "host": host, "path": path, "project_id": project,
+        "envelope_url": format!("{}://{}{}/api/{}/envelope/", scheme, host, path, project),
+    }))
+}
+
+fn send(dsn: &str, event: Value) -> Result<Value, String> {
+    let d = sentry_dsn(dsn)?;
+    let id = event["event_id"].as_str().unwrap_or_default().to_string();
+    let header = json!({ "event_id": id, "dsn": dsn_or_env(dsn)?, "sent_at": iso(now()) });
+    let body = format!("{}\n{}\n{}\n", header, json!({ "type": "event", "content_type": "application/json" }), event);
+    let auth = format!("Sentry sentry_version=7, sentry_client=quillo-sentry/1.0, sentry_key={}", d["public_key"].as_str().unwrap_or(""));
+    let res = ureq::post(d["envelope_url"].as_str().unwrap_or(""))
+        .timeout(std::time::Duration::from_secs(10))
+        .set("Content-Type", "application/x-sentry-envelope")
+        .set("X-Sentry-Auth", &auth)
+        .send_string(&body);
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("Sentry: {}", e)),
+    };
+    let ok = (200..300).contains(&status);
+    Ok(json!({ "ok": ok, "status": status, "event_id": id, "error": if ok { Value::Null } else { json!(text.chars().take(300).collect::<String>()) }, "rate_limited": status == 429 }))
+}
+
+fn iso(t: f64) -> String {
+    let secs = t as i64;
+    let (days, s) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, s / 3600, s % 3600 / 60, s % 60)
+}
+
+fn base_event(level: &str, options: &Map<String, Value>) -> Result<Value, String> {
+    if !["fatal", "error", "warning", "info", "debug"].contains(&level) {
+        return Err(format!("level `{}` is fatal, error, warning, info or debug", level));
+    }
+    let mut e = json!({
+        "event_id": event_id(),
+        "timestamp": now(),
+        "platform": "other",
+        "level": level,
+        "logger": options.get("logger").cloned().unwrap_or(json!("quillo")),
+        "sdk": { "name": "quillo-sentry", "version": "1.0.0" },
+    });
+    if let Some(h) = options.get("server_name").cloned().or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()).map(Value::String)) {
+        e["server_name"] = h;
+    }
+    let env_or = |k: &str, var: &str| options.get(k).cloned().or_else(|| std::env::var(var).ok().map(Value::String));
+    if let Some(r) = env_or("release", "SENTRY_RELEASE") { e["release"] = r; }
+    if let Some(r) = env_or("environment", "SENTRY_ENVIRONMENT") { e["environment"] = r; }
+    for k in ["tags", "extra", "user", "contexts", "fingerprint", "transaction"] {
+        if let Some(v) = options.get(k) { e[k] = v.clone(); }
+    }
+    if let Some(r) = options.get("request") {
+        // Only what helps to reproduce; cookies and authorization never leave.
+        let mut req = r.clone();
+        if let Some(h) = req.get_mut("headers").and_then(|h| h.as_object_mut()) {
+            h.retain(|k, _| !["cookie", "authorization", "x-api-key"].contains(&k.to_lowercase().as_str()));
+        }
+        e["request"] = req;
+    }
+    if let Some(b) = options.get("breadcrumbs").and_then(|b| b.as_array()) {
+        e["breadcrumbs"] = json!({ "values": b });
+    }
+    Ok(e)
+}
+
+/// Sends a message event (`level` "fatal", "error", "warning", "info" or "debug") to the DSN's project (empty: SENTRY_DSN).
+/// `options` may hold `tags`, `extra`, `user` (`{ id, email }`), `request` (`{ url, method, headers }`, cookies and authorization
+/// dropped), `release` and `environment` (else SENTRY_RELEASE, SENTRY_ENVIRONMENT), `breadcrumbs`, `fingerprint`, `transaction`.
+/// Gives `{ ok, status, event_id, error, rate_limited }`.
+pub fn sentry_message(dsn: &str, message: &str, level: &str, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let o: Map<String, Value> = options.into_iter().collect();
+    let mut e = base_event(level, &o)?;
+    e["message"] = json!({ "formatted": message });
+    send(dsn, e)
+}
+
+/// Sends an error event: `error_type` ("PaymentFailed") and `value` (its message) show as the issue's title; `options` as for
+/// `sentry_message`, plus `stacktrace`, a list of frames `{ function, filename, lineno }` from the outermost call in, and `level`
+/// ("error" unless given). Events with the same type and stack trace group into one issue.
+pub fn sentry_error(dsn: &str, error_type: &str, value: &str, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let o: Map<String, Value> = options.into_iter().collect();
+    let level = o.get("level").and_then(|l| l.as_str()).unwrap_or("error").to_string();
+    let mut e = base_event(&level, &o)?;
+    let mut ex = json!({ "type": error_type, "value": value, "mechanism": { "type": "generic", "handled": true } });
+    if let Some(frames) = o.get("stacktrace").and_then(|s| s.as_array()) {
+        ex["stacktrace"] = json!({ "frames": frames.iter().map(|f| { let mut f = f.clone(); f["in_app"] = json!(true); f }).collect::<Vec<_>>() });
+    }
+    e["exception"] = json!({ "values": [ex] });
+    send(dsn, e)
+}

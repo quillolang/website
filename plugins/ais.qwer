@@ -1,0 +1,385 @@
+//! Ship AIS messages decoded from the NMEA lines a receiver gives (!AIVDM, !AIVDO): checksums checked, multi-part messages joined, and the common types read: position reports (1, 2, 3, 18, 19, 27), base stations (4), static and voyage data (5: name, call sign, IMO, type, size, destination, ETA, draught), class B static data (24) and aids to navigation (21), with navigation status and ship type in words.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+/// The payload's six-bit characters as a list of bits.
+fn bits_of(payload: &str, fill: usize) -> Result<Vec<bool>, String> {
+    let mut b = Vec::with_capacity(payload.len() * 6);
+    for c in payload.chars() {
+        let mut v = c as i32 - 48;
+        if v > 40 {
+            v -= 8;
+        }
+        if !(0..64).contains(&v) {
+            return Err(format!("{:?} is not an AIS payload character", c));
+        }
+        for i in (0..6).rev() {
+            b.push((v >> i) & 1 == 1);
+        }
+    }
+    b.truncate(b.len().saturating_sub(fill));
+    Ok(b)
+}
+
+struct Bits<'a> {
+    b: &'a [bool],
+}
+
+impl<'a> Bits<'a> {
+    fn u(&self, start: usize, len: usize) -> Option<u64> {
+        if start + len > self.b.len() {
+            return None;
+        }
+        Some(self.b[start..start + len].iter().fold(0u64, |a, &x| (a << 1) | x as u64))
+    }
+    fn i(&self, start: usize, len: usize) -> Option<i64> {
+        let u = self.u(start, len)? as i64;
+        Some(if u & (1 << (len - 1)) != 0 { u - (1 << len) } else { u })
+    }
+    /// Six-bit text, `@` padding and trailing spaces taken off.
+    fn text(&self, start: usize, chars: usize) -> Option<String> {
+        let mut s = String::new();
+        for k in 0..chars {
+            let v = self.u(start + k * 6, 6)? as u8;
+            s.push(if v < 32 { (v + 64) as char } else { v as char });
+        }
+        let s = s.split('@').next().unwrap_or("").trim_end().to_string();
+        Some(s)
+    }
+}
+
+fn nav_status(s: u64) -> &'static str {
+    match s {
+        0 => "under way using engine",
+        1 => "at anchor",
+        2 => "not under command",
+        3 => "restricted manoeuvrability",
+        4 => "constrained by her draught",
+        5 => "moored",
+        6 => "aground",
+        7 => "engaged in fishing",
+        8 => "under way sailing",
+        11 => "towing astern",
+        12 => "pushing ahead or towing alongside",
+        14 => "AIS-SART active",
+        _ => "not defined",
+    }
+}
+
+/// A ship type code (5 and 24) in words.
+fn ship_type(t: u64) -> String {
+    let cargo = |kind: &str, t: u64| match t % 10 {
+        1 => format!("{}, hazardous category A", kind),
+        2 => format!("{}, hazardous category B", kind),
+        3 => format!("{}, hazardous category C", kind),
+        4 => format!("{}, hazardous category D", kind),
+        _ => kind.to_string(),
+    };
+    match t {
+        0 => "not available".into(),
+        20..=29 => cargo("wing in ground", t),
+        30 => "fishing".into(),
+        31 | 32 => "towing".into(),
+        33 => "dredging or underwater ops".into(),
+        34 => "diving ops".into(),
+        35 => "military ops".into(),
+        36 => "sailing".into(),
+        37 => "pleasure craft".into(),
+        40..=49 => cargo("high speed craft", t),
+        50 => "pilot vessel".into(),
+        51 => "search and rescue vessel".into(),
+        52 => "tug".into(),
+        53 => "port tender".into(),
+        54 => "anti-pollution equipment".into(),
+        55 => "law enforcement".into(),
+        58 => "medical transport".into(),
+        59 => "noncombatant ship".into(),
+        60..=69 => cargo("passenger", t),
+        70..=79 => cargo("cargo", t),
+        80..=89 => cargo("tanker", t),
+        90..=99 => "other type".into(),
+        _ => "reserved".into(),
+    }
+}
+
+fn epfd(t: u64) -> &'static str {
+    match t {
+        1 => "GPS",
+        2 => "GLONASS",
+        3 => "combined GPS/GLONASS",
+        4 => "Loran-C",
+        5 => "Chayka",
+        6 => "integrated navigation system",
+        7 => "surveyed",
+        8 => "Galileo",
+        15 => "internal GNSS",
+        _ => "undefined",
+    }
+}
+
+fn aid_type(t: u64) -> &'static str {
+    const NAMES: [&str; 32] = [
+        "default", "reference point", "RACON", "fixed structure off shore", "spare", "light, without sectors", "light, with sectors", "leading light front", "leading light rear",
+        "beacon, cardinal N", "beacon, cardinal E", "beacon, cardinal S", "beacon, cardinal W", "beacon, port hand", "beacon, starboard hand", "beacon, preferred channel port hand",
+        "beacon, preferred channel starboard hand", "beacon, isolated danger", "beacon, safe water", "beacon, special mark", "cardinal mark N", "cardinal mark E", "cardinal mark S",
+        "cardinal mark W", "port hand mark", "starboard hand mark", "preferred channel port hand", "preferred channel starboard hand", "isolated danger", "safe water", "special mark",
+        "light vessel / LANBY / rigs",
+    ];
+    NAMES.get(t as usize).copied().unwrap_or("unknown")
+}
+
+/// Position in degrees from 1/10000 minute units; null when "not available" (181°, 91°).
+fn pos(lon: Option<i64>, lat: Option<i64>, scale: f64) -> (Value, Value) {
+    let (Some(lon), Some(lat)) = (lon, lat) else { return (Value::Null, Value::Null) };
+    let (x, y) = (lon as f64 / scale, lat as f64 / scale);
+    if x.abs() > 180.0 || y.abs() > 90.0 {
+        return (Value::Null, Value::Null);
+    }
+    (json!((x * 1e6).round() / 1e6), json!((y * 1e6).round() / 1e6))
+}
+
+fn speed(v: Option<u64>) -> Value {
+    match v {
+        Some(1023) | None => Value::Null,
+        Some(s) => json!(s as f64 / 10.0),
+    }
+}
+
+fn course(v: Option<u64>) -> Value {
+    match v {
+        Some(c) if c < 3600 => json!(c as f64 / 10.0),
+        _ => Value::Null,
+    }
+}
+
+fn heading(v: Option<u64>) -> Value {
+    match v {
+        Some(h) if h < 360 => json!(h),
+        _ => Value::Null,
+    }
+}
+
+fn dims(b: &Bits, at: usize) -> Value {
+    let (bow, stern, port, star) = (b.u(at, 9).unwrap_or(0), b.u(at + 9, 9).unwrap_or(0), b.u(at + 18, 6).unwrap_or(0), b.u(at + 24, 6).unwrap_or(0));
+    json!({ "to_bow": bow, "to_stern": stern, "to_port": port, "to_starboard": star, "length": bow + stern, "beam": port + star })
+}
+
+/// One message from its bits.
+fn decode(b: &[bool]) -> Result<Value, String> {
+    let b = Bits { b };
+    let t = b.u(0, 6).ok_or("an empty message")?;
+    let mmsi = b.u(8, 30).ok_or("a message cut short")?;
+    let mut m = Map::new();
+    m.insert("type".into(), json!(t));
+    m.insert("repeat".into(), json!(b.u(6, 2)));
+    m.insert("mmsi".into(), json!(mmsi));
+    let ins = |m: &mut Map<String, Value>, k: &str, v: Value| {
+        m.insert(k.to_string(), v);
+    };
+    match t {
+        1 | 2 | 3 => {
+            let status = b.u(38, 4).unwrap_or(15);
+            ins(&mut m, "status", json!(status));
+            ins(&mut m, "status_text", json!(nav_status(status)));
+            let rot = b.i(42, 8).unwrap_or(-128);
+            ins(&mut m, "turn", match rot {
+                -128 => Value::Null,
+                127 => json!("turning right, more than 5° in 30 s"),
+                -127 => json!("turning left, more than 5° in 30 s"),
+                r => json!(((r as f64 / 4.733).powi(2) * r.signum() as f64 * 10.0).round() / 10.0),
+            });
+            ins(&mut m, "speed", speed(b.u(50, 10)));
+            ins(&mut m, "accuracy", json!(b.u(60, 1) == Some(1)));
+            let (lon, lat) = pos(b.i(61, 28), b.i(89, 27), 600_000.0);
+            ins(&mut m, "lon", lon);
+            ins(&mut m, "lat", lat);
+            ins(&mut m, "course", course(b.u(116, 12)));
+            ins(&mut m, "heading", heading(b.u(128, 9)));
+            ins(&mut m, "second", json!(b.u(137, 6)));
+        }
+        4 | 11 => {
+            ins(&mut m, "time", json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", b.u(38, 14).unwrap_or(0), b.u(52, 4).unwrap_or(0), b.u(56, 5).unwrap_or(0), b.u(61, 5).unwrap_or(0), b.u(66, 6).unwrap_or(0), b.u(72, 6).unwrap_or(0))));
+            ins(&mut m, "accuracy", json!(b.u(78, 1) == Some(1)));
+            let (lon, lat) = pos(b.i(79, 28), b.i(107, 27), 600_000.0);
+            ins(&mut m, "lon", lon);
+            ins(&mut m, "lat", lat);
+            ins(&mut m, "epfd", json!(epfd(b.u(134, 4).unwrap_or(0))));
+        }
+        5 => {
+            let st = b.u(232, 8).unwrap_or(0);
+            ins(&mut m, "ais_version", json!(b.u(38, 2)));
+            ins(&mut m, "imo", json!(b.u(40, 30)));
+            ins(&mut m, "callsign", json!(b.text(70, 7)));
+            ins(&mut m, "name", json!(b.text(112, 20)));
+            ins(&mut m, "ship_type", json!(st));
+            ins(&mut m, "ship_type_text", json!(ship_type(st)));
+            ins(&mut m, "dimensions", dims(&b, 240));
+            ins(&mut m, "epfd", json!(epfd(b.u(270, 4).unwrap_or(0))));
+            let (mo, d, h, mi) = (b.u(274, 4).unwrap_or(0), b.u(278, 5).unwrap_or(0), b.u(283, 5).unwrap_or(24), b.u(288, 6).unwrap_or(60));
+            ins(&mut m, "eta", if mo == 0 || d == 0 { Value::Null } else { json!(format!("{:02}-{:02} {:02}:{:02} UTC", mo, d, h.min(24), mi.min(60))) });
+            ins(&mut m, "draught", json!(b.u(294, 8).unwrap_or(0) as f64 / 10.0));
+            ins(&mut m, "destination", json!(b.text(302, 20)));
+        }
+        18 | 19 => {
+            ins(&mut m, "speed", speed(b.u(46, 10)));
+            ins(&mut m, "accuracy", json!(b.u(56, 1) == Some(1)));
+            let (lon, lat) = pos(b.i(57, 28), b.i(85, 27), 600_000.0);
+            ins(&mut m, "lon", lon);
+            ins(&mut m, "lat", lat);
+            ins(&mut m, "course", course(b.u(112, 12)));
+            ins(&mut m, "heading", heading(b.u(124, 9)));
+            ins(&mut m, "second", json!(b.u(133, 6)));
+            if t == 19 {
+                let st = b.u(263, 8).unwrap_or(0);
+                ins(&mut m, "name", json!(b.text(143, 20)));
+                ins(&mut m, "ship_type", json!(st));
+                ins(&mut m, "ship_type_text", json!(ship_type(st)));
+                ins(&mut m, "dimensions", dims(&b, 271));
+            } else {
+                ins(&mut m, "class_b_unit", json!(if b.u(141, 1) == Some(1) { "CS" } else { "SOTDMA" }));
+            }
+        }
+        21 => {
+            let at = b.u(38, 5).unwrap_or(0);
+            ins(&mut m, "aid_type", json!(at));
+            ins(&mut m, "aid_type_text", json!(aid_type(at)));
+            let ext = if b.b.len() > 272 { b.text(272, (b.b.len() - 272) / 6).unwrap_or_default() } else { String::new() };
+            ins(&mut m, "name", json!(format!("{}{}", b.text(43, 20).unwrap_or_default(), ext)));
+            let (lon, lat) = pos(b.i(164, 28), b.i(192, 27), 600_000.0);
+            ins(&mut m, "lon", lon);
+            ins(&mut m, "lat", lat);
+            ins(&mut m, "off_position", json!(b.u(259, 1) == Some(1)));
+            ins(&mut m, "virtual", json!(b.u(269, 1) == Some(1)));
+        }
+        24 => {
+            let part = b.u(38, 2).unwrap_or(0);
+            ins(&mut m, "part", json!(if part == 0 { "A" } else { "B" }));
+            if part == 0 {
+                ins(&mut m, "name", json!(b.text(40, 20)));
+            } else {
+                let st = b.u(40, 8).unwrap_or(0);
+                ins(&mut m, "ship_type", json!(st));
+                ins(&mut m, "ship_type_text", json!(ship_type(st)));
+                ins(&mut m, "vendor", json!(b.text(48, 3)));
+                ins(&mut m, "callsign", json!(b.text(90, 7)));
+                ins(&mut m, "dimensions", dims(&b, 132));
+            }
+        }
+        27 => {
+            let status = b.u(40, 4).unwrap_or(15);
+            ins(&mut m, "status", json!(status));
+            ins(&mut m, "status_text", json!(nav_status(status)));
+            let (lon, lat) = pos(b.i(44, 18), b.i(62, 17), 600.0);
+            ins(&mut m, "lon", lon);
+            ins(&mut m, "lat", lat);
+            ins(&mut m, "speed", match b.u(79, 6) { Some(63) | None => Value::Null, Some(s) => json!(s) });
+            ins(&mut m, "course", match b.u(85, 9) { Some(511) | None => Value::Null, Some(c) => json!(c) });
+        }
+        _ => {
+            ins(&mut m, "note", json!("this message type is not read field by field"));
+        }
+    }
+    Ok(Value::Object(m))
+}
+
+/// One NMEA line split and checked: (total, number, sequence id, channel, payload, fill bits).
+fn line(s: &str) -> Result<(usize, usize, String, String, String, usize), String> {
+    let s = s.trim();
+    let start = s.find(['!', '$']).ok_or("no ! at the start")?;
+    let s = &s[start..];
+    let (body, sum) = s[1..].split_once('*').ok_or("no checksum")?;
+    let want = u8::from_str_radix(sum.get(..2).ok_or("a short checksum")?, 16).map_err(|_| "a bad checksum")?;
+    let got = body.bytes().fold(0u8, |a, b| a ^ b);
+    if got != want {
+        return Err(format!("checksum {:02X}, the line says {:02X}", got, want));
+    }
+    let f: Vec<&str> = body.split(',').collect();
+    if f.len() < 7 || !(f[0].ends_with("VDM") || f[0].ends_with("VDO")) {
+        return Err("not an AIVDM or AIVDO line".into());
+    }
+    Ok((f[1].parse().map_err(|_| "a bad fragment count")?, f[2].parse().map_err(|_| "a bad fragment number")?, f[3].to_string(), f[4].to_string(), f[5].to_string(), f[6].parse().unwrap_or(0)))
+}
+
+/// AIS messages decoded from NMEA lines (one sentence each; multi-part messages are joined when their parts follow).
+/// Gives one map per message: `{ type, mmsi, channel, lat, lon, speed (knots), course, heading, status_text, name, callsign, imo, ship_type_text, dimensions, destination, eta, draught, ... }`; a bad line gives `{ error, line }` and the rest go on.
+pub fn ais_decode(lines: Vec<String>) -> Vec<serde_json::Value> {
+    let mut out = vec![];
+    let mut parts: HashMap<String, (usize, Vec<Option<(String, usize)>>)> = HashMap::new();
+    for (n, l) in lines.iter().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let (total, num, seq, chan, payload, fill) = match line(l) {
+            Ok(x) => x,
+            Err(e) => {
+                out.push(json!({ "error": e, "line": n + 1 }));
+                continue;
+            }
+        };
+        let whole = if total <= 1 {
+            Some((payload, fill))
+        } else {
+            let key = format!("{}/{}", seq, chan);
+            let e = parts.entry(key.clone()).or_insert_with(|| (total, vec![None; total]));
+            if num >= 1 && num <= total {
+                e.1[num - 1] = Some((payload, fill));
+            }
+            if e.1.iter().all(Option::is_some) {
+                let (_, ps) = parts.remove(&key).unwrap();
+                let fill = ps.last().unwrap().as_ref().unwrap().1;
+                Some((ps.into_iter().map(|p| p.unwrap().0).collect::<String>(), fill))
+            } else {
+                None
+            }
+        };
+        if let Some((payload, fill)) = whole {
+            match bits_of(&payload, fill).and_then(|b| decode(&b)) {
+                Ok(mut m) => {
+                    m["channel"] = json!(chan);
+                    out.push(m);
+                }
+                Err(e) => out.push(json!({ "error": e, "line": n + 1 })),
+            }
+        }
+    }
+    for (k, _) in parts {
+        out.push(json!({ "error": format!("message {} has parts missing", k) }));
+    }
+    out
+}
+
+/// One AIS payload (the armoured text of field 6, joined if it came in parts) decoded, with its fill bits.
+pub fn ais_decode_payload(payload: &str, fill_bits: i64) -> Result<serde_json::Value, String> {
+    decode(&bits_of(payload, fill_bits.clamp(0, 5) as usize)?)
+}
+
+/// The ships in a log, latest first: messages joined by MMSI (position from position reports, name and voyage from static data), for a map or a port's list.
+pub fn ais_ships(lines: Vec<String>) -> Vec<serde_json::Value> {
+    let mut ships: Vec<(u64, Map<String, Value>)> = vec![];
+    for m in ais_decode(lines) {
+        let Some(mmsi) = m["mmsi"].as_u64() else { continue };
+        let i = match ships.iter().position(|s| s.0 == mmsi) {
+            Some(i) => i,
+            None => {
+                ships.push((mmsi, Map::new()));
+                ships.len() - 1
+            }
+        };
+        let s = &mut ships[i].1;
+        for k in ["mmsi", "lat", "lon", "speed", "course", "heading", "status_text", "name", "callsign", "imo", "ship_type_text", "destination", "eta", "draught", "dimensions"] {
+            if !m[k].is_null() {
+                s.insert(k.to_string(), m[k].clone());
+            }
+        }
+    }
+    ships.into_iter().rev().map(|(_, m)| Value::Object(m)).collect()
+}
+
+/// The words for a ship type code (70 is "cargo", 84 "tanker, hazardous category D").
+pub fn ais_ship_type(code: i64) -> String {
+    ship_type(code.clamp(0, 255) as u64)
+}

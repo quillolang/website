@@ -1,0 +1,409 @@
+//! .env files: read with their quoting rules and `${VAR}` expansion, checked for mistakes and against .env.example, and written or changed one key at a time with comments kept.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+/// One assignment as read: its key, its value, its line, and where it sits in the text (line start to line end).
+struct Item {
+    key: String,
+    value: String,
+    line: usize,
+    span: (usize, usize),
+    quoted: bool,
+    raw: String,
+}
+
+struct P<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> P<'a> {
+    fn line(&self, at: usize) -> usize {
+        self.s[..at.min(self.s.len())].matches('\n').count() + 1
+    }
+    fn peek(&self) -> Option<char> {
+        self.s[self.i..].chars().next()
+    }
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.i += c.len_utf8();
+        Some(c)
+    }
+    fn skip_spaces(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t')) {
+            self.i += 1;
+        }
+    }
+    fn to_eol(&mut self) {
+        while self.peek().is_some_and(|c| c != '\n') {
+            self.bump();
+        }
+    }
+}
+
+fn valid_key(k: &str) -> bool {
+    let mut c = k.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|x| x.is_ascii_alphanumeric() || x == '_' || x == '.')
+}
+
+/// `$NAME`, `${NAME}`, `${NAME:-default}` and `${NAME-default}` in `raw`, from `known`; a name not known is empty.
+fn expand(raw: &str, known: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut it = raw.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match it.peek().map(|&(_, c)| c) {
+            Some('{') => {
+                // Find the matching `}`, nested ones counted.
+                let start = i + 2;
+                let mut depth = 1;
+                let mut end = None;
+                for (j, d) in raw[start..].char_indices() {
+                    match d {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(start + j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else {
+                    out.push_str(&raw[i..]);
+                    return out;
+                };
+                let inner = &raw[start..end];
+                let (name, default, empty_too) = if let Some((n, d)) = inner.split_once(":-") {
+                    (n, Some(d), true)
+                } else if let Some((n, d)) = inner.split_once('-') {
+                    (n, Some(d), false)
+                } else {
+                    (inner, None, false)
+                };
+                let v = known(name);
+                let use_default = match &v {
+                    None => true,
+                    Some(s) => empty_too && s.is_empty(),
+                };
+                if use_default {
+                    out.push_str(&default.map(|d| expand(d, known)).unwrap_or_default());
+                } else {
+                    out.push_str(&v.unwrap_or_default());
+                }
+                while it.peek().is_some_and(|&(j, _)| j <= end) {
+                    it.next();
+                }
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i + 1;
+                let mut end = start;
+                while let Some(&(j, d)) = it.peek() {
+                    if d.is_ascii_alphanumeric() || d == '_' {
+                        end = j + d.len_utf8();
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str(&known(&raw[start..end]).unwrap_or_default());
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
+/// Reads the text: the items in order, each value expanded from the keys before it, then from `vars`.
+fn read(text: &str, vars: &HashMap<String, String>) -> Result<Vec<Item>, String> {
+    let mut p = P { s: text.trim_start_matches('\u{feff}'), i: 0 };
+    let mut items: Vec<Item> = vec![];
+    let mut so_far: HashMap<String, String> = HashMap::new();
+    loop {
+        // Blank lines and comments.
+        loop {
+            while matches!(p.peek(), Some(' ' | '\t' | '\r' | '\n')) {
+                p.bump();
+            }
+            if p.peek() == Some('#') {
+                p.to_eol();
+            } else {
+                break;
+            }
+        }
+        if p.peek().is_none() {
+            return Ok(items);
+        }
+        let line_start = p.s[..p.i].rfind('\n').map_or(0, |n| n + 1);
+        let line = p.line(p.i);
+        if p.s[p.i..].starts_with("export ") || p.s[p.i..].starts_with("export\t") {
+            p.i += 7;
+            p.skip_spaces();
+        }
+        let k0 = p.i;
+        while p.peek().is_some_and(|c| c != '=' && c != '\n' && c != ' ' && c != '\t') {
+            p.bump();
+        }
+        let key = p.s[k0..p.i].to_string();
+        p.skip_spaces();
+        if p.peek() != Some('=') {
+            return Err(format!("line {}: `{}` has no `=`", line, p.s[k0..].lines().next().unwrap_or("").trim()));
+        }
+        if !valid_key(&key) {
+            return Err(format!("line {}: `{}` is not a variable name (letters, digits and _, not starting with a digit)", line, key));
+        }
+        p.bump();
+        p.skip_spaces();
+        let known = |n: &str| so_far.get(n).cloned().or_else(|| vars.get(n).cloned());
+        let (value, quoted, raw) = match p.peek() {
+            Some(q @ ('\'' | '`')) => {
+                p.bump();
+                let start = p.i;
+                let end = p.s[start..].find(q).ok_or_else(|| format!("line {}: the {} quote of `{}` is not closed", line, q, key))?;
+                p.i = start + end + 1;
+                (p.s[start..start + end].to_string(), true, String::new())
+            }
+            Some('"') => {
+                p.bump();
+                // Escapes first, `$` kept apart when it was written `\$`.
+                let mut raw = String::new();
+                loop {
+                    match p.bump() {
+                        None => return Err(format!("line {}: the \" quote of `{}` is not closed", line, key)),
+                        Some('"') => break,
+                        Some('\\') => match p.bump() {
+                            Some('n') => raw.push('\n'),
+                            Some('r') => raw.push('\r'),
+                            Some('t') => raw.push('\t'),
+                            Some('"') => raw.push('"'),
+                            Some('\\') => raw.push('\\'),
+                            Some('$') => raw.push('\u{0}'),
+                            Some(c) => {
+                                raw.push('\\');
+                                raw.push(c);
+                            }
+                            None => return Err(format!("line {}: the \" quote of `{}` is not closed", line, key)),
+                        },
+                        Some(c) => raw.push(c),
+                    }
+                }
+                (expand(&raw, &known).replace('\u{0}', "$"), true, raw)
+            }
+            _ => {
+                let start = p.i;
+                p.to_eol();
+                let mut v = &p.s[start..p.i];
+                // An inline comment starts at a `#` after a space.
+                if let Some(h) = v.find(" #").or_else(|| v.find("\t#")) {
+                    v = &v[..h];
+                }
+                let v = v.trim();
+                (expand(v, &known), false, v.to_string())
+            }
+        };
+        if quoted {
+            p.skip_spaces();
+            match p.peek() {
+                None | Some('\n') | Some('\r') => {}
+                Some('#') => p.to_eol(),
+                Some(_) => return Err(format!("line {}: text after the closing quote of `{}`", p.line(p.i), key)),
+            }
+        }
+        let end = p.s[p.i..].find('\n').map_or(p.s.len(), |n| p.i + n);
+        so_far.insert(key.clone(), value.clone());
+        items.push(Item { key, value, line, span: (line_start, end), quoted, raw });
+    }
+}
+
+fn to_map(items: &[Item]) -> Value {
+    let mut m = Map::new();
+    for it in items {
+        m.insert(it.key.clone(), json!(it.value));
+    }
+    Value::Object(m)
+}
+
+/// A value written so it reads back as it is: bare when plain, else in double quotes with `\n`, `\"`, `\\` and `\$`.
+fn quote(v: &str) -> String {
+    let plain = !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:@,+=%".contains(c));
+    if plain {
+        return v.to_string();
+    }
+    let mut o = String::from("\"");
+    for c in v.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            '$' => o.push_str("\\$"),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// The variables of a .env text, in order: `KEY=value` lines, `export` allowed, `#` comments (after a space on an
+/// unquoted line), 'single quotes' kept as written, "double quotes" with `\n` escapes and over several lines, and
+/// `$VAR`, `${VAR}`, `${VAR:-default}` expanded from the keys above. A line it cannot read is an error naming it.
+pub fn dotenv_parse(text: &str) -> Result<Value, String> {
+    Ok(to_map(&read(text, &HashMap::new())?))
+}
+
+/// As `dotenv_parse`, with `${VAR}` also taken from `vars` when the file has not set it (the server's own settings,
+/// a deploy's secrets).
+pub fn dotenv_parse_with(text: &str, vars: std::collections::HashMap<String, String>) -> Result<Value, String> {
+    Ok(to_map(&read(text, &vars)?))
+}
+
+/// The variables of the .env file at `path`, as `dotenv_parse` reads them.
+pub fn dotenv_read_file(path: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    dotenv_parse(&text).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// A map as .env text, one `KEY=value` a line in the map's order, values quoted only when they need it (and `$`
+/// escaped, so nothing expands on the way back). A bad name is an error.
+pub fn dotenv_write(vars: serde_json::Value) -> Result<String, String> {
+    let m = vars.as_object().ok_or("a map of names to values")?;
+    let mut out = String::new();
+    for (k, v) in m {
+        if !valid_key(k) {
+            return Err(format!("`{}` is not a variable name", k));
+        }
+        out.push_str(&format!("{}={}\n", k, quote(&text_of(v))));
+    }
+    Ok(out)
+}
+
+/// The .env text with `key` set to `value`: its line replaced where it is (its last one, if it is there twice), or
+/// added at the end; comments, order and the other lines kept as they were.
+pub fn dotenv_set(text: &str, key: &str, value: serde_json::Value) -> Result<String, String> {
+    if !valid_key(key) {
+        return Err(format!("`{}` is not a variable name", key));
+    }
+    let body = text.trim_start_matches('\u{feff}');
+    let items = read(body, &HashMap::new())?;
+    let line = format!("{}={}", key, quote(&text_of(&value)));
+    Ok(match items.iter().rev().find(|i| i.key == key) {
+        Some(it) => {
+            let prefix = if body[it.span.0..].starts_with("export") { "export " } else { "" };
+            format!("{}{}{}{}", &body[..it.span.0], prefix, line, &body[it.span.1..])
+        }
+        None => {
+            let sep = if body.is_empty() || body.ends_with('\n') { "" } else { "\n" };
+            format!("{}{}{}\n", body, sep, line)
+        }
+    })
+}
+
+/// The .env text without `key` (every line that sets it), the rest as it was.
+pub fn dotenv_unset(text: &str, key: &str) -> Result<String, String> {
+    let body = text.trim_start_matches('\u{feff}');
+    let items = read(body, &HashMap::new())?;
+    let mut out = body.to_string();
+    for it in items.iter().rev().filter(|i| i.key == key) {
+        let end = if out[it.span.1..].starts_with('\n') { it.span.1 + 1 } else { it.span.1 };
+        out.replace_range(it.span.0..end, "");
+    }
+    Ok(out)
+}
+
+/// What looks wrong in a .env text, as a linter says it: `[{ line, key, problem }]`, empty when all is well. Finds
+/// lines it cannot read, keys set twice, lower-case keys, unquoted values with spaces, and `${VAR}` naming a key
+/// the file never sets.
+pub fn dotenv_check(text: &str) -> Vec<Value> {
+    // A line that cannot be read is reported, then left out, and the rest read again.
+    let mut out = vec![];
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let items = loop {
+        match read(&lines.join("\n"), &HashMap::new()) {
+            Ok(i) => break i,
+            Err(e) => {
+                let line: usize = e.strip_prefix("line ").and_then(|r| r.split(':').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+                out.push(json!({ "line": line, "key": null, "problem": e.split_once(": ").map_or(e.clone(), |(_, p)| p.to_string()) }));
+                if line == 0 || line > lines.len() || out.len() > 100 {
+                    return out;
+                }
+                lines[line - 1].clear();
+            }
+        }
+    };
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for it in &items {
+        if let Some(first) = seen.get(it.key.as_str()) {
+            out.push(json!({ "line": it.line, "key": it.key, "problem": format!("set again: line {} set it first, and this one wins", first) }));
+        }
+        seen.entry(it.key.as_str()).or_insert(it.line);
+        if it.key.chars().any(|c| c.is_ascii_lowercase()) {
+            out.push(json!({ "line": it.line, "key": it.key, "problem": "lower-case letters in the name: names are usually upper case" }));
+        }
+        if !it.quoted && it.raw.contains(' ') {
+            out.push(json!({ "line": it.line, "key": it.key, "problem": "a space in an unquoted value: quote it, as other tools may cut it there" }));
+        }
+        for name in refs(&it.raw) {
+            if !seen.contains_key(name.as_str()) || name == it.key && seen[name.as_str()] == it.line {
+                out.push(json!({ "line": it.line, "key": it.key, "problem": format!("`${{{}}}` is not set above it: it is empty", name) }));
+            }
+        }
+    }
+    out.sort_by_key(|v| v["line"].as_i64());
+    out
+}
+
+fn refs(raw: &str) -> Vec<String> {
+    let mut out = vec![];
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' {
+            let braced = b.get(i + 1) == Some(&b'{');
+            let start = if braced { i + 2 } else { i + 1 };
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let has_default = braced && matches!(b.get(j), Some(b':' | b'-'));
+            if j > start && !has_default {
+                out.push(raw[start..j].to_string());
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A .env text against its .env.example: `{ missing, extra, empty }`, the keys the example has and the file lacks,
+/// those only the file has, and those the file leaves empty. For a deploy check, or a start-up warning.
+pub fn dotenv_compare(example: &str, text: &str) -> Result<Value, String> {
+    let ex = read(example, &HashMap::new()).map_err(|e| format!("the example: {}", e))?;
+    let it = read(text, &HashMap::new())?;
+    let has = |items: &[Item], k: &str| items.iter().any(|i| i.key == k);
+    let mut missing: Vec<&str> = ex.iter().map(|i| i.key.as_str()).filter(|k| !has(&it, k)).collect();
+    missing.dedup();
+    let extra: Vec<&str> = it.iter().map(|i| i.key.as_str()).filter(|k| !has(&ex, k)).collect();
+    let empty: Vec<&str> = it.iter().filter(|i| i.value.is_empty()).map(|i| i.key.as_str()).collect();
+    Ok(json!({ "missing": missing, "extra": extra, "empty": empty }))
+}

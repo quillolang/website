@@ -1,0 +1,403 @@
+//! CAN bus data made readable with a DBC file (the database cars, trucks, batteries and machines describe their messages in): messages and signals read with their bit layout (Intel and Motorola), scale, offset, units, ranges, value names, comments and multiplexing; frames decoded into physical values, frames encoded from values, and candump logs decoded line by line.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone)]
+struct Signal {
+    name: String,
+    start: u32,
+    len: u32,
+    little: bool,
+    signed: bool,
+    factor: f64,
+    offset: f64,
+    min: f64,
+    max: f64,
+    unit: String,
+    mux: Option<Option<u64>>, // Some(None): the multiplexer; Some(Some(n)): present when it is n
+    values: Vec<(i64, String)>,
+    comment: Option<String>,
+    receivers: Vec<String>,
+}
+
+#[derive(Clone)]
+struct Message {
+    id: u32,
+    extended: bool,
+    name: String,
+    size: u32,
+    sender: String,
+    signals: Vec<Signal>,
+    comment: Option<String>,
+}
+
+struct Dbc {
+    messages: Vec<Message>,
+    nodes: Vec<String>,
+}
+
+/// Splits a line into tokens, quoted strings kept whole.
+fn tokens(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in s.chars() {
+        if quoted {
+            if c == '"' {
+                out.push(format!("\"{}", cur));
+                cur.clear();
+                quoted = false;
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            quoted = true;
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn parse(text: &str) -> Result<Dbc, String> {
+    let mut messages: Vec<Message> = vec![];
+    let mut nodes = vec![];
+    // Statements may run over lines (comments): join until a ; ends them for CM_ and VAL_.
+    let mut lines: Vec<String> = vec![];
+    let mut pending = String::new();
+    for raw in text.lines() {
+        let l = raw.trim();
+        if pending.is_empty() && (l.starts_with("CM_ ") || l.starts_with("VAL_ ")) && !l.ends_with(';') {
+            pending = l.to_string();
+            continue;
+        }
+        if !pending.is_empty() {
+            pending.push('\n');
+            pending.push_str(l);
+            if l.ends_with(';') {
+                lines.push(std::mem::take(&mut pending));
+            }
+            continue;
+        }
+        lines.push(l.to_string());
+    }
+    for (n, l) in lines.iter().enumerate() {
+        if let Some(rest) = l.strip_prefix("BU_:") {
+            nodes = rest.split_whitespace().map(str::to_string).collect();
+        } else if l.starts_with("BO_ ") {
+            // BO_ 2364540158 EEC1: 8 Engine
+            let t = tokens(l);
+            if t.len() < 4 {
+                return Err(format!("line {}: a BO_ needs an id, a name and a size", n + 1));
+            }
+            let raw: u64 = t[1].parse().map_err(|_| format!("line {}: bad id {}", n + 1, t[1]))?;
+            let name = t[2].trim_end_matches(':').to_string();
+            let size: u32 = t[3].trim_start_matches(':').parse().unwrap_or(8);
+            messages.push(Message { id: (raw & 0x1fff_ffff) as u32, extended: raw & 0x8000_0000 != 0, name, size, sender: t.get(4).cloned().unwrap_or_default(), signals: vec![], comment: None });
+        } else if l.starts_with("SG_ ") {
+            let m = messages.last_mut().ok_or(format!("line {}: a signal before any message", n + 1))?;
+            // SG_ name [M|mN] : start|len@1+ (factor,offset) [min|max] "unit" receivers
+            let (head, body) = l[4..].split_once(':').ok_or(format!("line {}: a signal without ':'", n + 1))?;
+            let h: Vec<&str> = head.split_whitespace().collect();
+            let name = h.first().ok_or(format!("line {}: a signal without a name", n + 1))?.to_string();
+            let mux = match h.get(1) {
+                Some(&"M") => Some(None),
+                Some(s) if s.starts_with('m') => Some(Some(s[1..].trim_end_matches('M').parse::<u64>().map_err(|_| format!("line {}: bad multiplex {}", n + 1, s))?)),
+                _ => None,
+            };
+            let t = tokens(body);
+            let layout = t.first().ok_or(format!("line {}: no layout", n + 1))?;
+            let (sl, rest) = layout.split_once('@').ok_or(format!("line {}: bad layout {}", n + 1, layout))?;
+            let (s, ln) = sl.split_once('|').ok_or(format!("line {}: bad layout {}", n + 1, layout))?;
+            let little = rest.starts_with('1');
+            let signed = rest.ends_with('-');
+            let fo = t.get(1).map(|s| s.trim_matches(|c| c == '(' || c == ')')).unwrap_or("1,0");
+            let (f, o) = fo.split_once(',').unwrap_or(("1", "0"));
+            let mm = t.get(2).map(|s| s.trim_matches(|c| c == '[' || c == ']')).unwrap_or("0|0");
+            let (mi, ma) = mm.split_once('|').unwrap_or(("0", "0"));
+            let unit = t.get(3).map(|s| s.trim_start_matches('"').to_string()).unwrap_or_default();
+            let receivers = t.get(4).map(|r| r.split(',').map(str::to_string).collect()).unwrap_or_default();
+            m.signals.push(Signal {
+                name,
+                start: s.trim().parse().map_err(|_| format!("line {}: bad start bit", n + 1))?,
+                len: ln.trim().parse().map_err(|_| format!("line {}: bad length", n + 1))?,
+                little,
+                signed,
+                factor: f.parse().unwrap_or(1.0),
+                offset: o.parse().unwrap_or(0.0),
+                min: mi.parse().unwrap_or(0.0),
+                max: ma.parse().unwrap_or(0.0),
+                unit,
+                mux,
+                values: vec![],
+                comment: None,
+                receivers,
+            });
+        } else if l.starts_with("CM_ ") {
+            let t = tokens(l.trim_end_matches(';'));
+            let text = t.last().map(|s| s.trim_start_matches('"').to_string());
+            match t.get(1).map(String::as_str) {
+                Some("BO_") => {
+                    let id: u64 = t.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    if let Some(m) = messages.iter_mut().find(|m| m.id == (id & 0x1fff_ffff) as u32) {
+                        m.comment = text;
+                    }
+                }
+                Some("SG_") => {
+                    let id: u64 = t.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let sg = t.get(3).cloned().unwrap_or_default();
+                    if let Some(s) = messages.iter_mut().find(|m| m.id == (id & 0x1fff_ffff) as u32).and_then(|m| m.signals.iter_mut().find(|s| s.name == sg)) {
+                        s.comment = text;
+                    }
+                }
+                _ => {}
+            }
+        } else if l.starts_with("VAL_ ") {
+            let t = tokens(l.trim_end_matches(';'));
+            let id: u64 = t.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let sg = t.get(2).cloned().unwrap_or_default();
+            let mut vals = vec![];
+            let mut i = 3;
+            while i + 1 < t.len() {
+                if let Ok(v) = t[i].parse::<i64>() {
+                    vals.push((v, t[i + 1].trim_start_matches('"').to_string()));
+                }
+                i += 2;
+            }
+            if let Some(s) = messages.iter_mut().find(|m| m.id == (id & 0x1fff_ffff) as u32).and_then(|m| m.signals.iter_mut().find(|s| s.name == sg)) {
+                s.values = vals;
+            }
+        }
+    }
+    if messages.is_empty() {
+        return Err("no messages (BO_) in the DBC".into());
+    }
+    Ok(Dbc { messages, nodes })
+}
+
+fn bit(data: &[u8], pos: u32) -> u64 {
+    data.get((pos / 8) as usize).map_or(0, |b| ((b >> (pos % 8)) & 1) as u64)
+}
+
+/// A signal's raw value from the frame's bytes.
+fn extract(s: &Signal, data: &[u8]) -> u64 {
+    let mut v = 0u64;
+    if s.little {
+        for i in 0..s.len {
+            v |= bit(data, s.start + i) << i;
+        }
+    } else {
+        // Motorola: the start bit is the most significant; bits run down a byte, then on to the next byte's bit 7.
+        let mut pos = s.start;
+        for _ in 0..s.len {
+            v = (v << 1) | bit(data, pos);
+            pos = if pos % 8 == 0 { pos + 15 } else { pos - 1 };
+        }
+    }
+    v
+}
+
+fn insert(s: &Signal, data: &mut [u8], v: u64) {
+    let mut set = |pos: u32, b: u64| {
+        if let Some(byte) = data.get_mut((pos / 8) as usize) {
+            if b == 1 {
+                *byte |= 1 << (pos % 8);
+            } else {
+                *byte &= !(1 << (pos % 8));
+            }
+        }
+    };
+    if s.little {
+        for i in 0..s.len {
+            set(s.start + i, (v >> i) & 1);
+        }
+    } else {
+        let mut pos = s.start;
+        for i in 0..s.len {
+            set(pos, (v >> (s.len - 1 - i)) & 1);
+            pos = if pos % 8 == 0 { pos + 15 } else { pos - 1 };
+        }
+    }
+}
+
+fn physical(s: &Signal, raw: u64) -> (i64, f64) {
+    let r = if s.signed && s.len < 64 && raw & (1 << (s.len - 1)) != 0 { raw as i64 - (1i64 << s.len) } else { raw as i64 };
+    (r, r as f64 * s.factor + s.offset)
+}
+
+fn tidy(x: f64) -> Value {
+    let r = (x * 1e9).round() / 1e9;
+    if r.fract() == 0.0 && r.abs() < 1e15 { json!(r as i64) } else { json!(r) }
+}
+
+fn decode_frame(m: &Message, data: &[u8]) -> Value {
+    let mux_value = m.signals.iter().find(|s| s.mux == Some(None)).map(|s| extract(s, data));
+    let mut sig = Map::new();
+    for s in &m.signals {
+        if let Some(Some(k)) = s.mux {
+            if mux_value != Some(k) {
+                continue;
+            }
+        }
+        let (raw, phys) = physical(s, extract(s, data));
+        let mut v = json!({ "value": tidy(phys), "raw": raw, "unit": s.unit });
+        if let Some((_, name)) = s.values.iter().find(|(k, _)| *k == raw) {
+            v["text"] = json!(name);
+        }
+        if s.max > s.min && (phys < s.min - 1e-9 || phys > s.max + 1e-9) {
+            v["out_of_range"] = json!(true);
+        }
+        sig.insert(s.name.clone(), v);
+    }
+    json!({ "id": m.id, "id_hex": format!("{:X}", m.id), "name": m.name, "sender": m.sender, "signals": sig })
+}
+
+fn store() -> &'static Mutex<HashMap<String, std::sync::Arc<Dbc>>> {
+    static S: OnceLock<Mutex<HashMap<String, std::sync::Arc<Dbc>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The DBC at `path`, read once and kept (read again when the file changes).
+fn load(path: &str) -> Result<std::sync::Arc<Dbc>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?;
+    let key = format!("{}|{:?}|{}", path, meta.modified().ok(), meta.len());
+    if let Some(d) = store().lock().unwrap().get(&key) {
+        return Ok(d.clone());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    // DBC files are often Windows-1252: read bytes over 127 as Latin-1.
+    let text: String = match String::from_utf8(bytes.clone()) {
+        Ok(s) => s,
+        Err(_) => bytes.iter().map(|b| *b as char).collect(),
+    };
+    let d = std::sync::Arc::new(parse(&text)?);
+    store().lock().unwrap().insert(key, d.clone());
+    Ok(d)
+}
+
+fn hexbytes(h: &str) -> Result<Vec<u8>, String> {
+    let h: String = h.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if h.len() % 2 == 1 || h.len() > 128 {
+        return Err("data is up to 64 bytes of hex".into());
+    }
+    Ok((0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap()).collect())
+}
+
+/// What a DBC file holds: `{ nodes, messages: [{ id, id_hex, extended, name, size, sender, comment, signals: [{ name, start, length, byte_order: "intel" | "motorola", signed, factor, offset, min, max, unit, multiplexer, multiplexed_by, values, comment, receivers }] }] }`.
+pub fn dbc_read(path: &str) -> Result<serde_json::Value, String> {
+    let d = load(path)?;
+    let msgs: Vec<Value> = d
+        .messages
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id, "id_hex": format!("{:X}", m.id), "extended": m.extended, "name": m.name, "size": m.size, "sender": m.sender, "comment": m.comment,
+                "signals": m.signals.iter().map(|s| json!({
+                    "name": s.name, "start": s.start, "length": s.len, "byte_order": if s.little { "intel" } else { "motorola" }, "signed": s.signed,
+                    "factor": s.factor, "offset": s.offset, "min": s.min, "max": s.max, "unit": s.unit,
+                    "multiplexer": s.mux == Some(None), "multiplexed_by": match s.mux { Some(Some(k)) => json!(k), _ => Value::Null },
+                    "values": s.values.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "comment": s.comment, "receivers": s.receivers,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({ "nodes": d.nodes, "messages": msgs }))
+}
+
+/// One CAN frame decoded by the DBC: `id` (the arbitration id, a number) and `data` (hex, `"0A FF 00..."` or `"0aff00"`).
+/// Gives `{ id, name, sender, signals: { name: { value, raw, unit, text (the value's name), out_of_range } } }`; only the signals of the multiplexer's current value.
+pub fn dbc_decode(path: &str, id: i64, data: &str) -> Result<serde_json::Value, String> {
+    let d = load(path)?;
+    let m = d.messages.iter().find(|m| m.id as i64 == (id & 0x1fff_ffff)).ok_or_else(|| format!("no message with id 0x{:X} in the DBC", id))?;
+    Ok(decode_frame(m, &hexbytes(data)?))
+}
+
+/// A frame built from physical values: `message` is its name or id, `values` a map of signal values (numbers, or a value's name); signals not given are 0. Gives `{ id, id_hex, data (hex) }`.
+pub fn dbc_encode(path: &str, message: serde_json::Value, values: serde_json::Value) -> Result<serde_json::Value, String> {
+    let d = load(path)?;
+    let m = match &message {
+        Value::String(n) => d.messages.iter().find(|m| &m.name == n),
+        Value::Number(n) => d.messages.iter().find(|m| m.id as u64 == n.as_u64().unwrap_or(u64::MAX) & 0x1fff_ffff),
+        _ => None,
+    }
+    .ok_or_else(|| format!("no message {} in the DBC", message))?;
+    let mut data = vec![0u8; m.size as usize];
+    let vals = values.as_object().ok_or("values are a map { signal: value }")?;
+    for (k, v) in vals {
+        let s = m.signals.iter().find(|s| &s.name == k).ok_or_else(|| format!("{} has no signal {}", m.name, k))?;
+        let phys = match v {
+            Value::String(t) => {
+                let (raw, _) = s.values.iter().find(|(_, n)| n == t).ok_or_else(|| format!("{} has no value named {:?}", k, t))?;
+                *raw as f64 * s.factor + s.offset
+            }
+            other => other.as_f64().ok_or_else(|| format!("{}: {} is not a number", k, other))?,
+        };
+        if s.max > s.min && (phys < s.min - 1e-9 || phys > s.max + 1e-9) {
+            return Err(format!("{} = {} is outside {}..{}", k, phys, s.min, s.max));
+        }
+        let raw = ((phys - s.offset) / s.factor).round() as i64;
+        let limit = if s.signed { 1i64 << (s.len - 1) } else { 1i64 << s.len.min(63) };
+        if (s.signed && (raw < -limit || raw >= limit)) || (!s.signed && (raw < 0 || raw >= limit)) {
+            return Err(format!("{} = {} does not fit in {} bits", k, phys, s.len));
+        }
+        let mask = if s.len >= 64 { u64::MAX } else { (1u64 << s.len) - 1 };
+        insert(s, &mut data, raw as u64 & mask);
+    }
+    Ok(json!({ "id": m.id, "id_hex": format!("{:X}", m.id), "name": m.name, "data": data.iter().map(|b| format!("{:02X}", b)).collect::<String>() }))
+}
+
+/// A candump log decoded line by line: `(1700000000.123456) can0 0CF00400#FF7D7D0000F0FFFF` or `can0  123   [8]  11 22 33 ...`. Lines the DBC does not describe are counted, not decoded.
+/// Gives `{ frames: [{ time, interface, id, name, signals }], unknown: { id_hex: count } }`, at most `limit` frames.
+pub fn dbc_decode_log(path: &str, log: &str, limit: i64) -> Result<serde_json::Value, String> {
+    let d = load(path)?;
+    let mut frames = vec![];
+    let mut unknown: Map<String, Value> = Map::new();
+    for l in log.lines() {
+        let t: Vec<&str> = l.split_whitespace().collect();
+        if t.is_empty() {
+            continue;
+        }
+        let (time, iface, id, data) = if let Some(f) = t.iter().find(|x| x.contains('#')) {
+            let (id, data) = f.split_once('#').unwrap();
+            let time = t.first().filter(|x| x.starts_with('(')).map(|x| x.trim_matches(|c| c == '(' || c == ')').parse::<f64>().unwrap_or(0.0));
+            let iface = t.iter().find(|x| !x.starts_with('(') && !x.contains('#')).copied().unwrap_or("");
+            (time, iface.to_string(), id.to_string(), data.trim_start_matches('#').to_string())
+        } else if t.len() >= 3 && t[2].starts_with('[') {
+            (None, t[0].to_string(), t[1].to_string(), t[3..].concat())
+        } else {
+            continue;
+        };
+        let Ok(idn) = u32::from_str_radix(&id, 16) else { continue };
+        match d.messages.iter().find(|m| m.id == idn & 0x1fff_ffff) {
+            Some(m) => {
+                if (frames.len() as i64) < limit.max(1) {
+                    let mut f = decode_frame(m, &hexbytes(&data)?);
+                    f["time"] = json!(time);
+                    f["interface"] = json!(iface);
+                    frames.push(f);
+                }
+            }
+            None => {
+                let k = format!("{:X}", idn);
+                let n = unknown.get(&k).and_then(Value::as_i64).unwrap_or(0);
+                unknown.insert(k, json!(n + 1));
+            }
+        }
+    }
+    Ok(json!({ "frames": frames, "unknown": unknown }))
+}

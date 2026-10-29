@@ -1,0 +1,466 @@
+//! HP PJL (Printer Job Language) for office and production printers: a PDF, PostScript or PCL file wrapped in a job with copies, duplex, paper, tray, output bin, toner saving, user name and held jobs released by PIN, sent to port 9100; the printer asked for its status, model, page count and settings, and its codes (10001, 40021, 41xxx...) told in words.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! image = { version = "0.25", default-features = false, features = ["png"] }
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+
+const UEL: &[u8] = b"\x1b%-12345X";
+
+/// A PJL value as a quoted string: printable ASCII without quotes, at most 80 characters.
+fn quoted(s: &str) -> String {
+    let clean: String = s.chars().filter(|c| (' '..='~').contains(c) && *c != '"').take(80).collect();
+    format!("\"{}\"", clean)
+}
+
+fn word(v: &Value, name: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+    match v.as_str() {
+        None => Ok(None),
+        Some(s) => {
+            let up = s.to_uppercase();
+            if allowed.contains(&up.as_str()) {
+                Ok(Some(up))
+            } else {
+                Err(format!("{} {:?}: {}", name, s, allowed.join(", ").to_lowercase()))
+            }
+        }
+    }
+}
+
+/// The PJL header of a job: UEL, JOB, the settings, ENTER LANGUAGE.
+fn header(options: &Value, language: &str) -> Result<String, String> {
+    let mut h = String::from("@PJL\r\n");
+    let name = options["name"].as_str().unwrap_or("Quillo job");
+    h.push_str(&format!("@PJL JOB NAME = {}\r\n", quoted(name)));
+    if let Some(u) = options["user"].as_str() {
+        h.push_str(&format!("@PJL SET USERNAME = {}\r\n", quoted(u)));
+    }
+    if let Some(c) = options["copies"].as_i64() {
+        // QTY collates whole copies of the job; COPIES repeats each page.
+        h.push_str(&format!("@PJL SET QTY = {}\r\n", c.clamp(1, 999)));
+    }
+    match options["duplex"].as_str() {
+        Some("long") => h.push_str("@PJL SET DUPLEX = ON\r\n@PJL SET BINDING = LONGEDGE\r\n"),
+        Some("short") => h.push_str("@PJL SET DUPLEX = ON\r\n@PJL SET BINDING = SHORTEDGE\r\n"),
+        Some("off") => h.push_str("@PJL SET DUPLEX = OFF\r\n"),
+        Some(o) => return Err(format!("duplex {:?}: long, short or off", o)),
+        None => {}
+    }
+    if let Some(p) = word(&options["paper"], "paper", &["A4", "A3", "A5", "LETTER", "LEGAL", "EXECUTIVE", "B5", "LEDGER"])? {
+        h.push_str(&format!("@PJL SET PAPER = {}\r\n", p));
+    }
+    if let Some(t) = word(&options["tray"], "tray", &["TRAY1", "TRAY2", "TRAY3", "TRAY4", "TRAY5", "MANUALFEED", "ENVELOPE", "AUTO"])? {
+        if t == "MANUALFEED" {
+            h.push_str("@PJL SET MANUALFEED = ON\r\n");
+        } else {
+            h.push_str(&format!("@PJL SET MEDIASOURCE = {}\r\n", t));
+        }
+    }
+    if let Some(b) = word(&options["output_bin"], "output_bin", &["UPPER", "LOWER", "FACEUP", "FACEDOWN", "STACKER", "OPTIONALOUTBIN1", "OPTIONALOUTBIN2"])? {
+        h.push_str(&format!("@PJL SET OUTBIN = {}\r\n", b));
+    }
+    if let Some(r) = options["resolution"].as_i64() {
+        h.push_str(&format!("@PJL SET RESOLUTION = {}\r\n", if r >= 1200 { 1200 } else if r >= 600 { 600 } else { 300 }));
+    }
+    if options["economode"] == true {
+        h.push_str("@PJL SET ECONOMODE = ON\r\n");
+    }
+    if options["color"] == false {
+        h.push_str("@PJL SET RENDERMODE = GRAYSCALE\r\n");
+    }
+    // A held job: kept in the printer until its owner types the PIN at the panel.
+    if let Some(pin) = options["pin"].as_str() {
+        if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
+            return Err("a job's PIN is 4 digits".into());
+        }
+        h.push_str(&format!("@PJL SET HOLD = ON\r\n@PJL SET HOLDTYPE = PRIVATE\r\n@PJL SET HOLDKEY = \"{}\"\r\n", pin));
+        h.push_str(&format!("@PJL SET JOBNAME = {}\r\n", quoted(name)));
+    }
+    if let Some(m) = options["display"].as_str() {
+        h.push_str(&format!("@PJL RDYMSG DISPLAY = {}\r\n", quoted(m)));
+    }
+    h.push_str(&format!("@PJL ENTER LANGUAGE = {}\r\n", language));
+    Ok(h)
+}
+
+/// The file's language from its first bytes: PDF, PostScript or PCL.
+fn language(data: &[u8], given: &Value) -> Result<String, String> {
+    if let Some(l) = word(given, "language", &["PDF", "POSTSCRIPT", "PCL", "PCLXL", "AUTO"])? {
+        return Ok(l);
+    }
+    Ok(if data.starts_with(b"%PDF") {
+        "PDF".into()
+    } else if data.starts_with(b"%!") {
+        "POSTSCRIPT".into()
+    } else if data.starts_with(b"\x1bE") || data.starts_with(b"\x1b%-12345X") || data.starts_with(b"\x1b&") || data.starts_with(b"\x1b*") || data.starts_with(b"\x1b(") {
+        "PCL".into()
+    } else if data.starts_with(b") HP-PCL XL") {
+        "PCLXL".into()
+    } else {
+        return Err("not a PDF, PostScript or PCL file: say its `language`".into());
+    })
+}
+
+fn wrap(data: &[u8], options: &Value) -> Result<(Vec<u8>, String), String> {
+    let lang = language(data, &options["language"])?;
+    let head = header(options, &lang)?;
+    let mut out = Vec::with_capacity(data.len() + head.len() + 64);
+    out.extend_from_slice(UEL);
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(UEL);
+    let eoj = format!("@PJL EOJ NAME = {}\r\n", quoted(options["name"].as_str().unwrap_or("Quillo job")));
+    out.extend_from_slice(eoj.as_bytes());
+    out.extend_from_slice(UEL);
+    let shown = format!("<ESC>%-12345X{}<{} bytes of {}><ESC>%-12345X{}<ESC>%-12345X", head, data.len(), lang, eoj).replace("\r\n", "\n");
+    Ok((out, shown))
+}
+
+fn read_file(path: &str) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    if data.len() > 500_000_000 {
+        return Err("at most 500 MB".into());
+    }
+    Ok(data)
+}
+
+/// The PJL around a file (PDF, PostScript or PCL), written for people, the file's bytes shown by their count. `options`: `{ name, user, copies, duplex: "long" | "short" | "off", paper: "a4" | "letter" | ..., tray: "tray2" | "manualfeed" | ..., output_bin, resolution, economode, color: false, pin: "1234" (held until released at the printer), display, language }`.
+pub fn pjl_job(path: &str, options: serde_json::Value) -> Result<String, String> {
+    Ok(wrap(&read_file(path)?, &options)?.1)
+}
+
+/// Writes the file wrapped in its PJL job to `out_path`, to send later. Gives the bytes written.
+pub fn pjl_write(path: &str, options: serde_json::Value, out_path: &str) -> Result<i64, String> {
+    let (bytes, _) = wrap(&read_file(path)?, &options)?;
+    write_bytes(&bytes, out_path)
+}
+
+/// Prints a PDF, PostScript or PCL file on a network printer: wrapped in PJL with the options, sent to its raw port (`host` or `host:port`, 9100). Most office printers print PDF this way without a driver. Gives the bytes sent.
+pub fn pjl_print(path: &str, options: serde_json::Value, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    let (bytes, _) = wrap(&read_file(path)?, &options)?;
+    send_bytes(&bytes, host, timeout_ms)
+}
+
+/// What a status code means: (words, kind: "ready" | "busy" | "warning" | "attention" | "error").
+fn meaning(code: i64) -> (String, &'static str) {
+    let (s, k): (String, &str) = match code {
+        10001 => ("ready".into(), "ready"),
+        10002 => ("ready, offline".into(), "attention"),
+        10003 | 10024 => ("warming up".into(), "busy"),
+        10004 | 10013 => ("self test".into(), "busy"),
+        10005 => ("resetting".into(), "busy"),
+        10006 => ("toner low".into(), "warning"),
+        10007 => ("cancelling the job".into(), "busy"),
+        10023 => ("printing".into(), "busy"),
+        10026 => ("data received".into(), "busy"),
+        10014..=10022 => ("printing an internal page".into(), "busy"),
+        11000..=11999 => ("loading paper".into(), "busy"),
+        12000..=12999 => ("a paper tray's status".into(), "warning"),
+        15000..=15999 => ("an output bin is full or missing".into(), "warning"),
+        30000..=30999 => ("a condition the printer will continue past".into(), "warning"),
+        35078 => ("power save".into(), "ready"),
+        35000..=35999 => ("may need someone soon".into(), "warning"),
+        40021 => ("a door is open".into(), "attention"),
+        40022 => ("paper jam".into(), "attention"),
+        40038 => ("toner low, replace soon".into(), "attention"),
+        40079 => ("offline".into(), "attention"),
+        40000..=40999 => ("needs someone at the printer".into(), "attention"),
+        41000..=41999 => ("paper to load: a tray is empty or holds the wrong size".into(), "attention"),
+        42000..=42999 | 44000..=44999 => ("paper jam".into(), "attention"),
+        43000..=43999 => ("an optional paper handler needs attention".into(), "attention"),
+        50000..=50999 => ("hardware error".into(), "error"),
+        _ => (format!("status {}", code), "warning"),
+    };
+    (s, k)
+}
+
+/// A PJL answer read: its `KEY=VALUE` lines as a map (quotes taken off), the other lines kept in order.
+fn parse(text: &str) -> Value {
+    let mut values = serde_json::Map::new();
+    let mut lines = vec![];
+    for l in text.split(|c| c == '\r' || c == '\n' || c == '\x0c') {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with("@PJL") {
+            continue;
+        }
+        match l.split_once('=') {
+            Some((k, v)) if !k.trim().contains(' ') => {
+                values.insert(k.trim().to_uppercase(), json!(v.trim().trim_matches('"')));
+            }
+            _ => lines.push(json!(l.trim_matches('"'))),
+        }
+    }
+    json!({ "values": values, "lines": lines })
+}
+
+/// A printer's answer to `@PJL INFO STATUS` read, as `pjl_status` gives it: `{ ready, code, kind, meaning, display, online }`.
+pub fn pjl_parse_status(answer: &str) -> Result<serde_json::Value, String> {
+    let p = parse(answer);
+    let code: i64 = p["values"]["CODE"].as_str().and_then(|c| c.parse().ok()).ok_or("no CODE= in the answer")?;
+    let (m, kind) = meaning(code);
+    let online = p["values"]["ONLINE"].as_str().map(|s| s.eq_ignore_ascii_case("TRUE"));
+    Ok(json!({ "ready": kind == "ready" && online != Some(false), "code": code, "kind": kind, "meaning": m, "display": p["values"]["DISPLAY"], "online": online }))
+}
+
+/// Asks a printer one PJL question and reads its answer up to the form feed: `question` is `INFO STATUS`, `INFO ID`, `INFO CONFIG`, `INFO PAGECOUNT`, `INFO VARIABLES`, `INFO USTATUS` or `INQUIRE <variable>`. Gives `{ values: { KEY: value }, lines: [...] }`.
+pub fn pjl_ask(host: &str, question: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let q = question.trim().to_uppercase();
+    let ok = ["INFO STATUS", "INFO ID", "INFO CONFIG", "INFO PAGECOUNT", "INFO VARIABLES", "INFO USTATUS", "INFO MEMORY", "INFO FILESYS"].contains(&q.as_str())
+        || (q.starts_with("INQUIRE ") && q[8..].chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '.'));
+    if !ok {
+        return Err(format!("{:?}: INFO STATUS, INFO ID, INFO CONFIG, INFO PAGECOUNT, INFO VARIABLES, INFO USTATUS, INFO MEMORY, INFO FILESYS or INQUIRE <variable>", question));
+    }
+    let mut s = connect(host, timeout_ms)?;
+    let mut ask = UEL.to_vec();
+    ask.extend_from_slice(format!("@PJL\r\n@PJL {}\r\n", q).as_bytes());
+    ask.extend_from_slice(UEL);
+    s.write_all(&ask).map_err(|e| e.to_string())?;
+    let mut buf = vec![];
+    let mut chunk = [0u8; 4096];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.contains(&0x0c) || buf.len() > 1_000_000 {
+                    break;
+                }
+            }
+            Err(e) if buf.is_empty() => return Err(format!("no answer from the printer: {}", e)),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if !text.contains("@PJL") {
+        return Err(format!("not a PJL answer: {:?}", text.chars().take(100).collect::<String>()));
+    }
+    Ok(parse(&text))
+}
+
+/// The printer's state in one answer (`@PJL INFO STATUS`): `{ ready, code, kind: "ready" | "busy" | "warning" | "attention" | "error", meaning, display, online }`.
+pub fn pjl_status(host: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let p = pjl_ask(host, "INFO STATUS", timeout_ms)?;
+    let code: i64 = p["values"]["CODE"].as_str().and_then(|c| c.parse().ok()).ok_or("the printer gave no CODE")?;
+    let (m, kind) = meaning(code);
+    let online = p["values"]["ONLINE"].as_str().map(|s| s.eq_ignore_ascii_case("TRUE"));
+    Ok(json!({ "ready": kind == "ready" && online != Some(false), "code": code, "kind": kind, "meaning": m, "display": p["values"]["DISPLAY"], "online": online }))
+}
+
+/// Puts a message on the printer's panel in place of "Ready" (`@PJL RDYMSG`); an empty message brings the printer's own back. Gives the bytes sent.
+pub fn pjl_display(host: &str, message: &str, timeout_ms: i64) -> Result<i64, String> {
+    let mut b = UEL.to_vec();
+    b.extend_from_slice(format!("@PJL RDYMSG DISPLAY = {}\r\n", quoted(message)).as_bytes());
+    b.extend_from_slice(UEL);
+    send_bytes(&b, host, timeout_ms)
+}
+
+// ---- Shared by the printer plugins: the job's bytes and a readable copy, pictures as bits, the network.
+
+/// A job's bytes, and the same job written for people: control bytes as `<ESC>`, graphics as `<N bytes>`.
+struct Out {
+    bytes: Vec<u8>,
+    text: String,
+}
+
+fn control_name(c: u8) -> String {
+    match c {
+        0x00 => "<NUL>".into(),
+        0x02 => "<STX>".into(),
+        0x03 => "<ETX>".into(),
+        0x0a => "\n".into(),
+        0x0c => "<FF>".into(),
+        0x0d => "<CR>".into(),
+        0x17 => "<ETB>".into(),
+        0x18 => "<CAN>".into(),
+        0x1b => "<ESC>".into(),
+        0x1e => "<RS>".into(),
+        c if c < 0x20 || c == 0x7f => format!("<{:02X}>", c),
+        c => (c as char).to_string(),
+    }
+}
+
+impl Out {
+    fn new() -> Out {
+        Out { bytes: vec![], text: String::new() }
+    }
+    /// Command bytes, shown as they are with control bytes named.
+    fn b(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        for c in data {
+            self.text.push_str(&control_name(*c));
+        }
+    }
+    /// ASCII command text.
+    fn s(&mut self, s: &str) {
+        self.b(s.as_bytes());
+    }
+    /// Text already encoded for the printer (`enc`), shown as written.
+    fn t(&mut self, shown: &str, enc: &[u8]) {
+        self.bytes.extend_from_slice(enc);
+        for c in shown.chars() {
+            if (c as u32) < 0x20 {
+                self.text.push_str(&control_name(c as u8));
+            } else {
+                self.text.push(c);
+            }
+        }
+    }
+    /// Text for the readable copy only (a line break between commands), not sent.
+    fn note(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+    /// The job for people: CR LF line ends shown as plain line breaks.
+    fn view(&self) -> String {
+        self.text.replace("<CR>\n", "\n")
+    }
+    /// Binary data (a picture), shown by its size.
+    fn blob(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        self.text.push_str(&format!("<{} bytes>", data.len()));
+    }
+}
+
+/// Dots per millimetre for a resolution in dpi.
+fn dots_per_mm(dpi: i64) -> f64 {
+    dpi.clamp(100, 1200) as f64 / 25.4
+}
+
+/// A length given in `units` ("mm", the default, "in" or "dots") as dots.
+fn to_dots(v: &Value, default: f64, dpmm: f64, units: &str) -> i64 {
+    let x = v.as_f64().unwrap_or(default);
+    let d = match units {
+        "dots" => x,
+        "in" | "inch" | "inches" => x * 25.4 * dpmm,
+        _ => x * dpmm,
+    };
+    d.round().max(0.0) as i64
+}
+
+/// A picture as rows of bits, true for black: scaled to `width` dots when given, dithered or cut at a threshold, transparency as white.
+fn bitmap(path: &str, width: Option<u32>, threshold: u8, dither: bool) -> Result<(usize, usize, Vec<Vec<bool>>), String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let img = match width {
+        Some(w) if w > 0 && w != img.width() => {
+            let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+            img.resize_exact(w, h, image::imageops::FilterType::Triangle)
+        }
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w * h > 8_000_000 {
+        return Err("the picture is over 8 million dots: give a width".into());
+    }
+    let mut lum: Vec<f32> = rgba
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold as f32;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                for (dx, dy, f) in [(1isize, 0usize, 7.0f32 / 16.0), (-1, 1, 3.0 / 16.0), (0, 1, 5.0 / 16.0), (1, 1, 1.0 / 16.0)] {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                }
+            }
+        }
+    }
+    Ok((w, h, rows))
+}
+
+/// Rows of bits packed 8 dots to a byte, the first dot in the high bit; `black_is_one` false for printers where 0 prints.
+fn pack_rows(w: usize, rows: &[Vec<bool>], black_is_one: bool) -> (usize, Vec<u8>) {
+    let bpr = (w + 7) / 8;
+    let mut out = Vec::with_capacity(bpr * rows.len());
+    for r in rows {
+        for b in 0..bpr {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = b * 8 + bit;
+                let black = x < w && r[x];
+                if black == black_is_one {
+                    byte |= 0x80 >> bit;
+                }
+            }
+            out.push(byte);
+        }
+    }
+    (bpr, out)
+}
+
+/// `host`, `host:port` or `[v6]:port` as an address; `port` when none is written.
+fn printer_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64);
+    let addr = printer_addr(host, 9100)?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", addr, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends bytes to a printer's raw port and closes it.
+fn send_bytes(bytes: &[u8], host: &str, timeout_ms: i64) -> Result<i64, String> {
+    use std::io::Write;
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(bytes).map_err(|e| format!("sending to the printer: {}", e))?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(bytes.len() as i64)
+}
+
+/// Writes bytes to a file or a device (`/dev/usb/lp0`), folders made for a file.
+fn write_bytes(bytes: &[u8], path: &str) -> Result<i64, String> {
+    use std::io::Write;
+    let p = std::path::Path::new(path);
+    let device = path.starts_with("/dev/");
+    if !device {
+        if let Some(dir) = p.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(!device).truncate(!device).open(p).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(bytes).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(bytes.len() as i64)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}

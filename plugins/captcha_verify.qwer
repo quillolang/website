@@ -1,0 +1,102 @@
+//! Server-side checks of Cloudflare Turnstile, hCaptcha and Google reCAPTCHA (v2 and v3) answers, with one call and one result shape; the hostname, action and score checked; and the widget's HTML for the form.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+
+use serde_json::{json, Value};
+
+fn endpoint(provider: &str) -> Result<&'static str, String> {
+    Ok(match provider {
+        "turnstile" => "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        "hcaptcha" => "https://api.hcaptcha.com/siteverify",
+        "recaptcha" => "https://www.google.com/recaptcha/api/siteverify",
+        other => return Err(format!("unknown provider `{}`: turnstile, hcaptcha or recaptcha", other)),
+    })
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// Asks `provider` ("turnstile", "hcaptcha" or "recaptcha") whether `token` (the form's `cf-turnstile-response`,
+/// `h-captcha-response` or `g-recaptcha-response`) is a solved challenge, with the site's `secret` and the visitor's `remote_ip`
+/// (or ""). `verify_url` sends the check elsewhere (a test); "" for CAPTCHA_VERIFY_URL, else the provider's. Gives `{ success,
+/// provider, hostname, action, score, challenge_ts, error_codes }`; `score` (reCAPTCHA v3, hCaptcha Enterprise) runs from 0, a
+/// bot, to 1. A missing token fails without a request.
+pub fn captcha_verify(provider: &str, secret: &str, token: &str, remote_ip: &str, verify_url: &str) -> Result<Value, String> {
+    let p = provider.to_lowercase();
+    let mut url = endpoint(&p)?.to_string();
+    let other = if verify_url.is_empty() { std::env::var("CAPTCHA_VERIFY_URL").unwrap_or_default() } else { verify_url.to_string() };
+    if !other.is_empty() {
+        url = other;
+    }
+    if token.trim().is_empty() {
+        return Ok(json!({ "success": false, "provider": p, "hostname": null, "action": null, "score": null, "challenge_ts": null, "error_codes": ["missing-input-response"] }));
+    }
+    if token.len() > 4096 {
+        return Ok(json!({ "success": false, "provider": p, "hostname": null, "action": null, "score": null, "challenge_ts": null, "error_codes": ["invalid-input-response"] }));
+    }
+    let mut body = format!("secret={}&response={}", enc(secret), enc(token.trim()));
+    if !remote_ip.is_empty() {
+        body.push_str(&format!("&remoteip={}", enc(remote_ip)));
+    }
+    let res = ureq::post(&url).timeout(std::time::Duration::from_secs(10)).set("Content-Type", "application/x-www-form-urlencoded").send_string(&body);
+    let text = match res {
+        Ok(r) => r.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(c, r)) => return Err(format!("{} answered {}: {}", p, c, r.into_string().unwrap_or_default().chars().take(200).collect::<String>())),
+        Err(e) => return Err(format!("{}: {}", p, e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|_| format!("{} did not answer JSON", p))?;
+    let codes = v.get("error-codes").cloned().unwrap_or(json!([]));
+    Ok(json!({
+        "success": v["success"].as_bool().unwrap_or(false),
+        "provider": p,
+        "hostname": v["hostname"],
+        "action": v["action"],
+        "score": v["score"],
+        "challenge_ts": v["challenge_ts"],
+        "error_codes": if v.get("success").is_none() && codes.as_array().is_some_and(|a| a.is_empty()) { json!(["unexpected-answer"]) } else { codes },
+    }))
+}
+
+/// Whether a result from `captcha_verify` is good enough: successful, and when `rules` names them, from `hostname` (your
+/// site, so a token solved elsewhere is refused), for `action` ("signup"), with at least `min_score`. Gives true, or an error value
+/// saying which rule failed.
+pub fn captcha_verify_rules(result: serde_json::Value, rules: std::collections::HashMap<String, serde_json::Value>) -> Result<bool, String> {
+    if result["success"] != json!(true) {
+        let codes: Vec<String> = result["error_codes"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+        return Err(format!("the challenge was not passed ({})", if codes.is_empty() { "no reason given".into() } else { codes.join(", ") }));
+    }
+    if let Some(h) = rules.get("hostname").and_then(|v| v.as_str()) {
+        if result["hostname"].as_str() != Some(h) {
+            return Err(format!("solved on {}, not {}", result["hostname"].as_str().unwrap_or("an unknown host"), h));
+        }
+    }
+    if let Some(a) = rules.get("action").and_then(|v| v.as_str()) {
+        if result["action"].as_str() != Some(a) {
+            return Err(format!("solved for action {}, not {}", result["action"].as_str().unwrap_or("none"), a));
+        }
+    }
+    if let Some(m) = rules.get("min_score").and_then(|v| v.as_f64()) {
+        match result["score"].as_f64() {
+            Some(s) if s >= m => {}
+            Some(s) => return Err(format!("score {} is below {}", s, m)),
+            None => return Err("no score in the answer (only reCAPTCHA v3 and hCaptcha Enterprise give one)".into()),
+        }
+    }
+    Ok(true)
+}
+
+/// The HTML to put in a form for `provider`'s widget with your `site_key`: the script and the element it fills. `action` names
+/// the form for the checks (Turnstile and reCAPTCHA), or "". Show it with `raw(...)`.
+pub fn captcha_widget(provider: &str, site_key: &str, action: &str) -> Result<String, String> {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+    let act = if action.is_empty() { String::new() } else { format!(" data-action=\"{}\"", esc(action)) };
+    Ok(match provider.to_lowercase().as_str() {
+        "turnstile" => format!("<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\" async defer></script>\n<div class=\"cf-turnstile\" data-sitekey=\"{}\"{}></div>", esc(site_key), act),
+        "hcaptcha" => format!("<script src=\"https://js.hcaptcha.com/1/api.js\" async defer></script>\n<div class=\"h-captcha\" data-sitekey=\"{}\"></div>", esc(site_key)),
+        "recaptcha" => format!("<script src=\"https://www.google.com/recaptcha/api.js\" async defer></script>\n<div class=\"g-recaptcha\" data-sitekey=\"{}\"{}></div>", esc(site_key), act),
+        other => return Err(format!("unknown provider `{}`: turnstile, hcaptcha or recaptcha", other)),
+    })
+}

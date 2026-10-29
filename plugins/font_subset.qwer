@@ -1,0 +1,457 @@
+//! Fonts cut down to the characters a page or a PDF uses: a TrueType font of a few kilobytes in place of hundreds, as .ttf, as .woff for the web, or as a data URL for CSS.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! flate2 = "1"
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+
+const MAX_FONT: u64 = 64 * 1024 * 1024;
+
+fn u16_at(d: &[u8], o: usize) -> Result<u16, String> {
+    d.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]])).ok_or_else(|| "the font is cut short".to_string())
+}
+fn i16_at(d: &[u8], o: usize) -> Result<i16, String> {
+    u16_at(d, o).map(|x| x as i16)
+}
+fn u32_at(d: &[u8], o: usize) -> Result<u32, String> {
+    d.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(|| "the font is cut short".to_string())
+}
+
+struct Font<'a> {
+    tables: BTreeMap<[u8; 4], &'a [u8]>,
+}
+
+impl<'a> Font<'a> {
+    fn parse(d: &'a [u8]) -> Result<Font<'a>, String> {
+        let mut start = 0usize;
+        match d.get(0..4) {
+            Some(b"ttcf") => start = u32_at(d, 12)? as usize, // a collection: its first font
+            Some(b"OTTO") => return Err("an OpenType font with CFF outlines (.otf): only TrueType outlines (.ttf, most web and system fonts) are cut".into()),
+            Some(b"wOFF") | Some(b"wOF2") => return Err("a WOFF font: give the .ttf it was made from".into()),
+            Some([0, 1, 0, 0]) | Some(b"true") => {}
+            _ => return Err("not a TrueType font".into()),
+        }
+        let n = u16_at(d, start + 4)? as usize;
+        let mut tables = BTreeMap::new();
+        for i in 0..n {
+            let e = start + 12 + i * 16;
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(d.get(e..e + 4).ok_or("the font is cut short")?);
+            let (off, len) = (u32_at(d, e + 8)? as usize, u32_at(d, e + 12)? as usize);
+            let t = d.get(off..off.checked_add(len).ok_or("bad table")?).ok_or_else(|| format!("the {} table runs past the end", String::from_utf8_lossy(&tag)))?;
+            tables.insert(tag, t);
+        }
+        for need in [b"head", b"hhea", b"maxp", b"hmtx", b"loca", b"glyf", b"cmap"] {
+            if !tables.contains_key(need) {
+                return Err(format!("the font has no {} table{}", String::from_utf8_lossy(need), if need == b"glyf" { " (not TrueType outlines)" } else { "" }));
+            }
+        }
+        Ok(Font { tables })
+    }
+
+    fn t(&self, tag: &[u8; 4]) -> &'a [u8] {
+        self.tables[tag]
+    }
+
+    fn num_glyphs(&self) -> Result<usize, String> {
+        Ok(u16_at(self.t(b"maxp"), 4)? as usize)
+    }
+
+    fn glyph(&self, gid: usize) -> Result<&'a [u8], String> {
+        let long = i16_at(self.t(b"head"), 50)? != 0;
+        let loca = self.t(b"loca");
+        let (a, b) = if long { (u32_at(loca, gid * 4)? as usize, u32_at(loca, gid * 4 + 4)? as usize) } else { (u16_at(loca, gid * 2)? as usize * 2, u16_at(loca, gid * 2 + 2)? as usize * 2) };
+        if b < a {
+            return Err(format!("glyph {}: a broken loca table", gid));
+        }
+        self.t(b"glyf").get(a..b).ok_or_else(|| format!("glyph {} runs past the glyf table", gid))
+    }
+
+    // Character to glyph, from the best Unicode cmap subtable: format 12 (all of Unicode) or format 4 (the BMP).
+    fn cmap(&self) -> Result<BTreeMap<u32, u16>, String> {
+        let c = self.t(b"cmap");
+        let n = u16_at(c, 2)? as usize;
+        let mut best: Option<(u8, usize)> = None;
+        for i in 0..n {
+            let (pid, eid, off) = (u16_at(c, 4 + i * 8)?, u16_at(c, 6 + i * 8)?, u32_at(c, 8 + i * 8)? as usize);
+            let fmt = u16_at(c, off).unwrap_or(0);
+            let rank = match (pid, eid, fmt) {
+                (3, 10, 12) | (0, 4, 12) | (0, 6, 12) => 3,
+                (3, 1, 4) | (0, _, 4) => 2,
+                (3, 0, 4) => 1,
+                _ => 0,
+            };
+            if rank > 0 && best.is_none_or(|(r, _)| rank > r) {
+                best = Some((rank, off));
+            }
+        }
+        let (_, off) = best.ok_or("the font has no Unicode character map (cmap format 4 or 12)")?;
+        let mut m = BTreeMap::new();
+        if u16_at(c, off)? == 12 {
+            let groups = u32_at(c, off + 12)? as usize;
+            for g in 0..groups.min(1_000_000) {
+                let b = off + 16 + g * 12;
+                let (s, e, gid) = (u32_at(c, b)?, u32_at(c, b + 4)?, u32_at(c, b + 8)?);
+                for (k, ch) in (s..=e.min(s + 0x10FFFF)).enumerate() {
+                    m.insert(ch, (gid as usize + k) as u16);
+                }
+            }
+        } else {
+            let segs = u16_at(c, off + 6)? as usize / 2;
+            let ends = off + 14;
+            let starts = ends + segs * 2 + 2;
+            let deltas = starts + segs * 2;
+            let ranges = deltas + segs * 2;
+            for s in 0..segs {
+                let (end, start, delta, ro) = (u16_at(c, ends + s * 2)?, u16_at(c, starts + s * 2)?, u16_at(c, deltas + s * 2)?, u16_at(c, ranges + s * 2)? as usize);
+                if start > end {
+                    continue;
+                }
+                for ch in start..=end {
+                    if ch == 0xFFFF {
+                        continue;
+                    }
+                    let gid = if ro == 0 {
+                        ch.wrapping_add(delta)
+                    } else {
+                        let at = ranges + s * 2 + ro + (ch - start) as usize * 2;
+                        let g = u16_at(c, at).unwrap_or(0);
+                        if g == 0 {
+                            0
+                        } else {
+                            g.wrapping_add(delta)
+                        }
+                    };
+                    if gid != 0 {
+                        m.insert(ch as u32, gid);
+                    }
+                }
+            }
+        }
+        Ok(m)
+    }
+
+    fn hmetric(&self, gid: usize) -> Result<(u16, i16), String> {
+        let nh = u16_at(self.t(b"hhea"), 34)? as usize;
+        let h = self.t(b"hmtx");
+        if gid < nh {
+            Ok((u16_at(h, gid * 4)?, i16_at(h, gid * 4 + 2)?))
+        } else {
+            Ok((u16_at(h, (nh - 1) * 4)?, i16_at(h, nh * 4 + (gid - nh) * 2).unwrap_or(0)))
+        }
+    }
+}
+
+// The glyphs a composite glyph is made of, with where each one's index is in its bytes.
+fn components(g: &[u8]) -> Vec<(usize, u16)> {
+    let mut out = vec![];
+    if g.len() < 10 || i16::from_be_bytes([g[0], g[1]]) >= 0 {
+        return out;
+    }
+    let mut o = 10;
+    loop {
+        if o + 4 > g.len() {
+            break;
+        }
+        let flags = u16::from_be_bytes([g[o], g[o + 1]]);
+        out.push((o + 2, u16::from_be_bytes([g[o + 2], g[o + 3]])));
+        o += 4 + if flags & 0x1 != 0 { 4 } else { 2 };
+        o += if flags & 0x8 != 0 {
+            2
+        } else if flags & 0x40 != 0 {
+            4
+        } else if flags & 0x80 != 0 {
+            8
+        } else {
+            0
+        };
+        if flags & 0x20 == 0 {
+            break;
+        }
+    }
+    out
+}
+
+fn checksum(d: &[u8]) -> u32 {
+    d.chunks(4).fold(0u32, |s, c| {
+        let mut b = [0u8; 4];
+        b[..c.len()].copy_from_slice(c);
+        s.wrapping_add(u32::from_be_bytes(b))
+    })
+}
+
+fn cmap_table(map: &BTreeMap<u32, u16>) -> Vec<u8> {
+    // Format 4 for the BMP, one segment per run of characters whose glyphs follow on; format 12 for everything.
+    let mut segs: Vec<(u16, u16, u16)> = vec![]; // start, end, first glyph
+    for (&ch, &g) in map.iter().filter(|(c, _)| **c < 0xFFFF) {
+        match segs.last_mut() {
+            Some((s, e, g0)) if *e as u32 + 1 == ch && (*g0 as u32 + (ch - *s as u32)) == g as u32 => *e = ch as u16,
+            _ => segs.push((ch as u16, ch as u16, g)),
+        }
+    }
+    segs.push((0xFFFF, 0xFFFF, 0));
+    let n = segs.len();
+    let mut f4 = vec![];
+    let len4 = 16 + n * 8;
+    let pow = 1usize << (usize::BITS - 1 - n.leading_zeros());
+    for v in [4u16, len4 as u16, 0, (n * 2) as u16, (pow * 2) as u16, (pow.trailing_zeros()) as u16, ((n - pow) * 2) as u16] {
+        f4.extend_from_slice(&v.to_be_bytes());
+    }
+    segs.iter().for_each(|s| f4.extend_from_slice(&s.1.to_be_bytes()));
+    f4.extend_from_slice(&0u16.to_be_bytes());
+    segs.iter().for_each(|s| f4.extend_from_slice(&s.0.to_be_bytes()));
+    segs.iter().for_each(|s| f4.extend_from_slice(&(if s.0 == 0xFFFF { 1u16 } else { s.2.wrapping_sub(s.0) }).to_be_bytes()));
+    segs.iter().for_each(|_| f4.extend_from_slice(&0u16.to_be_bytes()));
+    let mut groups: Vec<(u32, u32, u32)> = vec![];
+    for (&ch, &g) in map {
+        match groups.last_mut() {
+            Some((s, e, g0)) if *e + 1 == ch && *g0 + (ch - *s) == g as u32 => *e = ch,
+            _ => groups.push((ch, ch, g as u32)),
+        }
+    }
+    let mut f12 = vec![];
+    f12.extend_from_slice(&12u16.to_be_bytes());
+    f12.extend_from_slice(&0u16.to_be_bytes());
+    f12.extend_from_slice(&((16 + groups.len() * 12) as u32).to_be_bytes());
+    f12.extend_from_slice(&0u32.to_be_bytes());
+    f12.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    for (s, e, g) in groups {
+        for v in [s, e, g] {
+            f12.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+    let mut c = vec![];
+    for v in [0u16, 2, 3, 1] {
+        c.extend_from_slice(&v.to_be_bytes());
+    }
+    c.extend_from_slice(&20u32.to_be_bytes());
+    c.extend_from_slice(&3u16.to_be_bytes());
+    c.extend_from_slice(&10u16.to_be_bytes());
+    c.extend_from_slice(&((20 + f4.len()) as u32).to_be_bytes());
+    c.extend_from_slice(&f4);
+    c.extend_from_slice(&f12);
+    c
+}
+
+fn sfnt(tables: &BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
+    let n = tables.len();
+    let pow = 1usize << (usize::BITS - 1 - n.leading_zeros());
+    let mut out = vec![0, 1, 0, 0];
+    for v in [n as u16, (pow * 16) as u16, pow.trailing_zeros() as u16, ((n - pow) * 16) as u16] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    let mut off = 12 + n * 16;
+    let mut body = vec![];
+    let mut head_at = None;
+    for (tag, t) in tables {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&checksum(t).to_be_bytes());
+        out.extend_from_slice(&(off as u32).to_be_bytes());
+        out.extend_from_slice(&(t.len() as u32).to_be_bytes());
+        if tag == b"head" {
+            head_at = Some(off);
+        }
+        body.extend_from_slice(t);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        off = 12 + n * 16 + body.len();
+    }
+    out.extend_from_slice(&body);
+    if let Some(h) = head_at {
+        let adj = 0xB1B0AFBAu32.wrapping_sub(checksum(&out));
+        out[h + 8..h + 12].copy_from_slice(&adj.to_be_bytes());
+    }
+    out
+}
+
+fn woff(font: &[u8]) -> Result<Vec<u8>, String> {
+    let n = u16_at(font, 4)? as usize;
+    let mut dir = vec![];
+    let mut data = vec![];
+    let start = 44 + n * 20;
+    for i in 0..n {
+        let e = 12 + i * 16;
+        let (tag, sum, off, len) = (&font[e..e + 4], u32_at(font, e + 4)?, u32_at(font, e + 8)? as usize, u32_at(font, e + 12)? as usize);
+        let t = &font[off..off + len];
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(t).map_err(|e| e.to_string())?;
+        let packed = z.finish().map_err(|e| e.to_string())?;
+        let stored: &[u8] = if packed.len() < t.len() { &packed } else { t };
+        dir.extend_from_slice(tag);
+        dir.extend_from_slice(&((start + data.len()) as u32).to_be_bytes());
+        dir.extend_from_slice(&(stored.len() as u32).to_be_bytes());
+        dir.extend_from_slice(&(len as u32).to_be_bytes());
+        dir.extend_from_slice(&sum.to_be_bytes());
+        data.extend_from_slice(stored);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+    }
+    let total = start + data.len();
+    let mut out = b"wOFF".to_vec();
+    out.extend_from_slice(&font[0..4]);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&(n as u16).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&(font.len() as u32).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&[0u8; 20]);
+    out.extend_from_slice(&dir);
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+struct Cut {
+    font: Vec<u8>,
+    before: usize,
+    after: usize,
+    missing: Vec<String>,
+    chars: usize,
+}
+
+fn cut(path: &str, text: &str) -> Result<Cut, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?;
+    if meta.len() > MAX_FONT {
+        return Err(format!("{}: more than 64 MB", path));
+    }
+    let d = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let f = Font::parse(&d).map_err(|e| format!("{}: {}", path, e))?;
+    let n = f.num_glyphs()?;
+    let cmap = f.cmap()?;
+    let wanted: BTreeSet<char> = text.chars().filter(|c| !c.is_control()).collect();
+    let mut keep_map: BTreeMap<u32, u16> = BTreeMap::new();
+    let mut missing = vec![];
+    for ch in &wanted {
+        match cmap.get(&(*ch as u32)).filter(|g| (**g as usize) < n) {
+            Some(g) => {
+                keep_map.insert(*ch as u32, *g);
+            }
+            None if *ch == ' ' || *ch == '\u{A0}' => {}
+            None => missing.push(ch.to_string()),
+        }
+    }
+    // .notdef, the glyphs asked for, and every glyph a composite one is built from.
+    let mut keep: BTreeSet<u16> = [0u16].into_iter().chain(keep_map.values().copied()).collect();
+    let mut todo: Vec<u16> = keep.iter().copied().collect();
+    while let Some(g) = todo.pop() {
+        for (_, c) in components(f.glyph(g as usize)?) {
+            if (c as usize) < n && keep.insert(c) {
+                todo.push(c);
+            }
+        }
+    }
+    let new_id: BTreeMap<u16, u16> = keep.iter().enumerate().map(|(i, g)| (*g, i as u16)).collect();
+    let mut glyf = vec![];
+    let mut loca = vec![];
+    let mut hmtx = vec![];
+    for &g in &keep {
+        loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+        let mut bytes = f.glyph(g as usize)?.to_vec();
+        for (at, c) in components(&bytes.clone()) {
+            let nc = new_id.get(&c).copied().unwrap_or(0);
+            bytes[at..at + 2].copy_from_slice(&nc.to_be_bytes());
+        }
+        glyf.extend_from_slice(&bytes);
+        while glyf.len() % 4 != 0 {
+            glyf.push(0);
+        }
+        let (adv, lsb) = f.hmetric(g as usize)?;
+        hmtx.extend_from_slice(&adv.to_be_bytes());
+        hmtx.extend_from_slice(&lsb.to_be_bytes());
+    }
+    loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+    let count = keep.len() as u16;
+    let mut tables: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
+    let mut head = f.t(b"head").to_vec();
+    head[8..12].copy_from_slice(&[0; 4]);
+    head[50..52].copy_from_slice(&1i16.to_be_bytes());
+    tables.insert(*b"head", head);
+    let mut hhea = f.t(b"hhea").to_vec();
+    hhea[34..36].copy_from_slice(&count.to_be_bytes());
+    tables.insert(*b"hhea", hhea);
+    let mut maxp = f.t(b"maxp").to_vec();
+    maxp[4..6].copy_from_slice(&count.to_be_bytes());
+    tables.insert(*b"maxp", maxp);
+    tables.insert(*b"glyf", glyf);
+    tables.insert(*b"loca", loca);
+    tables.insert(*b"hmtx", hmtx);
+    let remapped: BTreeMap<u32, u16> = keep_map.iter().map(|(c, g)| (*c, new_id[g])).collect();
+    tables.insert(*b"cmap", cmap_table(&remapped));
+    if let Some(post) = f.tables.get(b"post").filter(|p| p.len() >= 32) {
+        // Version 3: no glyph names, which no longer match.
+        let mut p = post[..32].to_vec();
+        p[0..4].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+        tables.insert(*b"post", p);
+    }
+    if let Some(os2) = f.tables.get(b"OS/2").filter(|o| o.len() >= 68) {
+        let mut o = os2.to_vec();
+        let first = remapped.keys().next().copied().unwrap_or(0x20).min(0xFFFF) as u16;
+        let last = remapped.keys().last().copied().unwrap_or(0x20).min(0xFFFF) as u16;
+        o[64..66].copy_from_slice(&first.to_be_bytes());
+        o[66..68].copy_from_slice(&last.to_be_bytes());
+        tables.insert(*b"OS/2", o);
+    }
+    // Hinting and names go as they are: they do not depend on glyph numbers.
+    for tag in [b"name", b"cvt ", b"fpgm", b"prep", b"gasp"] {
+        if let Some(t) = f.tables.get(tag) {
+            tables.insert(*tag, t.to_vec());
+        }
+    }
+    Ok(Cut { font: sfnt(&tables), before: n, after: keep.len(), missing, chars: keep_map.len() })
+}
+
+/// Cuts the TrueType font at `path` (.ttf, or the first font of a .ttc) down to the characters of `text`, and writes it to `out`: a .ttf,
+/// or WOFF when `out` ends in ".woff". Kerning and other OpenType features (ligatures, alternates) are dropped; hinting is kept.
+/// Gives `{ glyphs_before, glyphs, characters, missing, bytes_before, bytes }`, `missing` the characters the font has no glyph for.
+/// Fonts whose licence forbids subsetting or embedding are the caller's to leave alone.
+pub fn font_subset(path: &str, text: &str, out: &str) -> Result<Value, String> {
+    let c = cut(path, text)?;
+    let bytes = if out.to_lowercase().ends_with(".woff") { woff(&c.font)? } else { c.font };
+    if let Some(dir) = std::path::Path::new(out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    std::fs::write(out, &bytes).map_err(|e| format!("{}: {}", out, e))?;
+    Ok(json!({
+        "glyphs_before": c.before,
+        "glyphs": c.after,
+        "characters": c.chars,
+        "missing": c.missing,
+        "bytes_before": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        "bytes": bytes.len(),
+    }))
+}
+
+/// The font cut to the characters of `text`, as a WOFF data URL for CSS: `@font-face { font-family: X; src: url(<this>) }` in a page or an
+/// email, with nothing else to serve.
+pub fn font_subset_data_url(path: &str, text: &str) -> Result<String, String> {
+    let c = cut(path, text)?;
+    Ok(format!("data:font/woff;base64,{}", STANDARD.encode(woff(&c.font)?)))
+}
+
+/// The characters of `text` the font at `path` has glyphs for, and those it lacks: `{ covered, missing }`, each a text of distinct characters
+/// in order. To check a name or a title before cutting, or pick a fallback font.
+pub fn font_subset_coverage(path: &str, text: &str) -> Result<Value, String> {
+    let d = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let f = Font::parse(&d).map_err(|e| format!("{}: {}", path, e))?;
+    let cmap = f.cmap()?;
+    let mut seen = BTreeSet::new();
+    let (mut covered, mut missing) = (String::new(), String::new());
+    for ch in text.chars().filter(|c| !c.is_control() && *c != ' ') {
+        if seen.insert(ch) {
+            if cmap.contains_key(&(ch as u32)) {
+                covered.push(ch);
+            } else {
+                missing.push(ch);
+            }
+        }
+    }
+    Ok(json!({ "covered": covered, "missing": missing }))
+}

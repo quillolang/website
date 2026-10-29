@@ -1,0 +1,270 @@
+//! Moving counts, sums, averages and rates over time windows, kept in memory by name for all requests: requests a minute, errors in the last five, sales this hour against the hour before.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+
+#[derive(Clone, Copy)]
+struct Bucket {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+struct Series {
+    /// One bucket a second, by the second since 1970.
+    buckets: BTreeMap<i64, Bucket>,
+    keep: i64,
+}
+
+const DEFAULT_KEEP: i64 = 86_400;
+const MAX_KEEP: i64 = 7 * 86_400;
+const MAX_SERIES: usize = 10_000;
+
+static SERIES: Mutex<Option<HashMap<String, Series>>> = Mutex::new(None);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn at_or_now(at_ms: i64) -> i64 {
+    if at_ms > 0 { at_ms } else { now_ms() }
+}
+
+fn window_ok(w: i64) -> Result<(), String> {
+    if (1..=MAX_KEEP).contains(&w) { Ok(()) } else { Err("a window is from 1 second to 7 days (604,800 s)".into()) }
+}
+
+fn add_to(s: &mut Series, at_ms: i64, value: f64) {
+    let sec = at_ms.div_euclid(1000);
+    let b = s.buckets.entry(sec).or_insert(Bucket { count: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY });
+    b.count += 1;
+    b.sum += value;
+    b.min = b.min.min(value);
+    b.max = b.max.max(value);
+    // Forget what is older than the series keeps, measured from its newest second.
+    if let Some((&last, _)) = s.buckets.iter().next_back() {
+        let cut = last - s.keep;
+        while let Some((&first, _)) = s.buckets.iter().next() {
+            if first > cut {
+                break;
+            }
+            s.buckets.remove(&first);
+        }
+    }
+}
+
+/// count, sum, min, max over the seconds (end - window, end].
+fn gather(s: &Series, end_ms: i64, window: i64) -> (u64, f64, f64, f64) {
+    let end = end_ms.div_euclid(1000);
+    let (mut c, mut sum, mut lo, mut hi) = (0u64, 0.0, f64::INFINITY, f64::NEG_INFINITY);
+    for (_, b) in s.buckets.range(end - window + 1..=end) {
+        c += b.count;
+        sum += b.sum;
+        lo = lo.min(b.min);
+        hi = hi.max(b.max);
+    }
+    (c, sum, lo, hi)
+}
+
+fn round(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+fn stats(c: u64, sum: f64, lo: f64, hi: f64, window: i64) -> Value {
+    let n = |x: f64| if c == 0 { Value::Null } else { json!(round(x)) };
+    json!({
+        "count": c,
+        "sum": round(sum),
+        "mean": n(sum / c.max(1) as f64),
+        "min": n(lo),
+        "max": n(hi),
+        "per_second": round(c as f64 / window as f64),
+        "per_minute": round(c as f64 * 60.0 / window as f64),
+        "window": window,
+    })
+}
+
+fn with<T>(f: impl FnOnce(&mut HashMap<String, Series>) -> T) -> T {
+    let mut g = SERIES.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+fn series<'a>(all: &'a mut HashMap<String, Series>, name: &str) -> Result<&'a mut Series, String> {
+    if !all.contains_key(name) && all.len() >= MAX_SERIES {
+        return Err("up to 10,000 series: rolling_clear old ones".into());
+    }
+    Ok(all.entry(name.to_string()).or_insert_with(|| Series { buckets: BTreeMap::new(), keep: DEFAULT_KEEP }))
+}
+
+/// Records one event in the series `name` (made on first use): `value` is what it counts for in sums and averages (1.0 for a
+/// plain count; an amount, a duration in ms), `at_ms` its time in milliseconds since 1970 (0 for now). Gives how many events
+/// the series holds. A series keeps a day unless `rolling_keep` says otherwise, at one-second resolution.
+pub fn rolling_add(name: &str, value: f64, at_ms: i64) -> Result<i64, String> {
+    if !value.is_finite() {
+        return Err("value must be a finite number".into());
+    }
+    with(|all| {
+        let s = series(all, name)?;
+        add_to(s, at_or_now(at_ms), value);
+        Ok(s.buckets.values().map(|b| b.count as i64).sum())
+    })
+}
+
+/// Records many events at once, each `{ at, value }` (`at` in ms since 1970, `value` 1 when left out): to fill a series from the
+/// database after a restart. Up to 1,000,000 a call; gives how many were added.
+pub fn rolling_add_many(name: &str, events: Vec<serde_json::Value>) -> Result<i64, String> {
+    if events.len() > 1_000_000 {
+        return Err("up to 1,000,000 events a call".into());
+    }
+    let mut parsed = Vec::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        let at = e.get("at").and_then(|x| x.as_i64()).ok_or_else(|| format!("event {} has no `at` (ms since 1970)", i))?;
+        let v = e.get("value").map_or(Some(1.0), |x| x.as_f64()).filter(|v| v.is_finite()).ok_or_else(|| format!("event {}'s `value` is not a number", i))?;
+        parsed.push((at, v));
+    }
+    parsed.sort_by_key(|p| p.0);
+    with(|all| {
+        let s = series(all, name)?;
+        for (at, v) in &parsed {
+            add_to(s, *at, *v);
+        }
+        Ok(parsed.len() as i64)
+    })
+}
+
+/// How long the series `name` keeps its events, in seconds (60 to 604,800, a week; a day by default). Older ones are forgotten.
+pub fn rolling_keep(name: &str, seconds: i64) -> Result<i64, String> {
+    if !(60..=MAX_KEEP).contains(&seconds) {
+        return Err("a series keeps from 60 seconds to 7 days (604,800 s)".into());
+    }
+    with(|all| {
+        let s = series(all, name)?;
+        s.keep = seconds;
+        Ok(seconds)
+    })
+}
+
+/// The series' events in the `window_seconds` before `at_ms` (0 for now): `{ count, sum, mean, min, max, per_second,
+/// per_minute, window }`; mean, min and max are null when there were none. An unknown series counts nothing.
+pub fn rolling_stats(name: &str, window_seconds: i64, at_ms: i64) -> Result<Value, String> {
+    window_ok(window_seconds)?;
+    let end = at_or_now(at_ms);
+    with(|all| {
+        let (c, s, lo, hi) = all.get(name).map_or((0, 0.0, f64::INFINITY, f64::NEG_INFINITY), |s| gather(s, end, window_seconds));
+        Ok(stats(c, s, lo, hi, window_seconds))
+    })
+}
+
+/// The last `steps` windows (up to 1,000), oldest first, each `window_seconds` long and `step_seconds` after the one before,
+/// the last ending at `at_ms` (0 for now): `[{ at, count, sum, mean, per_minute }]`, `at` each window's end in ms. For a sparkline
+/// of requests a minute over the last hour: window 60, step 60, 60 steps.
+pub fn rolling_series(name: &str, window_seconds: i64, step_seconds: i64, steps: i64, at_ms: i64) -> Result<Vec<Value>, String> {
+    window_ok(window_seconds)?;
+    window_ok(step_seconds)?;
+    if !(1..=1000).contains(&steps) {
+        return Err("steps is from 1 to 1,000".into());
+    }
+    let end = at_or_now(at_ms);
+    with(|all| {
+        Ok((0..steps)
+            .rev()
+            .map(|k| {
+                let t = end - k * step_seconds * 1000;
+                let (c, s, _, _) = all.get(name).map_or((0, 0.0, 0.0, 0.0), |s| gather(s, t, window_seconds));
+                json!({
+                    "at": t,
+                    "count": c,
+                    "sum": round(s),
+                    "mean": if c == 0 { Value::Null } else { json!(round(s / c as f64)) },
+                    "per_minute": round(c as f64 * 60.0 / window_seconds as f64),
+                })
+            })
+            .collect())
+    })
+}
+
+/// The share `part` is of `whole` in the same window, by count: errors over requests, sign-ups over visits. Null when `whole`
+/// had no events.
+pub fn rolling_ratio(part: &str, whole: &str, window_seconds: i64, at_ms: i64) -> Result<Option<f64>, String> {
+    window_ok(window_seconds)?;
+    let end = at_or_now(at_ms);
+    with(|all| {
+        let count = |n: &str| all.get(n).map_or(0, |s| gather(s, end, window_seconds).0);
+        let (p, w) = (count(part), count(whole));
+        Ok(if w == 0 { None } else { Some(round(p as f64 / w as f64)) })
+    })
+}
+
+/// This window against the one before it, for alerts: `{ now, before, change }` with `now` and `before` the counts (or the
+/// sums, when `by` is "sum"), and `change` the relative change (-0.4 for 40% fewer; null when `before` is 0).
+pub fn rolling_trend(name: &str, window_seconds: i64, by: &str, at_ms: i64) -> Result<Value, String> {
+    window_ok(window_seconds)?;
+    let end = at_or_now(at_ms);
+    let pick = |x: (u64, f64, f64, f64)| match by {
+        "sum" => Ok(x.1),
+        "count" | "" => Ok(x.0 as f64),
+        o => Err(format!("by is \"count\" or \"sum\", not `{}`", o)),
+    };
+    with(|all| {
+        let empty = (0, 0.0, 0.0, 0.0);
+        let (a, b) = all.get(name).map_or((empty, empty), |s| (gather(s, end, window_seconds), gather(s, end - window_seconds * 1000, window_seconds)));
+        let (now, before) = (pick(a)?, pick(b)?);
+        Ok(json!({ "now": round(now), "before": round(before), "change": if before == 0.0 { Value::Null } else { json!(round((now - before) / before)) } }))
+    })
+}
+
+/// The series in memory, by name, with how many events each holds.
+pub fn rolling_names() -> HashMap<String, i64> {
+    with(|all| all.iter().map(|(k, s)| (k.clone(), s.buckets.values().map(|b| b.count as i64).sum())).collect())
+}
+
+/// Forgets the series `name`: true when there was one.
+pub fn rolling_clear(name: &str) -> bool {
+    with(|all| all.remove(name).is_some())
+}
+
+/// Moving windows over rows you already have, without a series: `events` are `{ at, value }` (`at` in ms since 1970, `value` 1
+/// when left out), and the result has one window every `step_seconds`, each the `window_seconds` before its `at`, from the first
+/// event to the last: `[{ at, count, sum, mean }]`. A 7-day moving average of daily sales: window 604,800, step 86,400. Up to 10,000 windows.
+pub fn rolling_over(events: Vec<serde_json::Value>, window_seconds: i64, step_seconds: i64) -> Result<Vec<Value>, String> {
+    if window_seconds < 1 || step_seconds < 1 {
+        return Err("window_seconds and step_seconds are at least 1".into());
+    }
+    let mut pts = Vec::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        let at = e.get("at").and_then(|x| x.as_i64()).ok_or_else(|| format!("event {} has no `at` (ms since 1970)", i))?;
+        let v = e.get("value").map_or(Some(1.0), |x| x.as_f64()).ok_or_else(|| format!("event {}'s `value` is not a number", i))?;
+        pts.push((at, v));
+    }
+    if pts.is_empty() {
+        return Ok(vec![]);
+    }
+    pts.sort_by_key(|p| p.0);
+    let (first, last) = (pts[0].0, pts[pts.len() - 1].0);
+    let (step, win) = (step_seconds * 1000, window_seconds * 1000);
+    let n = (last - first) / step + 1;
+    if n > 10_000 {
+        return Err(format!("that is {} windows: take a longer step (up to 10,000 windows)", n));
+    }
+    // Two pointers over the sorted events: each window is (t - win, t].
+    let (mut lo, mut hi, mut sum, mut out) = (0usize, 0usize, 0.0, Vec::new());
+    for k in 0..n {
+        let t = first + k * step;
+        while hi < pts.len() && pts[hi].0 <= t {
+            sum += pts[hi].1;
+            hi += 1;
+        }
+        while lo < hi && pts[lo].0 <= t - win {
+            sum -= pts[lo].1;
+            lo += 1;
+        }
+        let c = hi - lo;
+        out.push(json!({ "at": t, "count": c, "sum": round(sum), "mean": if c == 0 { Value::Null } else { json!(round(sum / c as f64)) } }));
+    }
+    Ok(out)
+}

@@ -1,0 +1,433 @@
+//! UN/EDIFACT, the EDI of European retail, logistics and customs: interchanges parsed (ORDERS, INVOIC, DESADV and the like read into plain fields), built with their UNB/UNH envelopes, escapes and counts, and CONTRL acknowledgments made.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+
+const MAX: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct Seps {
+    comp: char,
+    el: char,
+    dec: char,
+    rel: char,
+    term: char,
+}
+
+const DEFAULT: Seps = Seps { comp: ':', el: '+', dec: '.', rel: '?', term: '\'' };
+
+/// A segment: its tag, and each element as its components (one component for a simple element).
+struct Seg {
+    tag: String,
+    els: Vec<Vec<String>>,
+}
+
+impl Seg {
+    /// Element `e`, component `c` (both from 0), or "".
+    fn c(&self, e: usize, c: usize) -> &str {
+        self.els.get(e).and_then(|x| x.get(c)).map(|s| s.as_str()).unwrap_or("")
+    }
+    fn opt(&self, e: usize, c: usize) -> Value {
+        match self.c(e, c).trim() {
+            "" => Value::Null,
+            s => Value::String(s.to_string()),
+        }
+    }
+}
+
+fn split(text: &str) -> Result<(Seps, Vec<Seg>), String> {
+    if text.len() > MAX {
+        return Err("the interchange is over 64 MB".into());
+    }
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    let (s, body) = if let Some(rest) = text.strip_prefix("UNA") {
+        let c: Vec<char> = rest.chars().take(6).collect();
+        if c.len() < 6 {
+            return Err("the UNA segment is cut short".into());
+        }
+        (Seps { comp: c[0], el: c[1], dec: c[2], rel: c[3], term: c[5] }, rest.char_indices().nth(6).map(|(i, _)| &rest[i..]).unwrap_or(""))
+    } else {
+        (DEFAULT, text)
+    };
+    if !body.trim_start().starts_with("UNB") && !body.trim_start().starts_with("UNH") {
+        return Err("not EDIFACT: no UNB (or UNH) segment at the start".into());
+    }
+    let mut segs = vec![];
+    let (mut els, mut comps, mut cur) = (Vec::<Vec<String>>::new(), Vec::<String>::new(), String::new());
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch == s.rel {
+            if let Some(n) = chars.next() {
+                cur.push(n);
+            }
+        } else if ch == s.comp {
+            comps.push(std::mem::take(&mut cur));
+        } else if ch == s.el {
+            comps.push(std::mem::take(&mut cur));
+            els.push(std::mem::take(&mut comps));
+        } else if ch == s.term {
+            comps.push(std::mem::take(&mut cur));
+            els.push(std::mem::take(&mut comps));
+            let mut all = std::mem::take(&mut els);
+            let tag = all.remove(0).join("").trim().to_string();
+            segs.push(Seg { tag, els: all });
+        } else if (ch == '\n' || ch == '\r') && cur.is_empty() && comps.is_empty() && els.is_empty() {
+            // Line breaks between segments.
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() || !els.is_empty() {
+        return Err(format!("the last segment has no terminator `{}`", s.term));
+    }
+    Ok((s, segs))
+}
+
+fn value_of(els: &[Vec<String>]) -> Value {
+    Value::Array(els.iter().map(|e| if e.len() == 1 { Value::String(e[0].clone()) } else { Value::Array(e.iter().map(|c| Value::String(c.clone())).collect()) }).collect())
+}
+
+fn date(v: &str, format: &str) -> Value {
+    let v = v.trim();
+    let ok = |n: usize| v.len() >= n && v[..n].bytes().all(|b| b.is_ascii_digit());
+    match format {
+        "102" | "" if v.len() == 8 && ok(8) => Value::String(format!("{}-{}-{}", &v[..4], &v[4..6], &v[6..8])),
+        "203" if v.len() == 12 && ok(12) => Value::String(format!("{}-{}-{}T{}:{}", &v[..4], &v[4..6], &v[6..8], &v[8..10], &v[10..12])),
+        "101" if v.len() == 6 && ok(6) => Value::String(format!("20{}-{}-{}", &v[..2], &v[2..4], &v[4..6])),
+        _ if v.is_empty() => Value::Null,
+        _ => Value::String(v.to_string()),
+    }
+}
+
+fn num(s: &str, dec: char) -> Value {
+    let t = s.trim().replace(dec, ".");
+    if let Ok(i) = t.parse::<i64>() {
+        return Value::from(i);
+    }
+    t.parse::<f64>().ok().map(Value::from).unwrap_or(Value::Null)
+}
+
+/// One message's segments in plain fields: number, dates, parties, references, lines and totals.
+/// A money amount as exact text, with a dot: "6.40".
+fn money(s: &str, dec: char) -> Value {
+    match s.trim() {
+        "" => Value::Null,
+        t => Value::String(t.replace(dec, ".")),
+    }
+}
+
+fn summary(segs: &[Seg], dec: char) -> Map<String, Value> {
+    let mut m = Map::new();
+    let (mut dates, mut refs, mut totals) = (Map::new(), Map::new(), Map::new());
+    let mut parties: Vec<Value> = vec![];
+    let mut lines: Vec<Value> = vec![];
+    let mut summary_part = false;
+    for s in segs {
+        match s.tag.as_str() {
+            "BGM" => {
+                m.insert("document".into(), s.opt(0, 0));
+                m.insert("number".into(), s.opt(1, 0));
+                m.insert("function".into(), s.opt(2, 0));
+            }
+            "DTM" => {
+                let d = date(s.c(0, 1), s.c(0, 2));
+                if lines.is_empty() || summary_part {
+                    dates.insert(s.c(0, 0).to_string(), d);
+                } else if let Some(l) = lines.last_mut() {
+                    l["dates"][s.c(0, 0)] = d;
+                }
+            }
+            "RFF" => {
+                if lines.is_empty() || summary_part {
+                    refs.insert(s.c(0, 0).to_string(), s.opt(0, 1));
+                } else if let Some(l) = lines.last_mut() {
+                    l["refs"][s.c(0, 0)] = s.opt(0, 1);
+                }
+            }
+            "CUX" => {
+                m.insert("currency".into(), s.opt(0, 1));
+            }
+            "NAD" => {
+                let name: Vec<&str> = s.els.get(3).map(|e| e.iter().map(|x| x.as_str()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+                let street: Vec<&str> = s.els.get(4).map(|e| e.iter().map(|x| x.as_str()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+                parties.push(json!({
+                    "role": s.opt(0, 0), "id": s.opt(1, 0), "agency": s.opt(1, 2),
+                    "name": if name.is_empty() { Value::Null } else { Value::String(name.join(" ")) },
+                    "street": if street.is_empty() { Value::Null } else { Value::String(street.join(", ")) },
+                    "city": s.opt(5, 0), "postcode": s.opt(7, 0), "country": s.opt(8, 0),
+                }));
+            }
+            "LIN" => lines.push(json!({ "line": s.opt(0, 0), "item": s.opt(2, 0), "item_type": s.opt(2, 1), "ids": {}, "description": null, "qty": null, "unit": null, "price": null, "amount": null, "dates": {}, "refs": {} })),
+            "PIA" => {
+                if let Some(l) = lines.last_mut() {
+                    for e in s.els.iter().skip(1) {
+                        if let (Some(id), Some(kind)) = (e.first().filter(|x| !x.is_empty()), e.get(1).filter(|x| !x.is_empty())) {
+                            l["ids"][kind.as_str()] = Value::String(id.clone());
+                        }
+                    }
+                }
+            }
+            "IMD" => {
+                if let Some(l) = lines.last_mut() {
+                    let d = s.c(2, 3);
+                    if !d.is_empty() {
+                        l["description"] = Value::String(d.to_string());
+                    }
+                }
+            }
+            "QTY" => {
+                if let Some(l) = lines.last_mut() {
+                    if l["qty"].is_null() || matches!(s.c(0, 0), "21" | "47" | "12") {
+                        l["qty"] = num(s.c(0, 1), dec);
+                        l["unit"] = s.opt(0, 2);
+                    }
+                }
+            }
+            "PRI" => {
+                if let Some(l) = lines.last_mut() {
+                    l["price"] = money(s.c(0, 1), dec);
+                }
+            }
+            "UNS" => summary_part = true,
+            "MOA" => {
+                if summary_part || lines.is_empty() {
+                    totals.insert(s.c(0, 0).to_string(), money(s.c(0, 1), dec));
+                } else if let Some(l) = lines.last_mut() {
+                    l["amount"] = money(s.c(0, 1), dec);
+                }
+            }
+            "CNT" => {
+                m.insert("line_count".into(), num(s.c(0, 1), dec));
+            }
+            _ => {}
+        }
+    }
+    m.insert("date".into(), dates.get("137").cloned().unwrap_or(Value::Null));
+    m.insert("dates".into(), Value::Object(dates));
+    m.insert("refs".into(), Value::Object(refs));
+    m.insert("parties".into(), Value::Array(parties));
+    m.insert("lines".into(), Value::Array(lines));
+    m.insert("totals".into(), Value::Object(totals));
+    m
+}
+
+fn read(text: &str) -> Result<Value, String> {
+    let (s, segs) = split(text)?;
+    let mut problems: Vec<String> = vec![];
+    let mut messages: Vec<Value> = vec![];
+    let mut head = json!({});
+    let mut i = 0;
+    while i < segs.len() {
+        let seg = &segs[i];
+        match seg.tag.as_str() {
+            "UNB" => {
+                head = json!({
+                    "syntax": seg.opt(0, 0), "syntax_version": seg.opt(0, 1),
+                    "sender": seg.opt(1, 0), "sender_qualifier": seg.opt(1, 1),
+                    "recipient": seg.opt(2, 0), "recipient_qualifier": seg.opt(2, 1),
+                    "date": date(seg.c(3, 0), if seg.c(3, 0).len() == 8 { "102" } else { "101" }), "time": seg.opt(3, 1),
+                    "control": seg.opt(4, 0), "test": seg.c(10, 0) == "1",
+                });
+            }
+            "UNH" => {
+                let start = i;
+                while i < segs.len() && segs[i].tag != "UNT" {
+                    i += 1;
+                }
+                let unh = &segs[start];
+                if i >= segs.len() {
+                    problems.push(format!("message {} has no UNT", unh.c(0, 0)));
+                    break;
+                }
+                let unt = &segs[i];
+                let count = i - start + 1;
+                if unt.c(0, 0).trim().parse::<usize>().ok() != Some(count) {
+                    problems.push(format!("message {}: UNT says {} segments, it has {}", unh.c(0, 0), unt.c(0, 0), count));
+                }
+                if unt.c(1, 0) != unh.c(0, 0) {
+                    problems.push(format!("message {}: UNT's reference is {}", unh.c(0, 0), unt.c(1, 0)));
+                }
+                let body = &segs[start..=i];
+                let mut msg = Map::new();
+                msg.insert("ref".into(), unh.opt(0, 0));
+                msg.insert("type".into(), unh.opt(1, 0));
+                msg.insert("version".into(), Value::String(format!("{}{}", unh.c(1, 1), unh.c(1, 2))));
+                msg.insert("agency".into(), unh.opt(1, 3));
+                msg.insert("association".into(), unh.opt(1, 4));
+                msg.extend(summary(body, s.dec));
+                msg.insert("segments".into(), Value::Array(body.iter().map(|x| json!({ "tag": x.tag, "elements": value_of(&x.els) })).collect()));
+                messages.push(Value::Object(msg));
+            }
+            "UNZ" => {
+                if seg.c(0, 0).trim().parse::<usize>().ok() != Some(messages.len()) {
+                    problems.push(format!("UNZ says {} messages, there are {}", seg.c(0, 0), messages.len()));
+                }
+                if Some(seg.c(1, 0)) != head["control"].as_str() {
+                    problems.push(format!("UNZ's control reference {} is not UNB's", seg.c(1, 0)));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut out = head.as_object().cloned().unwrap_or_default();
+    out.insert("separators".into(), json!({ "component": s.comp.to_string(), "element": s.el.to_string(), "decimal": s.dec.to_string(), "release": s.rel.to_string(), "segment": s.term.to_string() }));
+    out.insert("messages".into(), Value::Array(messages));
+    out.insert("problems".into(), json!(problems));
+    Ok(Value::Object(out))
+}
+
+/// An interchange read: `{ syntax, sender, recipient, date, time, control, test, separators, messages, problems }`.
+/// Each message has `ref`, `type` ("ORDERS"), `version` ("D96A"), `segments` (`{ tag, elements }`, a composite as a
+/// list) and plain fields: `document` and `number` (BGM), `date` (DTM 137) and `dates`, `currency`, `refs` (RFF),
+/// `parties` (NAD: `{ role, id, name, street, city, postcode, country }`), `lines` (LIN with PIA ids, IMD
+/// description, QTY, PRI, MOA, `{ line, item, ids, description, qty, unit, price, amount }`) and `totals` (MOA after
+/// UNS, by qualifier: 86, 79, 77...); amounts and prices are exact text ("6.40"), quantities numbers. The UNA segment's separators are used when there is one; `?` escapes are undone.
+pub fn edifact_parse(text: &str) -> Result<Value, String> {
+    read(text)
+}
+
+/// `edifact_parse` of a file (.edi, .txt).
+pub fn edifact_read_file(path: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    read(&text)
+}
+
+/// Every message of the interchange in one list, its plain fields only (no `segments`), each with the `sender`.
+pub fn edifact_documents(text: &str) -> Result<Vec<Value>, String> {
+    let x = read(text)?;
+    Ok(x["messages"].as_array().into_iter().flatten().map(|m| {
+        let mut m = m.clone();
+        if let Some(o) = m.as_object_mut() {
+            o.remove("segments");
+            o.insert("sender".into(), x["sender"].clone());
+        }
+        m
+    }).collect())
+}
+
+fn now() -> (String, String) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let z = secs.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let s = secs.rem_euclid(86400);
+    (format!("{:04}{:02}{:02}", y, m, d), format!("{:02}{:02}", s / 3600, s / 60 % 60))
+}
+
+fn esc(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        if matches!(c, '?' | '+' | ':' | '\'') {
+            o.push('?');
+        }
+        o.push(c);
+    }
+    o
+}
+
+fn scalar(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => esc(s),
+        other => esc(&other.to_string()),
+    }
+}
+
+fn element(v: &Value) -> String {
+    match v {
+        Value::Array(a) => {
+            let mut parts: Vec<String> = a.iter().map(scalar).collect();
+            while parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+                parts.pop();
+            }
+            parts.join(":")
+        }
+        v => scalar(v),
+    }
+}
+
+fn segment(parts: &[Value]) -> Result<String, String> {
+    let tag = parts.first().and_then(|t| t.as_str()).filter(|t| t.len() == 3 && t.bytes().all(|b| b.is_ascii_uppercase())).ok_or("a segment is a list starting with its three-letter tag: [\"BGM\", \"220\", ...]")?;
+    let mut els: Vec<String> = parts[1..].iter().map(element).collect();
+    while els.last().is_some_and(|e| e.is_empty()) {
+        els.pop();
+    }
+    Ok(if els.is_empty() { tag.to_string() } else { format!("{}+{}", tag, els.join("+")) })
+}
+
+/// An interchange built: `header` is `{ sender, recipient, control }`, and may add `sender_qualifier` and
+/// `recipient_qualifier` ("14" for GLNs, else left out), `syntax` ("UNOC:3"), `date` ("20261029", else today, UTC),
+/// `time` ("1405"), `test` (false), `newlines` (true: a line break after each `'`). `messages` are `[{ type:
+/// "ORDERS:D:96A:UN", segments: [["BGM", "220", "PO-1", "9"], ["DTM", ["137", "20261029", "102"]], ...] }]`, the
+/// segments between UNH and UNT: an element a text, a number, null for empty, or a list for a composite. Values are
+/// escaped with `?`; UNA, UNB, UNH (references 1, 2, ...), UNT and UNZ are written with their counts.
+pub fn edifact_build(header: serde_json::Value, messages: Vec<serde_json::Value>) -> Result<String, String> {
+    let get = |k: &str| header[k].as_str().map(|s| s.to_string()).or_else(|| header[k].as_i64().map(|n| n.to_string()));
+    let sender = get("sender").ok_or("the header needs a `sender`")?;
+    let recipient = get("recipient").ok_or("the header needs a `recipient`")?;
+    let control = get("control").ok_or("the header needs a `control` reference")?;
+    if control.is_empty() || control.len() > 14 {
+        return Err("`control` is 1 to 14 characters".into());
+    }
+    let (today, hhmm) = now();
+    let date = get("date").unwrap_or(today).replace('-', "");
+    let time = get("time").unwrap_or(hhmm).replace(':', "");
+    let syntax = get("syntax").unwrap_or_else(|| "UNOC:3".into());
+    let v4 = syntax.ends_with(":4");
+    let nl = if header["newlines"].as_bool().unwrap_or(true) { "'\n" } else { "'" };
+    let party = |id: String, q: Option<String>| match q { Some(q) => json!([id, q]), None => json!(id) };
+    let syn: Vec<Value> = syntax.split(':').map(|x| json!(x)).collect();
+    let mut unb = vec![json!("UNB"), Value::Array(syn), party(sender, get("sender_qualifier")), party(recipient, get("recipient_qualifier")),
+        json!([if v4 { date.clone() } else { date.chars().skip(2).collect::<String>() }, time]), json!(control.clone())];
+    if header["test"].as_bool().unwrap_or(false) {
+        unb.extend([Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, json!("1")]);
+    }
+    let mut out = format!("UNA:+.? {}", nl);
+    out.push_str(&segment(&unb)?);
+    out.push_str(nl);
+    for (i, m) in messages.iter().enumerate() {
+        let kind = m["type"].as_str().ok_or("each message needs a `type`, like \"ORDERS:D:96A:UN\"")?;
+        let segs = m["segments"].as_array().ok_or("each message needs `segments`, a list of lists")?;
+        let r = (i + 1).to_string();
+        let ty: Vec<Value> = kind.split(':').map(|x| json!(x)).collect();
+        out.push_str(&segment(&[json!("UNH"), json!(r), Value::Array(ty)])?);
+        out.push_str(nl);
+        for s in segs {
+            out.push_str(&segment(s.as_array().ok_or("a segment is a list: [\"BGM\", \"220\", ...]")?)?);
+            out.push_str(nl);
+        }
+        out.push_str(&segment(&[json!("UNT"), json!(segs.len() + 2), json!(r)])?);
+        out.push_str(nl);
+    }
+    out.push_str(&segment(&[json!("UNZ"), json!(messages.len()), json!(control)])?);
+    out.push_str(nl);
+    Ok(out)
+}
+
+/// The CONTRL message acknowledging a received interchange `text`: UCI with the interchange accepted (7) and a UCM
+/// for each message, sent back with sender and recipient swapped, under the control reference `control`.
+pub fn edifact_contrl(text: &str, control: &str) -> Result<String, String> {
+    let x = read(text)?;
+    let party = |k: &str, q: &str| if x[q].is_null() { x[k].clone() } else { json!([x[k], x[q]]) };
+    let mut segs = vec![json!(["UCI", x["control"], party("sender", "sender_qualifier"), party("recipient", "recipient_qualifier"), "7"])];
+    for m in x["messages"].as_array().into_iter().flatten() {
+        let v = m["version"].as_str().unwrap_or("");
+        let (ver, rel) = v.split_at(v.len().min(1));
+        segs.push(json!(["UCM", m["ref"], [m["type"], ver, rel, m["agency"]], "7"]));
+    }
+    let header = json!({
+        "sender": x["recipient"], "sender_qualifier": x["recipient_qualifier"],
+        "recipient": x["sender"], "recipient_qualifier": x["sender_qualifier"],
+        "control": control, "syntax": format!("{}:{}", x["syntax"].as_str().unwrap_or("UNOC"), x["syntax_version"].as_str().unwrap_or("3")),
+    });
+    edifact_build(header, vec![json!({ "type": "CONTRL:D:3:UN", "segments": segs })])
+}

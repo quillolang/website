@@ -1,0 +1,395 @@
+//! The text of OpenDocument files (LibreOffice's .odt, .ods and .odp, and their flat .fodt/.fods/.fodp forms): all of it, paragraphs with headings and lists, sheets as rows of typed cells, slides with their notes, and the title and author.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! roxmltree = "0.20"
+
+use roxmltree::{Document, Node, ParsingOptions};
+use serde_json::{json, Map, Value};
+use std::io::Read;
+
+const TEXT: &str = "urn:oasis:names:tc:opendocument:xmlns:text:1.0";
+const TABLE: &str = "urn:oasis:names:tc:opendocument:xmlns:table:1.0";
+const OFFICE: &str = "urn:oasis:names:tc:opendocument:xmlns:office:1.0";
+const DRAW: &str = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0";
+const PRES: &str = "urn:oasis:names:tc:opendocument:xmlns:presentation:1.0";
+const META: &str = "urn:oasis:names:tc:opendocument:xmlns:meta:1.0";
+const DC: &str = "http://purl.org/dc/elements/1.1/";
+const MAX_PART: u64 = 128 * 1024 * 1024;
+const MAX_CELLS: usize = 5_000_000;
+
+struct Odf {
+    mimetype: String,
+    content: String,
+    meta: Option<String>,
+}
+
+fn read_part(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Option<String>, String> {
+    let f = match z.by_name(name) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut s = String::new();
+    f.take(MAX_PART + 1).read_to_string(&mut s).map_err(|e| format!("{}: {}", name, e))?;
+    if s.len() as u64 > MAX_PART {
+        return Err(format!("{} is more than 128 MB", name));
+    }
+    Ok(Some(s))
+}
+
+fn open(path: &str) -> Result<Odf, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut head = [0u8; 2];
+    let is_zip = f.read_exact(&mut head).is_ok() && &head == b"PK";
+    if !is_zip {
+        // Flat ODF: one XML file holding the content and the meta both.
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+        let mimetype = Document::parse_with_options(&text, opts())
+            .ok()
+            .and_then(|d| d.root_element().attribute((OFFICE, "mimetype")).map(String::from))
+            .ok_or_else(|| format!("{}: not an OpenDocument file (neither a zip nor flat ODF XML)", path))?;
+        return Ok(Odf { mimetype, meta: Some(text.clone()), content: text });
+    }
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut z = zip::ZipArchive::new(file).map_err(|e| format!("{}: {}", path, e))?;
+    let mimetype = read_part(&mut z, "mimetype")?.unwrap_or_default().trim().to_string();
+    if !mimetype.starts_with("application/vnd.oasis.opendocument") {
+        return Err(format!("{}: not an OpenDocument file (its mimetype is `{}`)", path, mimetype));
+    }
+    let content = read_part(&mut z, "content.xml")?.ok_or_else(|| format!("{}: no content.xml", path))?;
+    let meta = read_part(&mut z, "meta.xml")?;
+    Ok(Odf { mimetype, content, meta })
+}
+
+fn opts() -> ParsingOptions {
+    ParsingOptions { allow_dtd: false, nodes_limit: 50_000_000 }
+}
+
+fn parse(xml: &str) -> Result<Document<'_>, String> {
+    Document::parse_with_options(xml, opts()).map_err(|e| format!("the XML is broken: {}", e))
+}
+
+fn is(n: &Node, ns: &str, name: &str) -> bool {
+    n.is_element() && n.tag_name().name() == name && n.tag_name().namespace() == Some(ns)
+}
+
+fn kind(mimetype: &str) -> &'static str {
+    let m = mimetype.trim_start_matches("application/vnd.oasis.opendocument.");
+    if m.starts_with("text") {
+        "text"
+    } else if m.starts_with("spreadsheet") {
+        "spreadsheet"
+    } else if m.starts_with("presentation") {
+        "presentation"
+    } else if m.starts_with("graphics") {
+        "drawing"
+    } else {
+        "other"
+    }
+}
+
+// A paragraph's text: runs of white space are one space (ODF says so), <text:s/> adds spaces, tabs and line breaks
+// are kept; notes, annotations and change marks are left out.
+fn inline(n: Node, out: &mut String) {
+    for c in n.children() {
+        if c.is_text() {
+            let t = c.text().unwrap_or("");
+            let mut last_space = out.ends_with(' ');
+            for ch in t.chars() {
+                if ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r' {
+                    if !last_space {
+                        out.push(' ');
+                        last_space = true;
+                    }
+                } else {
+                    out.push(ch);
+                    last_space = false;
+                }
+            }
+        } else if is(&c, TEXT, "s") {
+            let k: usize = c.attribute((TEXT, "c")).and_then(|v| v.parse().ok()).unwrap_or(1);
+            out.push_str(&" ".repeat(k.min(1000)));
+        } else if is(&c, TEXT, "tab") {
+            out.push('\t');
+        } else if is(&c, TEXT, "line-break") {
+            out.push('\n');
+        } else if is(&c, TEXT, "note") || is(&c, OFFICE, "annotation") || is(&c, TEXT, "tracked-changes") || c.tag_name().name() == "desc" || c.tag_name().name() == "title" {
+        } else if c.is_element() {
+            inline(c, out);
+        }
+    }
+}
+
+fn para_text(n: Node) -> String {
+    let mut s = String::new();
+    inline(n, &mut s);
+    s.trim().to_string()
+}
+
+// Every paragraph and heading under `n`, in order, with lists and tables walked into.
+fn blocks(n: Node, list_depth: usize, out: &mut Vec<Value>) {
+    for c in n.children().filter(|c| c.is_element()) {
+        if is(&c, TEXT, "h") {
+            let level: i64 = c.attribute((TEXT, "outline-level")).and_then(|v| v.parse().ok()).unwrap_or(1);
+            out.push(json!({ "kind": "heading", "level": level, "style": c.attribute((TEXT, "style-name")), "text": para_text(c) }));
+        } else if is(&c, TEXT, "p") {
+            let t = para_text(c);
+            let k = if list_depth > 0 { "list item" } else { "paragraph" };
+            let mut b = json!({ "kind": k, "style": c.attribute((TEXT, "style-name")), "text": t });
+            if list_depth > 0 {
+                b["level"] = json!(list_depth);
+            }
+            out.push(b);
+            // A frame in a paragraph (a text box, a caption) holds paragraphs of its own.
+            for f in c.descendants().filter(|d| is(d, DRAW, "text-box")) {
+                blocks(f, list_depth, out);
+            }
+        } else if is(&c, TEXT, "list") {
+            blocks(c, list_depth + 1, out);
+        } else if is(&c, TABLE, "table") {
+            let rows = table_rows(c, false);
+            out.push(json!({ "kind": "table", "name": c.attribute((TABLE, "name")), "rows": rows }));
+        } else if is(&c, TEXT, "tracked-changes") || is(&c, OFFICE, "annotation") {
+        } else {
+            blocks(c, list_depth, out);
+        }
+    }
+}
+
+fn cell_value(c: Node, typed: bool) -> Value {
+    let text = c.children().filter(|p| is(p, TEXT, "p") || is(p, TEXT, "h")).map(para_text).collect::<Vec<_>>().join("\n");
+    if !typed {
+        return Value::String(text);
+    }
+    match c.attribute((OFFICE, "value-type")) {
+        Some("float") | Some("percentage") | Some("currency") => c
+            .attribute((OFFICE, "value"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|f| json!(f))
+            .unwrap_or(Value::String(text)),
+        Some("boolean") => json!(c.attribute((OFFICE, "boolean-value")) == Some("true")),
+        Some("date") => Value::String(c.attribute((OFFICE, "date-value")).unwrap_or(&text).to_string()),
+        Some("time") => Value::String(c.attribute((OFFICE, "time-value")).unwrap_or(&text).to_string()),
+        _ if text.is_empty() => Value::Null,
+        _ => Value::String(text),
+    }
+}
+
+fn empty(v: &Value) -> bool {
+    v.is_null() || v.as_str() == Some("")
+}
+
+// A table's rows, repeated rows and columns spread out; the empty ones at the ends (a sheet's 1,024 blank columns) dropped.
+fn table_rows(t: Node, typed: bool) -> Vec<Value> {
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut cells = 0usize;
+    for r in t.descendants().filter(|r| is(r, TABLE, "table-row")) {
+        // Rows of a table inside this one belong to that one.
+        if r.ancestors().find(|a| is(a, TABLE, "table")) != Some(t) {
+            continue;
+        }
+        let mut row = Vec::new();
+        for c in r.children().filter(|c| is(c, TABLE, "table-cell") || is(c, TABLE, "covered-table-cell")) {
+            let rep: usize = c.attribute((TABLE, "number-columns-repeated")).and_then(|v| v.parse().ok()).unwrap_or(1);
+            let v = cell_value(c, typed);
+            let rep = if empty(&v) { rep.min(1024) } else { rep.min(10_000) };
+            for _ in 0..rep {
+                row.push(v.clone());
+            }
+        }
+        while row.last().is_some_and(empty) {
+            row.pop();
+        }
+        let rep: usize = r.attribute((TABLE, "number-rows-repeated")).and_then(|v| v.parse().ok()).unwrap_or(1);
+        let rep = if row.is_empty() { rep.min(1024) } else { rep.min(100_000) };
+        for _ in 0..rep {
+            cells += row.len().max(1);
+            if cells > MAX_CELLS {
+                break;
+            }
+            rows.push(row.clone());
+        }
+    }
+    while rows.last().is_some_and(|r| r.is_empty()) {
+        rows.pop();
+    }
+    rows.into_iter().map(Value::from).collect()
+}
+
+fn body<'a>(d: &'a Document) -> Result<Node<'a, 'a>, String> {
+    d.descendants().find(|n| is(n, OFFICE, "body")).ok_or_else(|| "no office:body in content.xml".to_string())
+}
+
+/// All the text of the OpenDocument file at `path` (.odt, .ods, .odp, or flat .fodt/.fods/.fodp): paragraphs and headings on lines of their own,
+/// table and sheet cells split by tabs, slides one after another with a blank line between. For search, previews and imports.
+pub fn odf_text(path: &str) -> Result<String, String> {
+    let f = open(path)?;
+    let d = parse(&f.content).map_err(|e| format!("{}: {}", path, e))?;
+    let b = body(&d)?;
+    let mut lines: Vec<String> = Vec::new();
+    match kind(&f.mimetype) {
+        "spreadsheet" => {
+            for t in b.descendants().filter(|t| is(t, TABLE, "table")) {
+                for r in table_rows(t, false) {
+                    lines.push(r.as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>().join("\t")).unwrap_or_default());
+                }
+                lines.push(String::new());
+            }
+        }
+        "presentation" | "drawing" => {
+            for s in slides(b) {
+                lines.push(s["text"].as_str().unwrap_or("").to_string());
+                lines.push(String::new());
+            }
+        }
+        _ => {
+            let mut out = Vec::new();
+            blocks(b, 0, &mut out);
+            for x in out {
+                if let Some(rows) = x["rows"].as_array() {
+                    for r in rows {
+                        lines.push(r.as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).collect::<Vec<_>>().join("\t")).unwrap_or_default());
+                    }
+                } else {
+                    lines.push(x["text"].as_str().unwrap_or("").to_string());
+                }
+            }
+        }
+    }
+    Ok(lines.join("\n").trim().to_string())
+}
+
+/// A text document's paragraphs in order: `[{ kind, text, style, level }]`, `kind` "heading" (with its outline `level`), "paragraph",
+/// "list item" (`level` its depth) or "table" (with `rows`, lists of cell texts, in place of `text`). For .odt and .fodt.
+pub fn odf_paragraphs(path: &str) -> Result<Vec<Value>, String> {
+    let f = open(path)?;
+    if kind(&f.mimetype) != "text" {
+        return Err(format!("{}: a {} document, not text: use odf_sheets or odf_slides", path, kind(&f.mimetype)));
+    }
+    let d = parse(&f.content).map_err(|e| format!("{}: {}", path, e))?;
+    let mut out = Vec::new();
+    blocks(body(&d)?, 0, &mut out);
+    Ok(out)
+}
+
+/// A spreadsheet's sheets: `[{ name, rows }]`, each row a list of cells, typed: numbers (currencies and percentages too) as floats,
+/// booleans, dates as "2026-10-29" text, empty cells null; blank rows and columns at the ends dropped. For .ods and .fods.
+pub fn odf_sheets(path: &str) -> Result<Vec<Value>, String> {
+    let f = open(path)?;
+    if kind(&f.mimetype) != "spreadsheet" {
+        return Err(format!("{}: a {} document, not a spreadsheet", path, kind(&f.mimetype)));
+    }
+    let d = parse(&f.content).map_err(|e| format!("{}: {}", path, e))?;
+    let b = body(&d)?;
+    Ok(b.descendants()
+        .filter(|t| is(t, TABLE, "table"))
+        .map(|t| json!({ "name": t.attribute((TABLE, "name")), "rows": table_rows(t, true) }))
+        .collect())
+}
+
+fn slides(b: Node) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, p) in b.descendants().filter(|p| is(p, DRAW, "page")).enumerate() {
+        let mut title = None;
+        let mut texts = Vec::new();
+        let mut notes = Vec::new();
+        for fr in p.descendants().filter(|f| is(f, DRAW, "frame") || is(f, DRAW, "custom-shape") || is(f, DRAW, "rect")) {
+            let in_notes = fr.ancestors().any(|a| is(&a, PRES, "notes"));
+            let class = fr.attribute((PRES, "class")).unwrap_or("");
+            let mut paras = Vec::new();
+            let mut list = Vec::new();
+            blocks(fr, 0, &mut list);
+            for x in list {
+                if let Some(t) = x["text"].as_str().filter(|t| !t.is_empty()) {
+                    paras.push(t.to_string());
+                }
+            }
+            if paras.is_empty() || class == "page-number" || class == "date-time" || class == "footer" {
+                continue;
+            }
+            if in_notes {
+                notes.extend(paras);
+            } else {
+                if title.is_none() && class == "title" {
+                    title = Some(paras.join(" "));
+                }
+                texts.extend(paras);
+            }
+        }
+        out.push(json!({
+            "number": i + 1,
+            "name": p.attribute((DRAW, "name")),
+            "title": title,
+            "text": texts.join("\n"),
+            "notes": notes.join("\n"),
+        }));
+    }
+    out
+}
+
+/// A presentation's slides in order: `[{ number, name, title, text, notes }]`, `text` every text box's paragraphs on lines of their own
+/// (the title first), `notes` the speaker's notes. For .odp and .fodp (and drawings' pages).
+pub fn odf_slides(path: &str) -> Result<Vec<Value>, String> {
+    let f = open(path)?;
+    let k = kind(&f.mimetype);
+    if k != "presentation" && k != "drawing" {
+        return Err(format!("{}: a {} document, not a presentation", path, k));
+    }
+    let d = parse(&f.content).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(slides(body(&d)?))
+}
+
+/// What the file says of itself (meta.xml): `{ kind, mimetype, title, subject, description, creator, initial_creator, created, modified,
+/// language, keywords, generator, statistics }`; `kind` is text, spreadsheet, presentation or drawing, `statistics` the counts the editor kept
+/// (pages, words, characters, tables...), missing ones null.
+pub fn odf_info(path: &str) -> Result<Value, String> {
+    let f = open(path)?;
+    let mut out = Map::new();
+    out.insert("kind".into(), json!(kind(&f.mimetype)));
+    out.insert("mimetype".into(), json!(f.mimetype));
+    for k in ["title", "subject", "description", "creator", "initial_creator", "created", "modified", "language", "generator"] {
+        out.insert(k.into(), Value::Null);
+    }
+    out.insert("keywords".into(), json!([]));
+    out.insert("statistics".into(), json!({}));
+    if let Some(meta) = &f.meta {
+        let d = parse(meta).map_err(|e| format!("{}: meta.xml: {}", path, e))?;
+        if let Some(m) = d.descendants().find(|n| is(n, OFFICE, "meta")) {
+            let mut keywords = Vec::new();
+            for c in m.children().filter(|c| c.is_element()) {
+                let t = c.text().unwrap_or("").trim().to_string();
+                let key = match (c.tag_name().namespace(), c.tag_name().name()) {
+                    (Some(DC), "title") => "title",
+                    (Some(DC), "subject") => "subject",
+                    (Some(DC), "description") => "description",
+                    (Some(DC), "creator") => "creator",
+                    (Some(DC), "date") => "modified",
+                    (Some(DC), "language") => "language",
+                    (Some(META), "initial-creator") => "initial_creator",
+                    (Some(META), "creation-date") => "created",
+                    (Some(META), "generator") => "generator",
+                    (Some(META), "keyword") => {
+                        keywords.push(t);
+                        continue;
+                    }
+                    (Some(META), "document-statistic") => {
+                        let mut s = Map::new();
+                        for a in c.attributes() {
+                            let name = a.name().replace('-', "_").replace("_count", "s");
+                            let v = a.value().parse::<i64>().map(Value::from).unwrap_or(json!(a.value()));
+                            s.insert(name, v);
+                        }
+                        out.insert("statistics".into(), Value::Object(s));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                out.insert(key.into(), json!(t));
+            }
+            out.insert("keywords".into(), json!(keywords));
+        }
+    }
+    Ok(Value::Object(out))
+}
