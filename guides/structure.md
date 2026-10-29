@@ -84,11 +84,10 @@ lib/early.qwe:1: error: `LATER` is used before it is defined (line 1)
 The order that works: pure helpers and constants first, then data (server fns,
 queries, rules), then views and pages, as in `main.qwe` above.
 
-### Names are global
+### Names are global, unless private
 
-There are no namespaces inside a program, so a name is defined once in it. `quillo
-check` (and `quillo run`, which checks first) refuses a second definition, naming both
-places:
+A program has one set of names, so a name is defined once in it. `quillo check` (and
+`quillo run`, which checks first) refuses a second definition, naming both places:
 
 ```
 main.qwe:4: error: `total` is defined twice, at lib/b.qwe:1 and main.qwe:4: the second replaces the first everywhere, so rename one
@@ -101,8 +100,28 @@ main.qwe:4: error: `total` is defined twice, at lib/b.qwe:1 and main.qwe:4: the 
 | `let x` twice in one file | Allowed: the second gives the variable again |
 | Route (same method, path) | Not reported: the first one loaded answers |
 
-So name things after their part: `order_total` and `cart_total` rather than two
-`total`s. A top-level `let` named like a builtin (`let last = ...`) or a module (`let
+So name what other files use after its part: `order_total` and `cart_total` rather
+than two `total`s. A file's own helpers need no such care: mark them `private`, and only
+that file sees them. Two files may each have a private `total`:
+
+```quillo
+// lib/cart.qwe
+private let TAX = 0.12
+private fn total(lines: list) = sum(lines | map((l) => l.price * l.qty))
+
+public fn cart_total(lines: list) = total(lines) * (1 + TAX)
+```
+
+`private` goes before a `fn`, `view`, `component` or top-level `let`, at a file's top
+level; `public`, which says the default, is optional. Another file that calls `total`
+is told so, and editors offer it only in its own file:
+
+```
+main.qwe:3: error: `total` is private to lib/cart.qwe: only that file sees it (make it `public` there, or call something public)
+```
+
+A `server fn` cannot be private (it is an address on the server anyone can call: keep the
+work in a private `fn` it calls), and neither can a `type` yet. A top-level `let` named like a builtin (`let last = ...`) or a module (`let
 json = request.json`, `let date = ...`) hides it in every file of the program: name such
 values otherwise (`body`, `created`).
 
@@ -111,6 +130,7 @@ When a part needs names of its own, give it a boundary:
 | Use | When | Its names |
 |---|---|---|
 | `use "lib/x.qwe"` | Parts of one program | Shared with the whole program |
+| `private fn`, `private let` | A file's own helpers | That file's only |
 | `mount /blog = "blog.qwe"` | Another program under a path | Its own globals and its own database ([Mounting programs](/docs/routes/#mounting-programs)) |
 | `service billing = "billing.qwe"` | A part others call, here or on its own server | Called as `billing.invoice(...)` ([Microservices](/docs/microservices/)) |
 
