@@ -1,0 +1,189 @@
+//! SQL read the way a database would: whether it parses in a dialect (PostgreSQL, MySQL, SQLite, SQL Server, BigQuery...), what kind of statement it is, which tables it reads and writes, and a fingerprint for grouping queries in logs.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sqlparser = { version = "0.52", features = ["visitor"] }
+
+use serde_json::{json, Value};
+use sqlparser::ast::{Expr, ObjectName, Statement, TableFactor};
+use sqlparser::parser::Parser;
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
+
+const MAX_SQL: usize = 1 << 20;
+
+fn parse(sql: &str, dialect: &str) -> Result<Vec<Statement>, String> {
+    if sql.len() > MAX_SQL {
+        return Err("SQL is at most 1 MB here".into());
+    }
+    let name = if dialect.is_empty() { "generic" } else { dialect };
+    let d = sqlparser::dialect::dialect_from_str(name).ok_or(format!(
+        "`{}` is not a dialect: generic, postgresql, mysql, sqlite, mssql, bigquery, snowflake, duckdb, clickhouse, redshift, hive, ansi",
+        name
+    ))?;
+    Parser::parse_sql(d.as_ref(), sql).map_err(|e| e.to_string())
+}
+
+fn name(o: &ObjectName) -> String {
+    o.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+}
+
+/// A data-changing statement inside `WITH ... INSERT`, which parses as a query around it.
+fn inner(s: &Statement) -> Option<&Statement> {
+    match s {
+        Statement::Query(q) => match q.body.as_ref() {
+            sqlparser::ast::SetExpr::Insert(i) | sqlparser::ast::SetExpr::Update(i) => Some(i),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn kind(s: &Statement) -> String {
+    if let Some(i) = inner(s) {
+        return kind(i);
+    }
+    match s {
+        Statement::Query(_) => "select".into(),
+        Statement::Insert(_) => "insert".into(),
+        Statement::Update { .. } => "update".into(),
+        Statement::Delete(_) => "delete".into(),
+        Statement::CreateTable(_) => "create_table".into(),
+        Statement::CreateView { .. } => "create_view".into(),
+        Statement::CreateIndex(_) => "create_index".into(),
+        Statement::AlterTable { .. } => "alter_table".into(),
+        Statement::Drop { .. } => "drop".into(),
+        Statement::Truncate { .. } => "truncate".into(),
+        Statement::Merge { .. } => "merge".into(),
+        Statement::StartTransaction { .. } => "begin".into(),
+        Statement::Commit { .. } => "commit".into(),
+        Statement::Rollback { .. } => "rollback".into(),
+        Statement::Explain { .. } => "explain".into(),
+        other => {
+            // Others by their name in the parser: `Grant`, `SetVariable`... in snake case.
+            let dbg = format!("{:?}", other);
+            let head: String = dbg.chars().take_while(|c| c.is_alphanumeric()).collect();
+            let mut out = String::new();
+            for (i, c) in head.chars().enumerate() {
+                if c.is_uppercase() && i > 0 {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            }
+            out
+        }
+    }
+}
+
+fn table_of(f: &TableFactor) -> Option<String> {
+    match f {
+        TableFactor::Table { name: n, .. } => Some(name(n)),
+        _ => None,
+    }
+}
+
+/// The tables a statement changes.
+fn writes(s: &Statement) -> Vec<String> {
+    if let Some(i) = inner(s) {
+        return writes(i);
+    }
+    match s {
+        Statement::Insert(i) => vec![name(&i.table_name)],
+        Statement::Update { table, .. } => table_of(&table.relation).into_iter().collect(),
+        Statement::Delete(d) => {
+            if !d.tables.is_empty() {
+                d.tables.iter().map(name).collect()
+            } else {
+                let from = match &d.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(t) | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+                };
+                from.iter().filter_map(|t| table_of(&t.relation)).collect()
+            }
+        }
+        Statement::CreateTable(c) => vec![name(&c.name)],
+        Statement::CreateView { name: n, .. } => vec![name(n)],
+        Statement::CreateIndex(c) => vec![name(&c.table_name)],
+        Statement::AlterTable { name: n, .. } => vec![name(n)],
+        Statement::Drop { names, .. } => names.iter().map(name).collect(),
+        Statement::Truncate { table_names, .. } => table_names.iter().map(|t| name(&t.name)).collect(),
+        Statement::Merge { table, .. } => table_of(table).into_iter().collect(),
+        _ => vec![],
+    }
+}
+
+fn ctes(s: &Statement) -> BTreeSet<String> {
+    let q = match s {
+        Statement::Query(q) => Some(q.as_ref()),
+        Statement::Insert(i) => i.source.as_deref(),
+        _ => None,
+    };
+    q.and_then(|q| q.with.as_ref()).map(|w| w.cte_tables.iter().map(|c| c.alias.name.value.clone()).collect()).unwrap_or_default()
+}
+
+/// What some SQL does, in `dialect` ("" for generic; postgresql, mysql, sqlite, mssql, bigquery, snowflake, duckdb...):
+/// `{ ok, error, statements: [{ kind, reads, writes }], reads, writes }`. `kind` is select, insert, update, delete, create_table, drop...;
+/// `reads` are the tables read (CTE names left out), `writes` those changed. SQL that does not parse is `ok: false` with the parser's message.
+pub fn sql_tables(sql: &str, dialect: &str) -> Value {
+    let stmts = match parse(sql, dialect) {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "error": e, "statements": [], "reads": [], "writes": [] }),
+    };
+    let (mut all_r, mut all_w) = (BTreeSet::new(), BTreeSet::new());
+    let mut out = Vec::new();
+    for s in &stmts {
+        let w: BTreeSet<String> = writes(s).into_iter().collect();
+        let skip = ctes(s);
+        let mut r = BTreeSet::new();
+        let _ = sqlparser::ast::visit_relations(s, |o| {
+            let n = name(o);
+            if !skip.contains(&n) && !w.contains(&n) {
+                r.insert(n);
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        all_r.extend(r.iter().cloned());
+        all_w.extend(w.iter().cloned());
+        out.push(json!({ "kind": kind(s), "reads": r, "writes": w }));
+    }
+    json!({ "ok": true, "error": null, "statements": out, "reads": all_r, "writes": all_w })
+}
+
+/// Does the SQL parse in `dialect`? `{ ok, error, count }`, `count` the number of statements.
+pub fn sql_valid(sql: &str, dialect: &str) -> Value {
+    match parse(sql, dialect) {
+        Ok(s) => json!({ "ok": true, "error": null, "count": s.len() }),
+        Err(e) => json!({ "ok": false, "error": e, "count": 0 }),
+    }
+}
+
+/// True when every statement only reads (SELECT, and EXPLAIN or SHOW), so it is safe to run on a read-only report page. SQL that does not parse is false.
+pub fn sql_read_only(sql: &str, dialect: &str) -> bool {
+    match parse(sql, dialect) {
+        Ok(stmts) => {
+            !stmts.is_empty()
+                && stmts.iter().all(|s| match s {
+                    Statement::Query(q) => match q.body.as_ref() {
+                        sqlparser::ast::SetExpr::Select(sel) => sel.into.is_none(),
+                        sqlparser::ast::SetExpr::Insert(_) | sqlparser::ast::SetExpr::Update(_) => false,
+                        _ => true,
+                    },
+                    Statement::Explain { analyze, statement, .. } => !*analyze && matches!(statement.as_ref(), Statement::Query(_)),
+                    Statement::ShowTables { .. } | Statement::ShowColumns { .. } | Statement::ShowVariable { .. } => true,
+                    _ => false,
+                })
+        }
+        Err(_) => false,
+    }
+}
+
+/// The SQL in one normal form with every literal (number, text, date) made `?`: queries that differ only in their values give the same fingerprint, for grouping a slow-query log.
+pub fn sql_fingerprint(sql: &str, dialect: &str) -> Result<String, String> {
+    let mut stmts = parse(sql, dialect)?;
+    let _ = sqlparser::ast::visit_expressions_mut(&mut stmts, |e| {
+        if let Expr::Value(_) = e {
+            *e = Expr::Value(sqlparser::ast::Value::Placeholder("?".into()));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    Ok(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; "))
+}

@@ -1,0 +1,122 @@
+//! Google Cloud Storage V4 signed URLs from a service-account key: browsers download or upload a file directly, for minutes or up to 7 days, with no Google library and no network call to sign.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rsa = "0.9"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! hex = "0.4"
+
+use rsa::pkcs1v15::SigningKey;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::signature::{SignatureEncoding, Signer};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+const HOST: &str = "storage.googleapis.com";
+
+fn enc(s: &str, keep_slash: bool) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// `20260301T090000Z`, now or from `at` given in that form or as `2026-03-01T09:00:00Z`.
+fn when(at: &str) -> Result<String, String> {
+    if at.is_empty() {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let (y, m, d) = civil(secs.div_euclid(86400));
+        let r = secs.rem_euclid(86400);
+        return Ok(format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, r / 3600, r % 3600 / 60, r % 60));
+    }
+    let digits: String = at.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 14 {
+        return Err(format!("`{}` is not a time like 20260301T090000Z", at));
+    }
+    Ok(format!("{}T{}Z", &digits[..8], &digits[8..14]))
+}
+
+/// The service account: its JSON text, or the path of its JSON file.
+fn account(service_account: &str) -> Result<(String, SigningKey<Sha256>), String> {
+    let text = if service_account.trim_start().starts_with('{') {
+        service_account.to_string()
+    } else {
+        std::fs::read_to_string(service_account).map_err(|e| format!("{}: {}", service_account, e))?
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    let email = v["client_email"].as_str().ok_or("the service account has no client_email")?.to_string();
+    let pem = v["private_key"].as_str().ok_or("the service account has no private_key")?;
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).map_err(|e| format!("the private key: {}", e))?;
+    Ok((email, SigningKey::<Sha256>::new(key)))
+}
+
+fn sign(service_account: &str, method: &str, bucket: &str, object: &str, headers: &[(&str, &str)], seconds: i64, at: &str) -> Result<String, String> {
+    if bucket.is_empty() || object.is_empty() {
+        return Err("a signed URL needs a bucket and an object name".into());
+    }
+    let (email, key) = account(service_account)?;
+    let stamp = when(at)?;
+    let scope = format!("{}/auto/storage/goog4_request", &stamp[..8]);
+    let mut hs: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_lowercase(), v.trim().to_string())).collect();
+    hs.push(("host".into(), HOST.into()));
+    hs.sort();
+    let signed = hs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let mut q = vec![
+        ("X-Goog-Algorithm".to_string(), "GOOG4-RSA-SHA256".to_string()),
+        ("X-Goog-Credential".to_string(), format!("{}/{}", email, scope)),
+        ("X-Goog-Date".to_string(), stamp.clone()),
+        ("X-Goog-Expires".to_string(), seconds.clamp(1, 604_800).to_string()),
+        ("X-Goog-SignedHeaders".to_string(), signed.clone()),
+    ];
+    q.sort();
+    let query = q.iter().map(|(k, v)| format!("{}={}", enc(k, false), enc(v, false))).collect::<Vec<_>>().join("&");
+    let path = format!("/{}/{}", enc(bucket, false), enc(object, true));
+    let canonical = format!(
+        "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+        method.to_uppercase(), path, query, hs.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect::<String>(), signed
+    );
+    let to_sign = format!("GOOG4-RSA-SHA256\n{}\n{}\n{}", stamp, scope, hex::encode(Sha256::digest(canonical.as_bytes())));
+    let sig = key.try_sign(to_sign.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(format!("https://{}{}?{}&X-Goog-Signature={}", HOST, path, query, hex::encode(sig.to_bytes())))
+}
+
+/// A link that downloads `object` from `bucket` for `seconds` (1 to 604,800: 7 days), signed with a service account (its JSON key's text, or the file's path).
+/// `at` is "" for now, or a fixed start like `20260301T090000Z`. Put it in an `<a>`, an `<img>` or a redirect.
+pub fn gcs_download_url(service_account: &str, bucket: &str, object: &str, seconds: i64, at: &str) -> Result<String, String> {
+    sign(service_account, "GET", bucket, object, &[], seconds, at)
+}
+
+/// A link the browser PUTs a file to, as `object`, for `seconds`. `content_type` ("" for any) is signed too:
+/// the upload must then send that same `Content-Type` header, so a link for an image cannot upload a page.
+pub fn gcs_upload_url(service_account: &str, bucket: &str, object: &str, content_type: &str, seconds: i64, at: &str) -> Result<String, String> {
+    if content_type.is_empty() {
+        sign(service_account, "PUT", bucket, object, &[], seconds, at)
+    } else {
+        sign(service_account, "PUT", bucket, object, &[("content-type", content_type)], seconds, at)
+    }
+}
+
+/// A signed URL for any method ("GET", "PUT", "DELETE", "HEAD"), for calls the server makes itself with `http.request`.
+pub fn gcs_signed_url(service_account: &str, method: &str, bucket: &str, object: &str, seconds: i64, at: &str) -> Result<String, String> {
+    if !["GET", "PUT", "DELETE", "HEAD", "POST"].contains(&method.to_uppercase().as_str()) {
+        return Err(format!("{} is not a method signed URLs take", method));
+    }
+    sign(service_account, method, bucket, object, &[], seconds, at)
+}

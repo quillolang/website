@@ -1,0 +1,154 @@
+//! OBD-II car data decoded from an ELM327 adapter's hex answers: speed, RPM, coolant and intake temperature, load, throttle, fuel level, voltage and more from mode 01, trouble codes (P0133...) from mode 03, and which PIDs the car supports. For fleet trackers and garage tools.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+
+/// The data bytes of an adapter's answer: spaces, `>` prompts, `SEARCHING...` and CAN headers (`7E8 06 ...`) taken out.
+fn bytes(raw: &str) -> Result<Vec<u8>, String> {
+    if raw.len() > 64 * 1024 {
+        return Err("an answer is at most 64 KB".into());
+    }
+    let mut out = Vec::new();
+    for line in raw.split(['\r', '\n', '>']).map(str::trim).filter(|l| !l.is_empty()) {
+        let up = line.to_ascii_uppercase();
+        if up.contains("NO DATA") || up.contains("UNABLE TO CONNECT") || up.contains("CAN ERROR") || up.contains("BUS INIT") && up.contains("ERROR") {
+            return Err(format!("the adapter said: {}", line));
+        }
+        if up.starts_with("SEARCHING") || up == "OK" || up.starts_with("ELM") || up.starts_with("AT") {
+            continue;
+        }
+        let toks: Vec<&str> = up.split_whitespace().collect();
+        let toks: Vec<String> = if toks.len() > 1 {
+            // A CAN line starts with its 3-digit header and then a length byte.
+            if toks[0].len() == 3 && toks.len() > 2 { toks[2..].iter().map(|t| t.to_string()).collect() } else { toks.iter().map(|t| t.to_string()).collect() }
+        } else {
+            let t = toks.first().copied().unwrap_or("");
+            (0..t.len() / 2).map(|i| t[2 * i..2 * i + 2].to_string()).collect()
+        };
+        for t in toks {
+            if t.ends_with(':') {
+                continue; // the frame numbers of a multi-frame answer, "0:", "1:"
+            }
+            out.push(u8::from_str_radix(&t, 16).map_err(|_| format!("`{}` is not a hex byte", t))?);
+        }
+    }
+    if out.is_empty() {
+        return Err("the answer has no data".into());
+    }
+    Ok(out)
+}
+
+/// A value rounded to 2 decimals, whole ones as ints.
+fn r(x: f64) -> Value {
+    let y = (x * 100.0).round() / 100.0;
+    if y.fract() == 0.0 { json!(y as i64) } else { json!(y) }
+}
+
+/// A mode 01 PID's name, value and unit from its data bytes.
+fn pid(p: u8, d: &[u8]) -> Option<(&'static str, Value, &'static str)> {
+    let a = *d.first()? as f64;
+    let b = d.get(1).map(|x| *x as f64);
+    let ab = || b.map(|b| a * 256.0 + b);
+    Some(match p {
+        0x01 => ("monitor status", json!({ "mil_on": d[0] & 0x80 != 0, "dtc_count": d[0] & 0x7f }), ""),
+        0x04 => ("engine load", r(a * 100.0 / 255.0), "%"),
+        0x05 => ("coolant temperature", r(a - 40.0), "°C"),
+        0x06 => ("short term fuel trim bank 1", r(a * 100.0 / 128.0 - 100.0), "%"),
+        0x07 => ("long term fuel trim bank 1", r(a * 100.0 / 128.0 - 100.0), "%"),
+        0x0A => ("fuel pressure", r(a * 3.0), "kPa"),
+        0x0B => ("intake manifold pressure", r(a), "kPa"),
+        0x0C => ("engine speed", r(ab()? / 4.0), "rpm"),
+        0x0D => ("vehicle speed", r(a), "km/h"),
+        0x0E => ("timing advance", r(a / 2.0 - 64.0), "° before TDC"),
+        0x0F => ("intake air temperature", r(a - 40.0), "°C"),
+        0x10 => ("mass air flow", r(ab()? / 100.0), "g/s"),
+        0x11 => ("throttle position", r(a * 100.0 / 255.0), "%"),
+        0x1F => ("run time since start", r(ab()?), "s"),
+        0x21 => ("distance with MIL on", r(ab()?), "km"),
+        0x2F => ("fuel level", r(a * 100.0 / 255.0), "%"),
+        0x31 => ("distance since codes cleared", r(ab()?), "km"),
+        0x33 => ("barometric pressure", r(a), "kPa"),
+        0x42 => ("control module voltage", r(ab()? / 1000.0), "V"),
+        0x45 => ("relative throttle position", r(a * 100.0 / 255.0), "%"),
+        0x46 => ("ambient air temperature", r(a - 40.0), "°C"),
+        0x51 => ("fuel type", json!(["none", "gasoline", "methanol", "ethanol", "diesel", "LPG", "CNG", "propane", "electric"].get(d[0] as usize).copied().unwrap_or("other")), ""),
+        0x5C => ("engine oil temperature", r(a - 40.0), "°C"),
+        0x5E => ("engine fuel rate", r(ab()? / 20.0), "L/h"),
+        _ => return None,
+    })
+}
+
+/// A mode 01 answer decoded: `"41 0C 1A F8"` (or the adapter's raw text, CAN headers and all) gives `{ pid: "0C", name: "engine speed", value: 1726.0, unit: "rpm" }`.
+/// Knows speed, RPM, load, coolant, intake, ambient and oil temperatures, throttle, MAF, fuel level, pressure, trims, voltage, run time, fuel rate and the MIL status;
+/// other PIDs come back with their `bytes` and a null value. An answer holding several PIDs (`41 0C .. .. 0D ..`) gives the first; the rest are in `more`.
+pub fn obd2_decode(answer: &str) -> Result<Value, String> {
+    let b = bytes(answer)?;
+    if b[0] != 0x41 {
+        return Err(format!("not a mode 01 answer (it starts with {:02X}, not 41)", b[0]));
+    }
+    let mut items = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        let p = b[i];
+        let n = match p {
+            0x0C | 0x10 | 0x1F | 0x21 | 0x31 | 0x42 | 0x5E => 2,
+            0x00 | 0x20 | 0x40 | 0x60 | 0x80 | 0xA0 | 0xC0 => 4,
+            0x01 => 4,
+            _ => 1,
+        };
+        let data = &b[(i + 1).min(b.len())..(i + 1 + n).min(b.len())];
+        items.push(match pid(p, data) {
+            Some((name, value, unit)) => json!({ "pid": format!("{:02X}", p), "name": name, "value": value, "unit": unit }),
+            None => json!({ "pid": format!("{:02X}", p), "name": null, "value": null, "unit": null, "bytes": data.iter().map(|x| format!("{:02X}", x)).collect::<Vec<_>>() }),
+        });
+        i += 1 + n;
+        if items.len() >= 6 {
+            break;
+        }
+    }
+    let mut first = items.first().cloned().ok_or("the answer names no PID")?;
+    first["more"] = Value::Array(items[1..].to_vec());
+    Ok(first)
+}
+
+/// The trouble codes in a mode 03 (stored), 07 (pending) or 0A (permanent) answer: `"43 01 33 00 00 00 00"` gives `["P0133"]`. Empty slots (`00 00`) are skipped; CAN answers with a count byte are understood.
+pub fn obd2_dtcs(answer: &str) -> Result<Vec<String>, String> {
+    let b = bytes(answer)?;
+    if !matches!(b[0], 0x43 | 0x47 | 0x4A) {
+        return Err(format!("not a trouble code answer (it starts with {:02X}, not 43, 47 or 4A)", b[0]));
+    }
+    let mut data = &b[1..];
+    if data.len() % 2 == 1 {
+        data = &data[1..]; // CAN: the first byte is the number of codes
+    }
+    let mut out = Vec::new();
+    for pair in data.chunks(2) {
+        if pair.len() < 2 || (pair[0] == 0 && pair[1] == 0) {
+            continue;
+        }
+        let letter = ['P', 'C', 'B', 'U'][(pair[0] >> 6) as usize];
+        out.push(format!("{}{}{:X}{:02X}", letter, (pair[0] >> 4) & 0x3, pair[0] & 0x0f, pair[1]));
+    }
+    Ok(out)
+}
+
+/// The PIDs a car supports, from the answer to `0100` (PIDs 01-20), `0120` (21-40) or `0140` (41-60): `["01", "04", "05", "0C", "0D", ...]`, in hex as you would ask for them.
+pub fn obd2_supported(answer: &str) -> Result<Vec<String>, String> {
+    let b = bytes(answer)?;
+    if b.len() < 6 || b[0] != 0x41 || b[1] % 0x20 != 0 {
+        return Err("not an answer to 0100, 0120, 0140...".into());
+    }
+    let base = b[1] as u32;
+    let mask = u32::from_be_bytes([b[2], b[3], b[4], b[5]]);
+    Ok((0..32).filter(|i| mask & (1 << (31 - i)) != 0).map(|i| format!("{:02X}", base + i + 1)).collect())
+}
+
+/// The command to send an ELM327 adapter for a mode and PID (`obd2_command(1, 12)` is `"010C\r"`): write it to the serial port or the Wi-Fi adapter's socket, then read until `>`.
+pub fn obd2_command(mode: i64, pid: i64) -> Result<String, String> {
+    if !(1..=10).contains(&mode) || !(-1..=255).contains(&pid) {
+        return Err("mode is 1 to 10 and pid 0 to 255 (-1 for a mode without a PID, such as 03)".into());
+    }
+    Ok(if pid < 0 { format!("{:02X}\r", mode) } else { format!("{:02X}{:02X}\r", mode, pid) })
+}

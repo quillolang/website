@@ -1,0 +1,121 @@
+//! SQL analytics over CSV and Parquet files, in the server's own process: sums, groups and joins over exports without loading them into a database first.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! duckdb = { version = "1.2", features = ["bundled", "parquet"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+const MAX_ROWS: usize = 10_000;
+
+fn to_sql(v: &Value) -> duckdb::types::Value {
+    use duckdb::types::Value as D;
+    match v {
+        Value::Null => D::Null,
+        Value::Bool(b) => D::Boolean(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => D::BigInt(i),
+            None => D::Double(n.as_f64().unwrap_or(0.0)),
+        },
+        Value::String(s) => D::Text(s.clone()),
+        other => D::Text(other.to_string()),
+    }
+}
+
+fn to_json(v: duckdb::types::Value) -> Value {
+    use duckdb::types::Value as D;
+    match v {
+        D::Null => Value::Null,
+        D::Boolean(b) => json!(b),
+        D::TinyInt(i) => json!(i),
+        D::SmallInt(i) => json!(i),
+        D::Int(i) => json!(i),
+        D::BigInt(i) => json!(i),
+        D::HugeInt(i) => i64::try_from(i).map(|i| json!(i)).unwrap_or_else(|_| json!(i.to_string())),
+        D::UTinyInt(i) => json!(i),
+        D::USmallInt(i) => json!(i),
+        D::UInt(i) => json!(i),
+        D::UBigInt(i) => i64::try_from(i).map(|i| json!(i)).unwrap_or_else(|_| json!(i.to_string())),
+        D::Float(f) => json!(f),
+        D::Double(f) => json!(f),
+        D::Decimal(d) => d.to_string().parse::<f64>().map(|f| json!(f)).unwrap_or_else(|_| json!(d.to_string())),
+        D::Text(s) => json!(s),
+        D::Enum(s) => json!(s),
+        D::Blob(b) => json!(format!("{} bytes", b.len())),
+        D::List(xs) | D::Array(xs) => Value::Array(xs.into_iter().map(to_json).collect()),
+        other => json!(format!("{:?}", other)),
+    }
+}
+
+fn run(conn: &duckdb::Connection, sql: &str, params: &[Value]) -> Result<Vec<HashMap<String, Value>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let params: Vec<duckdb::types::Value> = params.iter().map(to_sql).collect();
+    let mut rows = stmt.query(duckdb::params_from_iter(params)).map_err(|e| e.to_string())?;
+    let names: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if out.len() >= MAX_ROWS {
+            break;
+        }
+        let mut m = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            let v: duckdb::types::Value = row.get(i).map_err(|e| e.to_string())?;
+            m.insert(name.clone(), to_json(v));
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+fn quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
+}
+
+/// Runs one SQL query in a fresh in-memory DuckDB and gives its rows as maps (at most 10,000).
+/// Files are tables by their path: `select region, sum(total) from 'data/sales.csv' group by region`, or `read_parquet('x.parquet')`.
+/// `params` fill the `?` placeholders in order (text, numbers, booleans, null). Dates and timestamps come back as text when cast (`cast(d as varchar)`).
+pub fn duckdb_query(sql: &str, params: Vec<serde_json::Value>) -> Result<Vec<HashMap<String, Value>>, String> {
+    let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
+    run(&conn, sql, &params)
+}
+
+/// Runs SQL against a DuckDB database file (made if missing), for tables that stay between requests.
+/// Several statements may be given at once when `params` is empty (`create table ...; insert ...`); the rows are those of the last one that gives rows (at most 10,000).
+pub fn duckdb_query_file(db_path: &str, sql: &str, params: Vec<serde_json::Value>) -> Result<Vec<HashMap<String, Value>>, String> {
+    if let Some(dir) = std::path::Path::new(db_path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let conn = duckdb::Connection::open(db_path).map_err(|e| e.to_string())?;
+    if params.is_empty() && sql.trim().trim_end_matches(';').contains(';') {
+        let parts: Vec<&str> = sql.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let (last, rest) = parts.split_last().ok_or("no SQL given")?;
+        for s in rest {
+            conn.execute_batch(s).map_err(|e| e.to_string())?;
+        }
+        return run(&conn, last, &[]);
+    }
+    run(&conn, sql, &params)
+}
+
+/// A CSV file's columns: name, the type DuckDB guessed, min, max, distinct count and nulls (as `SUMMARIZE` gives).
+pub fn duckdb_csv_summary(csv_path: &str) -> Result<Vec<HashMap<String, Value>>, String> {
+    let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
+    run(&conn, &format!("select column_name, column_type, cast(min as varchar) as min, cast(max as varchar) as max, approx_unique, null_percentage from (summarize select * from read_csv_auto({}))", quote(csv_path)), &[])
+}
+
+/// Turns a CSV file into a Parquet file (compressed, typed columns, much faster to query), and gives the number of rows written.
+pub fn duckdb_csv_to_parquet(csv_path: &str, parquet_path: &str) -> Result<i64, String> {
+    if let Some(dir) = std::path::Path::new(parquet_path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
+    let n = conn
+        .execute(&format!("copy (select * from read_csv_auto({})) to {} (format parquet)", quote(csv_path), quote(parquet_path)), [])
+        .map_err(|e| e.to_string())?;
+    Ok(n as i64)
+}

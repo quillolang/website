@@ -1,0 +1,239 @@
+//! PDF files put together and taken apart: merge, pick and split pages, count them, and read or set the title and author.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! lopdf = { version = "0.36", default-features = false }
+
+use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+const MAX_FILES: usize = 100;
+const MAX_PAGES: usize = 5000;
+
+fn load(path: &str) -> Result<Document, String> {
+    let doc = Document::load(path).map_err(|e| format!("{}: {}", path, e))?;
+    if doc.is_encrypted() {
+        return Err(format!("{}: the PDF is encrypted with a password", path));
+    }
+    Ok(doc)
+}
+
+fn parent_dir(path: &str) -> Result<(), String> {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn save(mut doc: Document, out: &str) -> Result<i64, String> {
+    parent_dir(out)?;
+    let n = doc.get_pages().len() as i64;
+    doc.compress();
+    doc.save(out).map_err(|e| format!("{}: {}", out, e))?;
+    Ok(n)
+}
+
+fn info_dict(doc: &Document) -> Option<Dictionary> {
+    let o = doc.trailer.get(b"Info").ok()?;
+    let (_, o) = doc.dereference(o).ok()?;
+    o.as_dict().ok().cloned()
+}
+
+// A new document made of the chosen pages (1-based) of each part, in order.
+fn assemble(parts: Vec<(Document, Vec<u32>)>) -> Result<Document, String> {
+    let mut out = Document::with_version("1.7");
+    let pages_id: ObjectId = (1, 0);
+    let mut next = 2u32;
+    let mut kids: Vec<Object> = vec![];
+    let mut info: Option<Dictionary> = None;
+    for (mut doc, wanted) in parts {
+        doc.renumber_objects_with(next);
+        next = doc.max_id + 1;
+        if info.is_none() {
+            info = info_dict(&doc);
+        }
+        let pages = doc.get_pages();
+        let mut chosen: Vec<ObjectId> = vec![];
+        for n in wanted {
+            match pages.get(&n) {
+                Some(id) if !chosen.contains(id) => chosen.push(*id),
+                Some(_) => {}
+                None => return Err(format!("there is no page {} (the PDF has {})", n, pages.len())),
+            }
+        }
+        for id in &chosen {
+            let mut dict = doc.get_dictionary(*id).map_err(|e| e.to_string())?.clone();
+            // Pages inherit these from the page tree, which is replaced: keep them on the page.
+            for key in [&b"Resources"[..], b"MediaBox", b"CropBox", b"Rotate"] {
+                if dict.has(key) {
+                    continue;
+                }
+                let mut parent = dict.get(b"Parent").and_then(Object::as_reference).ok();
+                while let Some(pid) = parent {
+                    let Ok(pd) = doc.get_dictionary(pid) else { break };
+                    if let Ok(v) = pd.get(key) {
+                        dict.set(key.to_vec(), v.clone());
+                        break;
+                    }
+                    parent = pd.get(b"Parent").and_then(Object::as_reference).ok();
+                }
+            }
+            dict.set("Parent", Object::Reference(pages_id));
+            doc.objects.insert(*id, Object::Dictionary(dict));
+            kids.push(Object::Reference(*id));
+        }
+        for (id, obj) in doc.objects {
+            match obj.type_name() {
+                Ok(t) if t == b"Catalog" || t == b"Pages" => continue,
+                Ok(t) if t == b"Page" && !chosen.contains(&id) => continue,
+                _ => {}
+            }
+            out.objects.insert(id, obj);
+        }
+        if kids.len() > MAX_PAGES {
+            return Err(format!("more than {} pages", MAX_PAGES));
+        }
+    }
+    if kids.is_empty() {
+        return Err("no pages were chosen".into());
+    }
+    let count = kids.len() as i64;
+    out.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }));
+    out.max_id = next;
+    let catalog = out.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    out.trailer.set("Root", catalog);
+    if let Some(i) = info {
+        let id = out.add_object(i);
+        out.trailer.set("Info", id);
+    }
+    out.prune_objects();
+    out.renumber_objects();
+    Ok(out)
+}
+
+fn text(doc: &Document, o: &Object) -> Option<String> {
+    let (_, o) = doc.dereference(o).ok()?;
+    let Object::String(b, _) = o else { return None };
+    Some(if b.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = b[2..].chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])).collect();
+        String::from_utf16_lossy(&units)
+    } else if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(&b[3..]).into_owned()
+    } else {
+        b.iter().map(|&c| c as char).collect()
+    })
+}
+
+// "D:20260614093000+02'00'" as "2026-06-14T09:30:00+02:00".
+fn pdf_date(s: &str) -> String {
+    let d: String = s.trim_start_matches("D:").to_string();
+    let digits: String = d.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 4 {
+        return s.to_string();
+    }
+    let part = |a: usize, b: usize, def: &str| digits.get(a..b).unwrap_or(def).to_string();
+    let mut out = format!("{}-{}-{}T{}:{}:{}", part(0, 4, "0000"), part(4, 6, "01"), part(6, 8, "01"), part(8, 10, "00"), part(10, 12, "00"), part(12, 14, "00"));
+    let rest = &d[digits.len()..];
+    if rest.starts_with('Z') {
+        out.push('Z');
+    } else if rest.starts_with('+') || rest.starts_with('-') {
+        let z: String = rest[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+        out += &format!("{}{}:{}", &rest[..1], z.get(0..2).unwrap_or("00"), z.get(2..4).unwrap_or("00"));
+    }
+    out
+}
+
+fn text_object(s: &str) -> Object {
+    if s.is_ascii() {
+        Object::string_literal(s)
+    } else {
+        let mut b = vec![0xFE, 0xFF];
+        for u in s.encode_utf16() {
+            b.extend_from_slice(&u.to_be_bytes());
+        }
+        Object::String(b, StringFormat::Hexadecimal)
+    }
+}
+
+/// The number of pages of a PDF.
+pub fn pdf_page_count(path: &str) -> Result<i64, String> {
+    Ok(load(path)?.get_pages().len() as i64)
+}
+
+/// What a PDF says about itself: `{ pages, version, title, author, subject, keywords, creator, producer, created, modified }`.
+/// Missing fields are null; dates are ISO 8601 text ("2026-06-14T09:30:00+02:00").
+pub fn pdf_info(path: &str) -> Result<Value, String> {
+    let doc = load(path)?;
+    let mut v = json!({ "pages": doc.get_pages().len(), "version": doc.version });
+    let info = info_dict(&doc);
+    for (key, name) in [("title", "Title"), ("author", "Author"), ("subject", "Subject"), ("keywords", "Keywords"), ("creator", "Creator"), ("producer", "Producer"), ("created", "CreationDate"), ("modified", "ModDate")] {
+        let val = info.as_ref().and_then(|i| i.get(name.as_bytes()).ok()).and_then(|o| text(&doc, o));
+        let val = match (key, val) {
+            ("created" | "modified", Some(s)) => Value::String(pdf_date(&s)),
+            (_, Some(s)) => Value::String(s),
+            (_, None) => Value::Null,
+        };
+        v[key] = val;
+    }
+    Ok(v)
+}
+
+/// Joins PDFs into one, in the order given, and writes it to `out` (folders are made): its page count. The title and author are the first file's.
+pub fn pdf_merge(paths: Vec<String>, out: &str) -> Result<i64, String> {
+    if paths.is_empty() || paths.len() > MAX_FILES {
+        return Err(format!("give 1 to {} files", MAX_FILES));
+    }
+    let mut parts = vec![];
+    for p in &paths {
+        let doc = load(p)?;
+        let n = doc.get_pages().len() as u32;
+        parts.push((doc, (1..=n).collect()));
+    }
+    save(assemble(parts)?, out)
+}
+
+/// The pages given (numbered from 1, in the order given; a page asked twice comes once) as a new PDF at `out`: its page count.
+/// For a summary, a cover page or the signed page of a contract. A page past the end is an error.
+pub fn pdf_extract_pages(path: &str, pages: Vec<i64>, out: &str) -> Result<i64, String> {
+    let doc = load(path)?;
+    let wanted = pages.iter().map(|&p| if p < 1 { Err(format!("pages are numbered from 1, not {}", p)) } else { Ok(p as u32) }).collect::<Result<Vec<_>, _>>()?;
+    save(assemble(vec![(doc, wanted)])?, out)
+}
+
+/// Each page as a PDF of its own, `page-1.pdf`, `page-2.pdf`... in the folder `dir` (made if needed): the files' paths.
+pub fn pdf_split(path: &str, dir: &str) -> Result<Vec<String>, String> {
+    let doc = load(path)?;
+    let n = doc.get_pages().len();
+    if n > MAX_PAGES {
+        return Err(format!("more than {} pages", MAX_PAGES));
+    }
+    let mut files = vec![];
+    for i in 1..=n {
+        let out = format!("{}/page-{}.pdf", dir.trim_end_matches('/'), i);
+        save(assemble(vec![(doc.clone(), vec![i as u32])])?, &out)?;
+        files.push(out);
+    }
+    Ok(files)
+}
+
+/// A copy of the PDF at `out` with its document information changed: `info` has any of title, author, subject, keywords, creator; an empty text removes one.
+pub fn pdf_set_info(path: &str, out: &str, info: std::collections::HashMap<String, String>) -> Result<Value, String> {
+    let mut doc = load(path)?;
+    let mut dict = info_dict(&doc).unwrap_or_default();
+    let names: HashMap<&str, &str> = [("title", "Title"), ("author", "Author"), ("subject", "Subject"), ("keywords", "Keywords"), ("creator", "Creator")].into_iter().collect();
+    for (k, v) in &info {
+        let name = names.get(k.to_lowercase().as_str()).ok_or_else(|| format!("`{}` is not one of title, author, subject, keywords, creator", k))?;
+        if v.is_empty() {
+            dict.remove(name.as_bytes());
+        } else {
+            dict.set(name.as_bytes().to_vec(), text_object(v));
+        }
+    }
+    let id = doc.add_object(dict);
+    doc.trailer.set("Info", id);
+    save(doc, out)?;
+    pdf_info(out)
+}

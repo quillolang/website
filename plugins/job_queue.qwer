@@ -1,0 +1,178 @@
+//! A persistent job queue in one file: push work (emails, thumbnails, webhooks), take it in a worker, ack it when done, retry it when it fails; nothing is lost on a restart.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! redb = "2.6"
+
+use redb::{Database, ReadableTable, TableDefinition};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const JOBS: TableDefinition<u64, &str> = TableDefinition::new("jobs");
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const MAX_PAYLOAD: usize = 1 << 20;
+
+fn db(path: &str) -> Result<Arc<Database>, String> {
+    static DBS: OnceLock<Mutex<HashMap<String, Arc<Database>>>> = OnceLock::new();
+    let mut dbs = DBS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(d) = dbs.get(path) {
+        return Ok(d.clone());
+    }
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let d = Arc::new(Database::create(path).map_err(|e| format!("{}: {}", path, e))?);
+    dbs.insert(path.to_string(), d.clone());
+    Ok(d)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn e(x: impl std::fmt::Display) -> String {
+    x.to_string()
+}
+
+/// Is a job ready to be taken now: waiting and due, or taken by a worker whose lease ran out (it crashed).
+fn ready(job: &Value, t: i64) -> bool {
+    match job["state"].as_str() {
+        Some("ready") => job["run_at"].as_i64().unwrap_or(0) <= t,
+        Some("taken") => job["lease_until"].as_i64().unwrap_or(0) <= t,
+        _ => false,
+    }
+}
+
+/// Adds a job to `queue` in the queue file `db_path` (made if missing), to run after `delay_seconds` (0: now). Gives its id.
+pub fn job_push(db_path: &str, queue: &str, payload: serde_json::Value, delay_seconds: i64) -> Result<i64, String> {
+    let body = payload.to_string();
+    if body.len() > MAX_PAYLOAD {
+        return Err("a job's payload is at most 1 MB".into());
+    }
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(e)?;
+    let id = {
+        let mut meta = w.open_table(META).map_err(e)?;
+        let id = meta.get("next").map_err(e)?.map(|g| g.value()).unwrap_or(1);
+        meta.insert("next", id + 1).map_err(e)?;
+        let job = json!({ "id": id, "queue": queue, "payload": payload, "state": "ready", "attempts": 0,
+            "run_at": now() + delay_seconds.max(0), "lease_until": 0, "created": now(), "error": null });
+        w.open_table(JOBS).map_err(e)?.insert(id, job.to_string().as_str()).map_err(e)?;
+        id
+    };
+    w.commit().map_err(e)?;
+    Ok(id as i64)
+}
+
+/// The oldest job of `queue` that is due, marked taken for `lease_seconds` (at least 1): `{ id, payload, attempts, ... }`, or null when none is due.
+/// A job not acked before its lease ends is given out again, so a worker that dies loses nothing.
+pub fn job_take(db_path: &str, queue: &str, lease_seconds: i64) -> Result<Value, String> {
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(e)?;
+    let t = now();
+    let found = {
+        let mut jobs = w.open_table(JOBS).map_err(e)?;
+        let mut found: Option<Value> = None;
+        for item in jobs.iter().map_err(e)? {
+            let (_, v) = item.map_err(e)?;
+            let job: Value = serde_json::from_str(v.value()).map_err(e)?;
+            if job["queue"] == queue && ready(&job, t) {
+                found = Some(job);
+                break;
+            }
+        }
+        if let Some(job) = found.as_mut() {
+            job["state"] = json!("taken");
+            job["attempts"] = json!(job["attempts"].as_i64().unwrap_or(0) + 1);
+            job["lease_until"] = json!(t + lease_seconds.max(1));
+            let id = job["id"].as_u64().unwrap_or(0);
+            jobs.insert(id, job.to_string().as_str()).map_err(e)?;
+        }
+        found
+    };
+    w.commit().map_err(e)?;
+    Ok(found.unwrap_or(Value::Null))
+}
+
+/// Marks a taken job done, and removes it. Says whether it was there.
+pub fn job_ack(db_path: &str, id: i64) -> Result<bool, String> {
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(e)?;
+    let had = w.open_table(JOBS).map_err(e)?.remove(id.max(0) as u64).map_err(e)?.is_some();
+    w.commit().map_err(e)?;
+    Ok(had)
+}
+
+/// Gives a failed job back to its queue, to run again after `delay_seconds`, with `error` kept on it.
+/// Once it has been tried `max_attempts` times it is marked dead instead, and stays for `job_dead` to show. Gives the job's new state: "ready" or "dead".
+pub fn job_retry(db_path: &str, id: i64, error: &str, delay_seconds: i64, max_attempts: i64) -> Result<String, String> {
+    let d = db(db_path)?;
+    let w = d.begin_write().map_err(e)?;
+    let state = {
+        let mut jobs = w.open_table(JOBS).map_err(e)?;
+        let raw = jobs.get(id.max(0) as u64).map_err(e)?.map(|g| g.value().to_string()).ok_or(format!("no job {}", id))?;
+        let mut job: Value = serde_json::from_str(&raw).map_err(e)?;
+        let dead = job["attempts"].as_i64().unwrap_or(0) >= max_attempts;
+        job["state"] = json!(if dead { "dead" } else { "ready" });
+        job["run_at"] = json!(now() + delay_seconds.max(0));
+        job["lease_until"] = json!(0);
+        job["error"] = json!(error.chars().take(2000).collect::<String>());
+        jobs.insert(id as u64, job.to_string().as_str()).map_err(e)?;
+        job["state"].as_str().unwrap_or("ready").to_string()
+    };
+    w.commit().map_err(e)?;
+    Ok(state)
+}
+
+/// How many jobs each queue holds: `{ queue: { ready, waiting, taken, dead } }` (waiting: pushed with a delay not yet over).
+pub fn job_stats(db_path: &str) -> Result<HashMap<String, HashMap<String, i64>>, String> {
+    let d = db(db_path)?;
+    let r = d.begin_read().map_err(e)?;
+    let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    let jobs = match r.open_table(JOBS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(x) => return Err(x.to_string()),
+    };
+    let t = now();
+    for item in jobs.iter().map_err(e)? {
+        let (_, v) = item.map_err(e)?;
+        let job: Value = serde_json::from_str(v.value()).map_err(e)?;
+        let kind = match job["state"].as_str() {
+            Some("ready") if job["run_at"].as_i64().unwrap_or(0) > t => "waiting",
+            Some(s) => s,
+            None => "ready",
+        };
+        let q = out.entry(job["queue"].as_str().unwrap_or("").to_string()).or_insert_with(|| {
+            ["ready", "waiting", "taken", "dead"].iter().map(|k| (k.to_string(), 0)).collect()
+        });
+        *q.entry(kind.to_string()).or_insert(0) += 1;
+    }
+    Ok(out)
+}
+
+/// The dead jobs of `queue` (tried too many times), with their last error, oldest first: at most `limit` (1 to 1,000).
+pub fn job_dead(db_path: &str, queue: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let d = db(db_path)?;
+    let r = d.begin_read().map_err(e)?;
+    let jobs = match r.open_table(JOBS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+        Err(x) => return Err(x.to_string()),
+    };
+    let mut out = Vec::new();
+    for item in jobs.iter().map_err(e)? {
+        let (_, v) = item.map_err(e)?;
+        let job: Value = serde_json::from_str(v.value()).map_err(e)?;
+        if job["queue"] == queue && job["state"] == "dead" {
+            out.push(job);
+            if out.len() >= limit.clamp(1, 1000) as usize {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}

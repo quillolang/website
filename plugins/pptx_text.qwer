@@ -1,0 +1,175 @@
+//! The text of PowerPoint files (.pptx): each slide's title, text and speaker notes, in slide order, for search and imports.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! roxmltree = "0.20"
+
+use serde_json::{json, Value};
+use std::io::Read;
+
+const MAX_XML: u64 = 32 * 1024 * 1024;
+const MAX_SLIDES: usize = 5000;
+
+type Zip = zip::ZipArchive<std::fs::File>;
+
+fn open(path: &str) -> Result<Zip, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    zip::ZipArchive::new(f).map_err(|_| format!("{}: not a .pptx file (it is not a zip)", path))
+}
+
+fn read(z: &mut Zip, name: &str) -> Option<String> {
+    let e = z.by_name(name).ok()?;
+    let mut s = String::new();
+    e.take(MAX_XML).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+fn parse(xml: &str) -> Result<roxmltree::Document<'_>, String> {
+    roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 10_000_000 }).map_err(|e| e.to_string())
+}
+
+fn is(n: &roxmltree::Node, name: &str) -> bool {
+    n.is_element() && n.tag_name().name() == name
+}
+
+fn attr<'a>(n: &roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    n.attributes().find(|a| a.name() == name).map(|a| a.value())
+}
+
+// "slides/slide1.xml" seen from "ppt/presentation.xml" is "ppt/slides/slide1.xml"; "../notesSlides/n1.xml" from "ppt/slides/" is "ppt/notesSlides/n1.xml".
+fn resolve(dir: &str, target: &str) -> String {
+    if let Some(t) = target.strip_prefix('/') {
+        return t.to_string();
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for p in target.split('/') {
+        match p {
+            ".." => {
+                parts.pop();
+            }
+            "." | "" => {}
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
+
+// Relationship id -> (type, target) of a part's .rels file.
+fn rels(z: &mut Zip, part: &str) -> Vec<(String, String, String)> {
+    let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
+    let Some(xml) = read(z, &format!("{}/_rels/{}.rels", dir, file)) else { return vec![] };
+    let Ok(doc) = parse(&xml) else { return vec![] };
+    doc.descendants()
+        .filter(|n| is(n, "Relationship"))
+        .filter_map(|n| Some((attr(&n, "Id")?.to_string(), attr(&n, "Type")?.to_string(), resolve(dir, attr(&n, "Target")?))))
+        .collect()
+}
+
+// The slides' parts in the order the presentation shows them.
+fn slide_parts(z: &mut Zip) -> Result<Vec<String>, String> {
+    let pres = read(z, "ppt/presentation.xml").ok_or("not a PowerPoint file (no ppt/presentation.xml)")?;
+    let r = rels(z, "ppt/presentation.xml");
+    let doc = parse(&pres)?;
+    let ids: Vec<String> = doc.descendants().filter(|n| is(n, "sldId")).filter_map(|n| n.attributes().find(|a| a.name() == "id" && a.namespace().is_some()).map(|a| a.value().to_string())).collect();
+    let mut parts: Vec<String> = ids.iter().filter_map(|id| r.iter().find(|(rid, _, _)| rid == id).map(|(_, _, t)| t.clone())).collect();
+    parts.truncate(MAX_SLIDES);
+    Ok(parts)
+}
+
+fn paragraphs(n: &roxmltree::Node) -> Vec<String> {
+    n.descendants()
+        .filter(|p| is(p, "p") && p.tag_name().namespace().map_or(false, |ns| ns.contains("drawingml")))
+        .map(|p| {
+            let mut s = String::new();
+            for d in p.descendants() {
+                if is(&d, "t") {
+                    s.push_str(d.text().unwrap_or(""));
+                } else if is(&d, "br") {
+                    s.push('\n');
+                }
+            }
+            s
+        })
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+fn placeholder(sp: &roxmltree::Node) -> Option<String> {
+    sp.descendants().find(|n| is(n, "ph")).map(|ph| attr(&ph, "type").unwrap_or("body").to_string())
+}
+
+struct Slide {
+    title: String,
+    text: Vec<String>,
+    notes: String,
+}
+
+fn slide(z: &mut Zip, part: &str) -> Slide {
+    let mut s = Slide { title: String::new(), text: vec![], notes: String::new() };
+    let Some(xml) = read(z, part) else { return s };
+    if let Ok(doc) = parse(&xml) {
+        for sp in doc.descendants().filter(|n| is(n, "sp") || is(n, "graphicFrame")) {
+            let ps = paragraphs(&sp);
+            match placeholder(&sp).as_deref() {
+                Some("title") | Some("ctrTitle") if s.title.is_empty() => s.title = ps.join(" "),
+                Some("sldNum") | Some("dt") | Some("ftr") => {}
+                _ => s.text.extend(ps),
+            }
+        }
+    }
+    if let Some((_, _, notes)) = rels(z, part).into_iter().find(|(_, t, _)| t.ends_with("/notesSlide")) {
+        if let Some(xml) = read(z, &notes) {
+            if let Ok(doc) = parse(&xml) {
+                let body: Vec<String> = doc.descendants().filter(|n| is(n, "sp") && placeholder(n).as_deref() == Some("body")).flat_map(|sp| paragraphs(&sp)).collect();
+                s.notes = body.join("\n");
+            }
+        }
+    }
+    s
+}
+
+/// Each slide as `{ number, title, text, notes }`: `title` from its title placeholder ("" when none), `text` the rest of its text, a line per paragraph, `notes` the speaker notes.
+/// Hidden slides are included; pictures and charts give no text.
+pub fn pptx_slides(path: &str) -> Result<Vec<Value>, String> {
+    let mut z = open(path)?;
+    let parts = slide_parts(&mut z)?;
+    Ok(parts.iter().enumerate().map(|(i, p)| {
+        let s = slide(&mut z, p);
+        json!({ "number": i + 1, "title": s.title, "text": s.text.join("\n"), "notes": s.notes })
+    }).collect())
+}
+
+/// All the text of a presentation, slide after slide, parted by a blank line; notes are left out.
+pub fn pptx_text(path: &str) -> Result<String, String> {
+    let mut z = open(path)?;
+    let parts = slide_parts(&mut z)?;
+    let mut out = vec![];
+    for p in &parts {
+        let s = slide(&mut z, p);
+        let mut lines = vec![];
+        if !s.title.is_empty() {
+            lines.push(s.title);
+        }
+        lines.extend(s.text);
+        out.push(lines.join("\n"));
+    }
+    Ok(out.join("\n\n").trim().to_string())
+}
+
+/// The number of slides, and the title and author the file gives: `{ slides, title, creator }`, null when missing.
+pub fn pptx_info(path: &str) -> Result<Value, String> {
+    let mut z = open(path)?;
+    let n = slide_parts(&mut z)?.len();
+    let mut v = json!({ "slides": n, "title": null, "creator": null });
+    if let Some(core) = read(&mut z, "docProps/core.xml") {
+        if let Ok(doc) = parse(&core) {
+            for key in ["title", "creator"] {
+                if let Some(t) = doc.descendants().find(|n| is(n, key)).and_then(|n| n.text()) {
+                    v[key] = Value::String(t.trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(v)
+}

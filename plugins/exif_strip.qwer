@@ -1,0 +1,138 @@
+//! Photos made safe to publish: EXIF (GPS position, camera serial, dates), XMP, IPTC and comments taken out of JPEG, PNG and WebP files, without re-encoding them.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! img-parts = "0.4"
+//! kamadak-exif = "0.6"
+
+use img_parts::jpeg::{Jpeg, JpegSegment};
+use img_parts::png::Png;
+use img_parts::webp::WebP;
+use img_parts::{Bytes, ImageEXIF};
+use serde_json::{json, Value};
+
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn load(path: &str) -> Result<Bytes, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?.len();
+    if size > MAX_BYTES {
+        return Err(format!("{}: larger than 256 MB", path));
+    }
+    Ok(Bytes::from(std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?))
+}
+
+fn orientation_of(exif: &[u8]) -> Option<u16> {
+    let e = exif::Reader::new().read_raw(exif.to_vec()).ok()?;
+    let o = e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?.value.get_uint(0)? as u16;
+    (2..=8).contains(&o).then_some(o)
+}
+
+fn has_gps(exif: &[u8]) -> bool {
+    exif::Reader::new().read_raw(exif.to_vec()).map_or(false, |e| e.fields().any(|f| f.ifd_num == exif::In::PRIMARY && f.tag.context() == exif::Context::Gps))
+}
+
+// A smallest EXIF block holding only the orientation, so a photo stays upright once the rest is gone.
+fn orientation_only(o: u16) -> Vec<u8> {
+    let mut b = b"MM\0\x2a\0\0\0\x08".to_vec();
+    b.extend_from_slice(&[0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1]);
+    b.extend_from_slice(&o.to_be_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    b
+}
+
+fn jpeg_app1_exif(seg: &JpegSegment) -> Option<Bytes> {
+    let c = seg.contents();
+    (seg.marker() == 0xE1 && c.starts_with(b"Exif\0\0")).then(|| c.slice(6..))
+}
+
+enum Img {
+    Jpeg(Jpeg),
+    Png(Png),
+    WebP(WebP),
+}
+
+fn parse(path: &str, b: Bytes) -> Result<Img, String> {
+    if b.starts_with(&[0xFF, 0xD8]) {
+        Jpeg::from_bytes(b).map(Img::Jpeg).map_err(|e| format!("{}: {}", path, e))
+    } else if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Png::from_bytes(b).map(Img::Png).map_err(|e| format!("{}: {}", path, e))
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        WebP::from_bytes(b).map(Img::WebP).map_err(|e| format!("{}: {}", path, e))
+    } else {
+        Err(format!("{}: JPEG, PNG and WebP files only", path))
+    }
+}
+
+/// What metadata a picture carries: `{ format, exif, gps, xmp, iptc, comments, orientation }`, each true or false but `orientation` (1 to 8, 1 when none).
+/// Check uploads with it before showing them to others.
+pub fn exif_strip_check(path: &str) -> Result<Value, String> {
+    let img = parse(path, load(path)?)?;
+    let (format, exif, xmp, iptc, comments) = match &img {
+        Img::Jpeg(j) => (
+            "jpeg",
+            j.segments().iter().find_map(jpeg_app1_exif),
+            j.segments().iter().any(|s| s.marker() == 0xE1 && s.contents().starts_with(b"http://ns.adobe.com/xap/")),
+            j.segments().iter().any(|s| s.marker() == 0xED),
+            j.segments().iter().any(|s| s.marker() == 0xFE),
+        ),
+        Img::Png(p) => (
+            "png",
+            p.exif(),
+            p.chunks().iter().any(|c| &c.kind() == b"iTXt" && c.contents().starts_with(b"XML:com.adobe.xmp")),
+            false,
+            p.chunks().iter().any(|c| matches!(&c.kind(), b"tEXt" | b"zTXt" | b"iTXt")),
+        ),
+        Img::WebP(w) => ("webp", w.exif(), w.has_chunk(*b"XMP "), false, false),
+    };
+    Ok(json!({
+        "format": format,
+        "exif": exif.is_some(),
+        "gps": exif.as_ref().map_or(false, |e| has_gps(e)),
+        "xmp": xmp,
+        "iptc": iptc,
+        "comments": comments,
+        "orientation": exif.as_ref().and_then(|e| orientation_of(e)).unwrap_or(1),
+    }))
+}
+
+/// Writes a copy of the picture at `to` (folders made) with its metadata taken out: EXIF, XMP, IPTC, comments and PNG text chunks. Pixels are not touched.
+/// The orientation is kept (a tiny EXIF of that one tag) so photos stay upright; the colour profile is kept. `{ before, after, removed }`, sizes in bytes.
+pub fn exif_strip(from: &str, to: &str) -> Result<Value, String> {
+    let bytes = load(from)?;
+    let before = bytes.len();
+    let out: Bytes = match parse(from, bytes)? {
+        Img::Jpeg(mut j) => {
+            let orientation = j.segments().iter().find_map(jpeg_app1_exif).and_then(|e| orientation_of(&e));
+            // APP1 (EXIF, XMP), APP12/APP13 (IPTC, Photoshop) and comments out; JFIF, ICC (APP2) and Adobe (APP14) stay.
+            j.segments_mut().retain(|s| !matches!(s.marker(), 0xE1 | 0xEC | 0xED | 0xFE));
+            if let Some(o) = orientation {
+                let mut c = b"Exif\0\0".to_vec();
+                c.extend(orientation_only(o));
+                let at = if j.segments().first().map_or(false, |s| s.marker() == 0xE0) { 1 } else { 0 };
+                j.segments_mut().insert(at, JpegSegment::new_with_contents(0xE1, Bytes::from(c)));
+            }
+            j.encoder().bytes()
+        }
+        Img::Png(mut p) => {
+            let orientation = p.exif().and_then(|e| orientation_of(&e));
+            for kind in [*b"eXIf", *b"tEXt", *b"zTXt", *b"iTXt", *b"tIME"] {
+                p.remove_chunks_by_type(kind);
+            }
+            if let Some(o) = orientation {
+                p.set_exif(Some(Bytes::from(orientation_only(o))));
+            }
+            p.encoder().bytes()
+        }
+        Img::WebP(mut w) => {
+            let orientation = w.exif().and_then(|e| orientation_of(&e));
+            w.set_exif(orientation.map(|o| Bytes::from(orientation_only(o))));
+            w.remove_chunks_by_id(*b"XMP ");
+            w.encoder().bytes()
+        }
+    };
+    if let Some(dir) = std::path::Path::new(to).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    std::fs::write(to, &out).map_err(|e| format!("{}: {}", to, e))?;
+    Ok(json!({ "before": before, "after": out.len(), "removed": before.saturating_sub(out.len()) }))
+}

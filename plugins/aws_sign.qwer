@@ -1,0 +1,192 @@
+//! AWS Signature Version 4 for any AWS API: the headers that sign a request (SES, SQS, DynamoDB, Lambda, S3...), and presigned URLs, for calling AWS with Quillo's own `http` client.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! url = "2"
+
+use hmac::{Hmac, Mac};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+/// RFC 3986 encoding, as AWS wants it: only A-Z a-z 0-9 - _ . ~ kept (and `/` when asked).
+fn enc(s: &str, keep_slash: bool) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn dec(s: &str) -> String {
+    url::form_urlencoded::parse(format!("x={}", s.replace('+', "%2B")).as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default()
+}
+
+/// `20150830T123600Z` for a Unix time.
+fn amz_date(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, m, d) = civil(days);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// `20150830T123600Z` from "" (now), that form itself, or `2015-08-30T12:36:00Z`.
+fn when(at: &str) -> Result<String, String> {
+    if at.is_empty() {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        return Ok(amz_date(secs));
+    }
+    let digits: String = at.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 14 {
+        return Err(format!("`{}` is not a time like 20150830T123600Z", at));
+    }
+    Ok(format!("{}T{}Z", &digits[..8], &digits[8..14]))
+}
+
+struct Creds {
+    access: String,
+    secret: String,
+    token: Option<String>,
+}
+
+/// The credentials: a map `{ access_key, secret_key, session_token }`, or null for AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN.
+fn creds(c: &Value) -> Result<Creds, String> {
+    let get = |k: &str, env: &str| c.get(k).and_then(Value::as_str).map(str::to_string).or_else(|| std::env::var(env).ok());
+    Ok(Creds {
+        access: get("access_key", "AWS_ACCESS_KEY_ID").ok_or("no access_key (or AWS_ACCESS_KEY_ID)")?,
+        secret: get("secret_key", "AWS_SECRET_ACCESS_KEY").ok_or("no secret_key (or AWS_SECRET_ACCESS_KEY)")?,
+        token: get("session_token", "AWS_SESSION_TOKEN").filter(|t| !t.is_empty()),
+    })
+}
+
+fn canonical_path(u: &url::Url, service: &str) -> String {
+    let p = if u.path().is_empty() { "/" } else { u.path() };
+    if service == "s3" {
+        enc(&dec(p), true)
+    } else {
+        // Other services want each segment encoded twice: the path as sent, encoded again.
+        p.split('/').map(|seg| enc(seg, false)).collect::<Vec<_>>().join("/")
+    }
+}
+
+fn canonical_query(pairs: &[(String, String)]) -> String {
+    let mut q: Vec<(String, String)> = pairs.iter().map(|(k, v)| (enc(k, false), enc(v, false))).collect();
+    q.sort();
+    q.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
+}
+
+fn signature(secret: &str, date: &str, region: &str, service: &str, to_sign: &str) -> String {
+    let k = hmac(format!("AWS4{}", secret).as_bytes(), date);
+    let k = hmac(&k, region);
+    let k = hmac(&k, service);
+    let k = hmac(&k, "aws4_request");
+    hex::encode(hmac(&k, to_sign))
+}
+
+/// The headers to add to a request so AWS accepts it: `authorization`, `x-amz-date`, `host`, and `x-amz-security-token` with a session token, `x-amz-content-sha256` for S3.
+/// `request` is `{ method, url, headers, body }` (headers you will send that should be signed, such as content-type; body as text, "" for none);
+/// `credentials` is `{ access_key, secret_key, session_token }` or null to read AWS_* variables; `at` is "" for now, or a fixed time like `20150830T123600Z`.
+pub fn aws_sign_headers(request: serde_json::Value, credentials: serde_json::Value, region: &str, service: &str, at: &str) -> Result<HashMap<String, String>, String> {
+    let c = creds(&credentials)?;
+    let method = request["method"].as_str().unwrap_or("GET").to_uppercase();
+    let u = url::Url::parse(request["url"].as_str().ok_or("the request has no url")?).map_err(|e| e.to_string())?;
+    let body = request["body"].as_str().unwrap_or("");
+    let stamp = when(at)?;
+    let date = &stamp[..8];
+    let payload = sha_hex(body.as_bytes());
+    let host = match u.port() {
+        Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
+        None => u.host_str().unwrap_or("").to_string(),
+    };
+
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(h) = request["headers"].as_object() {
+        for (k, v) in h {
+            let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            headers.insert(k.to_lowercase(), v.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+    headers.insert("host".into(), host);
+    headers.insert("x-amz-date".into(), stamp.clone());
+    if service == "s3" {
+        headers.insert("x-amz-content-sha256".into(), payload.clone());
+    }
+    if let Some(t) = &c.token {
+        headers.insert("x-amz-security-token".into(), t.clone());
+    }
+    let signed = headers.keys().cloned().collect::<Vec<_>>().join(";");
+    let pairs: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let canonical = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, canonical_path(&u, service), canonical_query(&pairs),
+        headers.iter().map(|(k, v)| format!("{}:{}\n", k, v.trim())).collect::<String>(), signed, payload
+    );
+    let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canonical.as_bytes()));
+    let sig = signature(&c.secret, date, region, service, &to_sign);
+    headers.insert("authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", c.access, scope, signed, sig));
+    Ok(headers.into_iter().collect())
+}
+
+/// A presigned URL: anyone with it may make that one request (`GET` to download, `PUT` to upload) until it expires, in 1 second to 7 days.
+/// Same `credentials` and `at` as `aws_sign_headers`; the body is not signed (UNSIGNED-PAYLOAD), as for S3.
+pub fn aws_presign_url(method: &str, url: &str, credentials: serde_json::Value, region: &str, service: &str, expires_seconds: i64, at: &str) -> Result<String, String> {
+    let c = creds(&credentials)?;
+    let mut u = url::Url::parse(url).map_err(|e| e.to_string())?;
+    let stamp = when(at)?;
+    let date = &stamp[..8];
+    let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+    let host = match u.port() {
+        Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
+        None => u.host_str().unwrap_or("").to_string(),
+    };
+    let mut pairs: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    pairs.push(("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()));
+    pairs.push(("X-Amz-Credential".into(), format!("{}/{}", c.access, scope)));
+    pairs.push(("X-Amz-Date".into(), stamp.clone()));
+    pairs.push(("X-Amz-Expires".into(), expires_seconds.clamp(1, 604_800).to_string()));
+    if let Some(t) = &c.token {
+        pairs.push(("X-Amz-Security-Token".into(), t.clone()));
+    }
+    pairs.push(("X-Amz-SignedHeaders".into(), "host".into()));
+    let query = canonical_query(&pairs);
+    let canonical = format!("{}\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD", method.to_uppercase(), canonical_path(&u, service), query, host);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canonical.as_bytes()));
+    let sig = signature(&c.secret, date, region, service, &to_sign);
+    u.set_query(Some(&format!("{}&X-Amz-Signature={}", query, sig)));
+    Ok(u.to_string())
+}
+
+/// The SHA-256 of a body, as hex: what `x-amz-content-sha256` and some APIs' checksums want.
+pub fn aws_payload_hash(body: &str) -> String {
+    sha_hex(body.as_bytes())
+}

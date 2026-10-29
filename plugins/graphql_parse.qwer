@@ -1,0 +1,197 @@
+//! GraphQL queries read before they run: their operations, the fields they ask for and how deep they nest, limits that refuse expensive queries, and a check against your schema.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! graphql-parser = "0.4"
+
+use graphql_parser::query::{Definition, Document, OperationDefinition, Selection, SelectionSet, TypeCondition};
+use graphql_parser::schema;
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
+
+const MAX_QUERY: usize = 256 * 1024;
+
+type Frags<'a> = HashMap<&'a str, (&'a str, &'a SelectionSet<'a, &'a str>)>;
+
+fn parse(query: &str) -> Result<Document<'_, &str>, String> {
+    if query.len() > MAX_QUERY {
+        return Err("a query is at most 256 KB".into());
+    }
+    graphql_parser::parse_query::<&str>(query).map_err(|e| e.to_string().trim().to_string())
+}
+
+fn fragments<'a>(doc: &'a Document<'a, &'a str>) -> Frags<'a> {
+    doc.definitions
+        .iter()
+        .filter_map(|d| match d {
+            Definition::Fragment(f) => {
+                let TypeCondition::On(t) = &f.type_condition;
+                Some((f.name, (*t, &f.selection_set)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn operations<'a>(doc: &'a Document<'a, &'a str>) -> Vec<(&'static str, Option<&'a str>, &'a SelectionSet<'a, &'a str>, usize)> {
+    doc.definitions
+        .iter()
+        .filter_map(|d| match d {
+            Definition::Operation(OperationDefinition::SelectionSet(s)) => Some(("query", None, s, 0)),
+            Definition::Operation(OperationDefinition::Query(q)) => Some(("query", q.name, &q.selection_set, q.variable_definitions.len())),
+            Definition::Operation(OperationDefinition::Mutation(m)) => Some(("mutation", m.name, &m.selection_set, m.variable_definitions.len())),
+            Definition::Operation(OperationDefinition::Subscription(s)) => Some(("subscription", s.name, &s.selection_set, s.variable_definitions.len())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Walks a selection: the field paths, the deepest level, and the number of fields, fragments spread in place.
+fn walk<'a>(set: &'a SelectionSet<'a, &'a str>, frags: &Frags<'a>, prefix: &str, depth: usize, seen: &mut Vec<&'a str>, out: &mut (BTreeSet<String>, usize, usize)) {
+    for item in &set.items {
+        match item {
+            Selection::Field(f) => {
+                let path = if prefix.is_empty() { f.name.to_string() } else { format!("{}.{}", prefix, f.name) };
+                out.1 = out.1.max(depth + 1);
+                out.2 += 1;
+                if out.0.len() < 10_000 {
+                    out.0.insert(path.clone());
+                }
+                walk(&f.selection_set, frags, &path, depth + 1, seen, out);
+            }
+            Selection::FragmentSpread(s) => {
+                if let Some((_, fs)) = frags.get(s.fragment_name) {
+                    if !seen.contains(&s.fragment_name) && seen.len() < 64 {
+                        seen.push(s.fragment_name);
+                        walk(fs, frags, prefix, depth, seen, out);
+                        seen.pop();
+                    }
+                }
+            }
+            Selection::InlineFragment(i) => walk(&i.selection_set, frags, prefix, depth, seen, out),
+        }
+    }
+}
+
+/// What a query asks for: `{ operations: [{ kind, name, variables }], fields, depth, field_count, fragments }`.
+/// `fields` are paths such as `user.posts.title`; `depth` counts nested levels (`{ user { name } }` is 2); fragments are counted where they are spread.
+pub fn graphql_info(query: &str) -> Result<Value, String> {
+    let doc = parse(query)?;
+    let frags = fragments(&doc);
+    let mut ops = Vec::new();
+    let mut acc = (BTreeSet::new(), 0usize, 0usize);
+    for (kind, name, set, vars) in operations(&doc) {
+        ops.push(json!({ "kind": kind, "name": name, "variables": vars }));
+        walk(set, &frags, "", 0, &mut vec![], &mut acc);
+    }
+    let mut names: Vec<&str> = frags.keys().copied().collect();
+    names.sort();
+    Ok(json!({ "operations": ops, "fields": acc.0, "depth": acc.1, "field_count": acc.2, "fragments": names }))
+}
+
+/// Refuses queries too costly to run: deeper than `max_depth`, with more than `max_fields` fields (fragments counted where spread), or with more than one operation and none chosen.
+/// Gives `{ ok, depth, field_count, problems }`; a query that does not parse is `ok: false` with the parser's message.
+pub fn graphql_check_limits(query: &str, max_depth: i64, max_fields: i64) -> Value {
+    let info = match graphql_info(query) {
+        Ok(i) => i,
+        Err(e) => return json!({ "ok": false, "depth": null, "field_count": null, "problems": [e] }),
+    };
+    let (depth, count) = (info["depth"].as_i64().unwrap_or(0), info["field_count"].as_i64().unwrap_or(0));
+    let mut problems = Vec::new();
+    if depth > max_depth {
+        problems.push(format!("the query nests {} levels deep; at most {} are allowed", depth, max_depth));
+    }
+    if count > max_fields {
+        problems.push(format!("the query asks for {} fields; at most {} are allowed", count, max_fields));
+    }
+    json!({ "ok": problems.is_empty(), "depth": depth, "field_count": count, "problems": problems })
+}
+
+fn named<'a>(t: &'a schema::Type<'a, &'a str>) -> &'a str {
+    match t {
+        schema::Type::NamedType(n) => n,
+        schema::Type::ListType(t) | schema::Type::NonNullType(t) => named(t),
+    }
+}
+
+/// Checks a query against a schema (SDL, `type Query { ... }`): every field must exist on its type, every fragment be defined.
+/// Gives the problems as text, `[]` when the query fits the schema. Arguments and variable types are not checked.
+pub fn graphql_validate(query: &str, schema_sdl: &str) -> Result<Vec<String>, String> {
+    let doc = parse(query)?;
+    let sch = graphql_parser::parse_schema::<&str>(schema_sdl).map_err(|e| format!("the schema: {}", e.to_string().trim()))?;
+    let mut types: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    let mut roots = HashMap::from([("query", "Query"), ("mutation", "Mutation"), ("subscription", "Subscription")]);
+    for d in &sch.definitions {
+        let (name, fields) = match d {
+            schema::Definition::TypeDefinition(schema::TypeDefinition::Object(o)) => (o.name, &o.fields),
+            schema::Definition::TypeDefinition(schema::TypeDefinition::Interface(i)) => (i.name, &i.fields),
+            schema::Definition::TypeExtension(schema::TypeExtension::Object(o)) => (o.name, &o.fields),
+            schema::Definition::TypeExtension(schema::TypeExtension::Interface(i)) => (i.name, &i.fields),
+            schema::Definition::SchemaDefinition(s) => {
+                for (k, v) in [("query", s.query), ("mutation", s.mutation), ("subscription", s.subscription)] {
+                    if let Some(v) = v {
+                        roots.insert(k, v);
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        types.entry(name).or_default().extend(fields.iter().map(|f| (f.name, named(&f.field_type))));
+    }
+    let frags = fragments(&doc);
+    let mut problems = Vec::new();
+    fn check<'a>(set: &'a SelectionSet<'a, &'a str>, ty: &str, path: &str, types: &HashMap<&str, HashMap<&str, &str>>, frags: &Frags<'a>, seen: &mut Vec<&'a str>, problems: &mut Vec<String>) {
+        for item in &set.items {
+            if problems.len() >= 100 {
+                return;
+            }
+            match item {
+                Selection::Field(f) => {
+                    let p = if path.is_empty() { f.name.to_string() } else { format!("{}.{}", path, f.name) };
+                    if f.name == "__typename" {
+                        continue;
+                    }
+                    match types.get(ty).and_then(|fs| fs.get(f.name)) {
+                        Some(next) => {
+                            if !f.selection_set.items.is_empty() && !types.contains_key(next) {
+                                problems.push(format!("{}: {} is a {}, which has no fields to select", p, f.name, next));
+                            } else if f.selection_set.items.is_empty() && types.contains_key(next) {
+                                problems.push(format!("{}: {} is a {}, so it needs {{ fields }}", p, f.name, next));
+                            } else {
+                                check(&f.selection_set, next, &p, types, frags, seen, problems);
+                            }
+                        }
+                        None => problems.push(format!("{}: {} has no field `{}`", p, ty, f.name)),
+                    }
+                }
+                Selection::FragmentSpread(s) => match frags.get(s.fragment_name) {
+                    Some((on, fs)) => {
+                        if !seen.contains(&s.fragment_name) && seen.len() < 64 {
+                            seen.push(s.fragment_name);
+                            check(fs, on, path, types, frags, seen, problems);
+                            seen.pop();
+                        }
+                    }
+                    None => problems.push(format!("{}: no fragment named {}", if path.is_empty() { "(top)" } else { path }, s.fragment_name)),
+                },
+                Selection::InlineFragment(i) => {
+                    let on = match &i.type_condition {
+                        Some(TypeCondition::On(t)) => *t,
+                        None => ty,
+                    };
+                    check(&i.selection_set, on, path, types, frags, seen, problems);
+                }
+            }
+        }
+    }
+    for (kind, _, set, _) in operations(&doc) {
+        let root = roots.get(kind).copied().unwrap_or("Query");
+        if !types.contains_key(root) {
+            problems.push(format!("the schema has no {} type for a {}", root, kind));
+            continue;
+        }
+        check(set, root, "", &types, &frags, &mut vec![], &mut problems);
+    }
+    Ok(problems)
+}

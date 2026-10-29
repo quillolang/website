@@ -1,0 +1,152 @@
+//! Tar archives, gzipped or not: made from files and folders, listed, one file read, and opened safely into a folder.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! tar = { version = "0.4", default-features = false }
+//! flate2 = "1"
+
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+const MAX_ENTRIES: usize = 100_000;
+const MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_TEXT: u64 = 64 * 1024 * 1024;
+
+fn gz(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".gz") || p.ends_with(".tgz")
+}
+
+fn reader(path: &str) -> Result<Box<dyn Read>, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut magic = [0u8; 2];
+    let n = f.read(&mut magic).map_err(|e| e.to_string())?;
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    // Gzipped or not is read from the first bytes, whatever the name says.
+    Ok(if n == 2 && magic == [0x1f, 0x8b] { Box::new(GzDecoder::new(f)) } else { Box::new(f) })
+}
+
+// A name inside the archive that stays inside the folder: no absolute paths, no "..".
+fn safe(name: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in name.components() {
+        match c {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if out.as_os_str().is_empty() { None } else { Some(out) }
+}
+
+/// Makes the archive `to` from `files`, paths inside the folder `base` (folders are taken whole); gzipped when `to` ends in .gz or .tgz.
+/// Names in the archive are relative to `base`. The number of files put in.
+pub fn tar_create(to: &str, files: Vec<String>, base: &str) -> Result<i64, String> {
+    let base = Path::new(if base.is_empty() { "." } else { base });
+    if let Some(dir) = Path::new(to).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    let out = std::fs::File::create(to).map_err(|e| format!("{}: {}", to, e))?;
+    let w: Box<dyn std::io::Write> = if gz(to) { Box::new(GzEncoder::new(out, Compression::new(6))) } else { Box::new(out) };
+    let mut b = tar::Builder::new(w);
+    b.follow_symlinks(false);
+    let mut count = 0i64;
+    for f in &files {
+        let name = safe(Path::new(f)).ok_or_else(|| format!("`{}` is not a path inside the folder", f))?;
+        let full = base.join(&name);
+        let meta = std::fs::metadata(&full).map_err(|e| format!("{}: {}", full.display(), e))?;
+        if meta.is_dir() {
+            b.append_dir_all(&name, &full).map_err(|e| format!("{}: {}", full.display(), e))?;
+            count += walk_count(&full);
+        } else {
+            b.append_path_with_name(&full, &name).map_err(|e| format!("{}: {}", full.display(), e))?;
+            count += 1;
+        }
+    }
+    let w = b.into_inner().map_err(|e| e.to_string())?;
+    drop(w);
+    Ok(count)
+}
+
+fn walk_count(dir: &Path) -> i64 {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| if e.path().is_dir() { walk_count(&e.path()) } else { 1 }).sum()).unwrap_or(0)
+}
+
+/// The archive's entries as `{ name, size, kind, modified }`: `kind` is file, dir, symlink or other; `size` in bytes; `modified` in seconds since 1970.
+pub fn tar_list(path: &str) -> Result<Vec<Value>, String> {
+    let mut a = tar::Archive::new(reader(path)?);
+    let mut out = vec![];
+    for e in a.entries().map_err(|e| format!("{}: {}", path, e))? {
+        let e = e.map_err(|e| format!("{}: {}", path, e))?;
+        let h = e.header();
+        let kind = match h.entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Continuous => "file",
+            tar::EntryType::Directory => "dir",
+            tar::EntryType::Symlink | tar::EntryType::Link => "symlink",
+            _ => "other",
+        };
+        out.push(json!({ "name": e.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), "size": h.size().unwrap_or(0), "kind": kind, "modified": h.mtime().unwrap_or(0) }));
+        if out.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The text of one file in the archive, by its name there (as `tar_list` gives it); an error when it is missing. Up to 64 MB.
+pub fn tar_read_file(path: &str, name: &str) -> Result<String, String> {
+    let want = name.trim_start_matches("./");
+    let mut a = tar::Archive::new(reader(path)?);
+    for e in a.entries().map_err(|e| format!("{}: {}", path, e))? {
+        let e = e.map_err(|e| format!("{}: {}", path, e))?;
+        let n = e.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        if n.trim_start_matches("./") == want && e.header().entry_type().is_file() {
+            let mut s = String::new();
+            e.take(MAX_TEXT).read_to_string(&mut s).map_err(|e| format!("{}: {}", name, e))?;
+            return Ok(s);
+        }
+    }
+    Err(format!("{}: no file `{}` in it", path, name))
+}
+
+/// Opens the archive into the folder `to` (made if needed): the paths written. Safe for archives from anywhere:
+/// names that would land outside `to` (absolute, or with ".."), links and devices are skipped, and it stops past 100,000 entries or 4 GB.
+pub fn tar_extract(path: &str, to: &str) -> Result<Vec<String>, String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {}", to, e))?;
+    let mut a = tar::Archive::new(reader(path)?);
+    a.set_preserve_permissions(false);
+    a.set_unpack_xattrs(false);
+    let (mut written, mut total, mut seen) = (vec![], 0u64, 0usize);
+    for e in a.entries().map_err(|e| format!("{}: {}", path, e))? {
+        let mut e = e.map_err(|e| format!("{}: {}", path, e))?;
+        seen += 1;
+        if seen > MAX_ENTRIES {
+            return Err(format!("{}: more than {} entries", path, MAX_ENTRIES));
+        }
+        let ty = e.header().entry_type();
+        if !(ty.is_file() || ty.is_dir()) {
+            continue;
+        }
+        let Some(rel) = e.path().ok().and_then(|p| safe(&p)) else { continue };
+        total += e.header().size().unwrap_or(0);
+        if total > MAX_TOTAL {
+            return Err(format!("{}: more than 4 GB unpacked", path));
+        }
+        let dest = Path::new(to).join(&rel);
+        if ty.is_dir() {
+            std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+        }
+        let mut out = std::fs::File::create(&dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
+        std::io::copy(&mut e, &mut out).map_err(|e| format!("{}: {}", dest.display(), e))?;
+        written.push(dest.to_string_lossy().into_owned());
+    }
+    Ok(written)
+}

@@ -1,0 +1,186 @@
+//! Counting at scale in a little memory, kept by name for all requests: distinct counts by HyperLogLog (unique visitors, in 16 KB, about 1% off) and the most frequent items by a count-min sketch (top pages, top search terms).
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+const P: u32 = 14;
+const M: usize = 1 << P;
+const WIDTH: usize = 4096;
+const DEPTH: usize = 4;
+const TRACKED: usize = 200;
+const MAX_NAMES: usize = 1000;
+
+/// FNV-1a over the bytes, then the splitmix64 finalizer twice: well spread, and the same on every
+/// machine and Rust version (std's hasher is not promised to stay the same).
+fn hash(s: &str, seed: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mix = |mut z: u64| {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    mix(mix(h).wrapping_add(seed))
+}
+
+struct Hll(Vec<u8>);
+
+impl Hll {
+    fn add(&mut self, s: &str) {
+        let x = hash(s, 0);
+        let i = (x >> (64 - P)) as usize;
+        let rank = ((x << P) | (1 << (P - 1))).leading_zeros() as u8 + 1;
+        if rank > self.0[i] {
+            self.0[i] = rank;
+        }
+    }
+    /// Ertl's improved estimator (2017): accurate from 0 to billions, with no bias tables.
+    fn count(&self) -> i64 {
+        let q = 64 - P as usize;
+        let mut c = vec![0usize; q + 2];
+        for &r in &self.0 {
+            c[(r as usize).min(q + 1)] += 1;
+        }
+        let m = M as f64;
+        let sigma = |mut x: f64| -> f64 {
+            if x == 1.0 { return f64::INFINITY }
+            let (mut y, mut z) = (1.0, x);
+            loop {
+                x *= x;
+                let old = z;
+                z += x * y;
+                y += y;
+                if z == old { return z }
+            }
+        };
+        let tau = |mut x: f64| -> f64 {
+            if x == 0.0 || x == 1.0 { return 0.0 }
+            let (mut y, mut z) = (1.0, 1.0 - x);
+            loop {
+                x = x.sqrt();
+                let old = z;
+                y *= 0.5;
+                z -= (1.0 - x).powi(2) * y;
+                if z == old { return z / 3.0 }
+            }
+        };
+        let mut z = m * tau(1.0 - c[q + 1] as f64 / m);
+        for k in (1..=q).rev() {
+            z = 0.5 * (z + c[k] as f64);
+        }
+        z += m * sigma(c[0] as f64 / m);
+        (m * m / (2.0 * std::f64::consts::LN_2) / z).round() as i64
+    }
+}
+
+struct TopK {
+    cms: Vec<u64>,
+    top: HashMap<String, u64>,
+    total: u64,
+}
+
+impl TopK {
+    fn estimate(&self, s: &str) -> u64 {
+        (0..DEPTH).map(|d| self.cms[d * WIDTH + (hash(s, d as u64 + 1) as usize % WIDTH)]).min().unwrap_or(0)
+    }
+    fn add(&mut self, s: &str, n: u64) {
+        for d in 0..DEPTH {
+            let i = d * WIDTH + (hash(s, d as u64 + 1) as usize % WIDTH);
+            self.cms[i] += n;
+        }
+        self.total += n;
+        let e = self.estimate(s);
+        if self.top.contains_key(s) || self.top.len() < TRACKED {
+            self.top.insert(s.to_string(), e);
+        } else if let Some((k, &low)) = self.top.iter().min_by_key(|(_, &c)| c) {
+            if e > low {
+                let k = k.clone();
+                self.top.remove(&k);
+                self.top.insert(s.to_string(), e);
+            }
+        }
+    }
+}
+
+static HLLS: Mutex<Option<HashMap<String, Hll>>> = Mutex::new(None);
+static TOPS: Mutex<Option<HashMap<String, TopK>>> = Mutex::new(None);
+
+fn check(items: &[String]) -> Result<(), String> {
+    if items.len() > 100_000 { Err("up to 100,000 items a call".into()) } else { Ok(()) }
+}
+
+/// Adds `items` to the distinct count `name` (made on first use; up to 1,000 names), and gives the count after: `hll_add("visitors:2026-11-20", [request.ip])`. Adding an item twice counts it once.
+pub fn hll_add(name: &str, items: Vec<String>) -> Result<i64, String> {
+    check(&items)?;
+    let mut g = HLLS.lock().unwrap_or_else(|e| e.into_inner());
+    let all = g.get_or_insert_with(HashMap::new);
+    if !all.contains_key(name) && all.len() >= MAX_NAMES {
+        return Err("up to 1,000 counts: hll_reset old ones".into());
+    }
+    let h = all.entry(name.to_string()).or_insert_with(|| Hll(vec![0; M]));
+    for i in &items {
+        h.add(i);
+    }
+    Ok(h.count())
+}
+
+/// About how many different items `names` have together (one name, or several: the week's visitors from 7 days' counts), within about 1%; 0 for names never used.
+pub fn hll_count(names: Vec<String>) -> i64 {
+    let g = HLLS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(all) = g.as_ref() else { return 0 };
+    let mut u = Hll(vec![0; M]);
+    for n in &names {
+        if let Some(h) = all.get(n) {
+            for (a, b) in u.0.iter_mut().zip(&h.0) {
+                *a = (*a).max(*b);
+            }
+        }
+    }
+    u.count()
+}
+
+/// Counts `items` once each in the frequency sketch `name` (made on first use; up to 1,000 names): page views, search terms, error messages.
+pub fn topk_add(name: &str, items: Vec<String>) -> Result<(), String> {
+    check(&items)?;
+    let mut g = TOPS.lock().unwrap_or_else(|e| e.into_inner());
+    let all = g.get_or_insert_with(HashMap::new);
+    if !all.contains_key(name) && all.len() >= MAX_NAMES {
+        return Err("up to 1,000 sketches: topk_reset old ones".into());
+    }
+    let t = all.entry(name.to_string()).or_insert_with(|| TopK { cms: vec![0; WIDTH * DEPTH], top: HashMap::new(), total: 0 });
+    for i in &items {
+        t.add(i, 1);
+    }
+    Ok(())
+}
+
+/// The `n` most frequent items of sketch `name` (up to 200), as `[{ item, count }]`, most first. Counts may run a little high, never low.
+pub fn topk_top(name: &str, n: i64) -> Vec<Value> {
+    let g = TOPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(t) = g.as_ref().and_then(|a| a.get(name)) else { return vec![] };
+    let mut v: Vec<(&String, u64)> = t.top.keys().map(|k| (k, t.estimate(k))).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v.into_iter().take(n.clamp(0, TRACKED as i64) as usize).map(|(k, c)| json!({ "item": k, "count": c })).collect()
+}
+
+/// About how many times `item` was counted in sketch `name`, and the total of all: `{ count, total }`.
+pub fn topk_count(name: &str, item: &str) -> Value {
+    let g = TOPS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_ref().and_then(|a| a.get(name)) {
+        Some(t) => json!({ "count": t.estimate(item), "total": t.total }),
+        None => json!({ "count": 0, "total": 0 }),
+    }
+}
+
+/// Forgets the distinct count and the sketch called `name`, to start again or free memory.
+pub fn sketch_reset(name: &str) {
+    if let Some(a) = HLLS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { a.remove(name); }
+    if let Some(a) = TOPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { a.remove(name); }
+}

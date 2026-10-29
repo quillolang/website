@@ -1,0 +1,135 @@
+//! Whether a URL someone typed is safe for the server to fetch (webhooks, link previews, imports): http or https, an allowed port, and no address on this machine, a private network or a cloud's metadata service.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! url = "2"
+//! ipnet = "2"
+
+use ipnet::{Ipv4Net, Ipv6Net};
+use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+
+const V4: &[(&str, &str)] = &[
+    ("0.0.0.0/8", "this network"),
+    ("10.0.0.0/8", "private"),
+    ("100.64.0.0/10", "carrier-grade NAT"),
+    ("127.0.0.0/8", "loopback"),
+    ("169.254.0.0/16", "link-local (cloud metadata)"),
+    ("172.16.0.0/12", "private"),
+    ("192.0.0.0/24", "IETF protocol assignments"),
+    ("192.0.2.0/24", "documentation"),
+    ("192.88.99.0/24", "6to4 relay"),
+    ("192.168.0.0/16", "private"),
+    ("198.18.0.0/15", "benchmarking"),
+    ("198.51.100.0/24", "documentation"),
+    ("203.0.113.0/24", "documentation"),
+    ("224.0.0.0/4", "multicast"),
+    ("240.0.0.0/4", "reserved"),
+];
+
+const V6: &[(&str, &str)] = &[
+    ("::/128", "unspecified"),
+    ("::1/128", "loopback"),
+    ("100::/64", "discard"),
+    ("2001:db8::/32", "documentation"),
+    ("fc00::/7", "unique local (private)"),
+    ("fe80::/10", "link-local"),
+    ("ff00::/8", "multicast"),
+];
+
+fn v4_kind(ip: Ipv4Addr) -> Option<&'static str> {
+    if ip.is_broadcast() {
+        return Some("broadcast");
+    }
+    V4.iter().find(|(net, _)| net.parse::<Ipv4Net>().is_ok_and(|n| n.contains(&ip))).map(|(_, k)| *k)
+}
+
+fn kind(ip: IpAddr) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => v4_kind(v4).map(str::to_string),
+        IpAddr::V6(v6) => {
+            // IPv4 written inside IPv6 (::ffff:127.0.0.1, 64:ff9b::7f00:1, 2002:7f00:1::) is judged as that IPv4.
+            let s = v6.segments();
+            let embedded = if let Some(v4) = v6.to_ipv4_mapped() {
+                Some(v4)
+            } else if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+                Some(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8))
+            } else if s[0] == 0x2002 {
+                Some(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8))
+            } else if s[..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && s[7] <= 1) {
+                Some(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8))
+            } else {
+                None
+            };
+            if let Some(v4) = embedded {
+                return v4_kind(v4).map(|k| format!("{} (IPv4 inside IPv6)", k));
+            }
+            V6.iter().find(|(net, _)| net.parse::<Ipv6Net>().is_ok_and(|n| n.contains(&v6))).map(|(_, k)| k.to_string())
+        }
+    }
+}
+
+fn verdict(safe: bool, reason: Option<String>, host: Option<String>, addresses: Vec<String>) -> Value {
+    json!({ "safe": safe, "reason": reason, "host": host, "addresses": addresses })
+}
+
+/// Whether the server may fetch `url`: `{ safe, reason, host, addresses }`. Refused: a scheme other than http and https, a user
+/// and password in the URL, a port not in `ports` (empty: 80 and 443 only), and a host whose addresses include one that is
+/// not on the public internet (loopback, private, link-local and so cloud metadata at 169.254.169.254, carrier-grade NAT,
+/// multicast, documentation and reserved ranges, IPv4 hidden inside IPv6). A name is looked up in DNS here; one that does not
+/// resolve is refused. Check when the URL is saved, and fetch it with `http`'s `public_only: true` too: DNS can change between.
+pub fn ssrf_check(url: &str, ports: Vec<i64>) -> Value {
+    let u = match url::Url::parse(url.trim()) {
+        Ok(u) => u,
+        Err(e) => return verdict(false, Some(format!("not a URL: {}", e)), None, vec![]),
+    };
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return verdict(false, Some(format!("the scheme is `{}`: only http and https", u.scheme())), None, vec![]);
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return verdict(false, Some("the URL holds a user name or password".into()), None, vec![]);
+    }
+    let port = u.port_or_known_default().unwrap_or(0) as i64;
+    let allowed = if ports.is_empty() { vec![80, 443] } else { ports };
+    if !allowed.contains(&port) {
+        return verdict(false, Some(format!("port {} is not allowed", port)), None, vec![]);
+    }
+    let (host, ips): (String, Vec<IpAddr>) = match u.host() {
+        Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
+        Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_lowercase();
+            if d == "localhost" || d.ends_with(".localhost") || d.ends_with(".local") || d.ends_with(".internal") {
+                return verdict(false, Some(format!("`{}` is a name for this machine or its network", d)), Some(d), vec![]);
+            }
+            match (d.as_str(), port as u16).to_socket_addrs() {
+                Ok(a) => (d, a.map(|s| s.ip()).take(32).collect()),
+                Err(e) => return verdict(false, Some(format!("`{}` does not resolve: {}", d, e)), Some(d), vec![]),
+            }
+        }
+        None => return verdict(false, Some("the URL has no host".into()), None, vec![]),
+    };
+    if ips.is_empty() {
+        return verdict(false, Some(format!("`{}` has no address", host)), Some(host), vec![]);
+    }
+    let addrs: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
+    for ip in &ips {
+        if let Some(k) = kind(*ip) {
+            return verdict(false, Some(format!("{} is {}", ip, k)), Some(host), addrs);
+        }
+    }
+    verdict(true, None, Some(host), addrs)
+}
+
+/// Only whether `url` is safe, with ports 80 and 443: ssrf_check without the reasons.
+pub fn ssrf_safe(url: &str) -> bool {
+    ssrf_check(url, vec![])["safe"] == Value::Bool(true)
+}
+
+/// What an IP address is: null for one on the public internet, else its kind ("loopback", "private", "link-local (cloud
+/// metadata)" ...). An error for text that is not an address.
+pub fn ssrf_ip_kind(ip: &str) -> Result<Option<String>, String> {
+    let ip: IpAddr = ip.trim().trim_start_matches('[').trim_end_matches(']').parse().map_err(|_| format!("`{}` is not an IP address", ip))?;
+    Ok(kind(ip))
+}
+

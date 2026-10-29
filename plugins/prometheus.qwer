@@ -1,0 +1,172 @@
+//! Prometheus metrics kept in the server's memory: counters, gauges and histograms with labels, and the `/metrics` text Prometheus, Grafana Agent or VictoriaMetrics scrape.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
+use std::sync::{Mutex, OnceLock};
+
+const DEFAULT_BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const MAX_SERIES: usize = 10_000;
+
+enum Kind {
+    Counter,
+    Gauge,
+    Histogram(Vec<f64>),
+}
+
+struct Series {
+    value: f64,
+    counts: Vec<u64>,
+    sum: f64,
+    count: u64,
+}
+
+struct Metric {
+    kind: Kind,
+    help: String,
+    series: BTreeMap<String, Series>,
+}
+
+fn reg() -> std::sync::MutexGuard<'static, BTreeMap<String, Metric>> {
+    static R: OnceLock<Mutex<BTreeMap<String, Metric>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn valid_name(n: &str, label: bool) -> bool {
+    let mut cs = n.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || (!label && c == ':'))
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || (!label && c == ':'))
+}
+
+/// Labels as Prometheus writes them, sorted: `method="GET",status="200"`.
+fn label_text(labels: &HashMap<String, String>) -> Result<String, String> {
+    let mut ls: Vec<_> = labels.iter().collect();
+    ls.sort();
+    let mut out = Vec::new();
+    for (k, v) in ls {
+        if !valid_name(k, true) || k.starts_with("__") {
+            return Err(format!("`{}` is not a label name", k));
+        }
+        out.push(format!("{}=\"{}\"", k, v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")));
+    }
+    Ok(out.join(","))
+}
+
+fn with_series(name: &str, labels: &HashMap<String, String>, kind: Kind, f: impl FnOnce(&mut Series, &Kind)) -> Result<(), String> {
+    if !valid_name(name, false) {
+        return Err(format!("`{}` is not a metric name (letters, digits, _ and :)", name));
+    }
+    let key = label_text(labels)?;
+    let mut r = reg();
+    let total: usize = r.values().map(|m| m.series.len()).sum();
+    let m = r.entry(name.to_string()).or_insert_with(|| Metric { kind, help: String::new(), series: BTreeMap::new() });
+    if !m.series.contains_key(&key) && total >= MAX_SERIES {
+        return Err(format!("at most {} series: a label with too many values (an id, a URL with ids) makes too many", MAX_SERIES));
+    }
+    let nb = match &m.kind {
+        Kind::Histogram(b) => b.len(),
+        _ => 0,
+    };
+    let s = m.series.entry(key).or_insert_with(|| Series { value: 0.0, counts: vec![0; nb], sum: 0.0, count: 0 });
+    f(s, &m.kind);
+    Ok(())
+}
+
+/// Adds `by` (0 or more) to a counter: requests served, emails sent, errors. `labels` split it (`{ route: "/cart", status: "200" }`; `{}` for none).
+pub fn metric_inc(name: &str, labels: std::collections::HashMap<String, String>, by: f64) -> Result<(), String> {
+    if !(by >= 0.0) {
+        return Err("a counter only goes up: `by` is 0 or more".into());
+    }
+    with_series(name, &labels, Kind::Counter, |s, k| match k {
+        Kind::Counter => s.value += by,
+        _ => {}
+    })
+}
+
+/// Sets a gauge to `value`: a number that goes up and down, such as jobs waiting, users online, or the size of a cache.
+pub fn metric_set(name: &str, labels: std::collections::HashMap<String, String>, value: f64) -> Result<(), String> {
+    with_series(name, &labels, Kind::Gauge, |s, k| match k {
+        Kind::Gauge => s.value = value,
+        _ => {}
+    })
+}
+
+/// Records one observation in a histogram, such as a request's duration in seconds. `buckets` are the upper bounds,
+/// fixed by the first call (`[]` for the usual 5 ms to 10 s); Prometheus works out percentiles from them.
+pub fn metric_observe(name: &str, labels: std::collections::HashMap<String, String>, value: f64, buckets: Vec<f64>) -> Result<(), String> {
+    let mut b: Vec<f64> = if buckets.is_empty() { DEFAULT_BUCKETS.to_vec() } else { buckets.into_iter().filter(|x| x.is_finite()).take(50).collect() };
+    b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    b.dedup();
+    with_series(name, &labels, Kind::Histogram(b), |s, k| {
+        if let Kind::Histogram(bounds) = k {
+            for (i, ub) in bounds.iter().enumerate() {
+                if value <= *ub {
+                    s.counts[i] += 1;
+                }
+            }
+            s.sum += value;
+            s.count += 1;
+        }
+    })
+}
+
+/// Sets the `# HELP` line of a metric, shown in Prometheus and Grafana.
+pub fn metric_help(name: &str, help: &str) -> Result<(), String> {
+    let mut r = reg();
+    let m = r.get_mut(name).ok_or(format!("no metric `{}` yet: help comes after its first use", name))?;
+    m.help = help.replace('\\', "\\\\").replace('\n', "\\n");
+    Ok(())
+}
+
+fn num(x: f64) -> String {
+    if x.is_infinite() {
+        if x > 0.0 { "+Inf".into() } else { "-Inf".into() }
+    } else if x.fract() == 0.0 && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        format!("{}", x)
+    }
+}
+
+/// Every metric in Prometheus's text format (version 0.0.4): answer `/metrics` with it, as `text/plain; version=0.0.4`.
+pub fn metrics_text() -> String {
+    let r = reg();
+    let mut out = String::new();
+    for (name, m) in r.iter() {
+        if !m.help.is_empty() {
+            let _ = writeln!(out, "# HELP {} {}", name, m.help);
+        }
+        let kind = match m.kind {
+            Kind::Counter => "counter",
+            Kind::Gauge => "gauge",
+            Kind::Histogram(_) => "histogram",
+        };
+        let _ = writeln!(out, "# TYPE {} {}", name, kind);
+        for (labels, s) in &m.series {
+            let braces = |extra: &str| -> String {
+                match (labels.is_empty(), extra.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => format!("{{{}}}", extra),
+                    (false, true) => format!("{{{}}}", labels),
+                    (false, false) => format!("{{{},{}}}", labels, extra),
+                }
+            };
+            match &m.kind {
+                Kind::Histogram(bounds) => {
+                    for (i, ub) in bounds.iter().enumerate() {
+                        let _ = writeln!(out, "{}_bucket{} {}", name, braces(&format!("le=\"{}\"", num(*ub))), s.counts[i]);
+                    }
+                    let _ = writeln!(out, "{}_bucket{} {}", name, braces("le=\"+Inf\""), s.count);
+                    let _ = writeln!(out, "{}_sum{} {}", name, braces(""), num(s.sum));
+                    let _ = writeln!(out, "{}_count{} {}", name, braces(""), s.count);
+                }
+                _ => {
+                    let _ = writeln!(out, "{}{} {}", name, braces(""), num(s.value));
+                }
+            }
+        }
+    }
+    out
+}

@@ -1,0 +1,138 @@
+//! Check that a webhook really came from Stripe, GitHub, Slack, Shopify or a Standard Webhooks sender (Svix, Resend, Clerk), with the timestamp's tolerance; and sign your own.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::collections::HashMap;
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn mac(key: &[u8], parts: &[&[u8]]) -> HmacSha256 {
+    let mut m = HmacSha256::new_from_slice(key).expect("HMAC takes any key length");
+    for p in parts {
+        m.update(p);
+    }
+    m
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+fn header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Result<&'a str, String> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).ok_or_else(|| format!("no `{}` header", name))
+}
+
+fn fresh(ts: &str, tolerance: i64) -> Result<i64, String> {
+    let t: i64 = ts.trim().parse().map_err(|_| format!("the timestamp `{}` is not a number", ts))?;
+    if tolerance > 0 && (now() - t).abs() > tolerance {
+        return Err(format!("the timestamp is {} s away from now, more than the {} s allowed: a replay, or a clock that is off", (now() - t).abs(), tolerance));
+    }
+    Ok(t)
+}
+
+fn standard_key(secret: &str) -> Result<Vec<u8>, String> {
+    STANDARD.decode(secret.trim().trim_start_matches("whsec_")).map_err(|_| "a Standard Webhooks secret is `whsec_` and base64".to_string())
+}
+
+const NO_MATCH: &str = "the signature does not match: a wrong secret, or the body was changed (check it with the raw body, not one parsed and written again)";
+
+/// Checks a webhook: `provider` is "stripe", "github", "slack", "shopify" or "standard"; `body` the raw request body
+/// (`request.body`); `headers` the request's headers; `secret` the endpoint's signing secret. Stripe, Slack and Standard Webhooks
+/// carry a timestamp, refused when more than `tolerance_seconds` from now (300 is usual; 0 skips that check).
+/// Gives true, or an error value saying what is wrong.
+pub fn webhook_verify(provider: &str, body: &str, headers: std::collections::HashMap<String, String>, secret: &str, tolerance_seconds: i64) -> Result<bool, String> {
+    let b = body.as_bytes();
+    let ok = match provider.to_lowercase().as_str() {
+        "stripe" => {
+            let h = header(&headers, "stripe-signature")?;
+            let mut t = None;
+            let mut sigs = vec![];
+            for part in h.split(',') {
+                match part.trim().split_once('=') {
+                    Some(("t", v)) => t = Some(v.to_string()),
+                    Some(("v1", v)) => sigs.push(v.to_string()),
+                    _ => {}
+                }
+            }
+            let t = t.ok_or("the Stripe-Signature header has no t=")?;
+            fresh(&t, tolerance_seconds)?;
+            sigs.iter().filter_map(|s| unhex(s)).any(|s| mac(secret.as_bytes(), &[t.as_bytes(), b".", b]).verify_slice(&s).is_ok())
+        }
+        "github" => {
+            let h = header(&headers, "x-hub-signature-256")?;
+            let s = h.trim().strip_prefix("sha256=").ok_or("X-Hub-Signature-256 starts with sha256=")?;
+            unhex(s).is_some_and(|s| mac(secret.as_bytes(), &[b]).verify_slice(&s).is_ok())
+        }
+        "slack" => {
+            let t = header(&headers, "x-slack-request-timestamp")?;
+            fresh(t, tolerance_seconds)?;
+            let s = header(&headers, "x-slack-signature")?;
+            let s = s.trim().strip_prefix("v0=").ok_or("X-Slack-Signature starts with v0=")?;
+            unhex(s).is_some_and(|s| mac(secret.as_bytes(), &[b"v0:", t.trim().as_bytes(), b":", b]).verify_slice(&s).is_ok())
+        }
+        "shopify" => {
+            let s = header(&headers, "x-shopify-hmac-sha256")?;
+            STANDARD.decode(s.trim()).ok().is_some_and(|s| mac(secret.as_bytes(), &[b]).verify_slice(&s).is_ok())
+        }
+        "standard" => {
+            let id = header(&headers, "webhook-id")?;
+            let t = header(&headers, "webhook-timestamp")?;
+            fresh(t, tolerance_seconds)?;
+            let key = standard_key(secret)?;
+            let sigs = header(&headers, "webhook-signature")?;
+            sigs.split_whitespace().filter_map(|s| s.strip_prefix("v1,")).filter_map(|s| STANDARD.decode(s).ok())
+                .any(|s| mac(&key, &[id.as_bytes(), b".", t.trim().as_bytes(), b".", b]).verify_slice(&s).is_ok())
+        }
+        other => return Err(format!("unknown provider `{}`: stripe, github, slack, shopify or standard", other)),
+    };
+    if ok { Ok(true) } else { Err(NO_MATCH.into()) }
+}
+
+/// The headers to send with a webhook of your own, signed as `provider` signs them, for `body` at `timestamp`
+/// (Unix seconds; 0 for now). For tests of a receiver, and for apps that send webhooks; "standard" also takes `id`
+/// from a `webhook-id`-style message id (empty: one made from the time).
+pub fn webhook_sign(provider: &str, body: &str, secret: &str, timestamp: i64, id: &str) -> Result<HashMap<String, String>, String> {
+    let t = if timestamp > 0 { timestamp } else { now() };
+    let ts = t.to_string();
+    let b = body.as_bytes();
+    let sign = |parts: &[&[u8]]| mac(secret.as_bytes(), parts).finalize().into_bytes();
+    Ok(match provider.to_lowercase().as_str() {
+        "stripe" => HashMap::from([("stripe-signature".into(), format!("t={},v1={}", ts, hex(&sign(&[ts.as_bytes(), b".", b]))))]),
+        "github" => HashMap::from([("x-hub-signature-256".into(), format!("sha256={}", hex(&sign(&[b]))))]),
+        "slack" => HashMap::from([
+            ("x-slack-request-timestamp".into(), ts.clone()),
+            ("x-slack-signature".into(), format!("v0={}", hex(&sign(&[b"v0:", ts.as_bytes(), b":", b])))),
+        ]),
+        "shopify" => HashMap::from([("x-shopify-hmac-sha256".into(), STANDARD.encode(sign(&[b])))]),
+        "standard" => {
+            let id = if id.is_empty() { format!("msg_{}", t) } else { id.to_string() };
+            let key = standard_key(secret)?;
+            let s = mac(&key, &[id.as_bytes(), b".", ts.as_bytes(), b".", b]).finalize().into_bytes();
+            HashMap::from([
+                ("webhook-id".into(), id),
+                ("webhook-timestamp".into(), ts),
+                ("webhook-signature".into(), format!("v1,{}", STANDARD.encode(s))),
+            ])
+        }
+        other => return Err(format!("unknown provider `{}`: stripe, github, slack, shopify or standard", other)),
+    })
+}

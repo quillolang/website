@@ -1,0 +1,147 @@
+//! Parquet files, the columnar format of data lakes, DuckDB, Spark and pandas: rows written with their column types found, and Parquet files read back as rows.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! parquet = { version = "53", default-features = false, features = ["snap", "flate2", "json"] }
+
+use parquet::basic::{Compression, ConvertedType, LogicalType, Repetition, Type as Physical};
+use parquet::column::writer::ColumnWriter;
+use parquet::data_type::ByteArray;
+use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::types::Type;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+/// At most a million rows are read at once.
+const MAX_ROWS: usize = 1_000_000;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Bool,
+    Int,
+    Float,
+    Text,
+}
+
+fn kind_of(rows: &[std::collections::HashMap<String, Value>], col: &str) -> Kind {
+    let mut k: Option<Kind> = None;
+    for r in rows {
+        let this = match r.get(col) {
+            None | Some(Value::Null) => continue,
+            Some(Value::Bool(_)) => Kind::Bool,
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => Kind::Int,
+            Some(Value::Number(_)) => Kind::Float,
+            Some(_) => Kind::Text,
+        };
+        k = Some(match (k, this) {
+            (None, t) => t,
+            (Some(a), b) if a == b => a,
+            (Some(Kind::Int), Kind::Float) | (Some(Kind::Float), Kind::Int) => Kind::Float,
+            _ => Kind::Text,
+        });
+    }
+    k.unwrap_or(Kind::Text)
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Writes `rows` (maps) to a new Parquet file at `path` (folders made), with `columns` in that order (empty: the first
+/// row's keys, sorted), Snappy-compressed; gives the number of rows. Each column's type comes from its values: booleans,
+/// ints (INT64), floats (DOUBLE, also when ints and floats mix), else text (UTF-8; lists and maps as JSON). Any value may be null.
+pub fn parquet_write(path: &str, rows: Vec<std::collections::HashMap<String, serde_json::Value>>, columns: Vec<String>) -> Result<i64, String> {
+    let cols: Vec<String> = if columns.is_empty() {
+        let mut k: Vec<String> = rows.first().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+        k.sort();
+        k
+    } else {
+        columns
+    };
+    if cols.is_empty() {
+        return Err("no columns: give them, or rows with keys".into());
+    }
+    let kinds: Vec<Kind> = cols.iter().map(|c| kind_of(&rows, c)).collect();
+    let mut fields = vec![];
+    for (c, k) in cols.iter().zip(&kinds) {
+        let b = match k {
+            Kind::Bool => Type::primitive_type_builder(c, Physical::BOOLEAN),
+            Kind::Int => Type::primitive_type_builder(c, Physical::INT64),
+            Kind::Float => Type::primitive_type_builder(c, Physical::DOUBLE),
+            Kind::Text => Type::primitive_type_builder(c, Physical::BYTE_ARRAY).with_logical_type(Some(LogicalType::String)).with_converted_type(ConvertedType::UTF8),
+        };
+        fields.push(Arc::new(b.with_repetition(Repetition::OPTIONAL).build().map_err(|e| format!("column `{}`: {}", c, e))?));
+    }
+    let schema = Arc::new(Type::group_type_builder("schema").with_fields(fields).build().map_err(|e| e.to_string())?);
+    let props = Arc::new(WriterProperties::builder().set_compression(Compression::SNAPPY).build());
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        }
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut w = SerializedFileWriter::new(file, schema, props).map_err(|e| e.to_string())?;
+    // Row groups of 100,000 rows keep memory flat for large exports.
+    for chunk in rows.chunks(100_000) {
+        let mut rg = w.next_row_group().map_err(|e| e.to_string())?;
+        let mut i = 0;
+        while let Some(mut col) = rg.next_column().map_err(|e| e.to_string())? {
+            let (name, k) = (&cols[i], kinds[i]);
+            let vals: Vec<Option<&Value>> = chunk.iter().map(|r| r.get(name).filter(|v| !v.is_null())).collect();
+            let defs: Vec<i16> = vals.iter().map(|v| v.is_some() as i16).collect();
+            let present = vals.iter().flatten();
+            let bad = |what: &str| format!("column `{}`: {}", name, what);
+            let r = match (col.untyped(), k) {
+                (ColumnWriter::BoolColumnWriter(cw), Kind::Bool) => cw.write_batch(&present.map(|v| v.as_bool().unwrap_or(false)).collect::<Vec<_>>(), Some(&defs), None),
+                (ColumnWriter::Int64ColumnWriter(cw), Kind::Int) => cw.write_batch(&present.map(|v| v.as_i64().unwrap_or(0)).collect::<Vec<_>>(), Some(&defs), None),
+                (ColumnWriter::DoubleColumnWriter(cw), Kind::Float) => cw.write_batch(&present.map(|v| v.as_f64().unwrap_or(0.0)).collect::<Vec<_>>(), Some(&defs), None),
+                (ColumnWriter::ByteArrayColumnWriter(cw), Kind::Text) => cw.write_batch(&present.map(|v| ByteArray::from(text(v).as_str())).collect::<Vec<_>>(), Some(&defs), None),
+                _ => return Err(bad("type mix-up")),
+            };
+            r.map_err(|e| bad(&e.to_string()))?;
+            col.close().map_err(|e| bad(&e.to_string()))?;
+            i += 1;
+        }
+        rg.close().map_err(|e| e.to_string())?;
+    }
+    w.close().map_err(|e| e.to_string())?;
+    Ok(rows.len() as i64)
+}
+
+fn reader(path: &str) -> Result<SerializedFileReader<std::fs::File>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    SerializedFileReader::new(f).map_err(|e| format!("{}: not a Parquet file: {}", path, e))
+}
+
+/// The rows of a Parquet file as maps (at most `limit`, up to a million; 0 for the most), from any writer (pandas, Spark,
+/// DuckDB): uncompressed, Snappy or gzip. Dates and timestamps come as text, decimals as numbers, nested columns as lists and maps.
+pub fn parquet_read(path: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let max = if limit <= 0 { MAX_ROWS } else { (limit as usize).min(MAX_ROWS) };
+    let r = reader(path)?;
+    let mut out = vec![];
+    for row in r.get_row_iter(None).map_err(|e| e.to_string())?.take(max) {
+        out.push(row.map_err(|e| e.to_string())?.to_json_value());
+    }
+    Ok(out)
+}
+
+/// What is in a Parquet file without reading its rows: `{ rows, row_groups, created_by, columns }`, each column
+/// `{ name, type }` (its physical type, and its logical one when it has one).
+pub fn parquet_info(path: &str) -> Result<Value, String> {
+    let r = reader(path)?;
+    let m = r.metadata();
+    let fm = m.file_metadata();
+    let cols: Vec<Value> = fm.schema_descr().columns().iter().map(|c| {
+        let t = match c.logical_type() {
+            Some(l) => format!("{} ({:?})", c.physical_type(), l),
+            None => c.physical_type().to_string(),
+        };
+        json!({ "name": c.path().string(), "type": t })
+    }).collect();
+    Ok(json!({ "rows": fm.num_rows(), "row_groups": m.num_row_groups(), "created_by": fm.created_by(), "columns": cols }))
+}

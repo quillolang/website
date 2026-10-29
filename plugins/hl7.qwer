@@ -1,0 +1,219 @@
+//! HL7 v2 messages, as hospitals and labs send them (ADT, ORU, ORM): segments, fields, components and repetitions read, values picked by path (`PID-5.1`), and ACK replies made.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+
+/// Messages up to 10 MB are read.
+const MAX: usize = 10 * 1024 * 1024;
+
+struct Seps {
+    field: char,
+    comp: char,
+    rep: char,
+    esc: char,
+    sub: char,
+}
+
+struct Msg {
+    seps: Seps,
+    /// Each segment: its name, then its fields as written (field 1 first).
+    segments: Vec<(String, Vec<String>)>,
+}
+
+fn read(text: &str) -> Result<Msg, String> {
+    if text.len() > MAX {
+        return Err("HL7 messages up to 10 MB".into());
+    }
+    // MLLP framing (0x0b ... 0x1c 0x0d) is taken off when present.
+    let t = text.trim_matches(|c: char| c == '\u{0b}' || c == '\u{1c}' || c.is_whitespace());
+    if !t.starts_with("MSH") || t.len() < 8 {
+        return Err("an HL7 v2 message starts with MSH".into());
+    }
+    let mut ch = t[3..].chars();
+    let field = ch.next().unwrap_or('|');
+    let enc: Vec<char> = ch.take_while(|&c| c != field).collect();
+    let seps = Seps {
+        field,
+        comp: *enc.first().unwrap_or(&'^'),
+        rep: *enc.get(1).unwrap_or(&'~'),
+        esc: *enc.get(2).unwrap_or(&'\\'),
+        sub: *enc.get(3).unwrap_or(&'&'),
+    };
+    let mut segments = vec![];
+    for line in t.split(['\r', '\n']).filter(|l| !l.trim().is_empty()).take(100_000) {
+        let parts: Vec<&str> = line.split(seps.field).collect();
+        let name = parts[0].trim().to_string();
+        let fields: Vec<String> = if name == "MSH" {
+            // MSH-1 is the field separator itself, MSH-2 the encoding characters.
+            std::iter::once(seps.field.to_string()).chain(parts[1..].iter().map(|s| s.to_string())).collect()
+        } else {
+            parts[1..].iter().map(|s| s.to_string()).collect()
+        };
+        segments.push((name, fields));
+    }
+    Ok(Msg { seps, segments })
+}
+
+fn unescape(s: &str, p: &Seps) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    // Escapes sit between two escape characters: \F\ and the like.
+    while let Some(i) = rest.find(p.esc) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + p.esc.len_utf8()..];
+        let Some(j) = after.find(p.esc) else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let code = &after[..j];
+        match code {
+            "F" => out.push(p.field),
+            "S" => out.push(p.comp),
+            "R" => out.push(p.rep),
+            "E" => out.push(p.esc),
+            "T" => out.push(p.sub),
+            ".br" => out.push('\n'),
+            c if c.starts_with('X') && c.len() % 2 == 1 && c[1..].chars().all(|x| x.is_ascii_hexdigit()) => {
+                let h = &c[1..];
+                out.extend((0..h.len() / 2).filter_map(|k| u8::from_str_radix(&h[k * 2..k * 2 + 2], 16).ok()).map(|b| b as char));
+            }
+            other => {
+                out.push(p.esc);
+                out.push_str(other);
+                out.push(p.esc);
+            }
+        }
+        rest = &after[j + p.esc.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A field as a value: text when it is one piece, a list of components (each text or a list of subcomponents) when it has
+/// several, and a list of those when it repeats.
+fn decode(field: &str, p: &Seps, is_msh_2: bool) -> Value {
+    if is_msh_2 {
+        return Value::String(field.to_string());
+    }
+    let one = |rep: &str| -> Value {
+        let comps: Vec<Value> = rep.split(p.comp).map(|c| {
+            let subs: Vec<&str> = c.split(p.sub).collect();
+            if subs.len() == 1 { Value::String(unescape(c, p)) } else { Value::Array(subs.iter().map(|s| Value::String(unescape(s, p))).collect()) }
+        }).collect();
+        if comps.len() == 1 { comps.into_iter().next().unwrap() } else { Value::Array(comps) }
+    };
+    let reps: Vec<&str> = field.split(p.rep).collect();
+    if reps.len() == 1 { one(reps[0]) } else { json!({ "repeats": reps.iter().map(|r| one(r)).collect::<Vec<_>>() }) }
+}
+
+fn get_raw<'a>(m: &'a Msg, seg: &str, nth: usize, field: usize) -> Option<&'a str> {
+    let (_, fields) = m.segments.iter().filter(|(n, _)| n == seg).nth(nth)?;
+    fields.get(field.checked_sub(1)?).map(|s| s.as_str())
+}
+
+/// Parses `PID-5.1`, `PID-3[2].1`, `OBX(2)-5` or `PID-11.1.2`.
+fn path(p: &str) -> Result<(String, usize, usize, usize, usize, usize), String> {
+    let bad = || format!("`{}` is not a path like PID-5.1, PID-3[2].1 or OBX(2)-5", p);
+    let (seg, rest) = p.trim().split_once('-').ok_or_else(bad)?;
+    let (seg, nth) = match seg.split_once('(') {
+        Some((s, n)) => (s.to_string(), n.trim_end_matches(')').parse::<usize>().map_err(|_| bad())?),
+        None => (seg.to_string(), 1),
+    };
+    let mut parts = rest.split('.');
+    let f = parts.next().ok_or_else(bad)?;
+    let (f, rep) = match f.split_once('[') {
+        Some((f, r)) => (f, r.trim_end_matches(']').parse::<usize>().map_err(|_| bad())?),
+        None => (f, 1),
+    };
+    let field = f.parse::<usize>().map_err(|_| bad())?;
+    let comp = parts.next().map(|c| c.parse::<usize>().map_err(|_| bad())).transpose()?.unwrap_or(0);
+    let sub = parts.next().map(|c| c.parse::<usize>().map_err(|_| bad())).transpose()?.unwrap_or(0);
+    if seg.len() != 3 || nth == 0 || rep == 0 || field == 0 {
+        return Err(bad());
+    }
+    Ok((seg.to_uppercase(), nth - 1, field, rep - 1, comp, sub))
+}
+
+/// An HL7 v2 message: `{ type, event, control_id, version, sender, receiver, sent_at, segments }`. `type` and `event` come
+/// from MSH-9 (`ADT`, `A01`), `sender` and `receiver` from MSH-3/4 and MSH-5/6. `segments` are `{ name, fields }` with
+/// field 1 first: text, a list of components, `{ repeats: [...] }` for a repeated field, escapes (`\F\`, `\S\`, `\.br\`)
+/// read. Segments end with carriage returns as HL7 says, or line breaks; MLLP framing is taken off.
+pub fn hl7_parse(text: &str) -> Result<Value, String> {
+    let m = read(text)?;
+    let g = |seg: &str, f: usize, c: usize| -> Option<String> {
+        let raw = get_raw(&m, seg, 0, f)?;
+        let first_rep = raw.split(m.seps.rep).next()?;
+        let comp = if c == 0 { first_rep.to_string() } else { first_rep.split(m.seps.comp).nth(c - 1)?.to_string() };
+        Some(unescape(&comp, &m.seps)).filter(|s| !s.is_empty())
+    };
+    let segments: Vec<Value> = m.segments.iter().map(|(name, fields)| json!({
+        "name": name,
+        "fields": fields.iter().enumerate().map(|(i, f)| decode(f, &m.seps, name == "MSH" && i <= 1)).collect::<Vec<_>>(),
+    })).collect();
+    Ok(json!({
+        "type": g("MSH", 9, 1),
+        "event": g("MSH", 9, 2),
+        "control_id": g("MSH", 10, 0),
+        "version": g("MSH", 12, 0),
+        "sender": { "application": g("MSH", 3, 1), "facility": g("MSH", 4, 1) },
+        "receiver": { "application": g("MSH", 5, 1), "facility": g("MSH", 6, 1) },
+        "sent_at": g("MSH", 7, 0),
+        "segments": segments,
+    }))
+}
+
+/// One value by its path: `PID-5.1` (segment PID, field 5, component 1), `PID-3[2].1` (the second repetition),
+/// `OBX(2)-5` (the second OBX segment), `PID-11.1.2` (a subcomponent). Text, escapes read; null when the message has
+/// nothing there. Without a component, the whole field's first repetition, as written.
+pub fn hl7_get(text: &str, at: &str) -> Result<Option<String>, String> {
+    let m = read(text)?;
+    let (seg, nth, field, rep, comp, sub) = path(at)?;
+    let Some(raw) = get_raw(&m, &seg, nth, field) else { return Ok(None) };
+    if seg == "MSH" && field <= 2 {
+        return Ok(Some(raw.to_string()));
+    }
+    let Some(r) = raw.split(m.seps.rep).nth(rep) else { return Ok(None) };
+    let v = if comp == 0 {
+        Some(r.to_string())
+    } else {
+        r.split(m.seps.comp).nth(comp - 1).and_then(|c| if sub == 0 { Some(c.to_string()) } else { c.split(m.seps.sub).nth(sub - 1).map(str::to_string) })
+    };
+    Ok(v.map(|s| unescape(&s, &m.seps)).filter(|s| !s.is_empty()))
+}
+
+/// The ACK to send back for `text`: `code` "AA" (accepted), "AE" (error) or "AR" (rejected), with `note` in MSA-3 (and an
+/// ERR segment for AE and AR). Its MSH swaps the sender and receiver and names the message's control id in MSA-2; segments
+/// end with carriage returns.
+pub fn hl7_ack(text: &str, code: &str, note: &str) -> Result<String, String> {
+    if !["AA", "AE", "AR", "CA", "CE", "CR"].contains(&code) {
+        return Err(format!("`{}` is not an acknowledgment code: AA, AE or AR", code));
+    }
+    let m = read(text)?;
+    let raw = |f: usize| get_raw(&m, "MSH", 0, f).unwrap_or("").to_string();
+    let s = &m.seps;
+    let esc = |t: &str| t.replace(s.esc, &format!("{e}E{e}", e = s.esc)).replace(s.field, &format!("{e}F{e}", e = s.esc)).replace(s.comp, &format!("{e}S{e}", e = s.esc))
+        .replace(s.rep, &format!("{e}R{e}", e = s.esc)).replace(s.sub, &format!("{e}T{e}", e = s.esc)).replace(['\r', '\n'], " ");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let stamp = {
+        let (days, secs) = (now / 86400, now % 86400);
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        format!("{:04}{:02}{:02}{:02}{:02}{:02}", yoe + era * 400 + if mo <= 2 { 1 } else { 0 }, mo, d, secs / 3600, secs % 3600 / 60, secs % 60)
+    };
+    let event = raw(9).split(s.comp).nth(1).unwrap_or("").to_string();
+    let f = s.field;
+    let mut out = format!("MSH{f}{}{f}{}{f}{}{f}{}{f}{}{f}{}{f}{f}ACK{c}{}{f}ACK{}{f}{}{f}{}\r", raw(2), raw(5), raw(6), raw(3), raw(4), stamp, event, raw(10), raw(11), raw(12), c = s.comp);
+    out.push_str(&format!("MSA{f}{}{f}{}{f}{}\r", code, raw(10), esc(note)));
+    if code.ends_with('E') || code.ends_with('R') {
+        out.push_str(&format!("ERR{f}{f}{f}207{c}Application internal error{c}HL70357{f}E{f}{f}{f}{}\r", esc(note), c = s.comp));
+    }
+    Ok(out)
+}

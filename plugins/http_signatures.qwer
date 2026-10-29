@@ -1,0 +1,202 @@
+//! HTTP Signatures for ActivityPub and the fediverse (Mastodon, Pixelfed, Lemmy...): RSA keys for an actor, outgoing requests signed with `Signature` and `Digest` headers, and incoming ones verified.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rsa = "0.9"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! rand_core = { version = "0.6", features = ["getrandom"] }
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::signature::{SignatureEncoding, Signer, Verifier};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// `Tue, 03 Mar 2026 09:00:00 GMT`, the form of the `Date` header.
+fn http_date(t: i64) -> String {
+    let days = t.div_euclid(86400);
+    let (y, m, d) = civil(days);
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let r = t.rem_euclid(86400);
+    format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT", wd, d, MONTHS[(m - 1) as usize], y, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn parse_http_date(s: &str) -> Option<i64> {
+    let p: Vec<&str> = s.split_whitespace().collect();
+    if p.len() < 5 {
+        return None;
+    }
+    let d: i64 = p[1].parse().ok()?;
+    let m = MONTHS.iter().position(|x| x.eq_ignore_ascii_case(p[2]))? as i64 + 1;
+    let y: i64 = p[3].parse().ok()?;
+    let hms: Vec<i64> = p[4].split(':').filter_map(|x| x.parse().ok()).collect();
+    if hms.len() != 3 {
+        return None;
+    }
+    let (yy, mm) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * mm + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400 + hms[0] * 3600 + hms[1] * 60 + hms[2])
+}
+
+fn lower(h: &HashMap<String, String>) -> HashMap<String, String> {
+    h.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect()
+}
+
+fn signing_string(names: &[String], method: &str, path: &str, h: &HashMap<String, String>) -> Result<String, String> {
+    names
+        .iter()
+        .map(|n| {
+            if n == "(request-target)" {
+                Ok(format!("(request-target): {} {}", method.to_lowercase(), path))
+            } else {
+                h.get(n).map(|v| format!("{}: {}", n, v.trim())).ok_or(format!("the `{}` header is signed but missing", n))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|l| l.join("\n"))
+}
+
+/// A new RSA key pair for an actor (2048 bits), as PEM: `{ private_key, public_key }`. Publish the public key in the actor's `publicKey.publicKeyPem`; keep the private one secret.
+pub fn httpsig_keypair() -> Result<HashMap<String, String>, String> {
+    let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
+    let private = key.to_pkcs8_pem(LineEnding::LF).map_err(|e| e.to_string())?.to_string();
+    let public = key.to_public_key().to_public_key_pem(LineEnding::LF).map_err(|e| e.to_string())?;
+    Ok(HashMap::from([("private_key".into(), private), ("public_key".into(), public)]))
+}
+
+/// The `Digest` header for a body: `SHA-256=<base64>`.
+pub fn httpsig_digest(body: &str) -> String {
+    format!("SHA-256={}", STANDARD.encode(Sha256::digest(body.as_bytes())))
+}
+
+/// Signs a request about to be sent: gives the headers to send with it, `host`, `date`, `digest` (for a body) and `signature`, the signature covering
+/// `(request-target) host date` and `digest`. `url` is the full URL; `headers` are others already set (`{}` for none); `key_id` is the key's URL, such as `https://example.com/users/ada#main-key`.
+pub fn httpsig_sign(method: &str, url: &str, headers: std::collections::HashMap<String, String>, body: &str, key_id: &str, private_key_pem: &str) -> Result<HashMap<String, String>, String> {
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+        .or_else(|_| <rsa::RsaPrivateKey as rsa::pkcs1::DecodeRsaPrivateKey>::from_pkcs1_pem(private_key_pem))
+        .map_err(|e| format!("the private key: {}", e))?;
+    let rest = url.split_once("://").ok_or("the url is not absolute")?.1;
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let mut h = lower(&headers);
+    h.entry("host".into()).or_insert_with(|| host.to_string());
+    h.entry("date".into()).or_insert_with(|| http_date(now()));
+    let mut names = vec!["(request-target)".to_string(), "host".into(), "date".into()];
+    if !body.is_empty() || method.eq_ignore_ascii_case("POST") {
+        h.insert("digest".into(), httpsig_digest(body));
+        names.push("digest".into());
+    }
+    if h.contains_key("content-type") {
+        names.push("content-type".into());
+    }
+    let text = signing_string(&names, method, path, &h)?;
+    let sig = SigningKey::<Sha256>::new(key).try_sign(text.as_bytes()).map_err(|e| e.to_string())?;
+    let mut out: HashMap<String, String> = ["host", "date", "digest"].iter().filter_map(|k| h.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
+    out.insert(
+        "signature".into(),
+        format!("keyId=\"{}\",algorithm=\"rsa-sha256\",headers=\"{}\",signature=\"{}\"", key_id.replace('"', ""), names.join(" "), STANDARD.encode(sig.to_bytes())),
+    );
+    Ok(out)
+}
+
+fn sig_params(header: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut rest = header.trim();
+    while !rest.is_empty() {
+        let Some(eq) = rest.find('=') else { break };
+        let key = rest[..eq].trim().trim_start_matches(',').trim().to_string();
+        let after = &rest[eq + 1..];
+        let (val, next) = if let Some(s) = after.strip_prefix('"') {
+            match s.find('"') {
+                Some(e) => (s[..e].to_string(), &s[e + 1..]),
+                None => (s.to_string(), ""),
+            }
+        } else {
+            match after.find(',') {
+                Some(e) => (after[..e].to_string(), &after[e..]),
+                None => (after.to_string(), ""),
+            }
+        };
+        out.insert(key, val);
+        rest = next.trim_start_matches(',').trim();
+    }
+    out
+}
+
+/// The `keyId` of a request's `Signature` header, or null: fetch that actor's public key before `httpsig_verify`.
+pub fn httpsig_key_id(headers: std::collections::HashMap<String, String>) -> Option<String> {
+    lower(&headers).get("signature").and_then(|s| sig_params(s).get("keyId").cloned())
+}
+
+/// Checks a request that came in: its `Signature` header against the sender's public key (PEM), its `Digest` against `body`, and its `Date` within `max_age_seconds` (0: not checked).
+/// `path` is the path with its query, as sent. Gives `{ ok, key_id, error }`.
+pub fn httpsig_verify(method: &str, path: &str, headers: std::collections::HashMap<String, String>, body: &str, public_key_pem: &str, max_age_seconds: i64) -> Value {
+    let h = lower(&headers);
+    let check = || -> Result<String, String> {
+        let p = sig_params(h.get("signature").ok_or("no Signature header")?);
+        let key_id = p.get("keyId").cloned().unwrap_or_default();
+        let names: Vec<String> = p.get("headers").map(|s| s.split_whitespace().map(str::to_lowercase).collect()).unwrap_or_else(|| vec!["date".into()]);
+        let alg = p.get("algorithm").map(String::as_str).unwrap_or("rsa-sha256");
+        if alg != "rsa-sha256" && alg != "hs2019" {
+            return Err(format!("the algorithm {} is not supported (rsa-sha256 is)", alg));
+        }
+        if !names.contains(&"(request-target)".to_string()) || !names.contains(&"date".to_string()) && !names.contains(&"(created)".to_string()) {
+            return Err("the signature must cover (request-target) and date".into());
+        }
+        if let Some(d) = h.get("digest") {
+            if d.trim() != httpsig_digest(body) {
+                return Err("the Digest does not match the body".into());
+            }
+        } else if !body.is_empty() {
+            return Err("a request with a body must have a Digest".into());
+        }
+        if !body.is_empty() && !names.contains(&"digest".to_string()) {
+            return Err("the Digest is not covered by the signature".into());
+        }
+        if max_age_seconds > 0 {
+            let t = h.get("date").and_then(|d| parse_http_date(d)).ok_or("the Date header is missing or not a date")?;
+            if (now() - t).abs() > max_age_seconds {
+                return Err("the Date is too far from now".into());
+            }
+        }
+        let text = signing_string(&names, method, path, &h)?;
+        let key = rsa::RsaPublicKey::from_public_key_pem(public_key_pem)
+            .or_else(|_| <rsa::RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(public_key_pem))
+            .map_err(|e| format!("the public key: {}", e))?;
+        let raw = STANDARD.decode(p.get("signature").ok_or("the Signature has no signature")?).map_err(|_| "the signature is not base64".to_string())?;
+        let sig = Signature::try_from(raw.as_slice()).map_err(|e| e.to_string())?;
+        VerifyingKey::<Sha256>::new(key).verify(text.as_bytes(), &sig).map_err(|_| "the signature does not match".to_string())?;
+        Ok(key_id)
+    };
+    match check() {
+        Ok(k) => json!({ "ok": true, "key_id": k, "error": null }),
+        Err(e) => json!({ "ok": false, "key_id": httpsig_key_id(headers.clone()), "error": e }),
+    }
+}

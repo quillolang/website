@@ -1,0 +1,112 @@
+//! Firebase Cloud Messaging (HTTP v1): notifications to Android, iOS and web apps, with the service account's token made, signed RS256, exchanged and kept until it expires.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! jsonwebtoken = "9"
+//! ureq = { version = "2", features = ["json"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+const SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The service account: its JSON text, or the path of its JSON file.
+fn account(service_account: &str) -> Result<Value, String> {
+    let text = if service_account.trim_start().starts_with('{') {
+        service_account.to_string()
+    } else {
+        std::fs::read_to_string(service_account).map_err(|e| format!("{}: {}", service_account, e))?
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key", "project_id"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+fn assertion(sa: &Value, token_url: &str) -> Result<String, String> {
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let claims = json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": token_url, "iat": t, "exp": t + 3600 });
+    jsonwebtoken::encode(&head, &claims, &key).map_err(|e| e.to_string())
+}
+
+fn token_url(sa: &Value, given: &str) -> String {
+    if !given.is_empty() {
+        given.to_string()
+    } else {
+        sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string()
+    }
+}
+
+/// The signed JWT a service account trades for an access token, and its claims: `{ assertion, claims }`. For a look at what is sent; `fcm_access_token` does the trade.
+pub fn fcm_assertion(service_account: &str) -> Result<Value, String> {
+    let sa = account(service_account)?;
+    let url = token_url(&sa, "");
+    let jwt = assertion(&sa, &url)?;
+    let t = now();
+    Ok(json!({ "assertion": jwt, "claims": { "iss": sa["client_email"], "scope": SCOPE, "aud": url, "iat": t, "exp": t + 3600 } }))
+}
+
+/// An OAuth access token for FCM from a service account (its JSON text or file path), kept and given again until five minutes before it expires.
+/// `token_url` is "" for the account's own `token_uri` (Google's); a stand-in server's address in tests.
+pub fn fcm_access_token(service_account: &str, token_url: &str) -> Result<String, String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
+    let sa = account(service_account)?;
+    let who = sa["client_email"].as_str().unwrap_or("").to_string();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((tok, until)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&who) {
+        if *until > now() + 300 {
+            return Ok(tok.clone());
+        }
+    }
+    let url = self::token_url(&sa, token_url);
+    let jwt = assertion(&sa, &url)?;
+    let res = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let body: Value = match res {
+        Ok(r) => r.into_json().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(code, r)) => return Err(format!("the token server answered {}: {}", code, r.into_string().unwrap_or_default())),
+        Err(e) => return Err(e.to_string()),
+    };
+    let tok = body["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    let until = now() + body["expires_in"].as_i64().unwrap_or(3600);
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(who, (tok.clone(), until));
+    Ok(tok)
+}
+
+/// Sends one message through FCM: `message` is the v1 `message` object, with `token` (one device), `topic` or `condition`, and `notification: { title, body }` and/or `data` (text values only).
+/// `base_url` is "" for Google's; a stand-in server's address in tests. Gives `{ status, ok, name, error, unregistered }`; `unregistered` is true when the device token is no longer valid and should be deleted.
+pub fn fcm_send(service_account: &str, access_token: &str, message: serde_json::Value, base_url: &str) -> Result<Value, String> {
+    let sa = account(service_account)?;
+    if !message.is_object() {
+        return Err("the message is a map: { token, notification: { title, body } }".into());
+    }
+    let base = if base_url.is_empty() { "https://fcm.googleapis.com" } else { base_url.trim_end_matches('/') };
+    let url = format!("{}/v1/projects/{}/messages:send", base, sa["project_id"].as_str().unwrap_or(""));
+    let res = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {}", access_token))
+        .send_json(json!({ "message": message }));
+    let (status, body) = match res {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let err_status = v["error"]["status"].as_str().unwrap_or("");
+    Ok(json!({
+        "status": status, "ok": (200..300).contains(&status), "name": v["name"],
+        "error": v["error"]["message"], "unregistered": status == 404 || err_status == "UNREGISTERED" || err_status == "NOT_FOUND",
+    }))
+}

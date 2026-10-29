@@ -1,0 +1,146 @@
+//! WebAssembly functions run in a sandbox: rules, pricing or scoring code compiled to .wasm (or written as .wat) called with numbers, with a fuel limit so a loop cannot hang the server and a memory cap. No host access at all.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! wasmi = "0.31"
+//! wat = "1"
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use wasmi::core::ValueType;
+
+const MAX_MODULE: usize = 32 << 20;
+const MAX_FUEL: i64 = 10_000_000_000;
+
+fn engine() -> &'static wasmi::Engine {
+    static E: OnceLock<wasmi::Engine> = OnceLock::new();
+    E.get_or_init(|| {
+        let mut c = wasmi::Config::default();
+        c.consume_fuel(true);
+        wasmi::Engine::new(&c)
+    })
+}
+
+/// The module's bytes: a .wasm or .wat file's path, or WAT text (`(module ...)`).
+fn bytes(source: &str) -> Result<Vec<u8>, String> {
+    let s = source.trim_start();
+    if s.starts_with('(') {
+        return wat::parse_str(source).map_err(|e| e.to_string());
+    }
+    let meta = std::fs::metadata(source).map_err(|e| format!("{}: {}", source, e))?;
+    if meta.len() as usize > MAX_MODULE {
+        return Err("a module is at most 32 MB".into());
+    }
+    let b = std::fs::read(source).map_err(|e| format!("{}: {}", source, e))?;
+    if b.starts_with(b"\0asm") {
+        Ok(b)
+    } else {
+        wat::parse_bytes(&b).map(|c| c.into_owned()).map_err(|e| e.to_string())
+    }
+}
+
+/// Compiled modules, by their bytes' hash, so a module used on every request is compiled once.
+fn module(source: &str) -> Result<std::sync::Arc<wasmi::Module>, String> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, std::sync::Arc<wasmi::Module>>>> = OnceLock::new();
+    let b = bytes(source)?;
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish()
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(m) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(m.clone());
+    }
+    let m = std::sync::Arc::new(wasmi::Module::new(engine(), &b[..]).map_err(|e| e.to_string())?);
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if c.len() >= 64 {
+        c.clear();
+    }
+    c.insert(key, m.clone());
+    Ok(m)
+}
+
+fn ty_name(t: ValueType) -> &'static str {
+    match t {
+        ValueType::I32 => "i32",
+        ValueType::I64 => "i64",
+        ValueType::F32 => "f32",
+        ValueType::F64 => "f64",
+        ValueType::FuncRef => "funcref",
+        ValueType::ExternRef => "externref",
+    }
+}
+
+/// What a module offers: its exports `[{ name, kind, params, results }]` (kind "func", "memory", "global" or "table"), and the imports it needs, which `wasm_call` cannot give it.
+pub fn wasm_exports(source: &str) -> Result<Value, String> {
+    let m = module(source)?;
+    let exports: Vec<Value> = m
+        .exports()
+        .map(|e| match e.ty() {
+            wasmi::ExternType::Func(f) => json!({ "name": e.name(), "kind": "func", "params": f.params().iter().map(|t| ty_name(*t)).collect::<Vec<_>>(), "results": f.results().iter().map(|t| ty_name(*t)).collect::<Vec<_>>() }),
+            wasmi::ExternType::Memory(_) => json!({ "name": e.name(), "kind": "memory" }),
+            wasmi::ExternType::Global(_) => json!({ "name": e.name(), "kind": "global" }),
+            wasmi::ExternType::Table(_) => json!({ "name": e.name(), "kind": "table" }),
+        })
+        .collect();
+    let imports: Vec<String> = m.imports().map(|i| format!("{}.{}", i.module(), i.name())).collect();
+    Ok(json!({ "exports": exports, "imports": imports }))
+}
+
+/// Calls the exported function `func` with `args` (numbers, converted to its parameter types), and gives `{ results, fuel_used }`.
+/// `fuel` (1 to ten billion) caps the work: about one unit per instruction; running out stops the call with an error, as does a trap (division by zero, unreachable).
+/// Memory is capped at 64 MB. `source` is a .wasm or .wat file's path, or WAT text. Modules that import functions are refused: the sandbox gives them nothing.
+pub fn wasm_call(source: &str, func: &str, args: Vec<serde_json::Value>, fuel: i64) -> Result<Value, String> {
+    let m = module(source)?;
+    let mut store = wasmi::Store::new(engine(), wasmi::StoreLimitsBuilder::new().memory_size(64 << 20).table_elements(100_000).instances(1).build());
+    store.limiter(|l| l);
+    let budget = fuel.clamp(1, MAX_FUEL) as u64;
+    store.add_fuel(budget).map_err(|e| e.to_string())?;
+    let linker = wasmi::Linker::<wasmi::StoreLimits>::new(engine());
+    let inst = linker.instantiate(&mut store, &m).map_err(|e| format!("cannot instantiate (imports are not given): {}", e))?.start(&mut store).map_err(|e| e.to_string())?;
+    let f = inst.get_func(&store, func).ok_or(format!("the module exports no function `{}`", func))?;
+    let ty = f.ty(&store);
+    if ty.params().len() != args.len() {
+        return Err(format!("`{}` takes {} arguments, not {}", func, ty.params().len(), args.len()));
+    }
+    let mut inputs = Vec::new();
+    for (t, a) in ty.params().iter().zip(&args) {
+        let n = a.as_f64().ok_or(format!("{} is not a number", a))?;
+        inputs.push(match t {
+            ValueType::I32 => wasmi::Value::I32(a.as_i64().unwrap_or(n as i64) as i32),
+            ValueType::I64 => wasmi::Value::I64(a.as_i64().unwrap_or(n as i64)),
+            ValueType::F32 => wasmi::Value::F32((n as f32).into()),
+            ValueType::F64 => wasmi::Value::F64(n.into()),
+            other => return Err(format!("a {} parameter cannot be given from here", ty_name(*other))),
+        });
+    }
+    let mut outputs: Vec<wasmi::Value> = ty.results().iter().map(|t| wasmi::Value::default(*t)).collect();
+    let run = f.call(&mut store, &inputs, &mut outputs);
+    let used = store.fuel_consumed().unwrap_or(0);
+    if let Err(e) = run {
+        let msg = e.to_string();
+        return Err(if used >= budget || msg.contains("fuel") { format!("out of fuel ({} units): the function ran too long", budget) } else { format!("the function trapped: {}", msg) });
+    }
+    let results: Vec<Value> = outputs
+        .iter()
+        .map(|v| match v {
+            wasmi::Value::I32(i) => json!(i),
+            wasmi::Value::I64(i) => json!(i),
+            wasmi::Value::F32(f) => json!(f32::from(*f) as f64),
+            wasmi::Value::F64(f) => json!(f64::from(*f)),
+            _ => Value::Null,
+        })
+        .collect();
+    Ok(json!({ "results": results, "fuel_used": used }))
+}
+
+/// Whether a module loads: `{ ok, error }`, for checking an upload before keeping it.
+pub fn wasm_validate(source: &str) -> Value {
+    match module(source) {
+        Ok(_) => json!({ "ok": true, "error": null }),
+        Err(e) => json!({ "ok": false, "error": e }),
+    }
+}

@@ -1,0 +1,263 @@
+// The newsletter: sign-up with a confirmation link, preferences and one-click
+// unsubscribing, and three kinds of email: issues written on the admin page, a weekly
+// digest of what is new (drafted on Mondays, sent once approved), and an alert for
+// each new blog post. Every email goes through the outbox table, which a job empties
+// every minute through MAIL_PROVIDER:
+//
+//   log        (the default) nothing is sent; each email is kept in the outbox, shown on
+//              the admin page, until a provider is chosen
+//   resend     Resend's API, with RESEND_API_KEY
+//   postmark   Postmark's API, with POSTMARK_TOKEN
+//
+// MAIL_FROM is the sender ("Quillo <news@quillolang.org>"), on a domain the provider knows.
+
+db.exec("create table if not exists subscribers (id integer primary key, email text unique, status text, token text, issues integer default 1, digest integer default 1, alerts integer default 1, ip text, created integer, confirmed integer)")
+db.exec("create table if not exists issues (id integer primary key, kind text, subject text, body text, status text, created integer, sent integer, recipients integer default 0)")
+db.exec("create table if not exists outbox (id integer primary key, email text, subject text, html text, text text, unsub text, issue integer default 0, status text, tries integer default 0, error text, created integer, sent integer)")
+db.exec("create index if not exists outbox_status on outbox (status)")
+db.exec("create table if not exists meta (k text primary key, v text)")
+db.exec("create table if not exists alerted (slug text primary key, at integer)")
+db.exec("create table if not exists seen (kind text, slug text, first_seen integer, primary key (kind, slug))")
+
+let NL_PROVIDER = lower(env("MAIL_PROVIDER") ?? "log")
+let NL_FROM = env("MAIL_FROM") ?? "Quillo <news@quillolang.org>"
+let NL_KINDS = { issue: "issues", digest: "digest", alert: "alerts" }
+
+fn nl_meta(k: str) = db.one("select v from meta where k = ?", k)?.v
+fn nl_set_meta(k: str, v: str) = db.exec("insert into meta (k, v) values (?, ?) on conflict (k) do update set v = excluded.v", k, v)
+
+fn nl_email_ok(e: str) = len(e) <= 254 && re.test(e, "^[^\\s@<>\"]+@[^\\s@<>\"]+\\.[A-Za-z]{2,}$")
+
+// ---- the emails themselves -------------------------------------------------------------------
+
+// An email's HTML: the body (HTML), with the site's name above and the unsubscribe link below.
+fn nl_html(title: str, body: str, unsub: str) = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(title)}</title></head>
+<body style="margin:0;padding:0;background:#f5f3ee;">
+<div style="max-width:600px;margin:0 auto;padding:28px 20px;font:16px/1.6 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1b1630;">
+<p style="margin:0 0 24px;font:600 15px/1 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;letter-spacing:.02em;"><a href="${CM_SITE}/" style="color:#1b1630;text-decoration:none;">Quillo</a></p>
+<div style="background:#ffffff;border-radius:12px;padding:28px 28px 20px;">${body}</div>
+<p style="margin:22px 0 0;font-size:13px;color:#6b6780;">You get this because you signed up at quillolang.org.
+<a href="${unsub}" style="color:#6b6780;">Unsubscribe or change what you get</a>.</p>
+</div></body></html>`
+
+fn nl_text(html: str) = trim(re.replace(re.replace(re.replace(html, "<br\\s*/?>|</p>|</h[1-6]>|</li>", "\n"), "<[^>]+>", ""), "\n{3,}", "\n\n"))
+
+fn nl_queue(email: str, subject: str, html: str, text: str, unsub: str, issue: int) =
+    db.exec("insert into outbox (email, subject, html, text, unsub, issue, status, created) values (?, ?, ?, ?, ?, ?, 'queued', ?)",
+        email, subject, html, text, unsub, issue, now())
+
+fn nl_prefs_url(s) = `${CM_SITE}/newsletter/preferences/?t=${s.token}`
+
+// One email, through the provider; true when it went (or was logged).
+fn nl_send(m) {
+    if NL_PROVIDER == "log" { return { ok: true, status: "logged" } }
+    let headers_list = { "List-Unsubscribe": `<${m.unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }
+    let r = NL_PROVIDER == "resend"
+        ? http.post("https://api.resend.com/emails", { from: NL_FROM, to: [m.email], subject: m.subject, html: m.html, text: m.text, headers: headers_list },
+            { authorization: `Bearer ${env("RESEND_API_KEY") ?? ""}` }, { timeout: 20 })
+        : NL_PROVIDER == "postmark"
+        ? http.post("https://api.postmarkapp.com/email", { From: NL_FROM, To: m.email, Subject: m.subject, HtmlBody: m.html, TextBody: m.text,
+            MessageStream: m.issue == 0 ? "outbound" : "broadcast", Headers: keys(headers_list) | map((k) => { Name: k, Value: headers_list[k] }) },
+            { "x-postmark-server-token": env("POSTMARK_TOKEN") ?? "", accept: "application/json" }, { timeout: 20 })
+        : err(`MAIL_PROVIDER is ${NL_PROVIDER}: it is log, resend or postmark`)
+    if is_err(r) { return { ok: false, error: r.error } }
+    r.ok ? { ok: true, status: "sent" } : { ok: false, error: `${r.status}: ${slice(r.body, 0, 300)}` }
+}
+
+// Every minute: up to 100 queued emails go out; one that fails is tried 3 times.
+fn nl_deliver() {
+    for m in db.query("select * from outbox where status = 'queued' or (status = 'failed' and tries < 3) order by id limit 100") {
+        let r = nl_send(m)
+        if r.ok {
+            db.exec("update outbox set status = ?, sent = ?, tries = tries + 1, error = null where id = ?", r.status, now(), m.id)
+        } else {
+            db.exec("update outbox set status = 'failed', tries = tries + 1, error = ? where id = ?", r.error, m.id)
+        }
+    }
+}
+schedule("1m", nl_deliver)
+
+// ---- issues, digests and alerts -------------------------------------------------------------
+
+// The confirmed subscribers who want `pref`: "issues", "digest" or "alerts".
+fn nl_wanting(pref: str) = db.query("select * from subscribers where status = 'confirmed' and ((? = 'issues' and issues = 1) or (? = 'digest' and digest = 1) or (? = 'alerts' and alerts = 1))", pref, pref, pref)
+
+// Sends an issue to every confirmed subscriber who wants its kind; how many.
+fn nl_send_issue(id: int) {
+    let i = db.one("select * from issues where id = ?", id)
+    if i == null || i.status == "sent" { return 0 }
+    let pref = NL_KINDS[i.kind] ?? "issues"
+    let subs = nl_wanting(pref)
+    let body = str(markdown(i.body, { html: true }))
+    for s in subs {
+        let html = nl_html(i.subject, body, nl_prefs_url(s))
+        nl_queue(s.email, i.subject, html, nl_text(body) + `\n\nUnsubscribe: ${nl_prefs_url(s)}`, `${CM_SITE}/newsletter/unsubscribe/?t=${s.token}`, id)
+    }
+    db.exec("update issues set status = 'sent', sent = ?, recipients = ? where id = ?", now(), len(subs), id)
+    len(subs)
+}
+
+// What the site has, so a digest can tell what is new: each component and plugin, the
+// time it was first seen. The first run sees them all at once, and counts none as new.
+fn nl_see() {
+    let first_run = nl_meta("since") == null
+    let at = first_run ? 0 : now()
+    for c in kit_items { db.exec("insert or ignore into seen (kind, slug, first_seen) values ('component', ?, ?)", c.slug, at) }
+    for p in plug_items { db.exec("insert or ignore into seen (kind, slug, first_seen) values ('plugin', ?, ?)", p.slug, at) }
+    if first_run {
+        nl_set_meta("since", str(now()))
+        for p in blog_posts { db.exec("insert or ignore into alerted (slug, at) values (?, ?)", p.slug, now()) }
+    }
+}
+
+// The digest since the last one, as a draft issue for an admin to look at and send; none
+// when nothing is new.
+fn nl_digest() {
+    nl_see()
+    let since = int(nl_meta("digest_at") ?? nl_meta("since") ?? "0")
+    let since_day = date.format(date.from_ms(since), "yyyy-MM-dd")
+    let posts = blog_posts | filter((p) => p.date > since_day && p.date <= date.format(date.today(), "yyyy-MM-dd"))
+    let comps = db.query("select slug from seen where kind = 'component' and first_seen > ?", since) | map((r) => find(kit_items, (c) => c.slug == r.slug)) | filter((c) => c != null)
+    let plugs = db.query("select slug from seen where kind = 'plugin' and first_seen > ?", since) | map((r) => find(plug_items, (p) => p.slug == r.slug)) | filter((p) => p != null)
+    let projects = db.query("select id, name, summary from projects where status = 'shown' and created > ? order by id", since)
+    nl_set_meta("digest_at", str(now()))
+    if len(posts) + len(comps) + len(plugs) + len(projects) == 0 { return null }
+    let part = (title: str, rows: list) => len(rows) == 0 ? "" : `## ${title}\n\n${join(rows, "\n")}\n\n`
+    let body = "What is new on quillolang.org this week.\n\n"
+        + part("On the blog", posts | map((p) => `- [${p.title}](${CM_SITE}${p.url}): ${p.summary}`))
+        + part("New components", comps | take(30) | map((c) => `- [${c.name}](${CM_SITE}/components/${c.slug}/): ${c.summary}`))
+        + part("New plugins", plugs | take(30) | map((p) => `- [${p.name}](${CM_SITE}/plugins/${p.slug}/): ${p.summary}`))
+        + part("In the showcase", projects | map((p) => `- [${p.name}](${CM_SITE}/showcase/${p.id}/): ${p.summary}`))
+    let subject = `Quillo this week: ${join(([len(posts) > 0 ? `${len(posts)} post${len(posts) == 1 ? "" : "s"}` : ""]
+        + [len(comps) > 0 ? `${len(comps)} component${len(comps) == 1 ? "" : "s"}` : ""]
+        + [len(plugs) > 0 ? `${len(plugs)} plugin${len(plugs) == 1 ? "" : "s"}` : ""]
+        + [len(projects) > 0 ? `${len(projects)} project${len(projects) == 1 ? "" : "s"}` : ""]) | filter((x) => x != ""), ", ")}`
+    db.exec("insert into issues (kind, subject, body, status, created) values ('digest', ?, ?, 'draft', ?)", subject, body, now())
+}
+schedule("0 8 * * 1", nl_digest)
+
+// Each hour: a blog post whose day has come is sent to those who want alerts, once.
+fn nl_alerts() {
+    nl_see()
+    let today = date.format(date.today(), "yyyy-MM-dd")
+    for p in blog_posts | filter((p) => p.date <= today) {
+        if db.one("select 1 as x from alerted where slug = ?", p.slug) == null {
+            db.exec("insert into alerted (slug, at) values (?, ?)", p.slug, now())
+            db.exec("insert into issues (kind, subject, body, status, created) values ('alert', ?, ?, 'draft', ?)",
+                `New on the Quillo blog: ${p.title}`, `## [${p.title}](${CM_SITE}${p.url})\n\n${p.summary}\n\n[Read it on quillolang.org](${CM_SITE}${p.url})`, now())
+            nl_send_issue(db.one("select max(id) as id from issues").id)
+        }
+    }
+}
+schedule("1h", nl_alerts)
+
+// ---- the pages ------------------------------------------------------------------------------
+
+// The sign-up form, without JavaScript: a page posts it, and comes back to `from`.
+view SiteSubscribe(from: str = "/blog/", compact: bool = false) =
+    <form.nl-form method="post" action="/newsletter/subscribe/">
+        {!compact && <p.nl-title><b>The Quillo newsletter</b><span>New posts, components and plugins, about once a week. No tracking.</span></p>}
+        <div.nl-row>
+            <label.visually-hidden for={`nl-email-${len(from)}`}>Your email</label>
+            <input id={`nl-email-${len(from)}`} name="email" type="email" required maxlength="254" placeholder="you@example.com" autocomplete="email"/>
+            <input.cm-trap name="website" tabindex="-1" autocomplete="off" aria-hidden="true"/>
+            <input type="hidden" name="from" value={from}/>
+            <button.cm-btn>Subscribe</button>
+        </div>
+    </form>
+
+fn nl_page(title: str, path: str, children) =
+    <SitePage title={`${title} · Quillo newsletter`} path={path} label="Newsletter" href="/newsletter/"
+              description="The Quillo newsletter: new blog posts, components and plugins, about once a week.">
+        <div.prose>{children}</div>
+    </SitePage>
+
+route GET /newsletter = nl_page("Subscribe", "/newsletter/", [
+    <p.kicker>Newsletter</p>,
+    <h1>What's new in Quillo, by email</h1>,
+    <p.lede>About once a week: new blog posts, components, plugins and projects from the showcase, and now and then an
+        issue written by hand. You confirm by email, and every email has a link to leave.</p>,
+    <SiteSubscribe from="/newsletter/" compact={true}/>,
+    <p>What you get is yours to choose after you confirm: written issues, the weekly digest, and a note for each new blog post.</p>,
+])
+
+// Sign-up: a confirmation link to the address. The answer is the same whether or not
+// the address was there already, so the form tells no one who subscribes.
+route POST /newsletter/subscribe { form: { email: str = "", website: str = "", from: str = "/" } } {
+    let e = lower(trim(email))
+    if website != "" || !nl_email_ok(e) { return respond(422, nl_page("Check the address", "/newsletter/", [<h1>That address does not look right</h1>, <p>Go back and check it.</p>])) }
+    let ip = crypto.sha256(`${env("QUILLO_SECRET") ?? "dev"}:${request.ip}`)
+    if db.one("select count(*) as n from subscribers where ip = ? and created > ?", ip, now() - 60 * CM_MINUTE).n >= 5 {
+        return respond(429, nl_page("Later", "/newsletter/", [<h1>Too many sign-ups from here</h1>, <p>Try again in an hour.</p>]))
+    }
+    let had = db.one("select * from subscribers where email = ?", e)
+    if had == null || had.status != "confirmed" {
+        let token = crypto.token(24)
+        if had == null {
+            db.exec("insert into subscribers (email, status, token, ip, created) values (?, 'pending', ?, ?, ?)", e, token, ip, now())
+        } else {
+            db.exec("update subscribers set status = 'pending', token = ?, ip = ?, created = ? where id = ?", token, ip, now(), had.id)
+        }
+        let link = `${CM_SITE}/newsletter/confirm/?t=${token}`
+        let body = `<h1 style="margin:0 0 12px;font-size:22px;">Confirm your subscription</h1><p>Someone, hopefully you, asked to get the Quillo newsletter at this address. To confirm, open this link:</p><p><a href="${link}" style="display:inline-block;padding:10px 18px;border-radius:999px;background:#f3b54a;color:#1b1630;font-weight:600;text-decoration:none;">Yes, subscribe me</a></p><p style="color:#6b6780;font-size:14px;">If it was not you, do nothing: you will not hear from us again.</p>`
+        nl_queue(e, "Confirm your Quillo newsletter subscription", nl_html("Confirm", body, link), `Confirm your subscription to the Quillo newsletter: ${link}`, link, 0)
+    }
+    redirect("/newsletter/thanks/")
+}
+
+route GET /newsletter/thanks = nl_page("Check your inbox", "/newsletter/thanks/", [
+    <p.kicker>Newsletter</p>, <h1>Check your inbox</h1>,
+    <p.lede>We sent a link to confirm. Once you open it, you're in. Nothing there? Look in the spam folder.</p>])
+
+route GET /newsletter/confirm ? { t: str = "" } {
+    let s = db.one("select * from subscribers where token = ?", t) ?? reply 404 "That link is out of date: sign up again."
+    db.exec("update subscribers set status = 'confirmed', confirmed = ? where id = ?", now(), s.id)
+    nl_page("You're in", "/newsletter/confirm/", [<p.kicker>Newsletter</p>, <h1>You're in</h1>,
+        <p.lede>The next email comes with what is new. <a href={`/newsletter/preferences/?t=${t}`}>Choose what you get</a>.</p>])
+}
+
+fn nl_prefs_page(s, saved: bool) =
+    nl_page("Your newsletter", "/newsletter/preferences/", [
+        <p.kicker>Newsletter</p>, <h1>What you get</h1>,
+        <p>For <b>{s.email}</b>{s.status == "unsubscribed" ? ": unsubscribed, you get nothing." : "."}</p>,
+        saved ? <p.cm-note role="status">Saved.</p> : null,
+        <form.cm-form method="post" action="/newsletter/preferences/">
+            <input type="hidden" name="t" value={s.token}/>
+            <label.nl-check><input type="checkbox" name="issues" value="1" checked={s.issues == 1}/> Issues written by hand, now and then</label>
+            <label.nl-check><input type="checkbox" name="digest" value="1" checked={s.digest == 1}/> The weekly digest of what is new</label>
+            <label.nl-check><input type="checkbox" name="alerts" value="1" checked={s.alerts == 1}/> A note for each new blog post</label>
+            <div.cm-row><button.cm-btn>Save</button></div>
+        </form>,
+        <form method="post" action={`/newsletter/unsubscribe/?t=${s.token}`}><button.cm-link>Unsubscribe from everything</button></form>,
+    ])
+
+route GET /newsletter/preferences ? { t: str = "" } {
+    let s = db.one("select * from subscribers where token = ?", t) ?? reply 404 "That link is out of date."
+    nl_prefs_page(s, false)
+}
+
+route POST /newsletter/preferences { form: { t: str = "", issues: str = "", digest: str = "", alerts: str = "" } } {
+    let s = db.one("select * from subscribers where token = ?", t) ?? reply 404 "That link is out of date."
+    let on = (v: str) => v == "1" ? 1 : 0
+    let any = on(issues) + on(digest) + on(alerts) > 0
+    db.exec("update subscribers set issues = ?, digest = ?, alerts = ?, status = ? where id = ?", on(issues), on(digest), on(alerts),
+        any ? (s.status == "unsubscribed" ? "confirmed" : s.status) : "unsubscribed", s.id)
+    nl_prefs_page(db.one("select * from subscribers where id = ?", s.id), true)
+}
+
+// One click from the email, or from the mail app's own button (RFC 8058, a POST from elsewhere).
+allow_cross_site("/newsletter/unsubscribe/")
+route GET /newsletter/unsubscribe ? { t: str = "" } {
+    let s = db.one("select * from subscribers where token = ?", t) ?? reply 404 "That link is out of date."
+    nl_page("Unsubscribe", "/newsletter/unsubscribe/", [<p.kicker>Newsletter</p>, <h1>Leave the newsletter?</h1>,
+        <p>For <b>{s.email}</b>.</p>,
+        <form method="post" action={`/newsletter/unsubscribe/?t=${t}`}><button.cm-btn>Unsubscribe</button></form>,
+        <p><a href={`/newsletter/preferences/?t=${t}`}>Or choose what you get</a>.</p>])
+}
+
+route POST /newsletter/unsubscribe ? { t: str = "" } {
+    let s = db.one("select * from subscribers where token = ?", t) ?? reply 404 "That link is out of date."
+    db.exec("update subscribers set status = 'unsubscribed' where id = ?", s.id)
+    nl_page("Unsubscribed", "/newsletter/unsubscribe/", [<p.kicker>Newsletter</p>, <h1>Unsubscribed</h1>,
+        <p.lede>You will get nothing more. Changed your mind? <a href={`/newsletter/preferences/?t=${t}`}>Choose what you get</a>.</p>])
+}
