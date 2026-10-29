@@ -60,6 +60,15 @@ ln -s "$kit" "$tmpkit/quillo-ui"
 (cd "$tmpkit" && zip -q -X "$out/components/quillo-ui.zip" -@ < "$out/kit-files.txt")
 rm -rf "$tmpkit" "$out/kit-files.txt"
 
+# The plugins: each one built and its example run first (SKIP_PLUGIN_TESTS=1 skips
+# it; it needs cargo), then the files to download and a zip of them all.
+if [ "${SKIP_PLUGIN_TESTS:-}" != 1 ]; then
+    QUILLO="$quillo" node "$here/plugins/test.mjs"
+fi
+"$here/plugins/zip.sh"
+mkdir -p "$out/plugins/files"
+cp "$here"/plugins/*.qwer "$here"/plugins/*.qwe "$here"/plugins/sample.jpg "$here/plugins/quillo-plugins.zip" "$out/plugins/files/"
+
 # Bundles are named by their content, so browsers may keep them for good.
 # Pages may be kept 30 seconds, as quillo run lets a prefetched page be kept:
 # a browser without speculation rules fetches the page a link points to, and
@@ -73,12 +82,12 @@ cat > "$out/.htaccess" <<'EOF'
   <FilesMatch "\.html$">
     Header set Cache-Control "private, max-age=30"
   </FilesMatch>
-  <FilesMatch "\.qwe$">
+  <FilesMatch "\.qwer?$">
     Header set Cache-Control "public, max-age=300"
   </FilesMatch>
 </IfModule>
 <IfModule mod_mime.c>
-  AddType text/plain;charset=utf-8 .qwe
+  AddType text/plain;charset=utf-8 .qwe .qwer
 </IfModule>
 <IfModule mod_deflate.c>
   AddOutputFilterByType DEFLATE text/html text/css text/plain application/javascript image/svg+xml
