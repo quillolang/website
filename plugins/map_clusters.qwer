@@ -1,0 +1,186 @@
+//! Map markers clustered by zoom, as Supercluster does for Mapbox and Leaflet: thousands of points loaded once, then for any view and zoom the clusters with their counts and the single points, a cluster's points and the zoom at which it opens.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::f64::consts::PI;
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct Node { x: f64, y: f64, count: usize, zoom: i64, children: Vec<usize>, point: Option<usize> }
+
+struct Index { nodes: Vec<Node>, points: Vec<Value>, levels: HashMap<i64, Vec<usize>>, min_zoom: i64, max_zoom: i64 }
+
+fn store() -> &'static Mutex<HashMap<String, Arc<Index>>> {
+    static S: OnceLock<Mutex<HashMap<String, Arc<Index>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get(name: &str) -> Result<Arc<Index>, String> {
+    store().lock().map_err(|_| "the cluster store is unavailable".to_string())?.get(name).cloned().ok_or_else(|| format!("no points loaded as `{}`: call map_clusters_load first", name))
+}
+
+fn lng_x(lng: f64) -> f64 { lng / 360.0 + 0.5 }
+fn lat_y(lat: f64) -> f64 {
+    let s = lat.to_radians().sin();
+    let y = 0.5 - 0.25 * ((1.0 + s) / (1.0 - s)).ln() / PI;
+    y.clamp(0.0, 1.0)
+}
+fn x_lng(x: f64) -> f64 { (x - 0.5) * 360.0 }
+fn y_lat(y: f64) -> f64 { (((180.0 - y * 360.0) * PI / 180.0).exp().atan() * 360.0 / PI) - 90.0 }
+
+fn opt(o: &Value, k: &str, d: f64) -> f64 { o.get(k).and_then(|v| v.as_f64()).unwrap_or(d) }
+
+fn point_of(v: &Value) -> Option<(f64, f64, Value)> {
+    if v.get("type").and_then(|t| t.as_str()) == Some("Feature") {
+        let c = v["geometry"]["coordinates"].as_array()?;
+        if v["geometry"]["type"] != "Point" || c.len() < 2 { return None }
+        return Some((c[0].as_f64()?, c[1].as_f64()?, v.clone()));
+    }
+    let lat = v.get("lat").and_then(|x| x.as_f64())?;
+    let lon = v.get("lon").or_else(|| v.get("lng")).and_then(|x| x.as_f64())?;
+    Some((lon, lat, json!({"type": "Feature", "properties": v, "geometry": {"type": "Point", "coordinates": [lon, lat]}})))
+}
+
+fn abbrev(n: usize) -> String {
+    if n >= 10000 { format!("{}k", (n as f64 / 1000.0).round()) } else if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
+}
+
+/// Loads points under `name` and clusters them for every zoom: `points` is a GeoJSON FeatureCollection of points, a list of point features, or rows with `lat` and `lon` (or `lng`).
+/// `options`: `radius` (pixels, 40), `extent` (tile size, 512), `min_zoom` (0), `max_zoom` (16), `min_points` (2). Loading again replaces them. The number of points loaded.
+pub fn map_clusters_load(name: &str, points: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    let list = match &points {
+        Value::Array(a) => a.clone(),
+        Value::Object(o) if o.get("features").is_some() => o["features"].as_array().cloned().unwrap_or_default(),
+        _ => return Err("points are a FeatureCollection or a list".into()),
+    };
+    let radius = opt(&options, "radius", 40.0);
+    let extent = opt(&options, "extent", 512.0);
+    let min_zoom = opt(&options, "min_zoom", 0.0) as i64;
+    let max_zoom = opt(&options, "max_zoom", 16.0) as i64;
+    let min_points = opt(&options, "min_points", 2.0).max(2.0) as usize;
+    if !(0..=24).contains(&min_zoom) || !(min_zoom..=24).contains(&max_zoom) {
+        return Err("zooms are 0 to 24, min_zoom at most max_zoom".into());
+    }
+    let mut nodes = Vec::new();
+    let mut pts = Vec::new();
+    for (i, v) in list.iter().enumerate() {
+        let (lon, lat, f) = point_of(v).ok_or_else(|| format!("point {} has no point geometry or lat and lon", i + 1))?;
+        nodes.push(Node { x: lng_x(lon), y: lat_y(lat), count: 1, zoom: i64::MAX, children: vec![], point: Some(pts.len()) });
+        pts.push(f);
+    }
+    let mut levels = HashMap::new();
+    let mut current: Vec<usize> = (0..nodes.len()).collect();
+    levels.insert(max_zoom + 1, current.clone());
+    for z in (min_zoom..=max_zoom).rev() {
+        let r = radius / (extent * 2f64.powi(z as i32));
+        let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for &n in &current { grid.entry(((nodes[n].x / r).floor() as i64, (nodes[n].y / r).floor() as i64)).or_default().push(n) }
+        let mut taken: HashMap<usize, bool> = HashMap::new();
+        let mut next = Vec::new();
+        for &n in &current {
+            if taken.contains_key(&n) { continue }
+            taken.insert(n, true);
+            let (x, y) = (nodes[n].x, nodes[n].y);
+            let (cx, cy) = ((x / r).floor() as i64, (y / r).floor() as i64);
+            let mut near = Vec::new();
+            for gx in cx - 1..=cx + 1 {
+                for gy in cy - 1..=cy + 1 {
+                    if let Some(cell) = grid.get(&(gx, gy)) {
+                        for &m in cell {
+                            if m != n && !taken.contains_key(&m) && (nodes[m].x - x).powi(2) + (nodes[m].y - y).powi(2) <= r * r { near.push(m) }
+                        }
+                    }
+                }
+            }
+            let total: usize = nodes[n].count + near.iter().map(|&m| nodes[m].count).sum::<usize>();
+            if near.is_empty() || total < min_points {
+                next.push(n);
+                continue;
+            }
+            let (mut wx, mut wy) = (x * nodes[n].count as f64, y * nodes[n].count as f64);
+            for &m in &near { taken.insert(m, true); wx += nodes[m].x * nodes[m].count as f64; wy += nodes[m].y * nodes[m].count as f64; }
+            let mut children = vec![n];
+            children.extend(near);
+            nodes.push(Node { x: wx / total as f64, y: wy / total as f64, count: total, zoom: z, children, point: None });
+            next.push(nodes.len() - 1);
+        }
+        levels.insert(z, next.clone());
+        current = next;
+    }
+    let count = pts.len() as i64;
+    let idx = Index { nodes, points: pts, levels, min_zoom, max_zoom };
+    store().lock().map_err(|_| "the cluster store is unavailable".to_string())?.insert(name.to_string(), Arc::new(idx));
+    Ok(count)
+}
+
+fn feature(idx: &Index, n: usize) -> Value {
+    let node = &idx.nodes[n];
+    if let Some(p) = node.point { return idx.points[p].clone() }
+    let mut props = Map::new();
+    props.insert("cluster".into(), json!(true));
+    props.insert("cluster_id".into(), json!(n));
+    props.insert("point_count".into(), json!(node.count));
+    props.insert("point_count_abbreviated".into(), json!(abbrev(node.count)));
+    let r = |v: f64| (v * 1e6).round() / 1e6;
+    json!({"type": "Feature", "properties": props, "geometry": {"type": "Point", "coordinates": [r(x_lng(node.x)), r(y_lat(node.y))]}})
+}
+
+/// The clusters and single points in a view, `[west, south, east, north]` in degrees, at `zoom`: GeoJSON features. A cluster's properties are `{ cluster: true, cluster_id, point_count, point_count_abbreviated }`; a single point is its own feature, properties and all.
+pub fn map_clusters_get(name: &str, bbox: Vec<f64>, zoom: i64) -> Result<Vec<Value>, String> {
+    let idx = get(name)?;
+    if bbox.len() != 4 { return Err("the view is [west, south, east, north]".into()) }
+    let z = zoom.clamp(idx.min_zoom, idx.max_zoom + 1);
+    let (w, s, e, n) = (bbox[0], bbox[1].max(-90.0), bbox[2], bbox[3].min(90.0));
+    let (y0, y1) = (lat_y(n), lat_y(s));
+    let span = e - w;
+    let ranges: Vec<(f64, f64)> = if span >= 360.0 { vec![(0.0, 1.0)] } else {
+        let w = ((w + 180.0).rem_euclid(360.0)) - 180.0;
+        let e = ((e + 180.0).rem_euclid(360.0)) - 180.0;
+        if w <= e { vec![(lng_x(w), lng_x(e))] } else { vec![(lng_x(w), 1.0), (0.0, lng_x(e))] }
+    };
+    let level = idx.levels.get(&z).cloned().unwrap_or_default();
+    Ok(level.into_iter().filter(|&i| {
+        let nd = &idx.nodes[i];
+        nd.y >= y0 && nd.y <= y1 && ranges.iter().any(|(a, b)| nd.x >= *a && nd.x <= *b)
+    }).map(|i| feature(&idx, i)).collect())
+}
+
+/// The points inside a cluster, as their features: `limit` of them after skipping `offset`, for a list beside the map.
+pub fn map_clusters_leaves(name: &str, cluster_id: i64, limit: i64, offset: i64) -> Result<Vec<Value>, String> {
+    let idx = get(name)?;
+    let id = cluster_id as usize;
+    if cluster_id < 0 || id >= idx.nodes.len() || idx.nodes[id].point.is_some() { return Err(format!("no cluster {}", cluster_id)) }
+    let mut out = Vec::new();
+    let mut stack = vec![id];
+    let mut skipped = 0;
+    while let Some(n) = stack.pop() {
+        let node = &idx.nodes[n];
+        if let Some(p) = node.point {
+            if skipped < offset { skipped += 1; continue }
+            out.push(idx.points[p].clone());
+            if out.len() as i64 >= limit { break }
+        } else {
+            stack.extend(node.children.iter().rev());
+        }
+    }
+    Ok(out)
+}
+
+/// What a cluster splits into one zoom in: its clusters and points, as features.
+pub fn map_clusters_children(name: &str, cluster_id: i64) -> Result<Vec<Value>, String> {
+    let idx = get(name)?;
+    let id = cluster_id as usize;
+    if cluster_id < 0 || id >= idx.nodes.len() || idx.nodes[id].point.is_some() { return Err(format!("no cluster {}", cluster_id)) }
+    Ok(idx.nodes[id].children.iter().map(|&c| feature(&idx, c)).collect())
+}
+
+/// The zoom at which a cluster breaks apart: where to zoom the map when someone clicks it.
+pub fn map_clusters_expansion_zoom(name: &str, cluster_id: i64) -> Result<i64, String> {
+    let idx = get(name)?;
+    let id = cluster_id as usize;
+    if cluster_id < 0 || id >= idx.nodes.len() || idx.nodes[id].point.is_some() { return Err(format!("no cluster {}", cluster_id)) }
+    Ok(idx.nodes[id].zoom + 1)
+}

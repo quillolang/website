@@ -1,0 +1,134 @@
+//! Loudness of WAV audio as broadcasters and streaming services measure it (EBU R128 / ITU BS.1770): integrated loudness in LUFS, loudness range, true peak; silences found; leading and trailing silence trimmed; and a file normalised to -16 LUFS for podcasts, -14 for Spotify and YouTube, or -23 for broadcast.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ebur128 = "=0.1.11"
+//! hound = "3.5"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use ebur128::{EbuR128, Mode};
+use serde_json::{json, Value};
+
+struct Audio { rate: u32, channels: u16, samples: Vec<f32> }
+
+const MAX_SAMPLES: usize = 400_000_000;
+
+fn read(path: &str) -> Result<Audio, String> {
+    let mut r = hound::WavReader::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let spec = r.spec();
+    if r.len() as usize > MAX_SAMPLES { return Err(format!("{}: too long", path)) }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>().map_err(|e| format!("{}: {}", path, e))?,
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            r.samples::<i32>().map(|s| s.map(|v| v as f32 / scale)).collect::<Result<_, _>>().map_err(|e| format!("{}: {}", path, e))?
+        }
+    };
+    Ok(Audio { rate: spec.sample_rate, channels: spec.channels, samples })
+}
+
+fn write(path: &str, a: &Audio, samples: &[f32]) -> Result<(), String> {
+    if let Some(d) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
+    let spec = hound::WavSpec { channels: a.channels, sample_rate: a.rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(path, spec).map_err(|e| format!("{}: {}", path, e))?;
+    for s in samples { w.write_sample((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).map_err(|e| e.to_string())? }
+    w.finalize().map_err(|e| e.to_string())
+}
+
+fn db(v: f64) -> Value {
+    if v.is_finite() { json!((v * 10.0).round() / 10.0) } else { Value::Null }
+}
+
+fn measure(a: &Audio, samples: &[f32]) -> Result<Value, String> {
+    let ch = a.channels as u32;
+    let mut m = EbuR128::new(ch, a.rate, Mode::I | Mode::LRA | Mode::TRUE_PEAK | Mode::SAMPLE_PEAK).map_err(|e| format!("{:?}", e))?;
+    // Fed a tenth of a second at a time, to note the loudest moments.
+    let block = (a.rate as usize / 10) * ch as usize;
+    let (mut max_m, mut max_s) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for chunk in samples.chunks(block.max(ch as usize)) {
+        m.add_frames_f32(chunk).map_err(|e| format!("{:?}", e))?;
+        if let Ok(v) = m.loudness_momentary() { max_m = max_m.max(v) }
+        if let Ok(v) = m.loudness_shortterm() { max_s = max_s.max(v) }
+    }
+    let tp = (0..ch).map(|c| m.true_peak(c).unwrap_or(0.0)).fold(0.0, f64::max);
+    let sp = (0..ch).map(|c| m.sample_peak(c).unwrap_or(0.0)).fold(0.0, f64::max);
+    Ok(json!({
+        "integrated_lufs": db(m.loudness_global().unwrap_or(f64::NEG_INFINITY)),
+        "range_lu": db(m.loudness_range().unwrap_or(0.0)),
+        "true_peak_dbtp": db(20.0 * tp.log10()),
+        "sample_peak_dbfs": db(20.0 * sp.log10()),
+        "max_momentary_lufs": db(max_m),
+        "max_short_term_lufs": db(max_s),
+        "duration": ((samples.len() as f64 / ch as f64 / a.rate as f64) * 100.0).round() / 100.0,
+        "sample_rate": a.rate,
+        "channels": ch,
+    }))
+}
+
+// The loudness of each 10 ms window, in dBFS (RMS across channels).
+fn windows(a: &Audio) -> (usize, Vec<f64>) {
+    let frame = a.channels as usize;
+    let w = (a.rate as usize / 100).max(1) * frame;
+    (w / frame, a.samples.chunks(w).map(|c| { let ms = c.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / c.len() as f64; 10.0 * ms.max(1e-12).log10() }).collect())
+}
+
+/// A WAV file's loudness by EBU R128: `{ integrated_lufs, range_lu, true_peak_dbtp, sample_peak_dbfs, max_momentary_lufs, max_short_term_lufs, duration, sample_rate, channels }`. LUFS to one decimal; a silent file's loudness is null.
+pub fn loudness_measure(path: &str) -> Result<Value, String> {
+    let a = read(path)?;
+    measure(&a, &a.samples)
+}
+
+/// The silences of a WAV file: stretches quieter than `threshold_db` (dBFS, -50 is a quiet room) lasting at least `min_seconds`: `[{ start, end, duration }]` in seconds. For splitting recordings and finding dead air.
+pub fn loudness_silences(path: &str, threshold_db: f64, min_seconds: f64) -> Result<Vec<Value>, String> {
+    let a = read(path)?;
+    let (win, levels) = windows(&a);
+    let sec = win as f64 / a.rate as f64;
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, l) in levels.iter().chain(std::iter::once(&0.0)).enumerate() {
+        let quiet = i < levels.len() && *l < threshold_db;
+        match (quiet, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                let (st, en) = (s as f64 * sec, (i as f64 * sec).min(a.samples.len() as f64 / a.channels as f64 / a.rate as f64));
+                if en - st >= min_seconds { out.push(json!({ "start": (st * 100.0).round() / 100.0, "end": (en * 100.0).round() / 100.0, "duration": ((en - st) * 100.0).round() / 100.0 })) }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// A WAV file with its leading and trailing silence (quieter than `threshold_db`) cut off, a little (`keep_seconds`) left at each end, written to `out_path` as 16-bit WAV: `{ path, removed_start, removed_end, duration }` in seconds. For voice notes and recorded answers.
+pub fn loudness_trim(path: &str, out_path: &str, threshold_db: f64, keep_seconds: f64) -> Result<Value, String> {
+    let a = read(path)?;
+    let (win, levels) = windows(&a);
+    let first = levels.iter().position(|l| *l >= threshold_db).ok_or_else(|| format!("{}: all of it is quieter than {} dB", path, threshold_db))?;
+    let last = levels.iter().rposition(|l| *l >= threshold_db).unwrap_or(levels.len() - 1);
+    let keep = (keep_seconds.max(0.0) * a.rate as f64) as usize;
+    let frames = a.samples.len() / a.channels as usize;
+    let s = (first * win).saturating_sub(keep);
+    let e = (((last + 1) * win) + keep).min(frames);
+    let ch = a.channels as usize;
+    write(out_path, &a, &a.samples[s * ch..e * ch])?;
+    let r = |x: f64| (x * 100.0).round() / 100.0;
+    Ok(json!({ "path": out_path, "removed_start": r(s as f64 / a.rate as f64), "removed_end": r((frames - e) as f64 / a.rate as f64), "duration": r((e - s) as f64 / a.rate as f64) }))
+}
+
+/// A WAV file brought to `target_lufs` (-16 for podcasts, -14 for music streaming, -23 for EBU broadcast) and written to `out_path` as 16-bit WAV; the gain is held back so the true peak stays under `max_true_peak` (-1 dBTP).
+/// `{ path, gain_db, limited_by_peak, before, after }`, `before` and `after` as `loudness_measure` gives them.
+pub fn loudness_normalize(path: &str, out_path: &str, target_lufs: f64, max_true_peak: f64) -> Result<Value, String> {
+    let a = read(path)?;
+    let before = measure(&a, &a.samples)?;
+    let now = before["integrated_lufs"].as_f64().ok_or_else(|| format!("{}: the file is silent", path))?;
+    let peak = before["true_peak_dbtp"].as_f64().unwrap_or(-100.0);
+    let mut gain = target_lufs - now;
+    let limited = peak + gain > max_true_peak;
+    if limited { gain = max_true_peak - peak }
+    let k = 10f64.powf(gain / 20.0) as f32;
+    let out: Vec<f32> = a.samples.iter().map(|s| s * k).collect();
+    write(out_path, &a, &out)?;
+    let after = loudness_measure(out_path)?;
+    Ok(json!({ "path": out_path, "gain_db": (gain * 10.0).round() / 10.0, "limited_by_peak": limited, "before": before, "after": after }))
+}

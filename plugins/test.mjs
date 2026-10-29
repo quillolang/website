@@ -7,7 +7,8 @@
 //
 // Each example is started with `quillo run <slug>.qwe` (which builds its .qwer file the
 // first time), each `try` request is made, and its answer must be a 2xx holding `expect`.
-// A plugin that `needs` a server gets a small stand-in: an SMTP sink or a Redis.
+// A plugin that `needs` a server gets a small stand-in: an SMTP sink, a Redis, an HTTP sink
+// or a label printer on a raw socket.
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -88,6 +89,23 @@ function redisStandIn(port) {
     }).listen(port, "127.0.0.1");
 }
 
+// A label printer on a raw socket (port 9100 on a real one), for the printer plugins: it
+// keeps every byte of every job, and answers the status questions printers answer: Zebra's
+// `~HS` (three host status lines, paper and ribbon in), PJL's `@PJL INFO STATUS` and
+// TSPL's `<ESC>!?` (one byte, 0: ready).
+const printed = [];
+function printerStandIn(port) {
+    return createServer((s) => {
+        s.on("data", (d) => {
+            printed.push(d);
+            const text = d.toString("latin1");
+            if (text.includes("~HS")) s.write("\x02030,0,0,1245,000,0,0,0,000,0,0,0\x03\r\n\x02000,0,0,0,0,2,4,0,00000000,1,000\x03\r\n\x021234,0\x03\r\n");
+            if (text.includes("@PJL INFO STATUS")) s.write("@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY=\"Ready\"\r\nONLINE=TRUE\r\n\x0c");
+            if (text.includes("\x1b!?")) s.write(Buffer.from([0]));
+        });
+    }).listen(port, "127.0.0.1");
+}
+
 let port = BASE, failed = 0, passed = 0;
 for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug))) {
     port += 1;
@@ -96,6 +114,7 @@ for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug)
     if (p.needs === "smtp") { helpers.push(smtpSink(BASE + 990)); env.SMTP_URL = `smtp://127.0.0.1:${BASE + 990}`; env.SMTP_FROM = "Shop <shop@example.com>"; }
     if (p.needs === "redis") { helpers.push(redisStandIn(BASE + 991)); env.REDIS_URL = `redis://127.0.0.1:${BASE + 991}/`; }
     if (p.needs === "http") { received.length = 0; helpers.push(httpSink(BASE + 992)); env.SINK_URL = `http://127.0.0.1:${BASE + 992}`; }
+    if (p.needs === "printer") { printed.length = 0; helpers.push(printerStandIn(BASE + 993)); env.PRINTER_HOST = `127.0.0.1:${BASE + 993}`; }
     const child = spawn(quillo, ["run", `${p.slug}.qwe`, "--port", String(port), "--log", "off"], { cwd: here, env });
     let out = "";
     child.stdout.on("data", (d) => (out += d)); child.stderr.on("data", (d) => (out += d));
@@ -114,6 +133,9 @@ for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug)
     }
     if (p.needs === "smtp" && up && !mail.some((l) => l.startsWith("Subject:"))) problems.push("the SMTP sink got no message");
     if (p.needs === "http" && up && received.length === 0) problems.push("the HTTP sink got no request");
+    // A job sent by the last request may still be on its way: give it a moment.
+    for (let i = 0; i < 20 && p.needs === "printer" && printed.length === 0; i++) await sleep(100);
+    if (p.needs === "printer" && up && printed.length === 0) problems.push("the printer got no job");
     // Every plugin says its version, on the second line of its header.
     const head = readFileSync(join(here, `${p.slug}.qwer`), "utf8").split("\n").slice(0, 3).join("\n");
     if (!/^\/\/! version: \d+\.\d+\.\d+$/m.test(head)) problems.push("no `//! version: X.Y.Z` line at the top of the file");

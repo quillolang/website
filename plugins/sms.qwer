@@ -1,0 +1,136 @@
+//! Text messages sent through Twilio or Vonage with one call, a message's encoding and segment count worked out before it is sent (GSM-7 or UCS-2, so an emoji does not triple the bill), and Twilio's webhook signatures checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! hmac = "0.12"
+//! sha1 = "0.10"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+
+const GSM: &str = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
+const GSM_EXT: &str = "^{}\\[~]|€\u{0C}";
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn conf(config: &Value, key: &str, env_key: &str) -> Option<String> {
+    config[key].as_str().map(str::to_string).filter(|s| !s.is_empty()).or_else(|| env(env_key))
+}
+
+fn form(pairs: &[(&str, String)]) -> String {
+    let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect::<String>();
+    pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+/// How `text` travels as SMS: `{ encoding, characters, units, segments, per_segment, unicode_characters }`. GSM-7 fits 160 per
+/// message (153 when split), UCS-2 70 (67); one character outside GSM-7 (an emoji, a curly quote) makes the whole text UCS-2.
+/// `unicode_characters` lists those, to replace them if the price matters.
+pub fn sms_segments(text: &str) -> Value {
+    let non_gsm: Vec<String> = text.chars().filter(|c| !GSM.contains(*c) && !GSM_EXT.contains(*c)).map(|c| c.to_string()).collect();
+    let gsm = non_gsm.is_empty();
+    let (units, single, multi) = if gsm {
+        (text.chars().map(|c| if GSM_EXT.contains(c) { 2 } else { 1 }).sum::<usize>(), 160, 153)
+    } else {
+        (text.encode_utf16().count(), 70, 67)
+    };
+    let segments = if units <= single { 1 } else { units.div_ceil(multi) };
+    let mut uniq = non_gsm.clone();
+    uniq.dedup();
+    json!({
+        "encoding": if gsm { "GSM-7" } else { "UCS-2" },
+        "characters": text.chars().count(),
+        "units": units,
+        "segments": if units == 0 { 0 } else { segments },
+        "per_segment": if segments > 1 { multi } else { single },
+        "unicode_characters": uniq,
+    })
+}
+
+/// Sends `text` to `to` (E.164, `+639171234567`) from `from` (a number, a sender name, or for Twilio a Messaging Service `MG...`)
+/// through `provider`: "twilio" (`config` or env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_API_URL) or "vonage"
+/// (VONAGE_API_KEY, VONAGE_API_SECRET, VONAGE_API_URL). Gives `{ ok, status, id, error, segments }`.
+pub fn sms_send(provider: &str, config: serde_json::Value, to: &str, from: &str, text: &str) -> Result<Value, String> {
+    if !to.trim().starts_with('+') || to.trim().len() < 8 {
+        return Err(format!("`{}` is not an E.164 number (+ and the country code)", to));
+    }
+    if text.is_empty() {
+        return Err("the message is empty".into());
+    }
+    let seg = sms_segments(text);
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+    let (status, body) = match provider.to_lowercase().as_str() {
+        "twilio" => {
+            let sid = conf(&config, "account_sid", "TWILIO_ACCOUNT_SID").ok_or("Twilio needs account_sid (or TWILIO_ACCOUNT_SID)")?;
+            let token = conf(&config, "auth_token", "TWILIO_AUTH_TOKEN").ok_or("Twilio needs auth_token (or TWILIO_AUTH_TOKEN)")?;
+            let base = conf(&config, "base_url", "TWILIO_API_URL").unwrap_or_else(|| "https://api.twilio.com".into());
+            let url = format!("{}/2010-04-01/Accounts/{}/Messages.json", base.trim_end_matches('/'), sid);
+            let sender = if from.starts_with("MG") { "MessagingServiceSid" } else { "From" };
+            let mut pairs = vec![("To", to.trim().to_string()), (sender, from.to_string()), ("Body", text.to_string())];
+            if let Some(cb) = config["status_callback"].as_str() {
+                pairs.push(("StatusCallback", cb.to_string()));
+            }
+            let auth = format!("Basic {}", STANDARD.encode(format!("{}:{}", sid, token)));
+            send(agent.post(&url).set("Authorization", &auth), &form(&pairs))?
+        }
+        "vonage" | "nexmo" => {
+            let key = conf(&config, "api_key", "VONAGE_API_KEY").ok_or("Vonage needs api_key (or VONAGE_API_KEY)")?;
+            let secret = conf(&config, "api_secret", "VONAGE_API_SECRET").ok_or("Vonage needs api_secret (or VONAGE_API_SECRET)")?;
+            let base = conf(&config, "base_url", "VONAGE_API_URL").unwrap_or_else(|| "https://rest.nexmo.com".into());
+            let mut pairs = vec![("api_key", key), ("api_secret", secret), ("to", to.trim().trim_start_matches('+').to_string()), ("from", from.to_string()), ("text", text.to_string())];
+            if seg["encoding"] == "UCS-2" {
+                pairs.push(("type", "unicode".into()));
+            }
+            send(agent.post(&format!("{}/sms/json", base.trim_end_matches('/'))), &form(&pairs))?
+        }
+        other => return Err(format!("unknown provider `{}`: twilio or vonage", other)),
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let vonage_err = v["messages"][0]["status"].as_str().filter(|s| *s != "0").map(|_| v["messages"][0]["error-text"].as_str().unwrap_or("refused").to_string());
+    let ok = (200..300).contains(&status) && vonage_err.is_none();
+    let id = v["sid"].as_str().or(v["messages"][0]["message-id"].as_str()).map(str::to_string);
+    let error = if ok { None } else { vonage_err.or(v["message"].as_str().map(str::to_string)).or(Some(body.chars().take(300).collect())) };
+    Ok(json!({ "ok": ok, "status": status, "id": id, "error": error, "segments": seg["segments"] }))
+}
+
+fn send(req: ureq::Request, body: &str) -> Result<(u16, String), String> {
+    match req.set("Content-Type", "application/x-www-form-urlencoded").send_string(body) {
+        Ok(r) => Ok((r.status(), r.into_string().unwrap_or_default())),
+        Err(ureq::Error::Status(c, r)) => Ok((c, r.into_string().unwrap_or_default())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether a request really came from Twilio: `signature` is its `X-Twilio-Signature` header, `url` the full URL Twilio called
+/// (with the query string), `params` the POSTed form fields (`request.form`), `auth_token` the account's token.
+pub fn sms_twilio_valid(url: &str, params: std::collections::HashMap<String, String>, signature: &str, auth_token: &str) -> bool {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    let mut data = url.to_string();
+    for k in keys {
+        data.push_str(k);
+        data.push_str(&params[k]);
+    }
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(auth_token.as_bytes()).expect("HMAC takes any key");
+    mac.update(data.as_bytes());
+    STANDARD.decode(signature.trim()).is_ok_and(|s| mac.verify_slice(&s).is_ok())
+}
+
+/// The `X-Twilio-Signature` Twilio would send for this request: for tests of a webhook.
+pub fn sms_twilio_signature(url: &str, params: std::collections::HashMap<String, String>, auth_token: &str) -> String {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    let mut data = url.to_string();
+    for k in keys {
+        data.push_str(k);
+        data.push_str(&params[k]);
+    }
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(auth_token.as_bytes()).expect("HMAC takes any key");
+    mac.update(data.as_bytes());
+    STANDARD.encode(mac.finalize().into_bytes())
+}

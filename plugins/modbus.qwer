@@ -1,0 +1,398 @@
+//! Modbus RTU and TCP frames built and read without a device: requests for coils and registers (functions 1 to 6, 15, 16, 23), answers and exceptions parsed with their meaning, CRC-16 and the MBAP header made and checked, registers turned into numbers (16 and 32-bit integers, floats, doubles, text) in any word order and back; and a small TCP client for a real PLC, meter or inverter.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xffff;
+    for b in data {
+        crc ^= *b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xa001 } else { crc >> 1 };
+        }
+    }
+    crc
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02X}", x)).collect::<Vec<_>>().join(" ")
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    let h: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if h.len() % 2 == 1 || h.is_empty() {
+        return Err("a frame is bytes in hex: \"01 03 00 00 00 0A C5 CD\"".into());
+    }
+    Ok((0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap()).collect())
+}
+
+fn function_name(f: u8) -> &'static str {
+    match f & 0x7f {
+        1 => "read coils",
+        2 => "read discrete inputs",
+        3 => "read holding registers",
+        4 => "read input registers",
+        5 => "write single coil",
+        6 => "write single register",
+        7 => "read exception status",
+        8 => "diagnostics",
+        15 => "write multiple coils",
+        16 => "write multiple registers",
+        17 => "report server id",
+        22 => "mask write register",
+        23 => "read/write multiple registers",
+        43 => "encapsulated interface (device identification)",
+        _ => "other",
+    }
+}
+
+fn exception(code: u8) -> &'static str {
+    match code {
+        1 => "illegal function: the device does not do this function",
+        2 => "illegal data address: no such register or coil",
+        3 => "illegal data value: a value or count the device refuses",
+        4 => "server device failure",
+        5 => "acknowledge: accepted, still working on it",
+        6 => "server device busy: try again later",
+        8 => "memory parity error",
+        10 => "gateway path unavailable",
+        11 => "gateway target device failed to respond",
+        _ => "unknown exception",
+    }
+}
+
+/// The request's PDU (function code and data).
+fn pdu(function: i64, address: i64, arg: &Value) -> Result<Vec<u8>, String> {
+    if !(0..=65535).contains(&address) {
+        return Err("an address is 0 to 65535 (the protocol's, not the 40001-style number)".into());
+    }
+    let a = (address as u16).to_be_bytes();
+    let f = function as u8;
+    let mut p = vec![f];
+    match function {
+        1 | 2 | 3 | 4 => {
+            let n = arg.as_i64().ok_or("give the count to read")?;
+            let max = if function <= 2 { 2000 } else { 125 };
+            if n < 1 || n > max {
+                return Err(format!("{} reads 1 to {} at a time", function_name(f), max));
+            }
+            p.extend_from_slice(&a);
+            p.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        5 => {
+            let on = arg.as_bool().ok_or("give true or false")?;
+            p.extend_from_slice(&a);
+            p.extend_from_slice(if on { &[0xff, 0x00] } else { &[0x00, 0x00] });
+        }
+        6 => {
+            let v = arg.as_i64().ok_or("give the register's value")?;
+            if !(-32768..=65535).contains(&v) {
+                return Err("a register holds 0 to 65535 (or -32768 to 32767)".into());
+            }
+            p.extend_from_slice(&a);
+            p.extend_from_slice(&(v as u16).to_be_bytes());
+        }
+        15 => {
+            let bits: Vec<bool> = arg.as_array().ok_or("give a list of true/false")?.iter().map(|v| v.as_bool().unwrap_or(v.as_i64() == Some(1))).collect();
+            if bits.is_empty() || bits.len() > 1968 {
+                return Err("1 to 1968 coils".into());
+            }
+            let mut bytes = vec![0u8; (bits.len() + 7) / 8];
+            for (i, b) in bits.iter().enumerate() {
+                if *b {
+                    bytes[i / 8] |= 1 << (i % 8);
+                }
+            }
+            p.extend_from_slice(&a);
+            p.extend_from_slice(&(bits.len() as u16).to_be_bytes());
+            p.push(bytes.len() as u8);
+            p.extend_from_slice(&bytes);
+        }
+        16 => {
+            let regs = regs_of(arg)?;
+            if regs.is_empty() || regs.len() > 123 {
+                return Err("1 to 123 registers".into());
+            }
+            p.extend_from_slice(&a);
+            p.extend_from_slice(&(regs.len() as u16).to_be_bytes());
+            p.push((regs.len() * 2) as u8);
+            for r in regs {
+                p.extend_from_slice(&r.to_be_bytes());
+            }
+        }
+        23 => {
+            // { read: [address, count], write: [values] } with `address` the write address.
+            let ra = arg["read_address"].as_i64().ok_or("give read_address")? as u16;
+            let rc = arg["read_count"].as_i64().ok_or("give read_count")?.clamp(1, 125) as u16;
+            let regs = regs_of(&arg["write"])?;
+            p.extend_from_slice(&ra.to_be_bytes());
+            p.extend_from_slice(&rc.to_be_bytes());
+            p.extend_from_slice(&a);
+            p.extend_from_slice(&(regs.len() as u16).to_be_bytes());
+            p.push((regs.len() * 2) as u8);
+            for r in regs {
+                p.extend_from_slice(&r.to_be_bytes());
+            }
+        }
+        _ => return Err(format!("function {}: 1, 2, 3, 4, 5, 6, 15, 16 or 23", function)),
+    }
+    Ok(p)
+}
+
+fn regs_of(v: &Value) -> Result<Vec<u16>, String> {
+    v.as_array()
+        .ok_or("give a list of register values")?
+        .iter()
+        .map(|x| match x.as_i64() {
+            Some(n) if (-32768..=65535).contains(&n) => Ok(n as u16),
+            _ => Err(format!("{} is not a register value", x)),
+        })
+        .collect()
+}
+
+fn frame(p: &[u8], options: &Value) -> Result<Vec<u8>, String> {
+    let unit = options["unit"].as_i64().unwrap_or(1);
+    if !(0..=255).contains(&unit) {
+        return Err("a unit (slave) id is 0 to 255".into());
+    }
+    match options["mode"].as_str().unwrap_or("rtu") {
+        "rtu" => {
+            let mut f = vec![unit as u8];
+            f.extend_from_slice(p);
+            let c = crc16(&f);
+            f.extend_from_slice(&c.to_le_bytes());
+            Ok(f)
+        }
+        "tcp" => {
+            let tid = options["transaction"].as_i64().unwrap_or(1) as u16;
+            let mut f = tid.to_be_bytes().to_vec();
+            f.extend_from_slice(&[0, 0]);
+            f.extend_from_slice(&((p.len() + 1) as u16).to_be_bytes());
+            f.push(unit as u8);
+            f.extend_from_slice(p);
+            Ok(f)
+        }
+        other => Err(format!("mode {:?}: rtu or tcp", other)),
+    }
+}
+
+/// A request frame in hex. `function`: 1 read coils, 2 read discrete inputs, 3 read holding registers, 4 read input registers (with `arg` the count), 5 write a coil (`true`), 6 write a register (a number), 15 write coils (a list of booleans), 16 write registers (a list of numbers), 23 read/write (`{ read_address, read_count, write: [...] }`).
+/// `address` is the protocol's, from 0 (holding register 40001 is 0). `options`: `{ mode: "rtu" | "tcp", unit: 1, transaction: 1 }`.
+pub fn modbus_request(function: i64, address: i64, arg: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    Ok(hex(&frame(&pdu(function, address, &arg)?, &options)?))
+}
+
+/// The unit, the PDU and checks of a frame: RTU (CRC checked) or TCP (the MBAP header read).
+fn unwrap_frame(b: &[u8], mode: &str) -> Result<(u8, Value, Vec<u8>), String> {
+    match mode {
+        "rtu" => {
+            if b.len() < 4 {
+                return Err("an RTU frame is at least 4 bytes".into());
+            }
+            let n = b.len();
+            let want = crc16(&b[..n - 2]);
+            let got = u16::from_le_bytes([b[n - 2], b[n - 1]]);
+            if want != got {
+                return Err(format!("CRC {:04X} does not match the frame's {:04X}", want, got));
+            }
+            Ok((b[0], json!({ "crc": format!("{:04X}", got) }), b[1..n - 2].to_vec()))
+        }
+        "tcp" => {
+            if b.len() < 8 {
+                return Err("a TCP frame is at least 8 bytes".into());
+            }
+            let len = u16::from_be_bytes([b[4], b[5]]) as usize;
+            if u16::from_be_bytes([b[2], b[3]]) != 0 {
+                return Err("the protocol id is not 0: not Modbus".into());
+            }
+            if len + 6 != b.len() {
+                return Err(format!("the header says {} bytes follow, {} do", len, b.len() - 6));
+            }
+            Ok((b[6], json!({ "transaction": u16::from_be_bytes([b[0], b[1]]) }), b[7..].to_vec()))
+        }
+        other => Err(format!("mode {:?}: rtu or tcp", other)),
+    }
+}
+
+/// An answer read: `{ unit, function, function_name, values (coils as booleans, registers as numbers), address and value for writes, exception and its meaning, crc | transaction }`.
+/// For coils, give `options.count` (the request's) to drop the padding bits. `options`: `{ mode: "rtu" | "tcp", count }`.
+pub fn modbus_response(frame_hex: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = unhex(frame_hex)?;
+    let (unit, mut info, p) = unwrap_frame(&b, options["mode"].as_str().unwrap_or("rtu"))?;
+    let f = *p.first().ok_or("no function code")?;
+    info["unit"] = json!(unit);
+    info["function"] = json!(f & 0x7f);
+    info["function_name"] = json!(function_name(f));
+    if f & 0x80 != 0 {
+        let code = *p.get(1).ok_or("an exception without its code")?;
+        info["exception"] = json!(code);
+        info["error"] = json!(exception(code));
+        return Ok(info);
+    }
+    match f {
+        1 | 2 => {
+            let n = *p.get(1).ok_or("cut short")? as usize;
+            let data = p.get(2..2 + n).ok_or("cut short")?;
+            let mut bits: Vec<bool> = (0..n * 8).map(|i| data[i / 8] & (1 << (i % 8)) != 0).collect();
+            if let Some(c) = options["count"].as_u64() {
+                bits.truncate(c as usize);
+            }
+            info["values"] = json!(bits);
+        }
+        3 | 4 | 23 => {
+            let n = *p.get(1).ok_or("cut short")? as usize;
+            let data = p.get(2..2 + n).ok_or("cut short")?;
+            info["values"] = json!(data.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>());
+        }
+        5 | 6 => {
+            info["address"] = json!(u16::from_be_bytes([*p.get(1).ok_or("cut short")?, *p.get(2).ok_or("cut short")?]));
+            let v = u16::from_be_bytes([*p.get(3).ok_or("cut short")?, *p.get(4).ok_or("cut short")?]);
+            info["value"] = if f == 5 { json!(v == 0xff00) } else { json!(v) };
+        }
+        15 | 16 => {
+            info["address"] = json!(u16::from_be_bytes([*p.get(1).ok_or("cut short")?, *p.get(2).ok_or("cut short")?]));
+            info["count"] = json!(u16::from_be_bytes([*p.get(3).ok_or("cut short")?, *p.get(4).ok_or("cut short")?]));
+        }
+        _ => info["data"] = json!(hex(&p[1..])),
+    }
+    Ok(info)
+}
+
+/// A request read, as a device (or a sniffer on the line) sees it: `{ unit, function, function_name, address, count, values }`.
+pub fn modbus_parse_request(frame_hex: &str, mode: &str) -> Result<serde_json::Value, String> {
+    let b = unhex(frame_hex)?;
+    let (unit, mut info, p) = unwrap_frame(&b, mode)?;
+    let f = *p.first().ok_or("no function code")?;
+    let u = |i: usize| -> Result<u16, String> { Ok(u16::from_be_bytes([*p.get(i).ok_or("cut short")?, *p.get(i + 1).ok_or("cut short")?])) };
+    info["unit"] = json!(unit);
+    info["function"] = json!(f);
+    info["function_name"] = json!(function_name(f));
+    info["address"] = json!(u(1)?);
+    match f {
+        1..=4 => info["count"] = json!(u(3)?),
+        5 => info["value"] = json!(u(3)? == 0xff00),
+        6 => info["value"] = json!(u(3)?),
+        15 => {
+            let n = u(3)? as usize;
+            let data = p.get(6..).ok_or("cut short")?;
+            info["values"] = json!((0..n).map(|i| data.get(i / 8).map_or(false, |b| b & (1 << (i % 8)) != 0)).collect::<Vec<_>>());
+        }
+        16 => {
+            let n = u(3)? as usize;
+            info["values"] = json!((0..n).map(|i| u(6 + i * 2)).collect::<Result<Vec<_>, _>>()?);
+        }
+        _ => {}
+    }
+    Ok(info)
+}
+
+/// The CRC-16 of RTU bytes (in hex), as the two bytes to append, low first: "01 03 00 00 00 0A" gives "C5 CD".
+pub fn modbus_crc(bytes_hex: &str) -> Result<String, String> {
+    Ok(hex(&crc16(&unhex(bytes_hex)?).to_le_bytes()))
+}
+
+/// Words in the device's order: "ABCD" (big-endian, the default), "CDAB" (word swap), "BADC" (byte swap), "DCBA".
+fn ordered(regs: &[u16], order: &str) -> Result<Vec<u8>, String> {
+    let mut b: Vec<u8> = regs.iter().flat_map(|r| r.to_be_bytes()).collect();
+    match order {
+        "ABCD" => {}
+        "CDAB" => {
+            let words: Vec<[u8; 2]> = b.chunks(2).map(|c| [c[0], c[1]]).rev().collect();
+            b = words.concat();
+        }
+        "BADC" => {
+            for c in b.chunks_mut(2) {
+                c.swap(0, 1);
+            }
+        }
+        "DCBA" => b.reverse(),
+        other => return Err(format!("order {:?}: ABCD, CDAB, BADC or DCBA", other)),
+    }
+    Ok(b)
+}
+
+/// Registers read as numbers: `kind` "u16", "i16", "u32", "i32", "f32", "u64", "i64", "f64" or "text"; `order` "ABCD", "CDAB", "BADC" or "DCBA" for the multi-register kinds; a `scale` (0.1 for a meter's tenths) multiplies.
+/// Gives a list of values, one per 1, 2 or 4 registers (one text for "text").
+pub fn modbus_values(registers: Vec<i64>, kind: &str, order: &str, scale: f64) -> Result<Vec<serde_json::Value>, String> {
+    let regs: Vec<u16> = registers.iter().map(|r| *r as u16).collect();
+    let width = match kind {
+        "u16" | "i16" => 1,
+        "u32" | "i32" | "f32" => 2,
+        "u64" | "i64" | "f64" => 4,
+        "text" => {
+            let b: Vec<u8> = regs.iter().flat_map(|r| r.to_be_bytes()).collect();
+            return Ok(vec![json!(String::from_utf8_lossy(&b).trim_end_matches(['\0', ' ']).to_string())]);
+        }
+        other => return Err(format!("kind {:?}: u16, i16, u32, i32, f32, u64, i64, f64 or text", other)),
+    };
+    if regs.len() % width != 0 {
+        return Err(format!("{} takes {} registers each; {} given", kind, width, regs.len()));
+    }
+    let s = if scale == 0.0 { 1.0 } else { scale };
+    let tidy = |x: f64| -> Value { let r = (x * 1e6).round() / 1e6; if s == 1.0 && r.fract() == 0.0 && r.abs() < 9e15 { json!(r as i64) } else { json!(r) } };
+    regs.chunks(width)
+        .map(|c| {
+            let b = if width == 1 { c[0].to_be_bytes().to_vec() } else { ordered(c, order)? };
+            let x: f64 = match kind {
+                "u16" => u16::from_be_bytes([b[0], b[1]]) as f64,
+                "i16" => i16::from_be_bytes([b[0], b[1]]) as f64,
+                "u32" => u32::from_be_bytes(b[..4].try_into().unwrap()) as f64,
+                "i32" => i32::from_be_bytes(b[..4].try_into().unwrap()) as f64,
+                // A float32 as its shortest decimal (230.4, not 230.399994).
+                "f32" => f32::from_be_bytes(b[..4].try_into().unwrap()).to_string().parse::<f64>().unwrap_or(f64::NAN),
+                "u64" => u64::from_be_bytes(b[..8].try_into().unwrap()) as f64,
+                "i64" => i64::from_be_bytes(b[..8].try_into().unwrap()) as f64,
+                _ => f64::from_be_bytes(b[..8].try_into().unwrap()),
+            };
+            if !x.is_finite() {
+                return Ok(Value::Null);
+            }
+            Ok(tidy(x * s))
+        })
+        .collect()
+}
+
+/// A number as the registers that hold it, for writing (function 16): `kind` and `order` as `modbus_values`.
+pub fn modbus_registers(value: f64, kind: &str, order: &str) -> Result<Vec<i64>, String> {
+    let b: Vec<u8> = match kind {
+        "u16" => (value as u16).to_be_bytes().to_vec(),
+        "i16" => (value as i16).to_be_bytes().to_vec(),
+        "u32" => (value as u32).to_be_bytes().to_vec(),
+        "i32" => (value as i32).to_be_bytes().to_vec(),
+        "f32" => (value as f32).to_be_bytes().to_vec(),
+        "u64" => (value as u64).to_be_bytes().to_vec(),
+        "i64" => (value as i64).to_be_bytes().to_vec(),
+        "f64" => value.to_be_bytes().to_vec(),
+        other => return Err(format!("kind {:?}: u16, i16, u32, i32, f32, u64, i64 or f64", other)),
+    };
+    let regs: Vec<u16> = b.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    // The same swaps undo themselves: put the big-endian words in the device's order.
+    let out = if regs.len() == 1 { b } else { ordered(&regs, order)? };
+    Ok(out.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]]) as i64).collect())
+}
+
+/// Reads from a Modbus TCP device (a PLC, an energy meter, a solar inverter) on `host:502`: `function` 1 to 4, `count` coils or registers. Gives `modbus_response`'s map.
+pub fn modbus_tcp_read(host: &str, unit: i64, function: i64, address: i64, count: i64, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    if !(1..=4).contains(&function) {
+        return Err("modbus_tcp_read reads: function 1, 2, 3 or 4".into());
+    }
+    let req = frame(&pdu(function, address, &json!(count))?, &json!({ "mode": "tcp", "unit": unit, "transaction": 7 }))?;
+    let target = if host.contains(':') { host.to_string() } else { format!("{}:502", host) };
+    let addr = target.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or("no address")?;
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 60_000) as u64);
+    let mut s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach {}: {}", addr, e))?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    let mut head = [0u8; 6];
+    s.read_exact(&mut head).map_err(|e| format!("no answer: {}", e))?;
+    let len = u16::from_be_bytes([head[4], head[5]]) as usize;
+    let mut rest = vec![0u8; len.min(300)];
+    s.read_exact(&mut rest).map_err(|e| format!("a cut answer: {}", e))?;
+    let mut all = head.to_vec();
+    all.extend_from_slice(&rest);
+    modbus_response(&hex(&all), json!({ "mode": "tcp", "count": count }))
+}

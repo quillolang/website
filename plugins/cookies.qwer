@@ -1,0 +1,203 @@
+//! Cookies beyond the session: Set-Cookie headers built and read with every attribute (Partitioned, Max-Age, SameSite), Cookie headers read and written, values signed or encrypted with a secret so the browser can keep but not change or read them, and a cookie jar for calling other sites.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! cookie = { version = "0.18", features = ["secure", "percent-encode"] }
+
+use cookie::time::{Duration, OffsetDateTime};
+use cookie::{Cookie, CookieJar, Key, SameSite};
+use serde_json::{json, Value};
+
+fn now() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn key(secret: &str) -> Result<Key, String> {
+    if secret.len() < 32 {
+        return Err("the secret should be at least 32 characters (crypto.token() makes one)".into());
+    }
+    Ok(Key::derive_from(secret.as_bytes()))
+}
+
+fn iso(t: OffsetDateTime) -> String {
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second())
+}
+
+/// A `Set-Cookie` header value for `name` and `value` (percent-encoded). `options` may hold `max_age` (seconds; 0 deletes it),
+/// `expires` (Unix seconds), `path` ("/" by default), `domain`, `secure`, `http_only` (both true by default), `same_site`
+/// ("Lax" by default, "Strict" or "None", which also makes it Secure) and `partitioned` (CHIPS, for cookies in third-party frames).
+pub fn cookie_build(name: &str, value: &str, options: std::collections::HashMap<String, serde_json::Value>) -> Result<String, String> {
+    if name.is_empty() || name.chars().any(|c| c.is_control() || " \t()<>@,;:\\\"/[]?={}".contains(c)) {
+        return Err(format!("`{}` is not a valid cookie name", name));
+    }
+    let b = |k: &str, d: bool| options.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let s = |k: &str| options.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let same = match s("same_site").unwrap_or_else(|| "Lax".into()).to_lowercase().as_str() {
+        "lax" => SameSite::Lax,
+        "strict" => SameSite::Strict,
+        "none" => SameSite::None,
+        other => return Err(format!("same_site `{}` is Lax, Strict or None", other)),
+    };
+    let mut c = Cookie::build((name.to_string(), value.to_string()))
+        .path(s("path").unwrap_or_else(|| "/".into()))
+        .secure(b("secure", true) || same == SameSite::None || b("partitioned", false))
+        .http_only(b("http_only", true))
+        .same_site(same)
+        .partitioned(b("partitioned", false));
+    if let Some(d) = s("domain") {
+        c = c.domain(d);
+    }
+    if let Some(m) = options.get("max_age").and_then(|v| v.as_i64()) {
+        c = c.max_age(Duration::seconds(m));
+    }
+    if let Some(t) = options.get("expires").and_then(|v| v.as_i64()) {
+        c = c.expires(OffsetDateTime::from_unix_timestamp(t).map_err(|e| e.to_string())?);
+    }
+    let c = c.build();
+    if name.starts_with("__Host-") && (c.domain().is_some() || c.path() != Some("/") || c.secure() != Some(true)) {
+        return Err("a __Host- cookie must be Secure, with Path=/ and no Domain".into());
+    }
+    if name.starts_with("__Secure-") && c.secure() != Some(true) {
+        return Err("a __Secure- cookie must be Secure".into());
+    }
+    Ok(c.encoded().to_string())
+}
+
+/// A `Set-Cookie` header value read: `{ name, value, path, domain, expires, max_age, secure, http_only, same_site, partitioned }`,
+/// the value percent-decoded, `expires` in ISO 8601.
+pub fn cookie_parse(set_cookie: &str) -> Result<Value, String> {
+    let c = Cookie::parse_encoded(set_cookie.trim().to_string()).map_err(|e| format!("not a Set-Cookie value: {}", e))?;
+    Ok(json!({
+        "name": c.name(),
+        "value": c.value(),
+        "path": c.path(),
+        "domain": c.domain(),
+        "expires": c.expires_datetime().map(iso),
+        "max_age": c.max_age().map(|d| d.whole_seconds()),
+        "secure": c.secure().unwrap_or(false),
+        "http_only": c.http_only().unwrap_or(false),
+        "same_site": c.same_site().map(|s| s.to_string()),
+        "partitioned": c.partitioned().unwrap_or(false),
+    }))
+}
+
+/// A request's `Cookie` header read into a map of names to values (percent-decoded); a name given twice keeps the first, as servers do.
+pub fn cookie_header_parse(header: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for c in Cookie::split_parse_encoded(header.to_string()).flatten() {
+        out.entry(c.name().to_string()).or_insert_with(|| c.value().to_string());
+    }
+    out
+}
+
+/// A `Cookie` header to send to another site, from a map of names to values.
+pub fn cookie_header(cookies: std::collections::HashMap<String, String>) -> String {
+    let mut names: Vec<&String> = cookies.keys().collect();
+    names.sort();
+    names.iter().map(|n| Cookie::new(n.as_str(), cookies[*n].as_str()).encoded().to_string()).collect::<Vec<_>>().join("; ")
+}
+
+/// `value` signed for the cookie `name` with `secret` (HMAC-SHA256): the browser can read it but not change it, nor move it to
+/// another cookie's name. Put the result in `set_cookie`; read it back with `cookie_verify`.
+pub fn cookie_sign(name: &str, value: &str, secret: &str) -> Result<String, String> {
+    // The MAC covers `name=value`, so a signed value cannot be moved to another cookie; only the value is kept after it.
+    let mut jar = CookieJar::new();
+    jar.signed_mut(&key(secret)?).add(Cookie::new(name.to_string(), format!("{}={}", name, value)));
+    let full = jar.get(name).map(|c| c.value().to_string()).unwrap_or_default();
+    Ok(format!("{}{}", &full[..MAC_LEN], value))
+}
+
+const MAC_LEN: usize = 44;
+
+/// The value of a cookie signed with `cookie_sign`, or an error value when it was changed, signed for another name, or with another secret.
+pub fn cookie_verify(name: &str, signed_value: &str, secret: &str) -> Result<String, String> {
+    let bad = || format!("the `{}` cookie was changed, signed for another cookie, or with another secret", name);
+    if signed_value.len() < MAC_LEN || !signed_value.is_char_boundary(MAC_LEN) {
+        return Err(bad());
+    }
+    let (mac, value) = signed_value.split_at(MAC_LEN);
+    let jar = CookieJar::new();
+    jar.signed(&key(secret)?)
+        .verify(Cookie::new(name.to_string(), format!("{}{}={}", mac, name, value)))
+        .map(|_| value.to_string())
+        .ok_or_else(bad)
+}
+
+/// `value` encrypted for the cookie `name` with `secret` (AES-256-GCM, the name as associated data): the browser can neither read
+/// nor change it. Read it back with `cookie_decrypt`.
+pub fn cookie_encrypt(name: &str, value: &str, secret: &str) -> Result<String, String> {
+    let mut jar = CookieJar::new();
+    jar.private_mut(&key(secret)?).add(Cookie::new(name.to_string(), value.to_string()));
+    Ok(jar.get(name).map(|c| c.value().to_string()).unwrap_or_default())
+}
+
+/// The value of a cookie encrypted with `cookie_encrypt`, or an error value when it was changed or made with another secret or name.
+pub fn cookie_decrypt(name: &str, encrypted_value: &str, secret: &str) -> Result<String, String> {
+    let jar = CookieJar::new();
+    jar.private(&key(secret)?)
+        .decrypt(Cookie::new(name.to_string(), encrypted_value.to_string()))
+        .map(|c| c.value().to_string())
+        .ok_or_else(|| format!("the `{}` cookie cannot be decrypted: changed, or made with another secret", name))
+}
+
+fn host_path(url: &str) -> Option<(String, String, bool)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (authority, path) = rest.find('/').map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
+    let host = authority.rsplit('@').next()?.split(':').next()?.to_lowercase();
+    let path = path.split(['?', '#']).next().unwrap_or("/").to_string();
+    Some((host, path, scheme.eq_ignore_ascii_case("https")))
+}
+
+/// A cookie jar for calling another site from the server: `jar` (a list, `[]` to start) with the cookies of a response's
+/// `Set-Cookie` headers (a list) added for `url`, as a browser keeps them: by domain and path, replacing ones of the same name,
+/// dropping expired and deleted ones. Gives the new jar; keep it between requests.
+pub fn cookie_jar_add(jar: Vec<serde_json::Value>, set_cookies: Vec<String>, url: &str) -> Result<Vec<Value>, String> {
+    let (host, path, _) = host_path(url).ok_or_else(|| format!("`{}` is not an http(s) URL", url))?;
+    let mut jar: Vec<Value> = jar.into_iter().filter(|c| c["expires_at"].as_i64().map_or(true, |t| t > now())).collect();
+    for sc in set_cookies {
+        let Ok(c) = Cookie::parse_encoded(sc.trim().to_string()) else { continue };
+        let (domain, host_only) = match c.domain() {
+            Some(d) => {
+                let d = d.trim_start_matches('.').to_lowercase();
+                if host != d && !host.ends_with(&format!(".{}", d)) {
+                    continue; // a site may not set cookies for another
+                }
+                (d, false)
+            }
+            None => (host.clone(), true),
+        };
+        let cpath = c.path().map(str::to_string).filter(|p| p.starts_with('/')).unwrap_or_else(|| {
+            let dir = &path[..path.rfind('/').unwrap_or(0)];
+            if dir.is_empty() { "/".into() } else { dir.to_string() }
+        });
+        let expires_at = match (c.max_age(), c.expires_datetime()) {
+            (Some(m), _) => Some(now() + m.whole_seconds()),
+            (None, Some(t)) => Some(t.unix_timestamp()),
+            _ => None,
+        };
+        jar.retain(|x| !(x["name"] == c.name() && x["domain"] == domain.as_str() && x["path"] == cpath.as_str()));
+        if expires_at.is_some_and(|t| t <= now()) {
+            continue;
+        }
+        jar.push(json!({ "name": c.name(), "value": c.value(), "domain": domain, "host_only": host_only, "path": cpath, "secure": c.secure().unwrap_or(false), "expires_at": expires_at }));
+    }
+    Ok(jar)
+}
+
+/// The `Cookie` header to send with a request to `url` from a jar `cookie_jar_add` made: the cookies whose domain and path match,
+/// not expired, Secure ones only over https, longer paths first. Empty when none match.
+pub fn cookie_jar_header(jar: Vec<serde_json::Value>, url: &str) -> Result<String, String> {
+    let (host, path, https) = host_path(url).ok_or_else(|| format!("`{}` is not an http(s) URL", url))?;
+    let mut hits: Vec<&Value> = jar
+        .iter()
+        .filter(|c| {
+            let d = c["domain"].as_str().unwrap_or("");
+            let dom = if c["host_only"].as_bool().unwrap_or(true) { host == d } else { host == d || host.ends_with(&format!(".{}", d)) };
+            let p = c["path"].as_str().unwrap_or("/");
+            let path_ok = path == p || (path.starts_with(p) && (p.ends_with('/') || path[p.len()..].starts_with('/')));
+            dom && path_ok && (https || !c["secure"].as_bool().unwrap_or(false)) && c["expires_at"].as_i64().map_or(true, |t| t > now())
+        })
+        .collect();
+    hits.sort_by_key(|c| std::cmp::Reverse(c["path"].as_str().map_or(0, str::len)));
+    Ok(hits.iter().map(|c| Cookie::new(c["name"].as_str().unwrap_or("").to_string(), c["value"].as_str().unwrap_or("").to_string()).encoded().to_string()).collect::<Vec<_>>().join("; "))
+}

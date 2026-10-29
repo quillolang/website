@@ -1,0 +1,419 @@
+//! Honeywell and Datamax-O'Neil DPL labels (I-Class, M-Class, E-Class, H-Class, PM42 in DPL) built from fields in millimetres, placed from the top left as people measure (DPL counts rows from the bottom): text in the resident fonts, Code 128, Code 39, EAN-13, UPC-A, Interleaved 2 of 5, QR and Data Matrix, lines and boxes, heat, speed and quantity, in metric mode; sent to port 9100.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! image = { version = "0.25", default-features = false, features = ["png"] }
+
+use serde_json::Value;
+
+/// A multiplier as DPL writes it: 1-9, then A-O for 10 to 24.
+fn mult(n: i64) -> char {
+    let n = n.clamp(1, 24) as u8;
+    if n <= 9 { (b'0' + n) as char } else { (b'A' + n - 10) as char }
+}
+
+/// Resident fonts 0-8, (height, width) in dots, at 203 or 300 dpi.
+fn fonts(dpi: i64) -> [(i64, i64); 9] {
+    if dpi >= 250 {
+        [(10, 7), (19, 10), (27, 15), (40, 21), (53, 27), (77, 27), (95, 47), (47, 22), (41, 22)]
+    } else {
+        [(7, 5), (13, 7), (18, 10), (27, 14), (36, 18), (52, 18), (64, 32), (32, 15), (28, 15)]
+    }
+}
+
+fn font_for(target: i64, dpi: i64) -> (i64, i64) {
+    let mut best = (2, 1, i64::MAX);
+    for (i, (h, _)) in fonts(dpi).iter().enumerate().take(7) {
+        for m in 1..=24 {
+            // The nearest height, a bigger font preferred to a bigger multiplier.
+            let d = (h * m - target).abs() + (m - 1) * 3;
+            if d < best.2 {
+                best = (i as i64, m, d);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
+fn rotation(v: &Value) -> char {
+    match v.as_i64().unwrap_or(0).rem_euclid(360) {
+        90 => '2',
+        180 => '3',
+        270 => '4',
+        _ => '1',
+    }
+}
+
+/// Text as DPL takes it: ASCII, others as `?`, no line ends.
+fn ascii(s: &str) -> String {
+    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect()
+}
+
+fn tenths(v: &Value, default: f64, units: &str) -> i64 {
+    let x = v.as_f64().unwrap_or(default);
+    let mm = match units {
+        "in" | "inch" | "inches" => x * 25.4,
+        _ => x,
+    };
+    (mm * 10.0).round().max(0.0) as i64
+}
+
+fn build(fields: &[Value], options: &Value) -> Result<Out, String> {
+    if fields.len() > 2000 {
+        return Err("at most 2,000 fields on a label".into());
+    }
+    let dpi = options["dpi"].as_i64().unwrap_or(203);
+    let dpmm = dots_per_mm(dpi);
+    let units = options["units"].as_str().unwrap_or("mm").to_string();
+    if units == "dots" {
+        return Err("DPL in metric mode takes millimetres (or inches): give x and y in mm".into());
+    }
+    let t = |v: &Value, def: f64| tenths(v, def, &units);
+    let label_h = t(&options["height"], 50.0);
+    let mut o = Out::new();
+    o.b(b"\x02L\r");
+    o.s("m\r");
+    o.s("D11\r");
+    if let Some(h) = options["heat"].as_i64() {
+        o.s(&format!("H{:02}\r", h.clamp(0, 30)));
+    }
+    if let Some(s) = options["speed"].as_f64() {
+        // Speed letters go up by half an inch a second from A (1 ips): C is 2, E is 3.
+        let letter = (b'A' + ((s.clamp(1.0, 10.0) - 1.0) * 2.0).round() as u8) as char;
+        o.s(&format!("P{}\r", letter));
+    }
+    let row_of = |y: i64, h: i64| -> Result<i64, String> {
+        let r = label_h - y - h;
+        if r < 0 {
+            return Err(format!("a field at {} mm goes past the label's height ({} mm)", y as f64 / 10.0, label_h as f64 / 10.0));
+        }
+        Ok(r)
+    };
+    for f in fields {
+        if let Some(raw) = f["raw"].as_str() {
+            o.s(&ascii(raw));
+            o.s("\r");
+            continue;
+        }
+        let x = t(&f["x"], 0.0);
+        let y = t(&f["y"], 0.0);
+        let rot = rotation(&f["rotate"]);
+        if !f["text"].is_null() {
+            let text = ascii(&text_of(&f["text"]));
+            let (font, m) = match f["font"].as_i64() {
+                Some(n) => (n.clamp(0, 8), f["multiply"].as_i64().unwrap_or(1)),
+                None => font_for(to_dots(&f["size"], 3.0, dpmm, &units).max(1), dpi),
+            };
+            let h_tenths = ((fonts(dpi)[font as usize].0 * m) as f64 / dpmm * 10.0).round() as i64;
+            o.s(&format!("{}{}{}{}000{:04}{:04}{}\r", rot, font, mult(m), mult(m), row_of(y, h_tenths)?, x, text));
+        } else if let Some(kind) = f["barcode"].as_str() {
+            let data = ascii(&text_of(&f["data"]));
+            if data.is_empty() {
+                return Err("a barcode needs its `data`".into());
+            }
+            let h = t(&f["height"], 15.0).clamp(1, 999);
+            let narrow = f["module"].as_i64().unwrap_or(0).clamp(0, 24);
+            let wide = f["wide"].as_i64().unwrap_or(if narrow == 0 { 0 } else { narrow * 3 }).clamp(0, 24);
+            let (wc, nc) = (if wide == 0 { '0' } else { mult(wide) }, if narrow == 0 { '0' } else { mult(narrow) });
+            let readable = f["readable"] != false;
+            let digits = data.chars().all(|c| c.is_ascii_digit());
+            let id = match kind {
+                "code128" => 'E',
+                "code39" => 'A',
+                "ean13" if digits && (data.len() == 12 || data.len() == 13) => 'F',
+                "upca" if digits && (data.len() == 11 || data.len() == 12) => 'B',
+                "itf" if digits && data.len() % 2 == 0 => 'D',
+                "ean13" | "upca" | "itf" => return Err(format!("{}: {:?} has the wrong digits", kind, data)),
+                "qr" | "datamatrix" => {
+                    let cell = f["magnification"].as_i64().unwrap_or(4).clamp(1, 24);
+                    let size = t(&f["size"], cell as f64 * 2.5);
+                    let row = row_of(y, size)?;
+                    if kind == "qr" {
+                        // W1d: QR Code, model 2, error correction M, the data ended by two carriage returns.
+                        o.s(&format!("{}W1d{}{}000{:04}{:04}{}\r\r", rot, mult(cell), mult(cell), row, x, data));
+                    } else {
+                        // W1c: Data Matrix ECC 200, format and size chosen by the printer.
+                        o.s(&format!("{}W1c{}{}000{:04}{:04}2000000000{}\r", rot, mult(cell), mult(cell), row, x, data));
+                    }
+                    continue;
+                }
+                other => return Err(format!("unknown barcode {:?}: code128, code39, ean13, upca, itf, qr or datamatrix", other)),
+            };
+            let data = match id {
+                'F' => data[..12].to_string(),
+                'B' => data[..11].to_string(),
+                _ => data,
+            };
+            let id = if readable { id } else { id.to_ascii_lowercase() };
+            // Human-readable text sits under the bars: leave it room.
+            let text_room = if readable { 30 } else { 0 };
+            o.s(&format!("{}{}{}{}{:03}{:04}{:04}{}\r", rot, id, wc, nc, h, row_of(y, h + text_room)? + text_room, x, data));
+        } else if f["box"] == true {
+            let th = t(&f["thickness"], 0.3).max(1);
+            let (w, h) = (t(&f["width"], 10.0).max(1), t(&f["height"], 10.0).max(1));
+            o.s(&format!("1X11000{:04}{:04}b{:04}{:04}{:04}{:04}\r", row_of(y, h)?, x, w, h, th, th));
+        } else if f["line"] == true {
+            let th = t(&f["thickness"], 0.3).max(1);
+            let (w, h) = if f["vertical"] == true { (th, t(&f["height"], 10.0).max(1)) } else { (t(&f["width"], 10.0).max(1), th) };
+            o.s(&format!("1X11000{:04}{:04}l{:04}{:04}\r", row_of(y, h)?, x, w, h));
+        } else {
+            return Err(format!("a field is text, barcode, box, line or raw: {}", f));
+        }
+    }
+    o.s(&format!("Q{:04}\r", options["quantity"].as_i64().unwrap_or(1).clamp(1, 9999)));
+    o.s("E\r");
+    Ok(o)
+}
+
+/// A label as DPL, written for people (`<STX>` and `<CR>` shown). Each field is a map at `x`, `y` in millimetres from the top left:
+/// `{ text, size: 3 (mm, the nearest resident font 0-6) or font: 0-8 with multiply, rotate: 90 }`, `{ barcode: "code128" | "code39" | "ean13" | "upca" | "itf" | "qr" | "datamatrix", data, height: 15, module, wide, readable, magnification, size }`,
+/// `{ box: true, width, height, thickness }`, `{ line: true, width, thickness, vertical }` or `{ raw: "..." }`.
+/// `options`: `{ dpi: 203, height: 50 (the label's height in mm, needed to count rows from the bottom), heat: 0-30, speed (inches a second), quantity }`.
+pub fn dpl_label(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(build(&fields, &options)?.text.replace("<CR>", "<CR>\n"))
+}
+
+/// The label's bytes in base64.
+pub fn dpl_job(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(b64(&build(&fields, &options)?.bytes))
+}
+
+/// Writes the label to a file or a USB printer's device. Gives the bytes written.
+pub fn dpl_write(fields: Vec<serde_json::Value>, options: serde_json::Value, path: &str) -> Result<i64, String> {
+    write_bytes(&build(&fields, &options)?.bytes, path)
+}
+
+/// Sends the label to a printer's raw port (`host` or `host:port`, 9100 when not given). Gives the bytes sent.
+pub fn dpl_send(fields: Vec<serde_json::Value>, options: serde_json::Value, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    send_bytes(&build(&fields, &options)?.bytes, host, timeout_ms)
+}
+
+/// System-level commands, each after `<STX>`: "reset" (`#`), "feed" (`F`, one label), "metric" (`m`) or "inches" (`n`), for `dpl_send_commands`.
+pub fn dpl_command(action: &str) -> Result<String, String> {
+    Ok(match action {
+        "reset" => "\u{2}#",
+        "feed" => "\u{2}F",
+        "metric" => "\u{2}m",
+        "inches" => "\u{2}n",
+        other => return Err(format!("{:?}: reset, feed, metric or inches", other)),
+    }
+    .to_string())
+}
+
+/// Sends DPL commands written as text (`\u{2}` for STX) to a printer. Gives the bytes sent.
+pub fn dpl_send_commands(commands: &str, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    send_bytes(ascii_keep_controls(commands).as_bytes(), host, timeout_ms)
+}
+
+fn ascii_keep_controls(s: &str) -> String {
+    s.chars().map(|c| if (c as u32) < 0x80 { c } else { '?' }).collect()
+}
+
+// ---- Shared by the printer plugins: the job's bytes and a readable copy, pictures as bits, the network.
+
+/// A job's bytes, and the same job written for people: control bytes as `<ESC>`, graphics as `<N bytes>`.
+struct Out {
+    bytes: Vec<u8>,
+    text: String,
+}
+
+fn control_name(c: u8) -> String {
+    match c {
+        0x00 => "<NUL>".into(),
+        0x02 => "<STX>".into(),
+        0x03 => "<ETX>".into(),
+        0x0a => "\n".into(),
+        0x0c => "<FF>".into(),
+        0x0d => "<CR>".into(),
+        0x17 => "<ETB>".into(),
+        0x18 => "<CAN>".into(),
+        0x1b => "<ESC>".into(),
+        0x1e => "<RS>".into(),
+        c if c < 0x20 || c == 0x7f => format!("<{:02X}>", c),
+        c => (c as char).to_string(),
+    }
+}
+
+impl Out {
+    fn new() -> Out {
+        Out { bytes: vec![], text: String::new() }
+    }
+    /// Command bytes, shown as they are with control bytes named.
+    fn b(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        for c in data {
+            self.text.push_str(&control_name(*c));
+        }
+    }
+    /// ASCII command text.
+    fn s(&mut self, s: &str) {
+        self.b(s.as_bytes());
+    }
+    /// Text already encoded for the printer (`enc`), shown as written.
+    fn t(&mut self, shown: &str, enc: &[u8]) {
+        self.bytes.extend_from_slice(enc);
+        for c in shown.chars() {
+            if (c as u32) < 0x20 {
+                self.text.push_str(&control_name(c as u8));
+            } else {
+                self.text.push(c);
+            }
+        }
+    }
+    /// Text for the readable copy only (a line break between commands), not sent.
+    fn note(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+    /// The job for people: CR LF line ends shown as plain line breaks.
+    fn view(&self) -> String {
+        self.text.replace("<CR>\n", "\n")
+    }
+    /// Binary data (a picture), shown by its size.
+    fn blob(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        self.text.push_str(&format!("<{} bytes>", data.len()));
+    }
+}
+
+/// Dots per millimetre for a resolution in dpi.
+fn dots_per_mm(dpi: i64) -> f64 {
+    dpi.clamp(100, 1200) as f64 / 25.4
+}
+
+/// A length given in `units` ("mm", the default, "in" or "dots") as dots.
+fn to_dots(v: &Value, default: f64, dpmm: f64, units: &str) -> i64 {
+    let x = v.as_f64().unwrap_or(default);
+    let d = match units {
+        "dots" => x,
+        "in" | "inch" | "inches" => x * 25.4 * dpmm,
+        _ => x * dpmm,
+    };
+    d.round().max(0.0) as i64
+}
+
+/// A picture as rows of bits, true for black: scaled to `width` dots when given, dithered or cut at a threshold, transparency as white.
+fn bitmap(path: &str, width: Option<u32>, threshold: u8, dither: bool) -> Result<(usize, usize, Vec<Vec<bool>>), String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let img = match width {
+        Some(w) if w > 0 && w != img.width() => {
+            let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+            img.resize_exact(w, h, image::imageops::FilterType::Triangle)
+        }
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w * h > 8_000_000 {
+        return Err("the picture is over 8 million dots: give a width".into());
+    }
+    let mut lum: Vec<f32> = rgba
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold as f32;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                for (dx, dy, f) in [(1isize, 0usize, 7.0f32 / 16.0), (-1, 1, 3.0 / 16.0), (0, 1, 5.0 / 16.0), (1, 1, 1.0 / 16.0)] {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                }
+            }
+        }
+    }
+    Ok((w, h, rows))
+}
+
+/// Rows of bits packed 8 dots to a byte, the first dot in the high bit; `black_is_one` false for printers where 0 prints.
+fn pack_rows(w: usize, rows: &[Vec<bool>], black_is_one: bool) -> (usize, Vec<u8>) {
+    let bpr = (w + 7) / 8;
+    let mut out = Vec::with_capacity(bpr * rows.len());
+    for r in rows {
+        for b in 0..bpr {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = b * 8 + bit;
+                let black = x < w && r[x];
+                if black == black_is_one {
+                    byte |= 0x80 >> bit;
+                }
+            }
+            out.push(byte);
+        }
+    }
+    (bpr, out)
+}
+
+/// `host`, `host:port` or `[v6]:port` as an address; `port` when none is written.
+fn printer_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64);
+    let addr = printer_addr(host, 9100)?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", addr, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends bytes to a printer's raw port and closes it.
+fn send_bytes(bytes: &[u8], host: &str, timeout_ms: i64) -> Result<i64, String> {
+    use std::io::Write;
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(bytes).map_err(|e| format!("sending to the printer: {}", e))?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(bytes.len() as i64)
+}
+
+/// Writes bytes to a file or a device (`/dev/usb/lp0`), folders made for a file.
+fn write_bytes(bytes: &[u8], path: &str) -> Result<i64, String> {
+    use std::io::Write;
+    let p = std::path::Path::new(path);
+    let device = path.starts_with("/dev/");
+    if !device {
+        if let Some(dir) = p.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(!device).truncate(!device).open(p).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(bytes).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(bytes.len() as i64)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}

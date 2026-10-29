@@ -1,0 +1,215 @@
+//! Shared documents that merge without conflicts (Yjs's CRDT, through yrs): edits made apart on a text, a map or a list joined so none is lost, and the server's side of syncing with Yjs editors in the browser.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! yrs = "=0.28.0"
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
+use yrs::{Any, Array, ClientID, Doc, GetString, Map, OffsetKind, Options, ReadTxn, StateVector, Text, Transact, Update};
+use yrs::types::ToJson;
+
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn bytes(b64: &str, what: &str) -> Result<Vec<u8>, String> {
+    let b = STANDARD.decode(b64.trim()).map_err(|_| format!("{} is not base64", what))?;
+    if b.len() > MAX_BYTES {
+        return Err(format!("{} is over 64 MB", what));
+    }
+    Ok(b)
+}
+
+fn b64(b: &[u8]) -> String {
+    STANDARD.encode(b)
+}
+
+fn doc(client: i64) -> Doc {
+    let id = if client > 0 {
+        client as u64
+    } else {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        (t ^ (t >> 21)) & ((1 << 53) - 1) | 1
+    };
+    let mut o = Options::with_client_id(ClientID::new(id));
+    // Positions count as in JavaScript (UTF-16), as Yjs editors in the browser count them.
+    o.offset_kind = OffsetKind::Utf16;
+    Doc::with_options(o)
+}
+
+enum Root {
+    Text(yrs::TextRef),
+    Map(yrs::MapRef),
+    Array(yrs::ArrayRef),
+}
+
+/// Declares each shared type before the state is read in, so it is known as what it is. The references are taken here, before
+/// any transaction: taking one while a transaction is open waits for it forever.
+fn declare(d: &Doc, schema: &HashMap<String, String>) -> Result<HashMap<String, Root>, String> {
+    let mut out = HashMap::new();
+    for (name, kind) in schema {
+        let r = match kind.as_str() {
+            "text" => Root::Text(d.get_or_insert_text(name.as_str())),
+            "map" => Root::Map(d.get_or_insert_map(name.as_str())),
+            "array" | "list" => Root::Array(d.get_or_insert_array(name.as_str())),
+            other => return Err(format!("`{}` is \"text\", \"map\" or \"array\", not `{}`", name, other)),
+        };
+        out.insert(name.clone(), r);
+    }
+    Ok(out)
+}
+
+fn load(d: &Doc, state: &str) -> Result<(), String> {
+    if state.trim().is_empty() {
+        return Ok(());
+    }
+    let u = Update::decode_v1(&bytes(state, "the state")?).map_err(|e| format!("the state is not a Yjs update: {}", e))?;
+    d.transact_mut().apply_update(u).map_err(|e| format!("the state cannot be applied: {}", e))
+}
+
+fn full(d: &Doc) -> String {
+    b64(&d.transact().encode_state_as_update_v1(&StateVector::default()))
+}
+
+fn any(v: &Value) -> Result<Any, String> {
+    Any::from_json(&v.to_string()).map_err(|e| e.to_string())
+}
+
+fn to_value(a: Any) -> Value {
+    let mut s = String::new();
+    a.to_json(&mut s);
+    serde_json::from_str(&s).unwrap_or(Value::Null)
+}
+
+/// A new, empty document's state ("" works as well wherever a state is taken).
+pub fn crdt_new() -> String {
+    full(&doc(1))
+}
+
+/// Joins states and updates of one document (each base64, as Yjs's `encodeStateAsUpdate` and `update` events give them) into
+/// one state, in any order and with repeats: every edit from every copy is kept. Save the result as the document.
+pub fn crdt_merge(updates: Vec<String>) -> Result<String, String> {
+    let all: Vec<Vec<u8>> = updates.iter().filter(|u| !u.trim().is_empty()).enumerate().map(|(i, u)| bytes(u, &format!("update {}", i))).collect::<Result<_, _>>()?;
+    if all.is_empty() {
+        return Ok(crdt_new());
+    }
+    yrs::merge_updates_v1(&all).map(|b| b64(&b)).map_err(|e| format!("not a Yjs update: {}", e))
+}
+
+/// The document's contents as plain values: `schema` names each shared type and what it is, `{ body: "text", meta: "map",
+/// todos: "array" }` (Yjs does not keep that), and the answer has the same keys: text, a map, a list.
+pub fn crdt_read(state: &str, schema: std::collections::HashMap<String, String>) -> Result<Value, String> {
+    let d = doc(1);
+    let refs = declare(&d, &schema)?;
+    load(&d, state)?;
+    let txn = d.transact();
+    let mut out = serde_json::Map::new();
+    for (name, r) in &refs {
+        let v = match r {
+            Root::Text(t) => json!(t.get_string(&txn)),
+            Root::Map(m) => to_value(m.to_json(&txn)),
+            Root::Array(a) => to_value(a.to_json(&txn)),
+        };
+        out.insert(name.clone(), v);
+    }
+    Ok(Value::Object(out))
+}
+
+/// Makes `edits` to the document as the editor `client` (a number unique to each copy that edits, as Yjs's clientID; 0 for a
+/// random one) and gives `{ state, update }`: the whole new state to save, and the update alone, to send to the other copies.
+/// Each edit is one of: `{ text, at, insert }`, `{ text, at, delete }` (that many characters), `{ map, set, value }`,
+/// `{ map, remove }`, `{ array, push }`, `{ array, at, insert }`, `{ array, at, delete }`. Positions count from 0, in UTF-16
+/// units as in JavaScript.
+pub fn crdt_edit(state: &str, edits: Vec<serde_json::Value>, client: i64) -> Result<Value, String> {
+    let d = doc(client);
+    let mut schema = HashMap::new();
+    for (i, e) in edits.iter().enumerate() {
+        let (kind, name) = ["text", "map", "array"].iter().find_map(|k| e.get(*k).and_then(|n| n.as_str()).map(|n| (*k, n))).ok_or_else(|| format!("edit {} names no `text`, `map` or `array`", i))?;
+        if let Some(old) = schema.insert(name.to_string(), kind.to_string()) {
+            if old != kind {
+                return Err(format!("`{}` is used as both {} and {}", name, old, kind));
+            }
+        }
+    }
+    let refs = declare(&d, &schema)?;
+    load(&d, state)?;
+    let update = {
+        let mut txn = d.transact_mut();
+        for (i, e) in edits.iter().enumerate() {
+            let at = |len: u32| -> Result<u32, String> {
+                let a = e.get("at").map_or(Some(len as i64), |x| x.as_i64()).ok_or_else(|| format!("edit {}'s `at` is not a whole number", i))?;
+                if a < 0 || a > len as i64 {
+                    return Err(format!("edit {}'s `at` ({}) is outside 0 to {}", i, a, len));
+                }
+                Ok(a as u32)
+            };
+            let count = |k: &str| e.get(k).and_then(|x| x.as_i64()).filter(|n| *n >= 0).map(|n| n as u32);
+            if let Some(name) = e.get("text").and_then(|n| n.as_str()) {
+                let Some(Root::Text(t)) = refs.get(name) else { unreachable!() };
+                let len = t.len(&txn);
+                if let Some(s) = e.get("insert").and_then(|x| x.as_str()) {
+                    let p = at(len)?;
+                    t.insert(&mut txn, p, s);
+                } else if let Some(n) = count("delete") {
+                    let p = at(len)?;
+                    t.remove_range(&mut txn, p, n.min(len - p));
+                } else {
+                    return Err(format!("edit {} on text `{}` has no `insert` (text) or `delete` (a count)", i, name));
+                }
+            } else if let Some(name) = e.get("map").and_then(|n| n.as_str()) {
+                let Some(Root::Map(m)) = refs.get(name) else { unreachable!() };
+                if let Some(k) = e.get("set").and_then(|x| x.as_str()) {
+                    m.insert(&mut txn, k, any(e.get("value").unwrap_or(&Value::Null))?);
+                } else if let Some(k) = e.get("remove").and_then(|x| x.as_str()) {
+                    m.remove(&mut txn, k);
+                } else {
+                    return Err(format!("edit {} on map `{}` has no `set` or `remove`", i, name));
+                }
+            } else if let Some(name) = e.get("array").and_then(|n| n.as_str()) {
+                let Some(Root::Array(a)) = refs.get(name) else { unreachable!() };
+                let len = a.len(&txn);
+                if let Some(v) = e.get("push") {
+                    a.push_back(&mut txn, any(v)?);
+                } else if let Some(v) = e.get("insert") {
+                    let p = at(len)?;
+                    a.insert(&mut txn, p, any(v)?);
+                } else if let Some(n) = count("delete") {
+                    let p = at(len)?;
+                    a.remove_range(&mut txn, p, n.min(len - p));
+                } else {
+                    return Err(format!("edit {} on array `{}` has no `push`, `insert` or `delete`", i, name));
+                }
+            }
+        }
+        txn.encode_update_v1()
+    };
+    Ok(json!({ "state": full(&d), "update": b64(&update) }))
+}
+
+/// The document's state vector (base64): what it has seen from each editor. A copy sends its own; the other answers with
+/// `crdt_diff` (Yjs's sync step 1 and 2).
+pub fn crdt_state_vector(state: &str) -> Result<String, String> {
+    if state.trim().is_empty() {
+        return Ok(b64(&StateVector::default().encode_v1()));
+    }
+    yrs::encode_state_vector_from_update_v1(&bytes(state, "the state")?).map(|b| b64(&b)).map_err(|e| format!("not a Yjs update: {}", e))
+}
+
+/// What `state` has that a copy with `state_vector` (from `crdt_state_vector`, or Yjs's `encodeStateVector`) lacks, as one
+/// update (base64): send it, and the copy is up to date without the whole document.
+pub fn crdt_diff(state: &str, state_vector: &str) -> Result<String, String> {
+    let s = if state.trim().is_empty() { crdt_new() } else { state.to_string() };
+    yrs::diff_updates_v1(&bytes(&s, "the state")?, &bytes(state_vector, "the state vector")?).map(|b| b64(&b)).map_err(|e| format!("not a Yjs update or state vector: {}", e))
+}
+
+/// Whether two states hold the same edits (the same state vector and contents), whatever order they were merged in.
+pub fn crdt_same(a: &str, b: &str, schema: std::collections::HashMap<String, String>) -> Result<bool, String> {
+    let sv = |s: &str| -> Result<StateVector, String> {
+        StateVector::decode_v1(&bytes(&crdt_state_vector(s)?, "the state vector")?).map_err(|e| e.to_string())
+    };
+    Ok(sv(a)? == sv(b)? && crdt_read(a, schema.clone())? == crdt_read(b, schema)?)
+}

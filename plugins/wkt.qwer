@@ -1,0 +1,385 @@
+//! Geometries in WKT and WKB, as PostGIS, SpatiaLite, SQL Server and GIS tools write them: read to GeoJSON and written from it, EWKT and EWKB with their SRID, 3D points kept, and a geometry's type, size and bounds.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+// ---------- WKT reading ----------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok { Word(String), Num(f64), Open, Close, Comma }
+
+fn lex(s: &str) -> Result<Vec<Tok>, String> {
+    let c: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() { i += 1; continue; }
+        match ch {
+            '(' => { out.push(Tok::Open); i += 1 }
+            ')' => { out.push(Tok::Close); i += 1 }
+            ',' => { out.push(Tok::Comma); i += 1 }
+            _ if ch.is_ascii_alphabetic() => {
+                let st = i;
+                while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') { i += 1 }
+                out.push(Tok::Word(c[st..i].iter().collect::<String>().to_ascii_uppercase()));
+            }
+            _ if ch.is_ascii_digit() || ch == '-' || ch == '+' || ch == '.' => {
+                let st = i;
+                i += 1;
+                while i < c.len() && (c[i].is_ascii_digit() || c[i] == '.' || c[i] == 'e' || c[i] == 'E' || ((c[i] == '-' || c[i] == '+') && (c[i - 1] == 'e' || c[i - 1] == 'E'))) { i += 1 }
+                let t: String = c[st..i].iter().collect();
+                out.push(Tok::Num(t.parse().map_err(|_| format!("`{}` is not a number", t))?));
+            }
+            _ => return Err(format!("unexpected `{}` at character {}", ch, i + 1)),
+        }
+    }
+    Ok(out)
+}
+
+struct P { t: Vec<Tok>, i: usize, dims: usize, has_m: bool }
+
+impl P {
+    fn peek(&self) -> Option<&Tok> { self.t.get(self.i) }
+    fn next(&mut self) -> Option<Tok> { let t = self.t.get(self.i).cloned(); self.i += 1; t }
+    fn expect(&mut self, want: Tok) -> Result<(), String> {
+        match self.next() {
+            Some(t) if t == want => Ok(()),
+            other => Err(format!("expected {:?} but found {:?}", want, other)),
+        }
+    }
+    fn coord(&mut self) -> Result<Value, String> {
+        let mut nums = Vec::new();
+        while let Some(Tok::Num(n)) = self.peek().cloned() { nums.push(n); self.i += 1; }
+        if nums.len() < 2 || nums.len() > 4 {
+            return Err(format!("a position has 2 to 4 numbers, not {}", nums.len()));
+        }
+        // GeoJSON keeps x, y and z; m goes.
+        let keep = if nums.len() == 3 && self.has_m && self.dims == 2 { 2 } else { nums.len().min(3) };
+        Ok(Value::Array(nums[..keep].iter().map(|&n| json!(n)).collect()))
+    }
+    fn list<F: FnMut(&mut P) -> Result<Value, String>>(&mut self, mut f: F) -> Result<Value, String> {
+        self.expect(Tok::Open)?;
+        let mut v = vec![f(self)?];
+        while self.peek() == Some(&Tok::Comma) { self.i += 1; v.push(f(self)?); }
+        self.expect(Tok::Close)?;
+        Ok(Value::Array(v))
+    }
+    fn ring(&mut self) -> Result<Value, String> { self.list(|p| p.coord()) }
+    fn polygon(&mut self) -> Result<Value, String> { self.list(|p| p.ring()) }
+    fn geometry(&mut self) -> Result<Value, String> {
+        let kind = match self.next() { Some(Tok::Word(w)) => w, other => return Err(format!("expected a geometry type, found {:?}", other)) };
+        self.has_m = false;
+        self.dims = 2;
+        if let Some(Tok::Word(w)) = self.peek().cloned() {
+            match w.as_str() {
+                "Z" => { self.dims = 3; self.i += 1 }
+                "M" => { self.has_m = true; self.i += 1 }
+                "ZM" => { self.dims = 3; self.has_m = true; self.i += 1 }
+                _ => {}
+            }
+        }
+        if let Some(Tok::Word(w)) = self.peek().cloned() {
+            if w == "EMPTY" {
+                self.i += 1;
+                let name = gj_name(&kind)?;
+                return Ok(if name == "GeometryCollection" { json!({ "type": name, "geometries": [] }) } else if name == "Point" { json!({ "type": name, "coordinates": [] }) } else { json!({ "type": name, "coordinates": [] }) });
+            }
+        }
+        let name = gj_name(&kind)?;
+        let coords = match name {
+            "Point" => { self.expect(Tok::Open)?; let c = self.coord()?; self.expect(Tok::Close)?; c }
+            "LineString" => self.ring()?,
+            "Polygon" => self.polygon()?,
+            "MultiPoint" => self.list(|p| if p.peek() == Some(&Tok::Open) { p.i += 1; let c = p.coord()?; p.expect(Tok::Close)?; Ok(c) } else { p.coord() })?,
+            "MultiLineString" => self.list(|p| p.ring())?,
+            "MultiPolygon" => self.list(|p| p.polygon())?,
+            _ => {
+                let geoms = self.list(|p| p.geometry())?;
+                return Ok(json!({ "type": "GeometryCollection", "geometries": geoms }));
+            }
+        };
+        Ok(json!({ "type": name, "coordinates": coords }))
+    }
+}
+
+fn gj_name(w: &str) -> Result<&'static str, String> {
+    Ok(match w {
+        "POINT" => "Point", "LINESTRING" => "LineString", "POLYGON" => "Polygon",
+        "MULTIPOINT" => "MultiPoint", "MULTILINESTRING" => "MultiLineString", "MULTIPOLYGON" => "MultiPolygon",
+        "GEOMETRYCOLLECTION" => "GeometryCollection",
+        _ => return Err(format!("`{}` is not a WKT geometry type", w)),
+    })
+}
+
+fn split_srid(text: &str) -> Result<(Option<i64>, &str), String> {
+    let t = text.trim();
+    if t.len() > 5 && t[..5].eq_ignore_ascii_case("SRID=") {
+        let semi = t.find(';').ok_or("an EWKT SRID is followed by `;`")?;
+        let srid = t[5..semi].trim().parse::<i64>().map_err(|_| format!("`{}` is not an SRID", &t[5..semi]))?;
+        return Ok((Some(srid), &t[semi + 1..]));
+    }
+    Ok((None, t))
+}
+
+fn parse_wkt(text: &str) -> Result<(Option<i64>, Value), String> {
+    let (srid, body) = split_srid(text)?;
+    let mut p = P { t: lex(body)?, i: 0, dims: 2, has_m: false };
+    let g = p.geometry()?;
+    if p.i < p.t.len() {
+        return Err(format!("text after the geometry: {:?}", p.t[p.i]));
+    }
+    Ok((srid, g))
+}
+
+// ---------- WKT writing ----------
+
+fn num(v: &Value) -> Result<f64, String> {
+    v.as_f64().ok_or_else(|| format!("{} is not a number", v))
+}
+
+fn arr(v: &Value) -> Result<&Vec<Value>, String> {
+    v.as_array().ok_or_else(|| format!("{} is not a list", v))
+}
+
+fn pos_text(v: &Value) -> Result<String, String> {
+    let a = arr(v)?;
+    if a.len() < 2 { return Err(format!("{} is not a position", v)) }
+    Ok(a.iter().map(|n| num(n).map(|f| f.to_string())).collect::<Result<Vec<_>, _>>()?.join(" "))
+}
+
+fn seq_text<F: Fn(&Value) -> Result<String, String>>(v: &Value, f: F) -> Result<String, String> {
+    Ok(format!("({})", arr(v)?.iter().map(|x| f(x)).collect::<Result<Vec<_>, _>>()?.join(", ")))
+}
+
+fn geometry_of(v: &Value) -> Result<&Value, String> {
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("Feature") => v.get("geometry").filter(|g| !g.is_null()).ok_or_else(|| "the feature has no geometry".to_string()),
+        Some(_) => Ok(v),
+        None => Err("a GeoJSON geometry has a `type`".into()),
+    }
+}
+
+fn has_z(v: &Value) -> bool {
+    match v {
+        Value::Array(a) if !a.is_empty() && a[0].is_number() => a.len() >= 3,
+        Value::Array(a) => a.iter().any(has_z),
+        Value::Object(o) => o.get("coordinates").map(has_z).unwrap_or(false) || o.get("geometries").map(has_z).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn to_wkt(g: &Value) -> Result<String, String> {
+    let g = geometry_of(g)?;
+    let t = g["type"].as_str().unwrap_or("");
+    let upper = match t {
+        "Point" => "POINT", "LineString" => "LINESTRING", "Polygon" => "POLYGON", "MultiPoint" => "MULTIPOINT",
+        "MultiLineString" => "MULTILINESTRING", "MultiPolygon" => "MULTIPOLYGON", "GeometryCollection" => "GEOMETRYCOLLECTION",
+        _ => return Err(format!("`{}` is not a GeoJSON geometry type", t)),
+    };
+    let z = if has_z(g) { " Z" } else { "" };
+    if t == "GeometryCollection" {
+        let gs = arr(&g["geometries"])?;
+        if gs.is_empty() { return Ok("GEOMETRYCOLLECTION EMPTY".into()) }
+        return Ok(format!("GEOMETRYCOLLECTION{} ({})", z, gs.iter().map(to_wkt).collect::<Result<Vec<_>, _>>()?.join(", ")));
+    }
+    let c = &g["coordinates"];
+    if arr(c)?.is_empty() { return Ok(format!("{} EMPTY", upper)) }
+    let body = match t {
+        "Point" => format!("({})", pos_text(c)?),
+        "LineString" => seq_text(c, pos_text)?,
+        "Polygon" | "MultiLineString" => seq_text(c, |r| seq_text(r, pos_text))?,
+        "MultiPoint" => seq_text(c, |p| Ok(format!("({})", pos_text(p)?)))?,
+        _ => seq_text(c, |p| seq_text(p, |r| seq_text(r, pos_text)))?,
+    };
+    Ok(format!("{}{} {}", upper, z, body))
+}
+
+// ---------- WKB ----------
+
+struct R<'a> { b: &'a [u8], i: usize }
+
+impl<'a> R<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.i + n > self.b.len() { return Err("the WKB ends too soon".into()) }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+    fn u32(&mut self, le: bool) -> Result<u32, String> {
+        let s: [u8; 4] = self.take(4)?.try_into().unwrap();
+        Ok(if le { u32::from_le_bytes(s) } else { u32::from_be_bytes(s) })
+    }
+    fn f64(&mut self, le: bool) -> Result<f64, String> {
+        let s: [u8; 8] = self.take(8)?.try_into().unwrap();
+        Ok(if le { f64::from_le_bytes(s) } else { f64::from_be_bytes(s) })
+    }
+    fn count(&mut self, le: bool) -> Result<usize, String> {
+        let n = self.u32(le)? as usize;
+        if n > self.b.len() { return Err("a count in the WKB is larger than the WKB".into()) }
+        Ok(n)
+    }
+    fn geometry(&mut self, depth: usize) -> Result<(Option<i64>, Value), String> {
+        if depth > 32 { return Err("the WKB nests too deeply".into()) }
+        let le = match self.take(1)?[0] { 0 => false, 1 => true, b => return Err(format!("{} is not a WKB byte order", b)) };
+        let raw = self.u32(le)?;
+        let mut srid = None;
+        if raw & 0x2000_0000 != 0 { srid = Some(self.u32(le)? as i64) }
+        let (mut z, mut m) = (raw & 0x8000_0000 != 0, raw & 0x4000_0000 != 0);
+        let mut base = raw & 0x0FFF_FFFF;
+        match base / 1000 { 1 => z = true, 2 => m = true, 3 => { z = true; m = true } _ => {} }
+        base %= 1000;
+        let dims = 2 + z as usize + m as usize;
+        let mut pos = |r: &mut R| -> Result<Value, String> {
+            let mut v = Vec::new();
+            for k in 0..dims { let f = r.f64(le)?; if k < 2 + z as usize { v.push(json!(f)) } }
+            Ok(Value::Array(v))
+        };
+        let g = match base {
+            1 => {
+                let p = pos(self)?;
+                if p[0].as_f64().map(|f| f.is_nan()).unwrap_or(false) { json!({"type": "Point", "coordinates": []}) } else { json!({"type": "Point", "coordinates": p}) }
+            }
+            2 => { let n = self.count(le)?; let mut v = Vec::new(); for _ in 0..n { v.push(pos(self)?) } json!({"type": "LineString", "coordinates": v}) }
+            3 => {
+                let rings = self.count(le)?;
+                let mut rv = Vec::new();
+                for _ in 0..rings { let n = self.count(le)?; let mut v = Vec::new(); for _ in 0..n { v.push(pos(self)?) } rv.push(Value::Array(v)) }
+                json!({"type": "Polygon", "coordinates": rv})
+            }
+            4 | 5 | 6 | 7 => {
+                let n = self.count(le)?;
+                let mut parts = Vec::new();
+                for _ in 0..n { parts.push(self.geometry(depth + 1)?.1) }
+                if base == 7 {
+                    json!({"type": "GeometryCollection", "geometries": parts})
+                } else {
+                    let name = ["MultiPoint", "MultiLineString", "MultiPolygon"][base as usize - 4];
+                    json!({"type": name, "coordinates": parts.into_iter().map(|p| p["coordinates"].clone()).collect::<Vec<_>>()})
+                }
+            }
+            _ => return Err(format!("WKB geometry type {} is not one this reads (points, lines, polygons, their multis and collections)", base)),
+        };
+        Ok((srid, g))
+    }
+}
+
+fn hex_bytes(text: &str) -> Result<Vec<u8>, String> {
+    let t = text.trim();
+    let t = t.strip_prefix("\\x").or_else(|| t.strip_prefix("0x")).unwrap_or(t);
+    if t.len() % 2 == 1 { return Err("WKB in hex has an even number of digits".into()) }
+    (0..t.len()).step_by(2).map(|i| u8::from_str_radix(&t[i..i + 2], 16).map_err(|_| format!("`{}` is not hex", &t[i..i + 2]))).collect()
+}
+
+fn write_wkb(out: &mut Vec<u8>, g: &Value, srid: Option<u32>, z: bool) -> Result<(), String> {
+    let g = geometry_of(g)?;
+    let t = g["type"].as_str().unwrap_or("");
+    let code: u32 = match t { "Point" => 1, "LineString" => 2, "Polygon" => 3, "MultiPoint" => 4, "MultiLineString" => 5, "MultiPolygon" => 6, "GeometryCollection" => 7, _ => return Err(format!("`{}` is not a GeoJSON geometry type", t)) };
+    out.push(1);
+    let mut head = code;
+    if z { head |= 0x8000_0000 }
+    if srid.is_some() { head |= 0x2000_0000 }
+    out.extend_from_slice(&head.to_le_bytes());
+    if let Some(s) = srid { out.extend_from_slice(&s.to_le_bytes()) }
+    let pos = |out: &mut Vec<u8>, p: &Value| -> Result<(), String> {
+        let a = arr(p)?;
+        if a.len() < 2 { return Err(format!("{} is not a position", p)) }
+        out.extend_from_slice(&num(&a[0])?.to_le_bytes());
+        out.extend_from_slice(&num(&a[1])?.to_le_bytes());
+        if z { out.extend_from_slice(&a.get(2).map(num).transpose()?.unwrap_or(0.0).to_le_bytes()) }
+        Ok(())
+    };
+    let seq = |out: &mut Vec<u8>, s: &Value| -> Result<(), String> {
+        let a = arr(s)?;
+        out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        for p in a { pos(out, p)? }
+        Ok(())
+    };
+    let c = &g["coordinates"];
+    match code {
+        1 => {
+            if arr(c)?.is_empty() { for _ in 0..(2 + z as usize) { out.extend_from_slice(&f64::NAN.to_le_bytes()) } } else { pos(out, c)? }
+        }
+        2 => seq(out, c)?,
+        3 => { let r = arr(c)?; out.extend_from_slice(&(r.len() as u32).to_le_bytes()); for ring in r { seq(out, ring)? } }
+        7 => { let gs = arr(&g["geometries"])?; out.extend_from_slice(&(gs.len() as u32).to_le_bytes()); for x in gs { write_wkb(out, x, None, z)? } }
+        _ => {
+            let parts = arr(c)?;
+            out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+            let name = ["Point", "LineString", "Polygon"][code as usize - 4];
+            for p in parts { write_wkb(out, &json!({"type": name, "coordinates": p}), None, z)? }
+        }
+    }
+    Ok(())
+}
+
+fn walk(v: &Value, f: &mut dyn FnMut(&[Value])) {
+    if let Value::Array(a) = v {
+        if !a.is_empty() && a[0].is_number() { f(a) } else { for x in a { walk(x, f) } }
+    }
+}
+
+fn info(g: &Value) -> Result<Value, String> {
+    let g = geometry_of(g)?;
+    let (mut n, mut b) = (0usize, [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY]);
+    let mut visit = |a: &[Value]| {
+        n += 1;
+        let (x, y) = (a[0].as_f64().unwrap_or(0.0), a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0));
+        b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+    };
+    fn all(g: &Value, f: &mut dyn FnMut(&[Value])) {
+        if let Some(gs) = g.get("geometries").and_then(|x| x.as_array()) { for x in gs { all(x, f) } } else { walk(&g["coordinates"], f) }
+    }
+    all(g, &mut visit);
+    let parts = match g["type"].as_str() { Some("GeometryCollection") => g["geometries"].as_array().map(|a| a.len()).unwrap_or(0), Some(t) if t.starts_with("Multi") => g["coordinates"].as_array().map(|a| a.len()).unwrap_or(0), _ => if n > 0 { 1 } else { 0 } };
+    Ok(json!({ "type": g["type"], "points": n, "parts": parts, "has_z": has_z(g), "empty": n == 0, "bbox": if n > 0 { json!(b) } else { Value::Null } }))
+}
+
+/// WKT or EWKT (`"POINT(4.89 52.37)"`, `"SRID=4326;POLYGON((...))"`) as a GeoJSON geometry; 3D positions are kept, M values dropped.
+pub fn wkt_to_geojson(wkt: &str) -> Result<Value, String> {
+    Ok(parse_wkt(wkt)?.1)
+}
+
+/// A GeoJSON geometry (or a feature's) as WKT, `"POLYGON Z (...)"` when it has heights; with `srid` above 0, as EWKT, `"SRID=4326;..."`.
+pub fn wkt_from_geojson(geometry: serde_json::Value, srid: i64) -> Result<String, String> {
+    let w = to_wkt(&geometry)?;
+    Ok(if srid > 0 { format!("SRID={};{}", srid, w) } else { w })
+}
+
+/// WKB or PostGIS EWKB in hex (as `SELECT geom` gives it) read: `{ srid, geometry }`, the geometry in GeoJSON and `srid` null when there is none. ISO and EWKB 3D both read.
+pub fn wkb_to_geojson(hex: &str) -> Result<Value, String> {
+    let b = hex_bytes(hex)?;
+    let mut r = R { b: &b, i: 0 };
+    let (srid, g) = r.geometry(0)?;
+    if r.i != b.len() { return Err(format!("{} bytes left after the geometry", b.len() - r.i)) }
+    let mut m = Map::new();
+    m.insert("srid".into(), json!(srid));
+    m.insert("geometry".into(), g);
+    Ok(Value::Object(m))
+}
+
+/// A GeoJSON geometry as WKB in hex, little-endian, for PostGIS's `ST_GeomFromEWKB(decode($1, 'hex'))`; with `srid` above 0 it is EWKB with the SRID inside.
+pub fn wkb_from_geojson(geometry: serde_json::Value, srid: i64) -> Result<String, String> {
+    let mut out = Vec::new();
+    let z = has_z(geometry_of(&geometry)?);
+    write_wkb(&mut out, &geometry, if srid > 0 { Some(srid as u32) } else { None }, z)?;
+    Ok(out.iter().map(|b| format!("{:02X}", b)).collect())
+}
+
+/// WKB or EWKB in hex as (E)WKT text, for logs and debugging what a database holds.
+pub fn wkb_to_wkt(hex: &str) -> Result<String, String> {
+    let v = wkb_to_geojson(hex)?;
+    let w = to_wkt(&v["geometry"])?;
+    Ok(match v["srid"].as_i64() { Some(s) => format!("SRID={};{}", s, w), None => w })
+}
+
+/// What a WKT holds: `{ type, srid, points, parts, has_z, empty, bbox }`, `bbox` as `[west, south, east, north]`.
+pub fn wkt_info(wkt: &str) -> Result<Value, String> {
+    let (srid, g) = parse_wkt(wkt)?;
+    let mut v = info(&g)?;
+    v["srid"] = json!(srid);
+    Ok(v)
+}

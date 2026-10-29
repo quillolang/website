@@ -1,0 +1,170 @@
+//! Minified JavaScript stack traces mapped back to the original files, lines, columns and function names with their source maps: error reports you can read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sourcemap = "=9.3.2"
+
+use serde_json::{json, Value};
+use sourcemap::{DecodedMap, SourceMap, SourceView};
+
+fn load(map: &str) -> Result<SourceMap, String> {
+    let bytes = if map.trim_start().starts_with('{') {
+        map.as_bytes().to_vec()
+    } else {
+        std::fs::read(map).map_err(|e| format!("{}: {}", map, e))?
+    };
+    match sourcemap::decode_slice(&bytes).map_err(|e| format!("not a source map: {}", e))? {
+        DecodedMap::Regular(sm) => Ok(sm),
+        DecodedMap::Index(ix) => ix.flatten().map_err(|e| format!("an index map that does not flatten: {}", e)),
+        _ => Err("a kind of source map that is not supported (a RAM bundle or Hermes map)".into()),
+    }
+}
+
+/// Looks up a 1-based line and column, as stack traces give them.
+fn find(sm: &SourceMap, line: i64, column: i64, minified: Option<&SourceView>, minified_name: Option<&str>) -> Option<Value> {
+    if line < 1 || column < 1 {
+        return None;
+    }
+    let (l, c) = ((line - 1) as u32, (column - 1) as u32);
+    let t = sm.lookup_token(l, c)?;
+    let source = t.get_source()?;
+    let function = match (minified, minified_name) {
+        (Some(v), Some(n)) if !n.is_empty() => sm.get_original_function_name(l, c, n, v).map(String::from),
+        _ => None,
+    };
+    let code = sm.get_source_view(t.get_src_id()).and_then(|v| v.get_line(t.get_src_line())).map(|s| s.trim().to_string());
+    Some(json!({
+        "source": source,
+        "line": t.get_src_line() + 1,
+        "column": t.get_src_col() + 1,
+        "name": t.get_name(),
+        "function": function,
+        "code": code,
+    }))
+}
+
+/// Where a place in the minified file comes from: `map` is a .map file's path or its JSON text, `line` and `column` count from 1, as
+/// in stack traces. `{ source, line, column, name, function, code }` (lines and columns from 1; `code` the original line, when the map
+/// carries the sources), or null when the map has nothing there.
+pub fn sourcemap_lookup(map: &str, line: i64, column: i64) -> Result<Option<Value>, String> {
+    let sm = load(map)?;
+    Ok(find(&sm, line, column, None, None))
+}
+
+/// The original lines around a place in the minified file: `{ source, line, column, lines }`, `lines` being `{ n, text, here }` from
+/// `around` lines before to `around` after (`here` marks the line itself). For an error page that shows the code. Needs the map to carry
+/// `sourcesContent`.
+pub fn sourcemap_context(map: &str, line: i64, column: i64, around: i64) -> Result<Option<Value>, String> {
+    let sm = load(map)?;
+    let Some(hit) = find(&sm, line, column, None, None) else { return Ok(None) };
+    let src = hit["source"].as_str().unwrap_or("");
+    let idx = (0..sm.get_source_count()).find(|i| sm.get_source(*i) == Some(src)).ok_or("no such source")?;
+    let view = sm.get_source_view(idx).ok_or("the map does not carry this file's text (sourcesContent)")?;
+    let at = hit["line"].as_u64().unwrap_or(1) as i64;
+    let around = around.clamp(0, 50);
+    let mut lines = vec![];
+    for n in (at - around).max(1)..=at + around {
+        if let Some(text) = view.get_line((n - 1) as u32) {
+            lines.push(json!({ "n": n, "text": text, "here": n == at }));
+        }
+    }
+    Ok(Some(json!({ "source": src, "line": at, "column": hit["column"], "lines": lines })))
+}
+
+struct Frame {
+    raw: String,
+    indent: String,
+    function: Option<String>,
+    url: String,
+    line: i64,
+    column: i64,
+}
+
+/// A stack trace line: Chrome and Node's `    at fn (url:12:34)` or `    at url:12:34`, Firefox and Safari's `fn@url:12:34`.
+fn frame(raw: &str) -> Option<Frame> {
+    let indent: String = raw.chars().take_while(|c| c.is_whitespace()).collect();
+    let t = raw.trim();
+    let (function, place) = if let Some(rest) = t.strip_prefix("at ") {
+        match rest.rfind(" (") {
+            Some(i) if rest.ends_with(')') => (Some(rest[..i].to_string()), &rest[i + 2..rest.len() - 1]),
+            _ => (None, rest),
+        }
+    } else if let Some(i) = t.find('@') {
+        (Some(t[..i].to_string()).filter(|s| !s.is_empty()), &t[i + 1..])
+    } else {
+        return None;
+    };
+    let (rest, col) = place.rsplit_once(':')?;
+    let (url, line) = rest.rsplit_once(':')?;
+    Some(Frame { raw: raw.to_string(), indent, function, url: url.to_string(), line: line.parse().ok()?, column: col.parse().ok()? })
+}
+
+fn base_name(url: &str) -> &str {
+    let u = url.split(['?', '#']).next().unwrap_or(url);
+    u.rsplit('/').next().unwrap_or(u)
+}
+
+/// A minified stack trace mapped back: each frame whose file has a map in the folder `maps_dir` (`app.min.js` looks for
+/// `app.min.js.map`; the minified file beside it, when there, gives the original function names) is rewritten as
+/// `at total (src/cart.ts:6:3)`. `{ text, frames }`: `text` the trace rewritten, `frames` each `{ function, file, line, column, mapped,
+/// source, source_line, source_column, code }`. Frames without a map stay as they were.
+pub fn sourcemap_stack(stack: &str, maps_dir: &str) -> Result<Value, String> {
+    let mut maps: std::collections::HashMap<String, Option<(SourceMap, Option<SourceView>)>> = std::collections::HashMap::new();
+    let mut text = vec![];
+    let mut frames = vec![];
+    for raw in stack.lines() {
+        let Some(f) = frame(raw) else {
+            text.push(raw.to_string());
+            continue;
+        };
+        let name = base_name(&f.url).to_string();
+        let entry = maps.entry(name.clone()).or_insert_with(|| {
+            if name.is_empty() || name.contains("..") {
+                return None;
+            }
+            let dir = std::path::Path::new(maps_dir);
+            let sm = load(dir.join(format!("{}.map", name)).to_str()?).ok()?;
+            let view = std::fs::read_to_string(dir.join(&name)).ok().map(SourceView::from_string);
+            Some((sm, view))
+        });
+        let short = f.function.as_deref().map(|s| s.rsplit('.').next().unwrap_or(s));
+        let hit = entry.as_ref().and_then(|(sm, view)| find(sm, f.line, f.column, view.as_ref(), short));
+        match &hit {
+            Some(h) => {
+                let func = h["function"].as_str().map(String::from).or_else(|| f.function.clone());
+                let place = format!("{}:{}:{}", h["source"].as_str().unwrap_or(""), h["line"], h["column"]);
+                text.push(match &func {
+                    Some(fun) => format!("{}at {} ({})", f.indent, fun, place),
+                    None => format!("{}at {}", f.indent, place),
+                });
+                frames.push(json!({
+                    "function": func, "file": f.url, "line": f.line, "column": f.column, "mapped": true,
+                    "source": h["source"], "source_line": h["line"], "source_column": h["column"], "code": h["code"],
+                }));
+            }
+            None => {
+                text.push(f.raw.clone());
+                frames.push(json!({
+                    "function": f.function, "file": f.url, "line": f.line, "column": f.column, "mapped": false,
+                    "source": null, "source_line": null, "source_column": null, "code": null,
+                }));
+            }
+        }
+    }
+    Ok(json!({ "text": text.join("\n"), "frames": frames }))
+}
+
+/// What a map holds: `{ file, sources, names, mappings, has_contents }`: the minified file's name, the original files, how many names and
+/// mappings, and whether the sources' text is in it (then a server needs nothing else to show code).
+pub fn sourcemap_info(map: &str) -> Result<Value, String> {
+    let sm = load(map)?;
+    let sources: Vec<&str> = sm.sources().collect();
+    let has = (0..sm.get_source_count()).all(|i| sm.get_source_contents(i).is_some());
+    Ok(json!({
+        "file": sm.get_file(),
+        "sources": sources,
+        "names": sm.get_name_count(),
+        "mappings": sm.get_token_count(),
+        "has_contents": has && !sources.is_empty(),
+    }))
+}

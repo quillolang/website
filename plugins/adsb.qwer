@@ -1,0 +1,339 @@
+//! Aircraft ADS-B and Mode S messages decoded from a 1090 MHz receiver's hex (dump1090, readsb, an RTL-SDR's AVR lines): CRC-24 checked, ICAO address, call sign, altitude, airborne positions resolved from even and odd CPR pairs (or near a reference point), ground speed, track, airspeed, heading and vertical rate, squawk codes, and the aircraft seen put together.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::f64::consts::PI;
+
+fn bytes_of(hex: &str) -> Result<Vec<u8>, String> {
+    let h: String = hex.trim().trim_start_matches(['*', '@']).trim_end_matches(';').chars().filter(|c| !c.is_whitespace()).collect();
+    // AVR with a timestamp (@ + 12 hex digits) keeps its message after the clock.
+    let h = if hex.trim().starts_with('@') && (h.len() == 40 || h.len() == 26) { h[12..].to_string() } else { h };
+    if h.len() != 28 && h.len() != 14 {
+        return Err(format!("a Mode S message is 14 or 28 hex digits, not {}", h.len()));
+    }
+    (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).map_err(|_| format!("{:?} is not hex", hex))).collect()
+}
+
+/// The CRC-24 remainder of a whole message (0 for an ADS-B message with nothing wrong).
+fn crc(msg: &[u8]) -> u32 {
+    let mut bits: Vec<u8> = vec![];
+    for b in msg {
+        for i in (0..8).rev() {
+            bits.push((b >> i) & 1);
+        }
+    }
+    let gen: [u8; 25] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1];
+    let n = bits.len();
+    for i in 0..n - 24 {
+        if bits[i] == 1 {
+            for (k, g) in gen.iter().enumerate() {
+                bits[i + k] ^= g;
+            }
+        }
+    }
+    bits[n - 24..].iter().fold(0u32, |a, &b| (a << 1) | b as u32)
+}
+
+fn field(msg: &[u8], start: usize, len: usize) -> u64 {
+    // `start` counts from 1, as the standard numbers the bits.
+    let mut v = 0u64;
+    for i in start - 1..start - 1 + len {
+        v = (v << 1) | ((msg[i / 8] >> (7 - i % 8)) & 1) as u64;
+    }
+    v
+}
+
+/// The number of longitude zones at a latitude (NZ = 15).
+fn nl(lat: f64) -> f64 {
+    if lat == 0.0 {
+        return 59.0;
+    }
+    if lat.abs() == 87.0 {
+        return 2.0;
+    }
+    if lat.abs() > 87.0 {
+        return 1.0;
+    }
+    let nz = 15.0;
+    let a = 1.0 - (PI / (2.0 * nz)).cos();
+    let b = (PI / 180.0 * lat).cos().powi(2);
+    (2.0 * PI / (1.0 - a / b).acos()).floor()
+}
+
+fn modp(a: f64, b: f64) -> f64 {
+    a - b * (a / b).floor()
+}
+
+/// A position from an even and an odd CPR pair, the newer one deciding.
+fn global(lat_e: f64, lon_e: f64, lat_o: f64, lon_o: f64, even_newer: bool) -> Option<(f64, f64)> {
+    let (dl_e, dl_o) = (360.0 / 60.0, 360.0 / 59.0);
+    let j = (59.0 * lat_e - 60.0 * lat_o + 0.5).floor();
+    let mut le = dl_e * (modp(j, 60.0) + lat_e);
+    let mut lo = dl_o * (modp(j, 59.0) + lat_o);
+    if le >= 270.0 {
+        le -= 360.0;
+    }
+    if lo >= 270.0 {
+        lo -= 360.0;
+    }
+    if nl(le) != nl(lo) {
+        return None;
+    }
+    let lat = if even_newer { le } else { lo };
+    let n = nl(lat);
+    let m = (lon_e * (n - 1.0) - lon_o * n + 0.5).floor();
+    let ni = if even_newer { n.max(1.0) } else { (n - 1.0).max(1.0) };
+    let mut lon = (360.0 / ni) * (modp(m, ni) + if even_newer { lon_e } else { lon_o });
+    if lon >= 180.0 {
+        lon -= 360.0;
+    }
+    Some((lat, lon))
+}
+
+/// A position from one CPR message near a known point (within about 180 NM).
+fn local(lat_c: f64, lon_c: f64, odd: bool, rlat: f64, rlon: f64) -> (f64, f64) {
+    let i = if odd { 1.0 } else { 0.0 };
+    let dlat = 360.0 / (60.0 - i);
+    let j = (rlat / dlat).floor() + (modp(rlat, dlat) / dlat - lat_c + 0.5).floor();
+    let lat = dlat * (j + lat_c);
+    let dlon = 360.0 / (nl(lat) - i).max(1.0);
+    let m = (rlon / dlon).floor() + (modp(rlon, dlon) / dlon - lon_c + 0.5).floor();
+    (lat, dlon * (m + lon_c))
+}
+
+fn round(x: f64, d: i32) -> f64 {
+    let p = 10f64.powi(d);
+    (x * p).round() / p
+}
+
+/// The 12-bit altitude of a position message, in feet (25-foot steps; Gillham-coded altitudes are not read).
+fn alt12(a: u64) -> Value {
+    if a == 0 {
+        return Value::Null;
+    }
+    if a & 0x10 != 0 {
+        let n = ((a & 0xfe0) >> 1) | (a & 0x0f);
+        json!(n as i64 * 25 - 1000)
+    } else {
+        Value::Null
+    }
+}
+
+/// The 13-bit altitude code of DF 0, 4, 16 and 20.
+fn alt13(a: u64) -> Value {
+    let m = a & 0x40 != 0;
+    let q = a & 0x10 != 0;
+    if a == 0 || m || !q {
+        return Value::Null;
+    }
+    let n = ((a & 0x1f80) >> 2) | ((a & 0x20) >> 1) | (a & 0x0f);
+    json!(n as i64 * 25 - 1000)
+}
+
+/// The squawk (identity) of DF 5 and 21: four octal digits.
+fn squawk(id: u64) -> String {
+    let b = |n: u32| ((id >> (12 - n)) & 1) as u32;
+    // Bits: C1 A1 C2 A2 C4 A4 X B1 D1 B2 D2 B4 D4.
+    let a = b(1) | b(3) << 1 | b(5) << 2;
+    let bb = b(7) | b(9) << 1 | b(11) << 2;
+    let c = b(0) | b(2) << 1 | b(4) << 2;
+    let d = b(8) | b(10) << 1 | b(12) << 2;
+    format!("{}{}{}{}", a, bb, c, d)
+}
+
+const CHARS: &[u8] = b"#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######";
+
+fn decode(msg: &[u8]) -> Value {
+    let df = (msg[0] >> 3) as u64;
+    let mut m = Map::new();
+    m.insert("df".into(), json!(df));
+    let rem = crc(msg);
+    match df {
+        17 | 18 if msg.len() == 14 => {
+            m.insert("crc_ok".into(), json!(rem == 0));
+            m.insert("icao".into(), json!(format!("{:06X}", field(msg, 9, 24))));
+            let tc = field(msg, 33, 5);
+            m.insert("tc".into(), json!(tc));
+            match tc {
+                1..=4 => {
+                    let cs: String = (0..8).map(|k| CHARS[field(msg, 41 + k * 6, 6) as usize] as char).collect();
+                    m.insert("kind".into(), json!("identification"));
+                    m.insert("callsign".into(), json!(cs.trim_end_matches(['#', ' ']).to_string()));
+                    m.insert("category".into(), json!(format!("{}{}", (b'E' - tc as u8) as char, field(msg, 38, 3))));
+                }
+                5..=8 => {
+                    m.insert("kind".into(), json!("surface position"));
+                    m.insert("odd".into(), json!(field(msg, 54, 1) == 1));
+                    m.insert("lat_cpr".into(), json!(field(msg, 55, 17) as f64 / 131072.0));
+                    m.insert("lon_cpr".into(), json!(field(msg, 72, 17) as f64 / 131072.0));
+                }
+                9..=18 | 20..=22 => {
+                    m.insert("kind".into(), json!("airborne position"));
+                    let a = field(msg, 41, 12);
+                    m.insert("altitude".into(), if tc >= 20 { json!(round(a as f64 * 3.28084, 0)) } else { alt12(a) });
+                    m.insert("altitude_type".into(), json!(if tc >= 20 { "GNSS" } else { "barometric" }));
+                    m.insert("odd".into(), json!(field(msg, 54, 1) == 1));
+                    m.insert("lat_cpr".into(), json!(field(msg, 55, 17) as f64 / 131072.0));
+                    m.insert("lon_cpr".into(), json!(field(msg, 72, 17) as f64 / 131072.0));
+                }
+                19 => {
+                    let st = field(msg, 38, 3);
+                    m.insert("kind".into(), json!("velocity"));
+                    m.insert("subtype".into(), json!(st));
+                    let mult = if st == 2 || st == 4 { 4.0 } else { 1.0 };
+                    if st == 1 || st == 2 {
+                        let (sew, vew, sns, vns) = (field(msg, 46, 1), field(msg, 47, 10), field(msg, 57, 1), field(msg, 58, 10));
+                        if vew > 0 && vns > 0 {
+                            let vx = (vew as f64 - 1.0) * mult * if sew == 1 { -1.0 } else { 1.0 };
+                            let vy = (vns as f64 - 1.0) * mult * if sns == 1 { -1.0 } else { 1.0 };
+                            m.insert("speed".into(), json!(round((vx * vx + vy * vy).sqrt(), 2)));
+                            m.insert("track".into(), json!(round(modp(vx.atan2(vy).to_degrees(), 360.0), 2)));
+                            m.insert("speed_type".into(), json!("ground speed"));
+                        }
+                    } else if st == 3 || st == 4 {
+                        if field(msg, 46, 1) == 1 {
+                            m.insert("heading".into(), json!(round(field(msg, 47, 10) as f64 * 360.0 / 1024.0, 2)));
+                        }
+                        let a = field(msg, 58, 10);
+                        if a > 0 {
+                            m.insert("speed".into(), json!((a as f64 - 1.0) * mult));
+                            m.insert("speed_type".into(), json!(if field(msg, 57, 1) == 1 { "true airspeed" } else { "indicated airspeed" }));
+                        }
+                    }
+                    let vr = field(msg, 70, 9);
+                    if vr > 0 {
+                        m.insert("vertical_rate".into(), json!((vr as i64 - 1) * 64 * if field(msg, 69, 1) == 1 { -1 } else { 1 }));
+                    }
+                }
+                28 => {
+                    m.insert("kind".into(), json!("aircraft status"));
+                    let id = field(msg, 44, 13);
+                    m.insert("squawk".into(), json!(squawk(id)));
+                    m.insert("emergency".into(), json!(match field(msg, 41, 3) { 0 => "none", 1 => "general", 2 => "medical", 3 => "minimum fuel", 4 => "no communications", 5 => "unlawful interference", 6 => "downed aircraft", _ => "reserved" }));
+                }
+                29 => {
+                    m.insert("kind".into(), json!("target state"));
+                }
+                31 => {
+                    m.insert("kind".into(), json!("operational status"));
+                }
+                _ => {
+                    m.insert("kind".into(), json!("other"));
+                }
+            }
+        }
+        0 | 4 | 16 | 20 => {
+            m.insert("kind".into(), json!("altitude reply"));
+            m.insert("icao".into(), json!(format!("{:06X}", rem)));
+            m.insert("altitude".into(), alt13(field(msg, 20, 13)));
+        }
+        5 | 21 => {
+            m.insert("kind".into(), json!("identity reply"));
+            m.insert("icao".into(), json!(format!("{:06X}", rem)));
+            m.insert("squawk".into(), json!(squawk(field(msg, 20, 13))));
+        }
+        11 => {
+            m.insert("kind".into(), json!("all-call reply"));
+            m.insert("crc_ok".into(), json!(rem & 0xffff80 == 0));
+            m.insert("icao".into(), json!(format!("{:06X}", field(msg, 9, 24))));
+        }
+        _ => {
+            m.insert("kind".into(), json!("other"));
+            m.insert("icao".into(), json!(format!("{:06X}", rem)));
+        }
+    }
+    Value::Object(m)
+}
+
+/// One Mode S message (28 or 14 hex digits; `*...;` and `@timestamp...;` lines too) decoded: `{ df, icao, crc_ok, tc, kind, callsign, altitude (ft), odd, lat_cpr, lon_cpr, speed (kt), track, heading, vertical_rate (ft/min), squawk }`.
+/// For DF 4, 5, 20 and 21 the ICAO address is the one hidden in the parity, so it is right only if the message arrived whole.
+pub fn adsb_decode(hex: &str) -> Result<serde_json::Value, String> {
+    Ok(decode(&bytes_of(hex)?))
+}
+
+/// The position from an even and an odd airborne position message of one aircraft (sent within 10 s): `{ lat, lon, altitude }`, the second message given being the newer.
+pub fn adsb_position(first_hex: &str, second_hex: &str) -> Result<serde_json::Value, String> {
+    let (a, b) = (decode(&bytes_of(first_hex)?), decode(&bytes_of(second_hex)?));
+    for m in [&a, &b] {
+        if m["kind"] != "airborne position" {
+            return Err("both messages must be airborne positions".into());
+        }
+    }
+    if a["odd"] == b["odd"] {
+        return Err("one message must be even, the other odd".into());
+    }
+    let (e, o) = if a["odd"] == false { (&a, &b) } else { (&b, &a) };
+    let even_newer = b["odd"] == false;
+    let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+    let (lat, lon) = global(f(&e["lat_cpr"]), f(&e["lon_cpr"]), f(&o["lat_cpr"]), f(&o["lon_cpr"]), even_newer).ok_or("the two messages are in different latitude zones: wait for another pair")?;
+    Ok(json!({ "lat": round(lat, 5), "lon": round(lon, 5), "altitude": b["altitude"] }))
+}
+
+/// A position from one airborne position message near a reference point (the receiver's place, within about 180 NM).
+pub fn adsb_position_near(hex: &str, ref_lat: f64, ref_lon: f64) -> Result<serde_json::Value, String> {
+    let m = decode(&bytes_of(hex)?);
+    if m["kind"] != "airborne position" {
+        return Err("not an airborne position message".into());
+    }
+    let (lat, lon) = local(m["lat_cpr"].as_f64().unwrap_or(0.0), m["lon_cpr"].as_f64().unwrap_or(0.0), m["odd"] == true, ref_lat, ref_lon);
+    Ok(json!({ "lat": round(lat, 5), "lon": round(lon, 5), "altitude": m["altitude"] }))
+}
+
+/// The aircraft in a receiver's log (one message per line, in order): messages with a bad CRC dropped, the rest joined by ICAO address into
+/// `{ icao, callsign, altitude, lat, lon, speed, track, vertical_rate, squawk, messages }`; positions from even/odd pairs, or from one message near `ref_lat`, `ref_lon` when given.
+pub fn adsb_aircraft(lines: Vec<String>, options: serde_json::Value) -> Vec<serde_json::Value> {
+    let reference = match (options["ref_lat"].as_f64(), options["ref_lon"].as_f64()) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    };
+    let mut order: Vec<String> = vec![];
+    let mut planes: HashMap<String, (Map<String, Value>, Option<Value>, Option<Value>)> = HashMap::new();
+    for l in &lines {
+        let Ok(b) = bytes_of(l) else { continue };
+        let m = decode(&b);
+        if m["crc_ok"] == false || (m["df"] != 17 && m["df"] != 18 && m["df"] != 4 && m["df"] != 5 && m["df"] != 20 && m["df"] != 21) {
+            continue;
+        }
+        let icao = m["icao"].as_str().unwrap_or("").to_string();
+        if (m["df"] == 4 || m["df"] == 5 || m["df"] == 20 || m["df"] == 21) && !planes.contains_key(&icao) {
+            // Parity-hidden addresses are trusted only for aircraft already seen in ADS-B.
+            continue;
+        }
+        if !planes.contains_key(&icao) {
+            order.push(icao.clone());
+        }
+        let p = planes.entry(icao.clone()).or_insert_with(|| (Map::new(), None, None));
+        p.0.insert("icao".into(), json!(icao));
+        let n = p.0.get("messages").and_then(Value::as_i64).unwrap_or(0);
+        p.0.insert("messages".into(), json!(n + 1));
+        for k in ["callsign", "altitude", "speed", "track", "heading", "vertical_rate", "squawk"] {
+            if !m[k].is_null() {
+                p.0.insert(k.into(), m[k].clone());
+            }
+        }
+        if m["kind"] == "airborne position" {
+            let odd = m["odd"] == true;
+            if odd { p.2 = Some(m.clone()) } else { p.1 = Some(m.clone()) }
+            let mut done = false;
+            if let (Some(e), Some(o)) = (&p.1, &p.2) {
+                let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+                if let Some((lat, lon)) = global(f(&e["lat_cpr"]), f(&e["lon_cpr"]), f(&o["lat_cpr"]), f(&o["lon_cpr"]), !odd) {
+                    p.0.insert("lat".into(), json!(round(lat, 5)));
+                    p.0.insert("lon".into(), json!(round(lon, 5)));
+                    done = true;
+                }
+            }
+            if !done {
+                if let Some((rl, rn)) = reference {
+                    let (lat, lon) = local(m["lat_cpr"].as_f64().unwrap_or(0.0), m["lon_cpr"].as_f64().unwrap_or(0.0), odd, rl, rn);
+                    p.0.insert("lat".into(), json!(round(lat, 5)));
+                    p.0.insert("lon".into(), json!(round(lon, 5)));
+                }
+            }
+        }
+    }
+    order.into_iter().filter_map(|k| planes.remove(&k).map(|p| Value::Object(p.0))).collect()
+}

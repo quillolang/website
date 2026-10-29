@@ -1,0 +1,322 @@
+//! Mailboxes in the mbox format (Thunderbird, Gmail's Takeout, Unix mail spools) read message by message without loading them whole: lists, search, one message in full, each saved as .eml; and messages appended to a mailbox.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! mail-parser = "0.9"
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use mail_parser::{Address, MessageParser, MimeHeaders};
+use serde_json::{json, Value};
+use std::io::{BufRead, Write};
+
+const MAX_MESSAGE: usize = 50 * 1024 * 1024;
+
+// A line that starts a message: "From " at the start of the file or after a blank line, or one that looks like a whole
+// From_ line ("From sender date ... 2026"); a body line starting "From " is written ">From " by mail programs.
+fn is_separator(line: &[u8], prev_blank: bool) -> bool {
+    if !line.starts_with(b"From ") {
+        return false;
+    }
+    if prev_blank {
+        return true;
+    }
+    let t = String::from_utf8_lossy(line);
+    let t = t.trim_end();
+    t.split_whitespace().count() >= 3 && t.chars().rev().take(4).all(|c| c.is_ascii_digit())
+}
+
+// Calls `f` with each message (index, From_ line, raw RFC 5322 bytes with ">From " lines unescaped); `f` returns false to stop.
+fn each(path: &str, mut f: impl FnMut(usize, &str, &[u8]) -> Result<bool, String>) -> Result<usize, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut r = std::io::BufReader::with_capacity(1 << 16, file);
+    let mut line = Vec::new();
+    let mut msg: Vec<u8> = Vec::new();
+    let mut from_line = String::new();
+    let mut started = false;
+    let mut prev_blank = true;
+    let mut n = 0usize;
+    let mut too_big = false;
+    loop {
+        line.clear();
+        let got = r.read_until(b'\n', &mut line).map_err(|e| format!("{}: {}", path, e))?;
+        let end = got == 0;
+        if end || is_separator(&line, prev_blank) {
+            if started {
+                // The blank line before the next From_ belongs to the mailbox, not to the message.
+                if msg.ends_with(b"\r\n\r\n") {
+                    msg.truncate(msg.len() - 2);
+                } else if msg.ends_with(b"\n\n") {
+                    msg.pop();
+                }
+                if !f(n, &from_line, &msg)? {
+                    return Ok(n + 1);
+                }
+                n += 1;
+            }
+            if end {
+                break;
+            }
+            started = true;
+            too_big = false;
+            from_line = String::from_utf8_lossy(&line).trim_end().to_string();
+            msg.clear();
+            prev_blank = false;
+            continue;
+        }
+        if !started {
+            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            return Err(format!("{}: not an mbox file (it does not start with a `From ` line)", path));
+        }
+        prev_blank = line == b"\n" || line == b"\r\n";
+        // mboxrd: ">From ", ">>From "... lose one ">".
+        let body: &[u8] = if line.starts_with(b">") && line.iter().skip_while(|&&b| b == b'>').take(5).eq(b"From ".iter()) { &line[1..] } else { &line };
+        if msg.len() + body.len() > MAX_MESSAGE {
+            too_big = true;
+        }
+        if !too_big {
+            msg.extend_from_slice(body);
+        }
+    }
+    Ok(n)
+}
+
+fn addr(a: Option<&Address>) -> Vec<Value> {
+    a.map(|a| a.iter().map(|x| json!({ "name": x.name(), "email": x.address() })).collect()).unwrap_or_default()
+}
+
+fn summary(i: usize, raw: &[u8], full: bool) -> Value {
+    let Some(m) = MessageParser::default().parse(raw) else {
+        return json!({ "index": i, "size": raw.len(), "error": "not a message" });
+    };
+    let text = m.body_text(0).map(|t| t.to_string()).or_else(|| m.body_html(0).map(|h| h.to_string())).unwrap_or_default();
+    let attachments: Vec<Value> = m
+        .attachments()
+        .map(|a| json!({ "name": a.attachment_name(), "type": a.content_type().map(|c| format!("{}/{}", c.c_type, c.c_subtype.as_deref().unwrap_or("octet-stream"))), "size": a.contents().len() }))
+        .collect();
+    let mut v = json!({
+        "index": i,
+        "from": addr(m.from()).into_iter().next(),
+        "to": addr(m.to()),
+        "subject": m.subject(),
+        "date": m.date().map(|d| d.to_rfc3339()),
+        "message_id": m.message_id(),
+        "size": raw.len(),
+    });
+    if full {
+        v["cc"] = json!(addr(m.cc()));
+        v["in_reply_to"] = json!(m.in_reply_to().as_text());
+        v["text"] = json!(text);
+        // mail-parser makes an HTML body from the text one; only a real HTML part counts here.
+        let has_html = m.parts.iter().any(|p| matches!(p.body, mail_parser::PartType::Html(_)));
+        v["html"] = if has_html { json!(m.body_html(0).map(|h| h.to_string())) } else { Value::Null };
+        v["attachments"] = json!(attachments);
+    } else {
+        let snippet: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(140).collect();
+        v["snippet"] = json!(snippet);
+        v["attachments"] = json!(attachments.len());
+    }
+    v
+}
+
+/// How many messages the mailbox at `path` holds.
+pub fn mbox_count(path: &str) -> Result<i64, String> {
+    Ok(each(path, |_, _, _| Ok(true))? as i64)
+}
+
+/// The messages from `offset` (0 the first), at most `limit` of them (1 to 10,000): `[{ index, from, to, subject, date, message_id, size,
+/// snippet, attachments }]`, `from` `{ name, email }`, `date` RFC 3339, `snippet` the first 140 characters of the text, `attachments` a count.
+pub fn mbox_list(path: &str, offset: i64, limit: i64) -> Result<Vec<Value>, String> {
+    let (from, limit) = (offset.max(0) as usize, limit.clamp(1, 10_000) as usize);
+    let mut out = Vec::new();
+    each(path, |i, _, raw| {
+        if i >= from {
+            out.push(summary(i, raw, false));
+        }
+        Ok(out.len() < limit)
+    })?;
+    Ok(out)
+}
+
+/// The message at `index` in full: what `mbox_list` gives, with `cc`, `in_reply_to`, `text`, `html` and `attachments` as
+/// `[{ name, type, size }]`. An error when the mailbox has fewer messages.
+pub fn mbox_message(path: &str, index: i64) -> Result<Value, String> {
+    let mut found = None;
+    let n = each(path, |i, _, raw| {
+        if i as i64 == index {
+            found = Some(summary(i, raw, true));
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    found.ok_or_else(|| format!("{}: no message {} (it has {})", path, index, n))
+}
+
+/// The messages whose subject, sender or text holds `query` (any case), as `mbox_list` gives them, at most `limit` (1 to 10,000).
+pub fn mbox_search(path: &str, query: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let q = query.to_lowercase();
+    let limit = limit.clamp(1, 10_000) as usize;
+    let mut out = Vec::new();
+    each(path, |i, _, raw| {
+        if let Some(m) = MessageParser::default().parse(raw) {
+            let mut hay = m.subject().unwrap_or("").to_lowercase();
+            for a in addr(m.from()) {
+                hay.push(' ');
+                hay.push_str(&a.to_string().to_lowercase());
+            }
+            hay.push(' ');
+            hay.push_str(&m.body_text(0).unwrap_or_default().to_lowercase());
+            if hay.contains(&q) {
+                out.push(summary(i, raw, false));
+            }
+        }
+        Ok(out.len() < limit)
+    })?;
+    Ok(out)
+}
+
+/// Each message saved as an .eml file in `folder` (made if needed), named `00001.eml`, `00002.eml`...: how many were written.
+/// To move a mailbox into a helpdesk, or read one message with any mail program.
+pub fn mbox_split(path: &str, folder: &str) -> Result<i64, String> {
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {}", folder, e))?;
+    let n = each(path, |i, _, raw| {
+        std::fs::write(std::path::Path::new(folder).join(format!("{:05}.eml", i + 1)), raw).map_err(|e| format!("{}: {}", folder, e))?;
+        Ok(true)
+    })?;
+    Ok(n as i64)
+}
+
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// (RFC 5322 date, From_ line date), both in UTC.
+fn dates(secs: i64) -> (String, String) {
+    let days = secs.div_euclid(86_400);
+    let s = secs.rem_euclid(86_400);
+    let (y, m, d) = civil(days);
+    let wd = DAYS[days.rem_euclid(7) as usize];
+    let mon = MONTHS[(m - 1) as usize];
+    let (hh, mm, ss) = (s / 3600, s / 60 % 60, s % 60);
+    (format!("{}, {:02} {} {} {:02}:{:02}:{:02} +0000", wd, d, mon, y, hh, mm, ss), format!("{} {} {:2} {:02}:{:02}:{:02} {}", wd, mon, d, hh, mm, ss, y))
+}
+
+fn header_text(s: &str) -> String {
+    let s = s.replace(['\r', '\n'], " ");
+    if s.is_ascii() {
+        s
+    } else {
+        format!("=?UTF-8?B?{}?=", STANDARD.encode(s.as_bytes()))
+    }
+}
+
+fn address(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.trim().is_empty() => Some(s.replace(['\r', '\n'], " ")),
+        Value::Object(o) => {
+            let email = o.get("email")?.as_str()?.replace(['\r', '\n', '<', '>'], "");
+            match o.get("name").and_then(|n| n.as_str()).filter(|n| !n.is_empty()) {
+                Some(n) if n.is_ascii() => Some(format!("\"{}\" <{}>", n.replace(['"', '\\', '\r', '\n'], ""), email)),
+                Some(n) => Some(format!("{} <{}>", header_text(n), email)),
+                None => Some(email),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn addresses(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::Array(a)) => a.iter().filter_map(address).collect(),
+        Some(x) => address(x).into_iter().collect(),
+        None => vec![],
+    }
+}
+
+/// Adds a message to the end of the mailbox at `path` (made when missing): `message` has `from` and `to` (an address, `{ name, email }`, or a
+/// list of them), `subject`, `text`, and any of `cc`, `html` (sent beside the text), `message_id`, `in_reply_to` and `date` (Unix seconds; now
+/// when missing). Lines starting "From " in the body are written ">From ", as mail programs expect. Gives the number of messages now.
+pub fn mbox_append(path: &str, message: serde_json::Value) -> Result<i64, String> {
+    let from = addresses(message.get("from")).into_iter().next().ok_or("`from` is needed: an address, or `{ name, email }`")?;
+    let to = addresses(message.get("to"));
+    if to.is_empty() {
+        return Err("`to` is needed: an address, `{ name, email }`, or a list of them".into());
+    }
+    let s = |k: &str| message.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let secs = message.get("date").and_then(|d| d.as_i64()).unwrap_or(now);
+    let (date, from_date) = dates(secs);
+    let envelope = from.rsplit('<').next().unwrap_or(&from).trim_end_matches('>').trim().to_string();
+    let host = envelope.rsplit('@').next().unwrap_or("localhost").to_string();
+    let id = if s("message_id").is_empty() { format!("<{}.{}@{}>", secs, std::process::id(), host) } else { format!("<{}>", s("message_id").trim_matches(['<', '>'])) };
+    let mut h = vec![format!("From: {}", from), format!("To: {}", to.join(", "))];
+    let cc = addresses(message.get("cc"));
+    if !cc.is_empty() {
+        h.push(format!("Cc: {}", cc.join(", ")));
+    }
+    h.push(format!("Subject: {}", header_text(&s("subject"))));
+    h.push(format!("Date: {}", date));
+    h.push(format!("Message-ID: {}", id));
+    if !s("in_reply_to").is_empty() {
+        h.push(format!("In-Reply-To: <{}>", s("in_reply_to").trim_matches(['<', '>'])));
+    }
+    h.push("MIME-Version: 1.0".into());
+    let text = s("text").replace("\r\n", "\n");
+    let html = s("html").replace("\r\n", "\n");
+    let body = if html.is_empty() {
+        h.push("Content-Type: text/plain; charset=utf-8".into());
+        h.push("Content-Transfer-Encoding: 8bit".into());
+        text
+    } else {
+        let b = format!("=_quillo_{}", secs);
+        h.push(format!("Content-Type: multipart/alternative; boundary=\"{}\"", b));
+        format!(
+            "--{b}\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n{text}\n--{b}\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n{html}\n--{b}--"
+        )
+    };
+    let mut out = format!("From {} {}\n{}\n\n", envelope, from_date, h.join("\n"));
+    for line in body.trim_end_matches('\n').split('\n') {
+        if line.trim_start_matches('>').starts_with("From ") {
+            out.push('>');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    // A mailbox that does not end in a blank line gets one, so this message's From_ line starts a message.
+    let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("{}: {}", path, e))?;
+    if existing > 0 {
+        let tail = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut r = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            r.seek(SeekFrom::Start(existing.saturating_sub(2))).map_err(|e| e.to_string())?;
+            let mut t = Vec::new();
+            r.read_to_end(&mut t).map_err(|e| e.to_string())?;
+            t
+        };
+        if !tail.ends_with(b"\n\n") {
+            f.write_all(if tail.ends_with(b"\n") { b"\n" } else { b"\n\n" }).map_err(|e| e.to_string())?;
+        }
+    }
+    f.write_all(out.as_bytes()).map_err(|e| format!("{}: {}", path, e))?;
+    drop(f);
+    mbox_count(path)
+}

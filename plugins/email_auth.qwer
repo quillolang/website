@@ -1,0 +1,498 @@
+//! Email authentication: messages signed and checked with DKIM (RSA and Ed25519, relaxed and simple), SPF records read and evaluated for a sending IP, and DMARC records read and applied, with the DNS records given as a map so it all runs offline and in tests.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rsa = "0.9"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+//! base64 = "0.22"
+//! ipnet = "2"
+//! psl = "2"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use ed25519_dalek::pkcs8::DecodePrivateKey as _;
+use ed25519_dalek::Signer as _;
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
+use rsa::signature::{SignatureEncoding, Signer, Verifier};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::net::IpAddr;
+
+// ---------- DNS records given as a map ----------
+
+/// The records of `name` of `kind` from the map: `{ "example.com": "v=spf1 ..." }` (TXT), or
+/// `{ "example.com": { TXT: [...], A: [...], AAAA: [...], MX: ["10 mx.example.com"] } }`.
+fn lookup(records: &Value, name: &str, kind: &str) -> Vec<String> {
+    let name = name.trim_end_matches('.').to_lowercase();
+    let Some(v) = records.as_object().and_then(|m| m.iter().find(|(k, _)| k.trim_end_matches('.').eq_ignore_ascii_case(&name)).map(|(_, v)| v)) else { return vec![] };
+    let list = |v: &Value| -> Vec<String> {
+        match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(xs) => xs.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            _ => vec![],
+        }
+    };
+    match v {
+        Value::Object(m) => m.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)).map(|(_, v)| list(v)).unwrap_or_default(),
+        other if kind == "TXT" => list(other),
+        _ => vec![],
+    }
+}
+
+fn tags(record: &str) -> Vec<(String, String)> {
+    record
+        .split(';')
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.chars().filter(|c| !c.is_whitespace()).collect::<String>()))
+        .collect()
+}
+
+fn tag<'a>(ts: &'a [(String, String)], k: &str) -> Option<&'a str> {
+    ts.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+}
+
+// ---------- DKIM ----------
+
+fn crlf(message: &str) -> String {
+    message.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+fn split_message(m: &str) -> (Vec<String>, String) {
+    let (head, body) = m.split_once("\r\n\r\n").map_or((m, ""), |(h, b)| (h, b));
+    let mut headers: Vec<String> = vec![];
+    for line in head.split("\r\n") {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+            let last = headers.last_mut().unwrap();
+            last.push_str("\r\n");
+            last.push_str(line);
+        } else if !line.is_empty() {
+            headers.push(line.to_string());
+        }
+    }
+    (headers, body.to_string())
+}
+
+fn collapse(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut ws = false;
+    for c in s.chars() {
+        if c == ' ' || c == '\t' {
+            ws = true;
+        } else {
+            if ws {
+                out.push(' ');
+            }
+            ws = false;
+            out.push(c);
+        }
+    }
+    if ws {
+        out.push(' ');
+    }
+    out
+}
+
+fn canon_body(body: &str, relaxed: bool, limit: Option<usize>) -> Vec<u8> {
+    let mut lines: Vec<String> = body.split("\r\n").map(|l| if relaxed { collapse(l).trim_end_matches(' ').to_string() } else { l.to_string() }).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let mut out = if lines.is_empty() { if relaxed { String::new() } else { "\r\n".into() } } else { lines.join("\r\n") + "\r\n" };
+    if let Some(l) = limit {
+        out.truncate(l.min(out.len()));
+    }
+    out.into_bytes()
+}
+
+fn canon_header(h: &str, relaxed: bool) -> String {
+    if !relaxed {
+        return h.to_string();
+    }
+    let (name, value) = h.split_once(':').unwrap_or((h, ""));
+    let value = collapse(&value.replace("\r\n", ""));
+    format!("{}:{}", name.trim().to_lowercase(), value.trim())
+}
+
+fn header_name(h: &str) -> String {
+    h.split(':').next().unwrap_or("").trim().to_lowercase()
+}
+
+/// The headers named in `h=`, each the last not yet used, from the bottom up, as RFC 6376 says.
+fn signed_headers(headers: &[String], names: &[String], relaxed: bool) -> String {
+    let mut used = vec![false; headers.len()];
+    let mut out = String::new();
+    for n in names {
+        let n = n.trim().to_lowercase();
+        if let Some(i) = (0..headers.len()).rev().find(|&i| !used[i] && header_name(&headers[i]) == n) {
+            used[i] = true;
+            out.push_str(&canon_header(&headers[i], relaxed));
+            out.push_str("\r\n");
+        }
+    }
+    out
+}
+
+fn strip_b(sig_header: &str) -> String {
+    // The b= tag's value is emptied, everything else kept exactly.
+    let mut out = String::new();
+    let mut rest = sig_header;
+    loop {
+        let Some(pos) = rest.find(|c: char| c == ';' || c == ':') else { out.push_str(rest); break };
+        out.push_str(&rest[..=pos]);
+        rest = &rest[pos + 1..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if trimmed.starts_with("b=") || trimmed.starts_with("b =") {
+            let lead = &rest[..rest.len() - trimmed.len()];
+            let eq = trimmed.find('=').unwrap();
+            out.push_str(lead);
+            out.push_str(&trimmed[..=eq]);
+            rest = &trimmed[eq + 1..];
+            rest = rest.find(';').map_or("", |i| &rest[i..]);
+        }
+    }
+    out
+}
+
+enum Key {
+    Rsa(rsa::RsaPrivateKey),
+    Ed(ed25519_dalek::SigningKey),
+}
+
+fn private_key(pem: &str) -> Result<Key, String> {
+    let pem = pem.trim();
+    if let Ok(k) = rsa::RsaPrivateKey::from_pkcs8_pem(pem) {
+        return Ok(Key::Rsa(k));
+    }
+    if let Ok(k) = <rsa::RsaPrivateKey as rsa::pkcs1::DecodeRsaPrivateKey>::from_pkcs1_pem(pem) {
+        return Ok(Key::Rsa(k));
+    }
+    if let Ok(k) = ed25519_dalek::SigningKey::from_pkcs8_pem(pem) {
+        return Ok(Key::Ed(k));
+    }
+    Err("the key is not an RSA or Ed25519 private key in PEM (PKCS#8 `BEGIN PRIVATE KEY`, or `BEGIN RSA PRIVATE KEY`)".into())
+}
+
+/// The DNS TXT record to publish at `<selector>._domainkey.<domain>` for a private key (PEM, RSA or Ed25519): `v=DKIM1; k=rsa; p=...`.
+pub fn dkim_record(private_key_pem: &str) -> Result<String, String> {
+    match private_key(private_key_pem)? {
+        Key::Rsa(k) => {
+            let der = rsa::RsaPublicKey::from(&k).to_public_key_der().map_err(|e| e.to_string())?;
+            Ok(format!("v=DKIM1; k=rsa; p={}", STANDARD.encode(der.as_bytes())))
+        }
+        Key::Ed(k) => Ok(format!("v=DKIM1; k=ed25519; p={}", STANDARD.encode(k.verifying_key().as_bytes()))),
+    }
+}
+
+/// `message` (headers, a blank line, the body) with a `DKIM-Signature` header added at the top, signed for `domain` with
+/// `selector` and the private key (PEM; RSA gives rsa-sha256, Ed25519 ed25519-sha256), relaxed/relaxed. `headers` names those
+/// to sign (empty: From, To, Cc, Subject, Date, Message-ID, Reply-To, MIME-Version, Content-Type). Line breaks become CRLF.
+pub fn dkim_sign(message: &str, domain: &str, selector: &str, private_key_pem: &str, headers: Vec<String>) -> Result<String, String> {
+    let key = private_key(private_key_pem)?;
+    let m = crlf(message);
+    let (hs, body) = split_message(&m);
+    let wanted: Vec<String> = if headers.is_empty() {
+        ["from", "to", "cc", "subject", "date", "message-id", "reply-to", "mime-version", "content-type"].iter().map(|s| s.to_string()).collect()
+    } else {
+        headers.iter().map(|h| h.trim().to_lowercase()).collect()
+    };
+    let present: Vec<String> = wanted.into_iter().filter(|n| hs.iter().any(|h| header_name(h) == *n)).collect();
+    if !present.iter().any(|n| n == "from") {
+        return Err("the message has no From header, which DKIM must sign".into());
+    }
+    let bh = STANDARD.encode(Sha256::digest(canon_body(&body, true, None)));
+    let algo = match key { Key::Rsa(_) => "rsa-sha256", Key::Ed(_) => "ed25519-sha256" };
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let unsigned = format!("DKIM-Signature: v=1; a={}; c=relaxed/relaxed; d={}; s={};\r\n\tt={}; h={};\r\n\tbh={};\r\n\tb=", algo, domain, selector, t, present.join(":"), bh);
+    let mut data = signed_headers(&hs, &present, true).into_bytes();
+    data.extend(canon_header(&unsigned, true).as_bytes());
+    let sig = match key {
+        Key::Rsa(k) => rsa::pkcs1v15::SigningKey::<Sha256>::new(k).sign(&data).to_vec(),
+        Key::Ed(k) => k.sign(&Sha256::digest(&data)).to_bytes().to_vec(),
+    };
+    let b = STANDARD.encode(sig);
+    let folded: Vec<&str> = b.as_bytes().chunks(72).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    Ok(format!("{}{}\r\n{}", unsigned, folded.join("\r\n\t "), m))
+}
+
+fn verify_one(hs: &[String], body: &str, sig_header: &str, records: &Value) -> Value {
+    let value = sig_header.split_once(':').map_or("", |(_, v)| v);
+    let ts = tags(&value.replace("\r\n", ""));
+    let d = tag(&ts, "d").unwrap_or("").to_lowercase();
+    let s = tag(&ts, "s").unwrap_or("").to_string();
+    let a = tag(&ts, "a").unwrap_or("").to_string();
+    let res = |result: &str, reason: &str| json!({ "domain": d, "selector": s, "algorithm": a, "result": result, "reason": reason });
+    if tag(&ts, "v") != Some("1") {
+        return res("permerror", "the signature has no v=1");
+    }
+    let c = tag(&ts, "c").unwrap_or("simple/simple");
+    let (ch, cb) = c.split_once('/').unwrap_or((c, "simple"));
+    let (rh, rb) = (ch == "relaxed", cb == "relaxed");
+    let names: Vec<String> = tag(&ts, "h").unwrap_or("").split(':').map(|n| n.trim().to_string()).collect();
+    if !names.iter().any(|n| n.eq_ignore_ascii_case("from")) {
+        return res("permerror", "From is not among the signed headers");
+    }
+    if let Some(x) = tag(&ts, "x").and_then(|x| x.parse::<u64>().ok()) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if x < now {
+            return res("fail", "the signature has expired (x=)");
+        }
+    }
+    let limit = tag(&ts, "l").and_then(|l| l.parse::<usize>().ok());
+    let bh = STANDARD.encode(Sha256::digest(canon_body(body, rb, limit)));
+    if Some(bh.as_str()) != tag(&ts, "bh") {
+        return res("fail", "the body hash does not match: the body was changed after signing");
+    }
+    let txt = lookup(records, &format!("{}._domainkey.{}", s, d), "TXT").join("");
+    if txt.is_empty() {
+        return res("temperror", &format!("no key record given for {}._domainkey.{}", s, d));
+    }
+    let kt = tags(&txt);
+    let p = tag(&kt, "p").unwrap_or("");
+    if p.is_empty() {
+        return res("fail", "the key was revoked (empty p=)");
+    }
+    let Ok(key) = STANDARD.decode(p) else { return res("permerror", "the key record's p= is not base64") };
+    let Ok(sig) = STANDARD.decode(tag(&ts, "b").unwrap_or("")) else { return res("permerror", "b= is not base64") };
+    let mut data = signed_headers(hs, &names, rh).into_bytes();
+    data.extend(canon_header(&strip_b(sig_header), rh).as_bytes());
+    let ok = match a.as_str() {
+        "rsa-sha256" => {
+            let pk = rsa::RsaPublicKey::from_public_key_der(&key).or_else(|_| rsa::RsaPublicKey::from_pkcs1_der(&key));
+            let Ok(pk) = pk else { return res("permerror", "the key record does not hold an RSA key") };
+            let Ok(sig) = rsa::pkcs1v15::Signature::try_from(sig.as_slice()) else { return res("fail", "the signature is damaged") };
+            rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pk).verify(&data, &sig).is_ok()
+        }
+        "ed25519-sha256" => {
+            let Ok(k) = <[u8; 32]>::try_from(key.as_slice()) else { return res("permerror", "an Ed25519 key is 32 bytes") };
+            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&k) else { return res("permerror", "not an Ed25519 key") };
+            let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig) else { return res("fail", "the signature is damaged") };
+            vk.verify_strict(&Sha256::digest(&data), &sig).is_ok()
+        }
+        "rsa-sha1" => return res("permerror", "rsa-sha1 is no longer accepted (RFC 8301)"),
+        other => return res("permerror", &format!("unknown algorithm `{}`", other)),
+    };
+    if ok { res("pass", "") } else { res("fail", "the signature does not verify: a signed header was changed, or the key is not the signer's") }
+}
+
+/// Checks every `DKIM-Signature` in `message`: `[{ domain, selector, algorithm, result, reason }]`, `result` being "pass", "fail",
+/// "permerror" or "temperror" (no key record). `records` gives the DNS TXT records, `{ "sel._domainkey.example.com": "v=DKIM1; ..." }`.
+/// An empty list means the message is not signed.
+pub fn dkim_verify(message: &str, records: serde_json::Value) -> Vec<Value> {
+    let m = crlf(message);
+    let (hs, body) = split_message(&m);
+    hs.iter().filter(|h| header_name(h) == "dkim-signature").map(|h| verify_one(&hs, &body, h, &records)).collect()
+}
+
+// ---------- SPF ----------
+
+/// An SPF record read: `{ version, terms: [{ qualifier, mechanism, value }], redirect, exp }`, or an error value when it is not `v=spf1`.
+pub fn spf_parse(record: &str) -> Result<Value, String> {
+    let mut words = record.split_whitespace();
+    if !words.next().is_some_and(|v| v.eq_ignore_ascii_case("v=spf1")) {
+        return Err("an SPF record starts with v=spf1".into());
+    }
+    let mut terms = vec![];
+    let (mut redirect, mut exp) = (Value::Null, Value::Null);
+    for w in words {
+        if let Some(v) = w.strip_prefix("redirect=") {
+            redirect = json!(v);
+            continue;
+        }
+        if let Some(v) = w.strip_prefix("exp=") {
+            exp = json!(v);
+            continue;
+        }
+        let (q, rest) = match w.chars().next() {
+            Some(c @ ('+' | '-' | '~' | '?')) => (c, &w[1..]),
+            _ => ('+', w),
+        };
+        let (mech, value) = match rest.find([':', '/']) {
+            Some(i) => (&rest[..i], rest[i..].trim_start_matches(':')),
+            None => (rest, ""),
+        };
+        let mech = mech.to_lowercase();
+        if !["all", "include", "a", "mx", "ptr", "ip4", "ip6", "exists"].contains(&mech.as_str()) {
+            return Err(format!("unknown SPF mechanism `{}`", w));
+        }
+        let qualifier = match q { '-' => "fail", '~' => "softfail", '?' => "neutral", _ => "pass" };
+        terms.push(json!({ "qualifier": qualifier, "mechanism": mech, "value": value }));
+    }
+    Ok(json!({ "version": "spf1", "terms": terms, "redirect": redirect, "exp": exp }))
+}
+
+struct Spf<'a> {
+    records: &'a Value,
+    ip: IpAddr,
+    sender: String,
+    lookups: usize,
+}
+
+fn expand(s: &str, domain: &str, spf: &Spf) -> String {
+    let local = spf.sender.split('@').next().unwrap_or("postmaster");
+    let sender_domain = spf.sender.rsplit('@').next().unwrap_or(domain);
+    s.replace("%{d}", domain).replace("%{i}", &spf.ip.to_string()).replace("%{s}", &spf.sender).replace("%{l}", local).replace("%{o}", sender_domain).replace("%%", "%")
+}
+
+fn cidr(value: &str, domain: &str) -> (String, Option<u8>, Option<u8>) {
+    // a:host/24//64, a/24, mx//64
+    let (host, v4, v6) = match value.split_once("//") {
+        Some((h, six)) => (h, None, six.parse().ok()),
+        None => (value, None, None),
+    };
+    let (host, v4) = match host.rsplit_once('/') {
+        Some((h, four)) => (h, four.parse().ok()),
+        None => (host, v4),
+    };
+    (if host.is_empty() { domain.to_string() } else { host.to_string() }, v4, v6)
+}
+
+fn ip_in(ip: IpAddr, addr: &str, v4: Option<u8>, v6: Option<u8>) -> bool {
+    let Ok(a) = addr.trim().parse::<IpAddr>() else { return false };
+    let prefix = if a.is_ipv4() { v4.unwrap_or(32) } else { v6.unwrap_or(128) };
+    ipnet::IpNet::new(a, prefix).map(|n| n.trunc().contains(&ip)).unwrap_or(false)
+}
+
+fn evaluate(domain: &str, spf: &mut Spf, depth: usize) -> Result<(String, String), String> {
+    if depth > 10 {
+        return Err("permerror: includes nest too deep".into());
+    }
+    let recs: Vec<String> = lookup(spf.records, domain, "TXT").into_iter().filter(|r| r.to_lowercase().starts_with("v=spf1")).collect();
+    let record = match recs.len() {
+        0 => return Ok(("none".into(), format!("{} has no SPF record", domain))),
+        1 => recs[0].clone(),
+        _ => return Err(format!("permerror: {} has {} SPF records, and may have only one", domain, recs.len())),
+    };
+    let parsed = spf_parse(&record).map_err(|e| format!("permerror: {}", e))?;
+    for t in parsed["terms"].as_array().unwrap() {
+        let (q, mech, value) = (t["qualifier"].as_str().unwrap(), t["mechanism"].as_str().unwrap(), t["value"].as_str().unwrap());
+        let value = expand(value, domain, spf);
+        if ["include", "a", "mx", "ptr", "exists"].contains(&mech) {
+            spf.lookups += 1;
+            if spf.lookups > 10 {
+                return Err("permerror: more than 10 DNS lookups (include, a, mx, ptr, exists, redirect)".into());
+            }
+        }
+        let ip = spf.ip;
+        let matched = match mech {
+            "all" => true,
+            "ip4" | "ip6" => {
+                let (a, p) = value.split_once('/').map_or((value.as_str(), None), |(a, p)| (a, p.parse::<u8>().ok()));
+                ip_in(ip, a, p, p)
+            }
+            "a" => {
+                let (host, v4, v6) = cidr(&value, domain);
+                lookup(spf.records, &host, "A").iter().chain(lookup(spf.records, &host, "AAAA").iter()).any(|a| ip_in(ip, a, v4, v6))
+            }
+            "mx" => {
+                let (host, v4, v6) = cidr(&value, domain);
+                lookup(spf.records, &host, "MX").iter().any(|mx| {
+                    let h = mx.split_whitespace().last().unwrap_or("");
+                    lookup(spf.records, h, "A").iter().chain(lookup(spf.records, h, "AAAA").iter()).any(|a| ip_in(ip, a, v4, v6))
+                })
+            }
+            "exists" => !lookup(spf.records, &value, "A").is_empty(),
+            "ptr" => false,
+            "include" => match evaluate(&value, spf, depth + 1)? {
+                (r, why) if r == "pass" => return Ok((q.to_string(), format!("{} (through include:{})", why, value))),
+                (r, why) if r == "none" => return Err(format!("permerror: include:{} ({})", value, why)),
+                _ => false,
+            },
+            _ => false,
+        };
+        if matched {
+            let term = format!("{}{}{}", if q == "pass" { "" } else { match q { "fail" => "-", "softfail" => "~", _ => "?" } }, mech, if value.is_empty() { String::new() } else { format!(":{}", value) });
+            return Ok((q.to_string(), format!("matched {} in {}'s record", term, domain)));
+        }
+    }
+    if let Some(r) = parsed["redirect"].as_str() {
+        spf.lookups += 1;
+        let r = expand(r, domain, spf);
+        return match evaluate(&r, spf, depth + 1)? {
+            (res, why) if res == "none" => Err(format!("permerror: redirect={} ({})", r, why)),
+            other => Ok(other),
+        };
+    }
+    Ok(("neutral".into(), format!("nothing in {}'s record matched", domain)))
+}
+
+/// Evaluates SPF for mail from `ip` with the envelope sender `sender` (`bounce@shop.example.com`, or the HELO name): `{ result,
+/// reason, domain, lookups }`, `result` being "pass", "fail", "softfail", "neutral", "none" or "permerror". `records` gives the
+/// DNS records it needs: TXT for each domain, and A, AAAA and MX where the record uses `a` or `mx`.
+pub fn spf_check(ip: &str, sender: &str, records: serde_json::Value) -> Result<Value, String> {
+    let ip: IpAddr = ip.trim().parse().map_err(|_| format!("`{}` is not an IP address", ip))?;
+    let domain = sender.rsplit('@').next().unwrap_or(sender).trim().to_lowercase();
+    let mut spf = Spf { records: &records, ip, sender: if sender.contains('@') { sender.to_string() } else { format!("postmaster@{}", domain) }, lookups: 0 };
+    let (result, reason) = match evaluate(&domain, &mut spf, 0) {
+        Ok(r) => r,
+        Err(e) => ("permerror".to_string(), e.trim_start_matches("permerror: ").to_string()),
+    };
+    Ok(json!({ "result": result, "reason": reason, "domain": domain, "lookups": spf.lookups }))
+}
+
+// ---------- DMARC ----------
+
+/// A DMARC record read into its tags, with the defaults filled in: `{ p, sp, pct, adkim, aspf, rua, ruf, fo }`.
+pub fn dmarc_parse(record: &str) -> Result<Value, String> {
+    let ts = tags(record);
+    if tag(&ts, "v") != Some("DMARC1") {
+        return Err("a DMARC record starts with v=DMARC1".into());
+    }
+    let p = tag(&ts, "p").ok_or("a DMARC record needs p= (none, quarantine or reject)")?.to_lowercase();
+    if !["none", "quarantine", "reject"].contains(&p.as_str()) {
+        return Err(format!("p={} is not none, quarantine or reject", p));
+    }
+    let list = |k: &str| -> Vec<String> { tag(&ts, k).map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default() };
+    Ok(json!({
+        "p": p,
+        "sp": tag(&ts, "sp").map(str::to_lowercase).unwrap_or_else(|| p.clone()),
+        "pct": tag(&ts, "pct").and_then(|v| v.parse::<i64>().ok()).unwrap_or(100),
+        "adkim": tag(&ts, "adkim").unwrap_or("r"),
+        "aspf": tag(&ts, "aspf").unwrap_or("r"),
+        "rua": list("rua"),
+        "ruf": list("ruf"),
+        "fo": tag(&ts, "fo").unwrap_or("0"),
+    }))
+}
+
+fn org(domain: &str) -> String {
+    psl::domain_str(domain).unwrap_or(domain).to_string()
+}
+
+fn aligned(a: &str, b: &str, strict: bool) -> bool {
+    let (a, b) = (a.trim_end_matches('.').to_lowercase(), b.trim_end_matches('.').to_lowercase());
+    if strict { a == b } else { org(&a) == org(&b) }
+}
+
+/// Applies the From domain's DMARC policy: `from_domain` is the domain in the From header, `spf` the result of `spf_check`
+/// (its `result` and `domain`), `dkim` the list `dkim_verify` gave. The record is looked up in `records` at `_dmarc.<from_domain>`,
+/// then at the organizational domain's. Gives `{ result, disposition, policy, spf_aligned, dkim_aligned, record }`: `result` "pass"
+/// or "fail" ("none" without a record), `disposition` what the receiver should do: "none", "quarantine" or "reject".
+pub fn dmarc_check(from_domain: &str, spf: serde_json::Value, dkim: Vec<serde_json::Value>, records: serde_json::Value) -> Result<Value, String> {
+    let from = from_domain.trim().to_lowercase();
+    let org_domain = org(&from);
+    let mut found = None;
+    for (name, is_sub) in [(format!("_dmarc.{}", from), false), (format!("_dmarc.{}", org_domain), from != org_domain)] {
+        if let Some(r) = lookup(&records, &name, "TXT").into_iter().find(|r| r.starts_with("v=DMARC1")) {
+            found = Some((r, is_sub));
+            break;
+        }
+    }
+    let Some((record, via_org)) = found else {
+        return Ok(json!({ "result": "none", "disposition": "none", "policy": null, "spf_aligned": false, "dkim_aligned": false, "record": null }));
+    };
+    let parsed = dmarc_parse(&record)?;
+    let spf_aligned = spf["result"] == "pass" && spf["domain"].as_str().is_some_and(|d| aligned(d, &from, parsed["aspf"] == "s"));
+    let dkim_aligned = dkim.iter().any(|d| d["result"] == "pass" && d["domain"].as_str().is_some_and(|x| aligned(x, &from, parsed["adkim"] == "s")));
+    let pass = spf_aligned || dkim_aligned;
+    let policy = if via_org { parsed["sp"].as_str().unwrap_or("none").to_string() } else { parsed["p"].as_str().unwrap_or("none").to_string() };
+    Ok(json!({
+        "result": if pass { "pass" } else { "fail" },
+        "disposition": if pass { "none".to_string() } else { policy.clone() },
+        "policy": policy,
+        "spf_aligned": spf_aligned,
+        "dkim_aligned": dkim_aligned,
+        "record": parsed,
+    }))
+}

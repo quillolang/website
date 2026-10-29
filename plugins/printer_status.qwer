@@ -1,0 +1,393 @@
+//! A printer asked how it is, in its own language, and one clear answer back: Zebra ZPL (~HS: paper out, ribbon out, head open, paused), HP and office printers (PJL INFO STATUS codes), TSC TSPL (ESC !?), ESC/POS receipt printers (DLE EOT), Brother QL and P-touch (ESC i S), and any networked printer by SNMP (the Printer MIB: its state, the errors it detects and toner or ink levels).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+fn addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+/// Writes `ask` and reads until `done` says the answer is whole, or the time is up.
+fn ask(host: &str, ask: &[u8], timeout_ms: i64, done: &dyn Fn(&[u8]) -> bool) -> Result<Vec<u8>, String> {
+    let t = Duration::from_millis(timeout_ms.clamp(100, 60_000) as u64);
+    let a = addr(host, 9100)?;
+    let mut s = TcpStream::connect_timeout(&a, t).map_err(|e| format!("cannot reach the printer at {}: {}", a, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.write_all(ask).map_err(|e| e.to_string())?;
+    let until = Instant::now() + t;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut out = vec![];
+    let mut buf = [0u8; 1024];
+    while Instant::now() < until && !done(&out) {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("the printer at {} did not answer", a));
+    }
+    Ok(out)
+}
+
+fn answer(kind: &str, problems: Vec<String>, busy: Option<&str>, details: Value) -> Value {
+    let state = if let Some(p) = problems.first() { p.clone() } else if let Some(b) = busy { b.to_string() } else { "ready".to_string() };
+    json!({ "kind": kind, "ready": problems.is_empty(), "state": state, "problems": problems, "details": details })
+}
+
+/// Zebra's three host status lines (~HS) read.
+fn zebra(raw: &[u8]) -> Result<Value, String> {
+    let text = String::from_utf8_lossy(raw);
+    let lines: Vec<Vec<String>> = text.split('\x02').skip(1).map(|l| l.split('\x03').next().unwrap_or("").split(',').map(|s| s.trim().to_string()).collect()).collect();
+    if lines.len() < 2 || lines[0].len() < 12 || lines[1].len() < 9 {
+        return Err(format!("not a Zebra ~HS answer: {:?}", text));
+    }
+    let f = |l: usize, i: usize| lines[l][i] == "1";
+    let mut p = vec![];
+    for (on, what) in [(f(0, 1), "paper out"), (f(1, 3), "ribbon out"), (f(1, 2), "head open"), (f(0, 2), "paused"), (f(0, 5), "buffer full"), (f(0, 11), "head too hot"), (f(0, 10), "head too cold"), (f(0, 9), "memory corrupt")] {
+        if on {
+            p.push(what.to_string());
+        }
+    }
+    let waiting: i64 = lines[0][4].parse().unwrap_or(0);
+    let remaining: i64 = lines[1][8].parse().unwrap_or(0);
+    let busy = if remaining > 0 || waiting > 0 { Some("printing") } else { None };
+    Ok(answer("zebra", p, busy, json!({ "formats_waiting": waiting, "labels_remaining": remaining, "label_length_dots": lines[0][3].parse::<i64>().unwrap_or(0), "thermal_transfer": f(1, 4) })))
+}
+
+fn pjl(raw: &[u8]) -> Result<Value, String> {
+    let text = String::from_utf8_lossy(raw);
+    let mut code = None;
+    let mut display = Value::Null;
+    let mut online = None;
+    for l in text.split(|c| c == '\r' || c == '\n' || c == '\x0c') {
+        if let Some((k, v)) = l.split_once('=') {
+            let v = v.trim().trim_matches('"');
+            match k.trim().to_uppercase().as_str() {
+                "CODE" => code = v.parse::<i64>().ok(),
+                "DISPLAY" => display = json!(v),
+                "ONLINE" => online = Some(v.eq_ignore_ascii_case("TRUE")),
+                _ => {}
+            }
+        }
+    }
+    let code = code.ok_or_else(|| format!("not a PJL status answer: {:?}", text))?;
+    let (problem, busy): (Option<String>, Option<&str>) = match code {
+        10001 | 35078 => (None, None),
+        10003 | 10024 => (None, Some("warming up")),
+        10023 | 10026 | 10007 | 10005 | 10004 | 10013..=10022 | 11000..=11999 => (None, Some("printing")),
+        10006 => (None, Some("toner low")),
+        10002 | 40079 => (Some("offline".into()), None),
+        40021 => (Some("door open".into()), None),
+        40022 | 42000..=42999 | 44000..=44999 => (Some("paper jam".into()), None),
+        40038 => (Some("toner low, replace soon".into()), None),
+        41000..=41999 => (Some("paper out".into()), None),
+        40000..=40999 | 43000..=43999 => (Some(format!("needs attention (code {})", code)), None),
+        50000..=59999 => (Some(format!("hardware error (code {})", code)), None),
+        12000..=35999 => (None, Some("warning")),
+        _ => (None, Some("unknown state")),
+    };
+    let mut p: Vec<String> = problem.into_iter().collect();
+    if online == Some(false) && p.is_empty() {
+        p.push("offline".into());
+    }
+    Ok(answer("pjl", p, busy, json!({ "code": code, "display": display, "online": online })))
+}
+
+fn tspl(raw: &[u8]) -> Result<Value, String> {
+    let c = *raw.first().ok_or("no TSPL status byte")?;
+    let mut p = vec![];
+    for (bit, what) in [(0x01, "head open"), (0x02, "paper jam"), (0x04, "paper out"), (0x08, "ribbon out"), (0x10, "paused"), (0x80, "other error")] {
+        if c & bit != 0 {
+            p.push(what.to_string());
+        }
+    }
+    Ok(answer("tspl", p, if c & 0x20 != 0 { Some("printing") } else { None }, json!({ "code": c })))
+}
+
+fn escpos(raw: &[u8]) -> Result<Value, String> {
+    if raw.len() < 4 || raw.iter().take(4).any(|b| b & 0x93 != 0x12) {
+        return Err(format!("not four ESC/POS status bytes: {:?}", raw));
+    }
+    let mut p = vec![];
+    for (on, what) in [
+        (raw[1] & 0x20 != 0 || raw[3] & 0x60 == 0x60, "paper out"),
+        (raw[1] & 0x04 != 0, "cover open"),
+        (raw[2] & 0x08 != 0, "cutter error"),
+        (raw[2] & 0x20 != 0, "unrecoverable error"),
+        (raw[2] & 0x40 != 0, "head too hot"),
+        (raw[0] & 0x08 != 0 && raw[1] & 0x24 == 0, "offline"),
+    ] {
+        if on {
+            p.push(what.to_string());
+        }
+    }
+    let near_end = raw[3] & 0x0c == 0x0c;
+    Ok(answer("escpos", p, if near_end { Some("paper near its end") } else { None }, json!({ "paper_near_end": near_end, "drawer_open": raw[0] & 0x04 == 0 })))
+}
+
+fn brother(raw: &[u8]) -> Result<Value, String> {
+    let s = raw;
+    if s.len() < 32 || s[0] != 0x80 || s[1] != 0x20 {
+        return Err("not a 32-byte Brother status".into());
+    }
+    let mut p = vec![];
+    for (byte, bit, what) in [(8, 0x01, "no media"), (8, 0x02, "end of media"), (8, 0x04, "cutter jam"), (8, 0x80, "fan error"), (9, 0x01, "wrong media"), (9, 0x10, "cover open"), (9, 0x40, "media cannot be fed"), (9, 0x80, "system error"), (9, 0x04, "communication error")] {
+        if s[byte] & bit != 0 {
+            p.push(what.to_string());
+        }
+    }
+    let busy = if s[8] & 0x10 != 0 { Some("printing") } else { None };
+    Ok(answer("brother", p, busy, json!({ "media_width_mm": s[10], "media_length_mm": s[17] })))
+}
+
+/// What a printer's status answer means, without asking: `kind` is "zebra", "pjl", "tspl", "escpos" or "brother", `reply` the bytes it sent, in base64.
+/// Gives `{ kind, ready, state: "ready" | "paper out" | "ribbon out" | "head open" | "paused" | "printing" | ..., problems: [...], details }`.
+pub fn printer_status_read(kind: &str, reply_base64: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD.decode(reply_base64.trim()).map_err(|e| format!("not base64: {}", e))?;
+    read(kind, &raw)
+}
+
+fn read(kind: &str, raw: &[u8]) -> Result<Value, String> {
+    match kind {
+        "zebra" => zebra(raw),
+        "pjl" => pjl(raw),
+        "tspl" => tspl(raw),
+        "escpos" => escpos(raw),
+        "brother" => brother(raw),
+        other => Err(format!("kind {:?}: zebra, pjl, tspl, escpos or brother", other)),
+    }
+}
+
+/// Asks a printer on its raw port (`host` or `host:port`, 9100) how it is, in the language `kind` names: "zebra" (~HS), "pjl" (@PJL INFO STATUS, laser and office printers), "tspl" (ESC !?), "escpos" (DLE EOT 1 to 4) or "brother" (ESC i S).
+/// Gives one answer: `{ kind, ready, state, problems, details }`. Ask in the printer's own language: another may print the question as text.
+pub fn printer_status(kind: &str, host: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let raw = match kind {
+        "zebra" => ask(host, b"~HS\r\n", timeout_ms, &|b| b.iter().filter(|c| **c == 0x03).count() >= 3)?,
+        "pjl" => ask(host, b"\x1b%-12345X@PJL\r\n@PJL INFO STATUS\r\n\x1b%-12345X", timeout_ms, &|b| b.contains(&0x0c))?,
+        "tspl" => ask(host, b"\x1b!?", timeout_ms, &|b| !b.is_empty())?,
+        "escpos" => ask(host, &[0x10, 0x04, 1, 0x10, 0x04, 2, 0x10, 0x04, 3, 0x10, 0x04, 4], timeout_ms, &|b| b.len() >= 4)?,
+        "brother" => {
+            let mut q = vec![0u8; 100];
+            q.extend_from_slice(&[0x1b, b'@', 0x1b, b'i', b'S']);
+            ask(host, &q, timeout_ms, &|b| b.len() >= 32)?
+        }
+        other => return Err(format!("kind {:?}: zebra, pjl, tspl, escpos or brother", other)),
+    };
+    read(kind, &raw)
+}
+
+// ---- SNMP v2c, enough for the Printer MIB: GETNEXT walks of a few columns.
+
+fn ber_len(n: usize, out: &mut Vec<u8>) {
+    if n < 128 {
+        out.push(n as u8);
+    } else if n < 256 {
+        out.extend_from_slice(&[0x81, n as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]);
+    }
+}
+
+fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag];
+    ber_len(body.len(), &mut v);
+    v.extend_from_slice(body);
+    v
+}
+
+fn ber_int(x: i64) -> Vec<u8> {
+    let mut b = x.to_be_bytes().to_vec();
+    while b.len() > 1 && ((b[0] == 0 && b[1] & 0x80 == 0) || (b[0] == 0xff && b[1] & 0x80 != 0)) {
+        b.remove(0);
+    }
+    tlv(0x02, &b)
+}
+
+fn ber_oid(oid: &[u32]) -> Vec<u8> {
+    let mut b = vec![(oid[0] * 40 + oid[1]) as u8];
+    for &n in &oid[2..] {
+        let mut stack = vec![(n & 0x7f) as u8];
+        let mut v = n >> 7;
+        while v > 0 {
+            stack.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        stack.reverse();
+        b.extend_from_slice(&stack);
+    }
+    tlv(0x06, &b)
+}
+
+fn get_next(community: &str, id: i64, oid: &[u32]) -> Vec<u8> {
+    let vb = tlv(0x30, &[ber_oid(oid), vec![0x05, 0x00]].concat());
+    let pdu = tlv(0xa1, &[ber_int(id), ber_int(0), ber_int(0), tlv(0x30, &vb)].concat());
+    tlv(0x30, &[ber_int(1), tlv(0x04, community.as_bytes()), pdu].concat())
+}
+
+/// Reads one TLV at `i`: (tag, body start, body end).
+fn read_tlv(b: &[u8], i: usize) -> Option<(u8, usize, usize)> {
+    let tag = *b.get(i)?;
+    let l0 = *b.get(i + 1)? as usize;
+    let (len, start) = if l0 < 0x80 {
+        (l0, i + 2)
+    } else {
+        let n = l0 & 0x7f;
+        let mut len = 0usize;
+        for k in 0..n {
+            len = (len << 8) | *b.get(i + 2 + k)? as usize;
+        }
+        (len, i + 2 + n)
+    };
+    if start + len > b.len() {
+        return None;
+    }
+    Some((tag, start, start + len))
+}
+
+/// The OID and value of a GetResponse's first variable binding.
+fn parse_response(b: &[u8]) -> Option<(Vec<u32>, Value)> {
+    let (_, s, _) = read_tlv(b, 0)?; // message
+    let (_, _, e1) = read_tlv(b, s)?; // version
+    let (_, _, e2) = read_tlv(b, e1)?; // community
+    let (tag, ps, _) = read_tlv(b, e2)?; // PDU
+    if tag != 0xa2 {
+        return None;
+    }
+    let (_, _, a) = read_tlv(b, ps)?; // request id
+    let (_, es, ee) = read_tlv(b, a)?; // error status
+    if b[es..ee].iter().any(|x| *x != 0) {
+        return None;
+    }
+    let (_, _, c) = read_tlv(b, ee)?; // error index
+    let (_, ls, _) = read_tlv(b, c)?; // binding list
+    let (_, vs, _) = read_tlv(b, ls)?; // binding
+    let (_, os, oe) = read_tlv(b, vs)?;
+    let ob = &b[os..oe];
+    let mut oid = vec![(ob[0] / 40) as u32, (ob[0] % 40) as u32];
+    let mut n = 0u32;
+    for &x in &ob[1..] {
+        n = (n << 7) | (x & 0x7f) as u32;
+        if x & 0x80 == 0 {
+            oid.push(n);
+            n = 0;
+        }
+    }
+    let (vt, vs2, ve) = read_tlv(b, oe)?;
+    let raw = &b[vs2..ve];
+    let v = match vt {
+        0x02 | 0x41 | 0x42 | 0x43 => {
+            let mut x: i64 = if vt == 0x02 && raw.first().map_or(false, |f| f & 0x80 != 0) { -1 } else { 0 };
+            for &y in raw {
+                x = (x << 8) | y as i64;
+            }
+            json!(x)
+        }
+        0x04 => {
+            if raw.iter().all(|c| *c >= 0x20 && *c < 0x7f || *c == b'\n' || *c == b'\r') {
+                json!(String::from_utf8_lossy(raw).trim_end_matches('\0').to_string())
+            } else {
+                json!(raw.iter().map(|c| format!("{:02x}", c)).collect::<String>())
+            }
+        }
+        _ => Value::Null,
+    };
+    Some((oid, v))
+}
+
+/// Walks a column of the MIB: each row's last OID number and its value.
+fn walk(sock: &UdpSocket, community: &str, base: &[u32], id: &mut i64) -> Result<Vec<(u32, Value)>, String> {
+    let mut out = vec![];
+    let mut cur = base.to_vec();
+    for _ in 0..64 {
+        *id += 1;
+        sock.send(&get_next(community, *id, &cur)).map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 2048];
+        let n = sock.recv(&mut buf).map_err(|e| format!("no SNMP answer: {}", e))?;
+        let Some((oid, v)) = parse_response(&buf[..n]) else { break };
+        if !oid.starts_with(base) || oid.len() <= base.len() {
+            break;
+        }
+        out.push((*oid.last().unwrap(), v));
+        cur = oid;
+    }
+    Ok(out)
+}
+
+/// A networked printer asked by SNMP v2c (UDP 161, `community` usually "public"), the Printer and Host Resources MIBs:
+/// `{ kind: "snmp", ready, state, problems (low paper, no paper, low toner, no toner, door open, jammed, offline, service requested...), details: { model, status, supplies: [{ name, level, max, percent }], pages } }`.
+pub fn printer_snmp(host: &str, community: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let a = addr(host, 161)?;
+    let sock = UdpSocket::bind(if a.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64))).map_err(|e| e.to_string())?;
+    sock.connect(a).map_err(|e| e.to_string())?;
+    let mut id = 1000;
+    let first = |v: Vec<(u32, Value)>| v.into_iter().next().map(|x| x.1).unwrap_or(Value::Null);
+    let model = first(walk(&sock, community, &[1, 3, 6, 1, 2, 1, 25, 3, 2, 1, 3], &mut id)?);
+    let status = first(walk(&sock, community, &[1, 3, 6, 1, 2, 1, 25, 3, 5, 1, 1], &mut id)?);
+    let errors = first(walk(&sock, community, &[1, 3, 6, 1, 2, 1, 25, 3, 5, 1, 2], &mut id)?);
+    let pages = first(walk(&sock, community, &[1, 3, 6, 1, 2, 1, 43, 10, 2, 1, 4], &mut id)?);
+    let names = walk(&sock, community, &[1, 3, 6, 1, 2, 1, 43, 11, 1, 1, 6], &mut id)?;
+    let maxes = walk(&sock, community, &[1, 3, 6, 1, 2, 1, 43, 11, 1, 1, 8], &mut id)?;
+    let levels = walk(&sock, community, &[1, 3, 6, 1, 2, 1, 43, 11, 1, 1, 9], &mut id)?;
+    let mut supplies = vec![];
+    for (k, name) in &names {
+        let max = maxes.iter().find(|m| m.0 == *k).and_then(|m| m.1.as_i64()).unwrap_or(-1);
+        let level = levels.iter().find(|m| m.0 == *k).and_then(|m| m.1.as_i64()).unwrap_or(-1);
+        // -2 is "unknown", -3 "some left"; a percent only when both are real.
+        let pct = if max > 0 && level >= 0 { json!((level * 100 / max).min(100)) } else { Value::Null };
+        supplies.push(json!({ "name": name, "level": level, "max": max, "percent": pct }));
+    }
+    // hrPrinterDetectedErrorState: a bit string, the first bit the high bit of the first byte.
+    let bits: Vec<u8> = errors.as_str().map(|h| (0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect()).unwrap_or_else(|| errors.as_str().map(|s| s.bytes().collect()).unwrap_or_default());
+    let names_of_bits = ["low paper", "no paper", "low toner", "no toner", "door open", "jammed", "offline", "service requested", "input tray missing", "output tray missing", "supply missing", "output nearly full", "output full", "input tray empty", "maintenance overdue"];
+    let mut problems = vec![];
+    for (i, n) in names_of_bits.iter().enumerate() {
+        if bits.get(i / 8).map_or(false, |b| b & (0x80 >> (i % 8)) != 0) && !matches!(*n, "low paper" | "low toner" | "output nearly full" | "maintenance overdue") {
+            problems.push(n.to_string());
+        }
+    }
+    let st = match status.as_i64() {
+        Some(3) => None,
+        Some(4) => Some("printing"),
+        Some(5) => Some("warming up"),
+        Some(1) | Some(2) => Some("unknown state"),
+        _ => None,
+    };
+    for s in &supplies {
+        if s["percent"].as_i64().map_or(false, |p| p == 0) {
+            problems.push(format!("{} empty", s["name"].as_str().unwrap_or("a supply")));
+        }
+    }
+    let mut ans = answer("snmp", problems, st, json!({ "model": model, "status": status, "supplies": supplies, "pages": pages }));
+    let low: Vec<String> = names_of_bits.iter().enumerate().filter(|(i, n)| bits.get(i / 8).map_or(false, |b| b & (0x80 >> (i % 8)) != 0) && matches!(**n, "low paper" | "low toner" | "output nearly full" | "maintenance overdue")).map(|(_, n)| n.to_string()).collect();
+    ans["details"]["warnings"] = json!(low);
+    Ok(ans)
+}
+
+/// The bytes of an SNMP v2c GETNEXT request for `oid` (dotted, like `1.3.6.1.2.1.43.11.1.1.9`), in hex: to check the encoding against a capture.
+pub fn printer_snmp_request(community: &str, oid: &str, request_id: i64) -> Result<String, String> {
+    let o: Vec<u32> = oid.trim_start_matches('.').split('.').map(|p| p.parse::<u32>().map_err(|_| format!("{:?} is not an OID", oid))).collect::<Result<_, _>>()?;
+    if o.len() < 2 {
+        return Err("an OID has at least two numbers".into());
+    }
+    Ok(get_next(community, request_id, &o).iter().map(|b| format!("{:02x}", b)).collect())
+}

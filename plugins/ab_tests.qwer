@@ -1,0 +1,202 @@
+//! A/B tests from start to end: users put in variants that stay theirs, the visitors needed, and whether a difference is real (z-test, Welch's t-test, Bayesian chance to win, sample ratio mismatch).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha2 = "0.10"
+//! statrs = "0.17"
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use statrs::distribution::{Beta, ChiSquared, Continuous, ContinuousCDF, Normal, StudentsT};
+
+fn unit(experiment: &str, user: &str, salt: &str) -> f64 {
+    let h = Sha256::digest(format!("{}:{}:{}", experiment, salt, user).as_bytes());
+    let n = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+    n as f64 / (u64::MAX as f64 + 1.0)
+}
+
+fn round(x: f64, d: i32) -> f64 {
+    let m = 10f64.powi(d);
+    (x * m).round() / m
+}
+
+fn std_normal() -> Normal {
+    Normal::new(0.0, 1.0).expect("the standard normal")
+}
+
+fn arms(variants: &[Value]) -> Result<Vec<(String, f64)>, String> {
+    let v: Vec<(String, f64)> = variants
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Ok((s.clone(), 1.0)),
+            Value::Object(o) => Ok((
+                o.get("name").and_then(Value::as_str).ok_or("a variant is a name, or { name, weight }")?.to_string(),
+                o.get("weight").and_then(Value::as_f64).unwrap_or(1.0),
+            )),
+            _ => Err("a variant is a name, or { name, weight }".to_string()),
+        })
+        .collect::<Result<_, _>>()?;
+    if v.is_empty() || v.iter().any(|(_, w)| *w < 0.0) || v.iter().map(|(_, w)| w).sum::<f64>() <= 0.0 {
+        return Err("give at least one variant, with weights above 0".into());
+    }
+    Ok(v)
+}
+
+/// The variant of `experiment` for `user` (any stable id), always the same one: `variants` are names (equal shares) or `{ name, weight }`.
+/// `traffic` is the percentage of users in the test at all (100 for everyone): the others get null and see what is there now.
+/// Users drawn into the test stay in it when `traffic` rises.
+pub fn ab_assign(experiment: &str, user: &str, variants: Vec<serde_json::Value>, traffic: f64) -> Result<Option<String>, String> {
+    let arms = arms(&variants)?;
+    if unit(experiment, user, "traffic") * 100.0 >= traffic {
+        return Ok(None);
+    }
+    let total: f64 = arms.iter().map(|a| a.1).sum();
+    let at = unit(experiment, user, "variant") * total;
+    let mut acc = 0.0;
+    for (name, w) in &arms {
+        acc += w;
+        if at < acc {
+            return Ok(Some(name.clone()));
+        }
+    }
+    Ok(arms.last().map(|a| a.0.clone()))
+}
+
+fn rate(arm: &Value, which: &str) -> Result<(f64, f64), String> {
+    let n = arm.get("visitors").and_then(Value::as_f64).ok_or_else(|| format!("the {} needs `visitors`", which))?;
+    let c = arm.get("conversions").and_then(Value::as_f64).ok_or_else(|| format!("the {} needs `conversions`", which))?;
+    if n <= 0.0 || c < 0.0 || c > n {
+        return Err(format!("the {}'s conversions must be from 0 to its visitors (above 0)", which));
+    }
+    Ok((n, c))
+}
+
+/// A conversion test: `control` and `variant` are `{ visitors, conversions }`. Gives `{ control_rate, variant_rate, lift, z, p_value,
+/// significant, ci_low, ci_high }`: rates and the 95% interval of the difference in percent, `lift` the relative change in percent,
+/// `p_value` two-sided from a two-proportion z-test, `significant` when it is below `alpha` (0.05 is usual).
+pub fn ab_significance(control: serde_json::Value, variant: serde_json::Value, alpha: f64) -> Result<Value, String> {
+    let (n1, c1) = rate(&control, "control")?;
+    let (n2, c2) = rate(&variant, "variant")?;
+    let (p1, p2) = (c1 / n1, c2 / n2);
+    let pool = (c1 + c2) / (n1 + n2);
+    let se = (pool * (1.0 - pool) * (1.0 / n1 + 1.0 / n2)).sqrt();
+    let z = if se > 0.0 { (p2 - p1) / se } else { 0.0 };
+    let nd = std_normal();
+    let p = 2.0 * (1.0 - nd.cdf(z.abs()));
+    let se_diff = (p1 * (1.0 - p1) / n1 + p2 * (1.0 - p2) / n2).sqrt();
+    let q = nd.inverse_cdf(1.0 - alpha / 2.0);
+    Ok(json!({
+        "control_rate": round(p1 * 100.0, 3),
+        "variant_rate": round(p2 * 100.0, 3),
+        "lift": if p1 > 0.0 { round((p2 - p1) / p1 * 100.0, 2) } else { 0.0 },
+        "z": round(z, 3),
+        "p_value": round(p, 5),
+        "significant": p < alpha,
+        "ci_low": round((p2 - p1 - q * se_diff) * 100.0, 3),
+        "ci_high": round((p2 - p1 + q * se_diff) * 100.0, 3),
+    }))
+}
+
+/// Means compared, for revenue or time per user: `control` and `variant` are `{ n, mean, sd }`. Welch's t-test: `{ difference, lift, t,
+/// df, p_value, significant }`, `lift` in percent, `p_value` two-sided.
+pub fn ab_means(control: serde_json::Value, variant: serde_json::Value, alpha: f64) -> Result<Value, String> {
+    let get = |a: &Value, k: &str| a.get(k).and_then(Value::as_f64).ok_or_else(|| format!("each side needs `n`, `mean` and `sd` (`{}` missing)", k));
+    let (n1, m1, s1) = (get(&control, "n")?, get(&control, "mean")?, get(&control, "sd")?);
+    let (n2, m2, s2) = (get(&variant, "n")?, get(&variant, "mean")?, get(&variant, "sd")?);
+    if n1 < 2.0 || n2 < 2.0 {
+        return Err("each side needs at least 2 users".into());
+    }
+    let (v1, v2) = (s1 * s1 / n1, s2 * s2 / n2);
+    let se = (v1 + v2).sqrt();
+    if se == 0.0 {
+        return Err("both standard deviations are 0".into());
+    }
+    let t = (m2 - m1) / se;
+    let df = (v1 + v2).powi(2) / (v1 * v1 / (n1 - 1.0) + v2 * v2 / (n2 - 1.0));
+    let dist = StudentsT::new(0.0, 1.0, df).map_err(|e| e.to_string())?;
+    let p = 2.0 * (1.0 - dist.cdf(t.abs()));
+    Ok(json!({
+        "difference": round(m2 - m1, 4),
+        "lift": if m1 != 0.0 { round((m2 - m1) / m1 * 100.0, 2) } else { 0.0 },
+        "t": round(t, 3),
+        "df": round(df, 1),
+        "p_value": round(p, 5),
+        "significant": p < alpha,
+    }))
+}
+
+/// The chance, in percent, that the variant's conversion rate beats the control's (Beta(1,1) priors, integrated), and the
+/// expected loss of choosing it in percentage points: `{ chance_to_win, expected_loss }`. Easier to explain than a p-value.
+pub fn ab_bayes(control: serde_json::Value, variant: serde_json::Value) -> Result<Value, String> {
+    let (n1, c1) = rate(&control, "control")?;
+    let (n2, c2) = rate(&variant, "variant")?;
+    let a = Beta::new(c1 + 1.0, n1 - c1 + 1.0).map_err(|e| e.to_string())?;
+    let b = Beta::new(c2 + 1.0, n2 - c2 + 1.0).map_err(|e| e.to_string())?;
+    // Integrate over the region where either density is not negligible.
+    let lo = a.inverse_cdf(1e-7).min(b.inverse_cdf(1e-7));
+    let hi = a.inverse_cdf(1.0 - 1e-7).max(b.inverse_cdf(1.0 - 1e-7));
+    let steps = 4000;
+    let h = (hi - lo) / steps as f64;
+    let (mut win, mut loss) = (0.0, 0.0);
+    for i in 0..=steps {
+        let x = lo + i as f64 * h;
+        let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+        let fb = b.pdf(x);
+        win += w * fb * a.cdf(x);
+        // E[max(A - B, 0)] = ∫ f_B(x) ∫_x^1 (y - x) f_A(y) dy dx; the inner part is (1 - F_A(x)) (E[A | A > x] - x).
+        let tail = 1.0 - a.cdf(x);
+        if tail > 1e-12 {
+            let mean_above = upper_mean(&a, x);
+            loss += w * fb * tail * (mean_above - x);
+        }
+    }
+    Ok(json!({ "chance_to_win": round(win * h * 100.0, 2), "expected_loss": round(loss * h * 100.0, 4) }))
+}
+
+/// E[A | A > x] for a Beta(α, β): α/(α+β) × (1 − I_x(α+1, β)) / (1 − I_x(α, β)).
+fn upper_mean(a: &Beta, x: f64) -> f64 {
+    let (al, be) = (a.shape_a(), a.shape_b());
+    let up = Beta::new(al + 1.0, be).map(|d| 1.0 - d.cdf(x)).unwrap_or(0.0);
+    let t = 1.0 - a.cdf(x);
+    if t <= 0.0 { x } else { al / (al + be) * up / t }
+}
+
+/// Visitors needed in EACH variant to see a change of `relative_change` percent (10 for +10%) from a `baseline_rate` in percent
+/// (3.5 for 3.5% converting), at significance `alpha` (0.05) and `power` (0.8): plan before starting, stop only once there.
+pub fn ab_sample_size(baseline_rate: f64, relative_change: f64, alpha: f64, power: f64) -> Result<i64, String> {
+    let p1 = baseline_rate / 100.0;
+    let p2 = p1 * (1.0 + relative_change / 100.0);
+    if !(0.0..1.0).contains(&p1) || p1 == 0.0 || !(0.0..=1.0).contains(&p2) || p1 == p2 {
+        return Err("the baseline must be between 0 and 100 percent, and the change must keep it there and not be 0".into());
+    }
+    if !(0.0..1.0).contains(&alpha) || !(0.0..1.0).contains(&power) {
+        return Err("alpha and power are between 0 and 1".into());
+    }
+    let nd = std_normal();
+    let za = nd.inverse_cdf(1.0 - alpha / 2.0);
+    let zb = nd.inverse_cdf(power);
+    let pbar = (p1 + p2) / 2.0;
+    let n = (za * (2.0 * pbar * (1.0 - pbar)).sqrt() + zb * (p1 * (1.0 - p1) + p2 * (1.0 - p2)).sqrt()).powi(2) / (p2 - p1).powi(2);
+    Ok(n.ceil() as i64)
+}
+
+/// A sample ratio mismatch check: were users split as planned? `counts` are the users each variant got, `weights` the planned
+/// shares (any scale). `{ p_value, mismatch, expected }`: a mismatch (p below 0.001) means the assignment or the tracking is broken
+/// and the results cannot be trusted.
+pub fn ab_srm(counts: Vec<i64>, weights: Vec<i64>) -> Result<Value, String> {
+    let counts: Vec<f64> = counts.iter().map(|x| *x as f64).collect();
+    let weights: Vec<f64> = weights.iter().map(|x| *x as f64).collect();
+    if counts.len() != weights.len() || counts.len() < 2 {
+        return Err("give two or more counts, and as many weights".into());
+    }
+    let n: f64 = counts.iter().sum();
+    let w: f64 = weights.iter().sum();
+    if n <= 0.0 || w <= 0.0 || weights.iter().any(|x| *x <= 0.0) {
+        return Err("counts and weights must add up to more than 0, and each weight be above 0".into());
+    }
+    let expected: Vec<f64> = weights.iter().map(|x| x / w * n).collect();
+    let chi: f64 = counts.iter().zip(&expected).map(|(o, e)| (o - e).powi(2) / e).sum();
+    let dist = ChiSquared::new((counts.len() - 1) as f64).map_err(|e| e.to_string())?;
+    let p = 1.0 - dist.cdf(chi);
+    Ok(json!({ "p_value": round(p, 6), "mismatch": p < 0.001, "expected": expected.iter().map(|e| round(*e, 1)).collect::<Vec<_>>() }))
+}

@@ -1,0 +1,561 @@
+//! PDF forms (AcroForm): the fields listed with their types, values and choices, filled from a map with appearances drawn so every viewer shows them, and flattened into the page so they cannot be changed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! lopdf = { version = "0.36", default-features = false }
+
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+
+const MAX_FIELDS: usize = 20_000;
+
+fn load(path: &str) -> Result<Document, String> {
+    let d = Document::load(path).map_err(|e| format!("{}: not a PDF it can read ({})", path, e))?;
+    if d.is_encrypted() {
+        return Err(format!("{}: the PDF is encrypted", path));
+    }
+    Ok(d)
+}
+
+fn deref<'a>(doc: &'a Document, o: &'a Object) -> &'a Object {
+    doc.dereference(o).map(|(_, o)| o).unwrap_or(o)
+}
+
+fn dict<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Dictionary> {
+    deref(doc, o).as_dict().ok()
+}
+
+fn num(doc: &Document, o: &Object) -> Option<f64> {
+    match deref(doc, o) {
+        Object::Integer(i) => Some(*i as f64),
+        Object::Real(r) => Some(*r as f64),
+        _ => None,
+    }
+}
+
+// PDF text strings: UTF-16BE after a byte-order mark, UTF-8 after its own (PDF 2.0), else PDFDocEncoding (Latin-1 for what forms hold).
+fn text(b: &[u8]) -> String {
+    if b.starts_with(&[0xFE, 0xFF]) {
+        let u: Vec<u16> = b[2..].chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&u)
+    } else if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(&b[3..]).into_owned()
+    } else {
+        b.iter().map(|&c| c as char).collect()
+    }
+}
+
+fn pdf_string(s: &str) -> Object {
+    if s.chars().all(|c| (c as u32) < 0x80) {
+        Object::String(s.as_bytes().to_vec(), StringFormat::Literal)
+    } else {
+        let mut b = vec![0xFE, 0xFF];
+        for u in s.encode_utf16() {
+            b.extend_from_slice(&u.to_be_bytes());
+        }
+        Object::String(b, StringFormat::Hexadecimal)
+    }
+}
+
+fn obj_text(doc: &Document, o: &Object) -> Option<String> {
+    match deref(doc, o) {
+        Object::String(b, _) => Some(text(b)),
+        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        _ => None,
+    }
+}
+
+struct Field {
+    name: String,
+    id: ObjectId,
+    ft: String,
+    ff: i64,
+    widgets: Vec<ObjectId>,
+    // Inherited from the parents when the field does not say.
+    v: Option<Object>,
+    dv: Option<Object>,
+    da: Option<String>,
+    opt: Option<Object>,
+    q: i64,
+}
+
+fn is_widget_only(d: &Dictionary) -> bool {
+    !d.has(b"T") && (d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Widget".as_slice()))
+}
+
+fn walk(doc: &Document, id: ObjectId, prefix: &str, inherit: &Field, out: &mut Vec<Field>, depth: usize) {
+    if depth > 32 || out.len() > MAX_FIELDS {
+        return;
+    }
+    let Ok(d) = doc.get_dictionary(id) else { return };
+    let part = d.get(b"T").ok().and_then(|t| obj_text(doc, t));
+    let name = match (&part, prefix.is_empty()) {
+        (Some(p), true) => p.clone(),
+        (Some(p), false) => format!("{}.{}", prefix, p),
+        (None, _) => prefix.to_string(),
+    };
+    let f = Field {
+        name: name.clone(),
+        id,
+        ft: d.get(b"FT").ok().and_then(|o| obj_text(doc, o)).unwrap_or_else(|| inherit.ft.clone()),
+        ff: d.get(b"Ff").ok().and_then(|o| num(doc, o)).map(|x| x as i64).unwrap_or(inherit.ff),
+        widgets: vec![],
+        v: d.get(b"V").ok().cloned().or_else(|| inherit.v.clone()),
+        dv: d.get(b"DV").ok().cloned().or_else(|| inherit.dv.clone()),
+        da: d.get(b"DA").ok().and_then(|o| obj_text(doc, o)).or_else(|| inherit.da.clone()),
+        opt: d.get(b"Opt").ok().cloned().or_else(|| inherit.opt.clone()),
+        q: d.get(b"Q").ok().and_then(|o| num(doc, o)).map(|x| x as i64).unwrap_or(inherit.q),
+    };
+    let kids: Vec<ObjectId> = d.get(b"Kids").ok().map(|k| deref(doc, k)).and_then(|k| k.as_array().ok()).map(|a| a.iter().filter_map(|k| k.as_reference().ok()).collect()).unwrap_or_default();
+    let field_kids: Vec<ObjectId> = kids.iter().copied().filter(|k| doc.get_dictionary(*k).map(|kd| !is_widget_only(kd)).unwrap_or(false)).collect();
+    if !field_kids.is_empty() {
+        for k in field_kids {
+            walk(doc, k, &name, &f, out, depth + 1);
+        }
+        return;
+    }
+    let widgets = if kids.is_empty() { vec![id] } else { kids };
+    out.push(Field { widgets, ..f });
+}
+
+fn fields(doc: &Document) -> Result<Vec<Field>, String> {
+    let catalog = doc.catalog().map_err(|e| e.to_string())?;
+    let Some(form) = catalog.get(b"AcroForm").ok().and_then(|f| dict(doc, f)) else {
+        return Ok(vec![]);
+    };
+    let da = form.get(b"DA").ok().and_then(|o| obj_text(doc, o));
+    let root = Field { name: String::new(), id: (0, 0), ft: String::new(), ff: 0, widgets: vec![], v: None, dv: None, da, opt: None, q: 0 };
+    let mut out = Vec::new();
+    if let Some(list) = form.get(b"Fields").ok().map(|f| deref(doc, f)).and_then(|f| f.as_array().ok()) {
+        for f in list {
+            if let Ok(id) = f.as_reference() {
+                walk(doc, id, "", &root, &mut out, 0);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn kind(f: &Field) -> &'static str {
+    match f.ft.as_str() {
+        "Tx" => "text",
+        "Btn" if f.ff & (1 << 16) != 0 => "button",
+        "Btn" if f.ff & (1 << 15) != 0 => "radio",
+        "Btn" => "checkbox",
+        "Ch" if f.ff & (1 << 17) != 0 => "choice",
+        "Ch" => "list",
+        "Sig" => "signature",
+        _ => "unknown",
+    }
+}
+
+// The names of a button widget's "on" appearances: "Yes" for most checkboxes, the option for a radio button.
+fn on_states(doc: &Document, widget: ObjectId) -> Vec<String> {
+    let Ok(w) = doc.get_dictionary(widget) else { return vec![] };
+    let n = w.get(b"AP").ok().and_then(|ap| dict(doc, ap)).and_then(|ap| ap.get(b"N").ok()).and_then(|n| dict(doc, n));
+    n.map(|n| n.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).filter(|k| k != "Off").collect()).unwrap_or_default()
+}
+
+fn options(doc: &Document, f: &Field) -> Vec<Value> {
+    match f.ft.as_str() {
+        "Ch" => f
+            .opt
+            .as_ref()
+            .map(|o| deref(doc, o))
+            .and_then(|o| o.as_array().ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| match deref(doc, x) {
+                        // [export, shown] pairs: the export value is what the field holds.
+                        Object::Array(p) => p.first().and_then(|e| obj_text(doc, e)),
+                        o => obj_text(doc, o),
+                    })
+                    .map(Value::String)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "Btn" => {
+            let mut s: Vec<String> = f.widgets.iter().flat_map(|w| on_states(doc, *w)).collect();
+            s.dedup();
+            s.into_iter().map(Value::String).collect()
+        }
+        _ => vec![],
+    }
+}
+
+fn value_of(doc: &Document, f: &Field, o: &Option<Object>) -> Value {
+    let Some(o) = o else { return Value::Null };
+    match (kind(f), deref(doc, o)) {
+        ("checkbox", Object::Name(n)) => json!(n.as_slice() != b"Off"),
+        ("radio", Object::Name(n)) if n.as_slice() == b"Off" => Value::Null,
+        (_, Object::Array(a)) => Value::Array(a.iter().filter_map(|x| obj_text(doc, x)).map(Value::String).collect()),
+        (_, o) => obj_text(doc, o).map(Value::String).unwrap_or(Value::Null),
+    }
+}
+
+fn page_of(doc: &Document) -> HashMap<ObjectId, u32> {
+    let mut m = HashMap::new();
+    for (n, pid) in doc.get_pages() {
+        if let Some(annots) = doc.get_dictionary(pid).ok().and_then(|p| p.get(b"Annots").ok()).map(|a| deref(doc, a)).and_then(|a| a.as_array().ok()) {
+            for a in annots {
+                if let Ok(id) = a.as_reference() {
+                    m.insert(id, n);
+                }
+            }
+        }
+    }
+    m
+}
+
+fn rect(doc: &Document, widget: ObjectId) -> Option<[f64; 4]> {
+    let r = doc.get_dictionary(widget).ok()?.get(b"Rect").ok().map(|r| deref(doc, r))?.as_array().ok()?;
+    let v: Vec<f64> = r.iter().filter_map(|x| num(doc, x)).collect();
+    if v.len() != 4 {
+        return None;
+    }
+    Some([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
+}
+
+/// The form's fields: `[{ name, type, value, default, options, required, read_only, multiline, max_length, label, page, rect }]`. `name` is the full
+/// name ("applicant.email"), `type` text, checkbox, radio, choice (a drop-down), list, button or signature; a checkbox's value is true or false,
+/// a radio group's the chosen option (null when none), `options` the choices or a button's "on" names; `label` the tooltip; `page` from 1;
+/// `rect` `[x1, y1, x2, y2]` in points from the bottom left. An empty list when the PDF has no form.
+pub fn pdf_form_fields(path: &str) -> Result<Vec<Value>, String> {
+    let doc = load(path)?;
+    let pages = page_of(&doc);
+    Ok(fields(&doc)?
+        .iter()
+        .map(|f| {
+            let d = doc.get_dictionary(f.id).ok();
+            let label = d.and_then(|d| d.get(b"TU").ok()).and_then(|t| obj_text(&doc, t));
+            let max = d.and_then(|d| d.get(b"MaxLen").ok()).and_then(|m| num(&doc, m)).map(|m| m as i64);
+            let w = f.widgets.first().copied();
+            json!({
+                "name": f.name,
+                "type": kind(f),
+                "value": value_of(&doc, f, &f.v),
+                "default": value_of(&doc, f, &f.dv),
+                "options": options(&doc, f),
+                "required": f.ff & 2 != 0,
+                "read_only": f.ff & 1 != 0,
+                "multiline": f.ft == "Tx" && f.ff & (1 << 12) != 0,
+                "max_length": max,
+                "label": label,
+                "page": w.and_then(|w| pages.get(&w)),
+                "rect": w.and_then(|w| rect(&doc, w)).map(|r| r.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>()),
+            })
+        })
+        .collect())
+}
+
+/// The form's values by full field name: text as text, checkboxes true or false, a radio group's option or null, a list's choices as a list.
+pub fn pdf_form_values(path: &str) -> Result<BTreeMap<String, Value>, String> {
+    let doc = load(path)?;
+    Ok(fields(&doc)?.iter().filter(|f| kind(f) != "button").map(|f| (f.name.clone(), value_of(&doc, f, &f.v))).collect())
+}
+
+// WinAnsiEncoding, as the standard Helvetica of form appearances uses it; characters it lacks become "?".
+fn win_ansi(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| match c {
+            '\u{20AC}' => 0x80,
+            '\u{201A}' => 0x82,
+            '\u{2026}' => 0x85,
+            '\u{2018}' => 0x91,
+            '\u{2019}' => 0x92,
+            '\u{201C}' => 0x93,
+            '\u{201D}' => 0x94,
+            '\u{2022}' => 0x95,
+            '\u{2013}' => 0x96,
+            '\u{2014}' => 0x97,
+            '\u{2122}' => 0x99,
+            '\u{0152}' => 0x8C,
+            '\u{0153}' => 0x9C,
+            c if (c as u32) < 0x80 || (0xA0..=0xFF).contains(&(c as u32)) => c as u8,
+            _ => b'?',
+        })
+        .collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02X}", x)).collect()
+}
+
+// A text field's look: the text in the field's font and size (from its DA; size 0 fits the height), one line or several.
+fn text_appearance(doc: &Document, form_dr: Option<Object>, f: &Field, widget: ObjectId, value: &str) -> Option<Stream> {
+    let [x1, y1, x2, y2] = rect(doc, widget)?;
+    let (w, h) = (x2 - x1, y2 - y1);
+    let da = f.da.clone().unwrap_or_else(|| "/Helv 0 Tf 0 g".into());
+    let toks: Vec<&str> = da.split_whitespace().collect();
+    let tf = toks.iter().position(|t| *t == "Tf");
+    let font = tf.and_then(|i| i.checked_sub(2)).and_then(|i| toks.get(i)).map(|s| s.trim_start_matches('/').to_string()).unwrap_or_else(|| "Helv".into());
+    let mut size: f64 = tf.and_then(|i| toks.get(i - 1)).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let multiline = f.ff & (1 << 12) != 0;
+    if size <= 0.0 {
+        size = if multiline { 10.0 } else { (h * 0.7).clamp(4.0, 12.0) };
+    }
+    let colour: String = tf.map(|i| toks[i + 1..].join(" ")).unwrap_or_else(|| "0 g".into());
+    let mut c = format!("/Tx BMC q 1 1 {:.2} {:.2} re W n BT /{} {:.2} Tf {} ", w - 2.0, h - 2.0, font, size, colour);
+    let lines: Vec<String> = if multiline {
+        // Wrapped by an estimate of Helvetica's widths (half the size per character), as the PDF's own font metrics are not read.
+        let per = ((w - 4.0) / (size * 0.5)).max(1.0) as usize;
+        let mut out = vec![];
+        for para in value.split('\n') {
+            let mut line = String::new();
+            for word in para.split(' ') {
+                if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > per {
+                    out.push(std::mem::take(&mut line));
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            out.push(line);
+        }
+        out
+    } else {
+        vec![value.replace('\n', " ")]
+    };
+    let lead = size * 1.15;
+    let first_y = if multiline { h - 2.0 - size } else { (h - size * 0.72) / 2.0 };
+    for (i, l) in lines.iter().enumerate() {
+        let est = l.chars().count() as f64 * size * 0.5;
+        let x = match f.q {
+            1 => ((w - est) / 2.0).max(2.0),
+            2 => (w - 2.0 - est).max(2.0),
+            _ => 2.0,
+        };
+        c.push_str(&format!("1 0 0 1 {:.2} {:.2} Tm <{}> Tj ", x, first_y - i as f64 * lead, hex(&win_ansi(l))));
+    }
+    c.push_str("ET Q EMC");
+    let mut d = Dictionary::new();
+    d.set("Type", Object::Name(b"XObject".to_vec()));
+    d.set("Subtype", Object::Name(b"Form".to_vec()));
+    d.set("BBox", Object::Array(vec![0.into(), 0.into(), Object::Real(w as f32), Object::Real(h as f32)]));
+    if let Some(dr) = form_dr {
+        d.set("Resources", dr);
+    }
+    Some(Stream::new(d, c.into_bytes()))
+}
+
+fn set_need_appearances(doc: &mut Document) -> Result<(), String> {
+    let form = doc.catalog().map_err(|e| e.to_string())?.get(b"AcroForm").map_err(|_| "the PDF has no form".to_string())?.clone();
+    match form {
+        Object::Reference(id) => doc.get_dictionary_mut(id).map_err(|e| e.to_string())?.set("NeedAppearances", Object::Boolean(true)),
+        Object::Dictionary(mut d) => {
+            d.set("NeedAppearances", Object::Boolean(true));
+            doc.catalog_mut().map_err(|e| e.to_string())?.set("AcroForm", Object::Dictionary(d));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn save(doc: &mut Document, out: &str) -> Result<(), String> {
+    if let Some(dir) = std::path::Path::new(out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    doc.save(out).map_err(|e| format!("{}: {}", out, e))?;
+    Ok(())
+}
+
+fn fill(doc: &mut Document, values: &HashMap<String, Value>) -> Result<Value, String> {
+    let list = fields(doc)?;
+    let dr = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"AcroForm").ok())
+        .and_then(|f| dict(doc, f))
+        .and_then(|f| f.get(b"DR").ok())
+        .map(|d| deref(doc, d).clone());
+    let mut filled = vec![];
+    let mut problems = vec![];
+    for f in &list {
+        let Some(v) = values.get(&f.name) else { continue };
+        let k = kind(f);
+        let s = match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            Value::Bool(b) => b.to_string(),
+            other => other.to_string(),
+        };
+        match k {
+            "text" | "choice" | "list" => {
+                if k != "text" {
+                    let opts = options(doc, f);
+                    let editable = f.ff & (1 << 18) != 0;
+                    if !s.is_empty() && !editable && !opts.iter().any(|o| o.as_str() == Some(&s)) {
+                        problems.push(format!("{}: `{}` is not one of its options {}", f.name, s, Value::Array(opts)));
+                        continue;
+                    }
+                }
+                if let Some(max) = doc.get_dictionary(f.id).ok().and_then(|d| d.get(b"MaxLen").ok()).and_then(|m| num(doc, m)) {
+                    if s.chars().count() as f64 > max {
+                        problems.push(format!("{}: longer than its {} characters", f.name, max));
+                        continue;
+                    }
+                }
+                doc.get_dictionary_mut(f.id).map_err(|e| e.to_string())?.set("V", pdf_string(&s));
+                for w in &f.widgets {
+                    if let Some(ap) = text_appearance(doc, dr.clone(), f, *w, &s) {
+                        let ap_id = doc.add_object(ap);
+                        let mut apd = Dictionary::new();
+                        apd.set("N", Object::Reference(ap_id));
+                        doc.get_dictionary_mut(*w).map_err(|e| e.to_string())?.set("AP", Object::Dictionary(apd));
+                    }
+                }
+            }
+            "checkbox" | "radio" => {
+                let states = options(doc, f);
+                let on: Option<String> = if k == "checkbox" {
+                    let yes = matches!(v, Value::Bool(true)) || matches!(s.to_lowercase().as_str(), "true" | "yes" | "on" | "1" | "x");
+                    if yes {
+                        Some(states.first().and_then(|x| x.as_str()).unwrap_or("Yes").to_string())
+                    } else if states.iter().any(|x| x.as_str() == Some(&s)) {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                } else if s.is_empty() || s == "false" {
+                    None
+                } else if states.iter().any(|x| x.as_str() == Some(&s)) {
+                    Some(s.clone())
+                } else {
+                    problems.push(format!("{}: `{}` is not one of its options {}", f.name, s, Value::Array(states)));
+                    continue;
+                };
+                let name = on.clone().unwrap_or_else(|| "Off".into());
+                doc.get_dictionary_mut(f.id).map_err(|e| e.to_string())?.set("V", Object::Name(name.clone().into_bytes()));
+                for w in &f.widgets {
+                    let mine = on_states(doc, *w);
+                    let state = if mine.contains(&name) { name.clone() } else { "Off".into() };
+                    doc.get_dictionary_mut(*w).map_err(|e| e.to_string())?.set("AS", Object::Name(state.into_bytes()));
+                }
+            }
+            other => {
+                problems.push(format!("{}: a {} field cannot be filled", f.name, other));
+                continue;
+            }
+        }
+        filled.push(f.name.clone());
+    }
+    let unknown: Vec<&String> = values.keys().filter(|k| !list.iter().any(|f| &f.name == *k)).collect();
+    if !filled.is_empty() {
+        set_need_appearances(doc)?;
+    }
+    Ok(json!({ "filled": filled, "unknown": unknown, "problems": problems }))
+}
+
+/// Fills the form at `path` from `values` (full field name to value: text, true/false for a checkbox, an option's name for a radio group or
+/// a drop-down) and writes it to `out`, with each text field's appearance drawn so viewers that do not redraw forms show it too.
+/// Gives `{ filled, unknown, problems }`: the fields filled, the names the form does not have, and values refused (an option it does not
+/// offer, text past a field's maximum length).
+pub fn pdf_form_fill(path: &str, values: std::collections::HashMap<String, serde_json::Value>, out: &str) -> Result<Value, String> {
+    let mut doc = load(path)?;
+    let r = fill(&mut doc, &values)?;
+    save(&mut doc, out)?;
+    Ok(r)
+}
+
+fn page_resources(doc: &mut Document, page: ObjectId) -> Result<Dictionary, String> {
+    // A page's resources may be its own, a reference, or inherited from its parents.
+    let mut at = Some(page);
+    let mut depth = 0;
+    while let Some(id) = at {
+        let d = doc.get_dictionary(id).map_err(|e| e.to_string())?;
+        if let Ok(r) = d.get(b"Resources") {
+            return Ok(deref(doc, r).as_dict().cloned().unwrap_or_default());
+        }
+        at = d.get(b"Parent").ok().and_then(|p| p.as_reference().ok());
+        depth += 1;
+        if depth > 64 {
+            break;
+        }
+    }
+    Ok(Dictionary::new())
+}
+
+/// Fills the form from `values` as `pdf_form_fill` does (an empty map fills nothing), then flattens it into `out`: each field's look drawn into
+/// its page and the form removed, so the PDF prints and shows the same everywhere and cannot be edited. Gives what `pdf_form_fill` gives,
+/// with `flattened`, the number of fields' widgets drawn.
+pub fn pdf_form_flatten(path: &str, values: std::collections::HashMap<String, serde_json::Value>, out: &str) -> Result<Value, String> {
+    let mut doc = load(path)?;
+    let mut r = fill(&mut doc, &values)?;
+    let mut drawn = 0;
+    for (_, pid) in doc.get_pages() {
+        let annots: Vec<Object> = doc.get_dictionary(pid).ok().and_then(|p| p.get(b"Annots").ok()).map(|a| deref(&doc, a).clone()).and_then(|a| a.as_array().ok().cloned()).unwrap_or_default();
+        let mut keep = vec![];
+        let mut content = String::new();
+        let mut xobjects: Vec<(String, ObjectId)> = vec![];
+        for a in annots {
+            let Ok(aid) = a.as_reference() else {
+                keep.push(a);
+                continue;
+            };
+            let Ok(ad) = doc.get_dictionary(aid) else { continue };
+            if ad.get(b"Subtype").and_then(|s| s.as_name()).ok() != Some(b"Widget".as_slice()) {
+                keep.push(a);
+                continue;
+            }
+            let hidden = ad.get(b"F").ok().and_then(|f| num(&doc, f)).map(|f| (f as i64) & 2 != 0).unwrap_or(false);
+            let ap = ad.get(b"AP").ok().and_then(|ap| dict(&doc, ap)).and_then(|ap| ap.get(b"N").ok()).cloned();
+            let state = ad.get(b"AS").ok().and_then(|s| s.as_name().ok()).map(|s| s.to_vec());
+            let rect_ = rect(&doc, aid);
+            // The normal appearance: a stream, or for a button the one its state names.
+            let stream_id = match ap.as_ref() {
+                Some(Object::Reference(id)) if doc.get_object(*id).map(|o| o.as_stream().is_ok()).unwrap_or(false) => Some(*id),
+                Some(o) => dict(&doc, o).and_then(|d| state.as_ref().and_then(|s| d.get(s).ok())).and_then(|s| s.as_reference().ok()),
+                None => None,
+            };
+            let (Some(sid), Some([x1, y1, x2, y2]), false) = (stream_id, rect_, hidden) else { continue };
+            let Ok(st) = doc.get_object(sid).and_then(|o| o.as_stream()) else { continue };
+            let bbox: Vec<f64> = st.dict.get(b"BBox").ok().and_then(|b| b.as_array().ok()).map(|a| a.iter().filter_map(|x| num(&doc, x)).collect()).unwrap_or_default();
+            let (bx1, by1, bx2, by2) = if bbox.len() == 4 { (bbox[0], bbox[1], bbox[2], bbox[3]) } else { (0.0, 0.0, x2 - x1, y2 - y1) };
+            let sx = if (bx2 - bx1).abs() > 1e-6 { (x2 - x1) / (bx2 - bx1) } else { 1.0 };
+            let sy = if (by2 - by1).abs() > 1e-6 { (y2 - y1) / (by2 - by1) } else { 1.0 };
+            let name = format!("QFlat{}", drawn);
+            content.push_str(&format!("q {:.4} 0 0 {:.4} {:.4} {:.4} cm /{} Do Q\n", sx, sy, x1 - bx1 * sx, y1 - by1 * sy, name));
+            xobjects.push((name, sid));
+            drawn += 1;
+        }
+        if xobjects.is_empty() && keep.len() == doc.get_dictionary(pid).ok().and_then(|p| p.get(b"Annots").ok()).map(|a| deref(&doc, a).as_array().map(|x| x.len()).unwrap_or(0)).unwrap_or(0) {
+            continue;
+        }
+        for (_, sid) in &xobjects {
+            if let Ok(Object::Stream(s)) = doc.get_object_mut(*sid) {
+                s.dict.set("Type", Object::Name(b"XObject".to_vec()));
+                s.dict.set("Subtype", Object::Name(b"Form".to_vec()));
+            }
+        }
+        let mut res = page_resources(&mut doc, pid)?;
+        let mut xo = res.get(b"XObject").ok().map(|x| deref(&doc, x).as_dict().cloned().unwrap_or_default()).unwrap_or_default();
+        for (n, sid) in &xobjects {
+            xo.set(n.as_bytes().to_vec(), Object::Reference(*sid));
+        }
+        res.set("XObject", Object::Dictionary(xo));
+        let before = doc.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
+        let after = doc.add_object(Stream::new(Dictionary::new(), format!("Q\n{}", content).into_bytes()));
+        let page = doc.get_dictionary(pid).map_err(|e| e.to_string())?;
+        let mut contents = vec![Object::Reference(before)];
+        match page.get(b"Contents").ok().map(|c| deref(&doc, c).clone()) {
+            Some(Object::Array(a)) => contents.extend(a),
+            Some(Object::Stream(_)) => contents.push(page.get(b"Contents").unwrap().clone()),
+            _ => {}
+        }
+        contents.push(Object::Reference(after));
+        let page = doc.get_dictionary_mut(pid).map_err(|e| e.to_string())?;
+        page.set("Resources", Object::Dictionary(res));
+        page.set("Contents", Object::Array(contents));
+        if keep.is_empty() {
+            page.remove(b"Annots");
+        } else {
+            page.set("Annots", Object::Array(keep));
+        }
+    }
+    doc.catalog_mut().map_err(|e| e.to_string())?.remove(b"AcroForm");
+    save(&mut doc, out)?;
+    r["flattened"] = json!(drawn);
+    Ok(r)
+}

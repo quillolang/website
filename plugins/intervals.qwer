@@ -1,0 +1,398 @@
+//! Time ranges that overlap: double bookings found, free slots in a day, busy spans merged, the most at once, bookings given rooms, and an interval index kept in memory for fast "what is on between" questions.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use serde_json::{json, Value};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::sync::Mutex;
+
+/// How times were written, so the answers are written the same way.
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Number,
+    Date,
+    Naive,
+    Offset(i32),
+}
+
+fn parse_text(s: &str) -> Option<(i64, Style)> {
+    let t = s.trim();
+    if t.len() == 10 {
+        let d = NaiveDate::parse_from_str(t, "%Y-%m-%d").ok()?;
+        return Some((d.and_hms_opt(0, 0, 0)?.and_utc().timestamp(), Style::Date));
+    }
+    if t.len() < 16 {
+        return None;
+    }
+    let mut t = t.to_string();
+    if t.as_bytes()[10] == b' ' {
+        t.replace_range(10..11, "T");
+    }
+    let time = &t[11..];
+    let has_offset = time.ends_with('Z') || time.ends_with('z') || time.contains('+') || time.contains('-');
+    if has_offset {
+        let t = if t.ends_with('Z') || t.ends_with('z') { format!("{}+00:00", &t[..t.len() - 1]) } else { t.clone() };
+        for f in ["%Y-%m-%dT%H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M%:z", "%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%dT%H:%M%z"] {
+            if let Ok(d) = DateTime::parse_from_str(&t, f) {
+                return Some((d.timestamp(), Style::Offset(d.offset().local_minus_utc())));
+            }
+        }
+        None
+    } else {
+        for f in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+            if let Ok(d) = NaiveDateTime::parse_from_str(&t, f) {
+                return Some((d.and_utc().timestamp(), Style::Naive));
+            }
+        }
+        None
+    }
+}
+
+fn time_of(v: &Value, what: &str) -> Result<(i64, Style), String> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f.round() as i64)).map(|x| (x, Style::Number)).ok_or_else(|| format!("{} is not a number", what)),
+        Value::String(s) => parse_text(s).ok_or_else(|| format!("{} `{}` is not a time: a number, \"2026-11-02\", \"2026-11-02T09:30\" or with an offset, \"2026-11-02T09:30:00+01:00\"", what, s)),
+        Value::Null => Err(format!("{} is missing", what)),
+        other => Err(format!("{} is not a time: {}", what, other)),
+    }
+}
+
+fn write_time(t: i64, style: Style) -> Value {
+    let naive = |t: i64| DateTime::from_timestamp(t, 0).map(|d| d.naive_utc());
+    match style {
+        Style::Number => json!(t),
+        Style::Date | Style::Naive => match naive(t) {
+            Some(d) if style == Style::Date && d.time().num_seconds_from_midnight() == 0 => json!(d.format("%Y-%m-%d").to_string()),
+            Some(d) if d.second() == 0 => json!(d.format("%Y-%m-%dT%H:%M").to_string()),
+            Some(d) => json!(d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            None => json!(t),
+        },
+        Style::Offset(o) => match FixedOffset::east_opt(o).and_then(|z| z.timestamp_opt(t, 0).single()) {
+            Some(d) => json!(d.format("%Y-%m-%dT%H:%M:%S%:z").to_string()),
+            None => json!(t),
+        },
+    }
+}
+
+/// A length: a number (in the times' own unit when they are numbers, seconds when they are text) or text like "30m", "1h30m", "2d".
+fn length_of(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Null => Ok(0),
+        Value::Number(n) => n.as_f64().map(|f| f.round() as i64).ok_or_else(|| "a length is a number".into()),
+        Value::String(s) => {
+            let (mut total, mut num) = (0i64, String::new());
+            for c in s.trim().chars() {
+                if c.is_ascii_digit() {
+                    num.push(c);
+                } else if c == ' ' {
+                    continue;
+                } else {
+                    let n: i64 = num.parse().map_err(|_| format!("`{}` is not a length like \"30m\" or \"1h30m\"", s))?;
+                    total += n * match c {
+                        's' => 1,
+                        'm' => 60,
+                        'h' => 3600,
+                        'd' => 86400,
+                        'w' => 604800,
+                        _ => return Err(format!("`{}` is not a length like \"30m\" or \"1h30m\"", s)),
+                    };
+                    num.clear();
+                }
+            }
+            if !num.is_empty() {
+                total += num.parse::<i64>().map_err(|_| format!("`{}` is not a length", s))?;
+            }
+            Ok(total)
+        }
+        other => Err(format!("a length is a number or text like \"30m\", not {}", other)),
+    }
+}
+
+struct Span {
+    start: i64,
+    end: i64,
+    item: Value,
+}
+
+fn spans(items: &[Value]) -> Result<(Vec<Span>, Style), String> {
+    if items.len() > 1_000_000 {
+        return Err("up to a million items".into());
+    }
+    let mut style = None;
+    let mut out = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let (s, st) = time_of(it.get("start").unwrap_or(&Value::Null), &format!("item {}'s `start`", i))?;
+        let (e, _) = time_of(it.get("end").unwrap_or(&Value::Null), &format!("item {}'s `end`", i))?;
+        if e < s {
+            return Err(format!("item {} ends before it starts", i));
+        }
+        style.get_or_insert(st);
+        out.push(Span { start: s, end: e, item: it.clone() });
+    }
+    Ok((out, style.unwrap_or(Style::Number)))
+}
+
+fn group_of(item: &Value, by: &str) -> String {
+    if by.is_empty() {
+        return String::new();
+    }
+    match item.get(by) {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
+}
+
+/// The items that overlap the range from `start` to `end`: each item a map with `start` and `end` (numbers, or dates and times as
+/// text), kept as given. Ranges include their start and not their end, so a booking ending at 10:00 does not overlap one from 10:00.
+pub fn intervals_overlapping(items: Vec<serde_json::Value>, start: serde_json::Value, end: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (s, _) = time_of(&start, "start")?;
+    let (e, _) = time_of(&end, "end")?;
+    let (sp, _) = spans(&items)?;
+    Ok(sp.into_iter().filter(|x| x.start < e && s < x.end || (x.start == x.end && s <= x.start && x.start < e)).map(|x| x.item).collect())
+}
+
+/// Every pair of items that overlap, with the same value of the field `group_by` ("room", "doctor"; "" for all items together):
+/// `[{ a, b, from, to }]`, `a` and `b` the items, `from` and `to` the time they share. Double bookings.
+pub fn intervals_conflicts(items: Vec<serde_json::Value>, group_by: &str) -> Result<Vec<Value>, String> {
+    let (mut sp, style) = spans(&items)?;
+    sp.sort_by_key(|x| (group_of(&x.item, group_by), x.start, x.end));
+    let mut out = Vec::new();
+    for i in 0..sp.len() {
+        let g = group_of(&sp[i].item, group_by);
+        for j in i + 1..sp.len() {
+            if group_of(&sp[j].item, group_by) != g || sp[j].start >= sp[i].end {
+                break;
+            }
+            out.push(json!({
+                "a": sp[i].item, "b": sp[j].item,
+                "from": write_time(sp[j].start, style), "to": write_time(sp[i].end.min(sp[j].end), style),
+            }));
+            if out.len() >= 100_000 {
+                return Err("more than 100,000 overlapping pairs".into());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The busy spans: the items joined where they overlap or touch, in order: `[{ start, end, count }]`, `count` the items in each.
+pub fn intervals_merge(items: Vec<serde_json::Value>) -> Result<Vec<Value>, String> {
+    let (mut sp, style) = spans(&items)?;
+    sp.sort_by_key(|x| (x.start, x.end));
+    let mut out: Vec<(i64, i64, usize)> = Vec::new();
+    for x in sp {
+        match out.last_mut() {
+            Some(last) if x.start <= last.1 => {
+                last.1 = last.1.max(x.end);
+                last.2 += 1;
+            }
+            _ => out.push((x.start, x.end, 1)),
+        }
+    }
+    Ok(out.into_iter().map(|(s, e, c)| json!({ "start": write_time(s, style), "end": write_time(e, style), "count": c })).collect())
+}
+
+/// The free slots between `start` and `end` that no item covers, at least `min_length` long (a number, or text like "30m";
+/// 0 for any): `[{ start, end }]`, written as `start` was. Free times for a calendar, or the gaps in a shift rota.
+pub fn intervals_free(items: Vec<serde_json::Value>, start: serde_json::Value, end: serde_json::Value, min_length: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (s, style) = time_of(&start, "start")?;
+    let (e, _) = time_of(&end, "end")?;
+    let min = length_of(&min_length)?.max(1);
+    let (mut sp, _) = spans(&items)?;
+    sp.sort_by_key(|x| x.start);
+    let (mut at, mut out) = (s, Vec::new());
+    for x in sp {
+        if x.end <= at || x.start >= e {
+            continue;
+        }
+        if x.start - at >= min {
+            out.push(json!({ "start": write_time(at, style), "end": write_time(x.start.min(e), style) }));
+        }
+        at = at.max(x.end);
+        if at >= e {
+            break;
+        }
+    }
+    if e - at >= min {
+        out.push(json!({ "start": write_time(at, style), "end": write_time(e, style) }));
+    }
+    Ok(out)
+}
+
+/// The most items going on at once, and the first time that happens: `{ count, start, end }`. The rooms, staff or parking
+/// places a day's bookings need.
+pub fn intervals_peak(items: Vec<serde_json::Value>) -> Result<Value, String> {
+    let (sp, style) = spans(&items)?;
+    let mut ev: Vec<(i64, i32)> = sp.iter().filter(|x| x.end > x.start).flat_map(|x| [(x.start, 1), (x.end, -1)]).collect();
+    // Ends before starts at the same time: a range does not include its end.
+    ev.sort();
+    let (mut cur, mut best, mut from, mut to) = (0, 0, 0i64, 0i64);
+    for (k, &(t, d)) in ev.iter().enumerate() {
+        cur += d;
+        if cur > best {
+            best = cur;
+            from = t;
+            to = ev[k + 1..].iter().find(|e| e.1 < 0).map_or(t, |e| e.0);
+        }
+    }
+    if best == 0 {
+        return Ok(json!({ "count": 0, "start": null, "end": null }));
+    }
+    Ok(json!({ "count": best, "start": write_time(from, style), "end": write_time(to, style) }))
+}
+
+/// Gives each item a place so that no two overlap in one place, using as few places as it can (earliest start first):
+/// `{ items, needed, unplaced }`. With `places` (room or table names) each item gets `place`, one of them, and those that fit in
+/// none are `unplaced`; with `[]` places are numbered from 1 and `needed` says how many it took.
+pub fn intervals_assign(items: Vec<serde_json::Value>, places: Vec<String>) -> Result<Value, String> {
+    let (sp, _) = spans(&items)?;
+    let mut order: Vec<usize> = (0..sp.len()).collect();
+    order.sort_by_key(|&i| (sp[i].start, sp[i].end));
+    // Free places by the time they free up, then by number, so the lowest free place is taken.
+    let mut busy: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let mut free: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    let mut place: Vec<Option<usize>> = vec![None; sp.len()];
+    let mut made = 0usize;
+    for i in order {
+        while let Some(&Reverse((end, p))) = busy.peek() {
+            if end > sp[i].start {
+                break;
+            }
+            busy.pop();
+            free.push(Reverse(p));
+        }
+        let p = match free.pop() {
+            Some(Reverse(p)) => Some(p),
+            None if places.is_empty() || made < places.len() => {
+                made += 1;
+                Some(made - 1)
+            }
+            None => None,
+        };
+        if let Some(p) = p {
+            busy.push(Reverse((sp[i].end, p)));
+            place[i] = Some(p);
+        }
+    }
+    let name = |p: usize| if places.is_empty() { json!(p + 1) } else { json!(places[p]) };
+    let mut out = Vec::new();
+    let mut unplaced = Vec::new();
+    for (i, x) in sp.into_iter().enumerate() {
+        let mut it = x.item;
+        match place[i] {
+            Some(p) => {
+                if let Value::Object(m) = &mut it {
+                    m.insert("place".into(), name(p));
+                }
+                out.push(it);
+            }
+            None => unplaced.push(it),
+        }
+    }
+    Ok(json!({ "items": out, "needed": made, "unplaced": unplaced }))
+}
+
+// ---- an index kept in memory -------------------------------------------------------
+
+#[derive(Default)]
+struct Index {
+    /// (start, id) to (end, item).
+    by_start: BTreeMap<(i64, String), (i64, Value)>,
+    starts: HashMap<String, i64>,
+    longest: i64,
+}
+
+static INDEXES: Mutex<Option<HashMap<String, Index>>> = Mutex::new(None);
+
+fn id_of(item: &Value, i: usize) -> Result<String, String> {
+    match item.get("id") {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Number(n)) => Ok(n.to_string()),
+        _ => Err(format!("item {} has no `id` (text or a number): the index finds items by it", i)),
+    }
+}
+
+/// Adds items (each with `id`, `start` and `end`) to the index `name`, made on first use (up to 1,000 indexes and 10 million
+/// items each). An item with an id already there replaces it. Gives the index's size.
+pub fn intervals_add(name: &str, items: Vec<serde_json::Value>) -> Result<i64, String> {
+    let (sp, _) = spans(&items)?;
+    let ids = items.iter().enumerate().map(|(i, it)| id_of(it, i)).collect::<Result<Vec<_>, _>>()?;
+    let mut g = INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    let all = g.get_or_insert_with(HashMap::new);
+    if !all.contains_key(name) && all.len() >= 1000 {
+        return Err("up to 1,000 indexes: intervals_clear old ones".into());
+    }
+    let idx = all.entry(name.to_string()).or_default();
+    for (x, id) in sp.into_iter().zip(ids) {
+        if let Some(old) = idx.starts.remove(&id) {
+            idx.by_start.remove(&(old, id.clone()));
+        }
+        if idx.by_start.len() >= 10_000_000 {
+            return Err("up to 10 million items an index".into());
+        }
+        idx.longest = idx.longest.max(x.end - x.start);
+        idx.starts.insert(id.clone(), x.start);
+        idx.by_start.insert((x.start, id), (x.end, x.item));
+    }
+    Ok(idx.by_start.len() as i64)
+}
+
+/// The items of the index `name` that overlap `start` to `end`, by start time: what is booked between two times, in a few
+/// microseconds among millions. A time alone (`start` equal to `end`) finds what is on at that moment.
+pub fn intervals_find(name: &str, start: serde_json::Value, end: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (s, _) = time_of(&start, "start")?;
+    let (e, _) = time_of(&end, "end")?;
+    let g = INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(idx) = g.as_ref().and_then(|a| a.get(name)) else { return Ok(vec![]) };
+    let from = s.saturating_sub(idx.longest);
+    let point = s == e;
+    let mut out = Vec::new();
+    for ((st, _), (en, item)) in idx.by_start.range((from, String::new())..) {
+        if *st > e || (!point && *st == e) {
+            break;
+        }
+        let hit = if point { *st <= s && (s < *en || *st == *en) } else { *en > s || (*st == *en && *st >= s) };
+        if hit {
+            out.push(item.clone());
+            if out.len() >= 100_000 {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Takes the items with these ids out of the index `name`: how many were there.
+pub fn intervals_remove(name: &str, ids: Vec<serde_json::Value>) -> Result<i64, String> {
+    let mut g = INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(idx) = g.as_mut().and_then(|a| a.get_mut(name)) else { return Ok(0) };
+    let mut n = 0;
+    for v in ids {
+        let id = match v {
+            Value::String(s) => s,
+            other => other.to_string(),
+        };
+        if let Some(st) = idx.starts.remove(&id) {
+            idx.by_start.remove(&(st, id));
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// How many items the index `name` holds (0 when there is none).
+pub fn intervals_count(name: &str) -> i64 {
+    let g = INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|a| a.get(name)).map_or(0, |i| i.by_start.len() as i64)
+}
+
+/// Forgets the index `name`: true when there was one.
+pub fn intervals_clear(name: &str) -> bool {
+    let mut g = INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_mut().is_some_and(|a| a.remove(name).is_some())
+}

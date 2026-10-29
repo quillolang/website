@@ -1,0 +1,240 @@
+//! Uploads checked before they are kept: the real type from the first bytes against the name's extension and an allow list, the size, double extensions, programs, zip bombs and paths that climb out of the folder, SVGs and PDFs that run scripts, Office macros, and images that are also a PHP page or a zip.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! infer = "0.19"
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+
+use serde_json::{json, Value};
+use std::io::Read;
+
+struct Problems(Vec<Value>);
+
+impl Problems {
+    fn add(&mut self, code: &str, message: String) {
+        self.0.push(json!({ "code": code, "message": message }));
+    }
+}
+
+const SCRIPT_EXTS: &[&str] = &["php", "php3", "php4", "php5", "phtml", "phar", "asp", "aspx", "jsp", "jspx", "cgi", "pl", "py", "rb", "sh", "bash", "exe", "dll", "bat", "cmd", "com", "scr", "msi", "ps1", "vbs", "js", "mjs", "jar", "hta", "html", "htm", "shtml", "svgz"];
+const ARCHIVE_EXTS: &[&str] = &["zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "zst", "cab", "iso"];
+
+fn canonical_ext(e: &str) -> String {
+    match e.to_lowercase().as_str() {
+        "jpeg" | "jpe" | "jfif" => "jpg".into(),
+        "tiff" => "tif".into(),
+        "htm" => "html".into(),
+        "mpeg" => "mpg".into(),
+        "oga" | "opus" => "ogg".into(),
+        "heif" => "heic".into(),
+        other => other.into(),
+    }
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn find_ci(hay: &[u8], needle: &str) -> bool {
+    let lower: Vec<u8> = hay.iter().map(|b| b.to_ascii_lowercase()).collect();
+    find(&lower, needle.as_bytes()).is_some()
+}
+
+/// What the bytes say a file is: `{ mime, extension, kind }`; text files that no magic number marks are "text/plain"
+/// (or "image/svg+xml", "text/html"), and anything else "application/octet-stream".
+fn sniff(bytes: &[u8]) -> (String, String, String) {
+    if let Some(t) = infer::get(bytes) {
+        let kind = format!("{:?}", t.matcher_type()).to_lowercase();
+        return (t.mime_type().into(), t.extension().into(), kind);
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    // UTF-8 without NUL bytes; the 4 KiB cut may split the last character.
+    let text = !head.contains(&0) && (0..4).any(|cut| std::str::from_utf8(&head[..head.len().saturating_sub(cut)]).is_ok());
+    if text {
+        let start = String::from_utf8_lossy(head).trim_start_matches('\u{feff}').trim_start().to_lowercase();
+        if start.contains("<svg") {
+            return ("image/svg+xml".into(), "svg".into(), "image".into());
+        }
+        if start.starts_with("<!doctype html") || start.starts_with("<html") || start.starts_with("<script") || start.starts_with("<head") {
+            return ("text/html".into(), "html".into(), "text".into());
+        }
+        return ("text/plain".into(), "txt".into(), "text".into());
+    }
+    ("application/octet-stream".into(), "bin".into(), "unknown".into())
+}
+
+fn allowed(rule: &str, mime: &str, ext: &str) -> bool {
+    let r = rule.trim().to_lowercase();
+    if r.contains('/') {
+        match r.strip_suffix("/*") {
+            Some(top) => mime.starts_with(&format!("{}/", top)),
+            None => r == mime,
+        }
+    } else {
+        canonical_ext(r.trim_start_matches('.')) == canonical_ext(ext)
+    }
+}
+
+fn check_zip(path: &str, opts: &Value, p: &mut Problems) -> Value {
+    let max_entries = opts["zip_max_entries"].as_u64().unwrap_or(1000);
+    let max_total = opts["zip_max_bytes"].as_u64().unwrap_or(200 * 1024 * 1024);
+    let max_ratio = opts["zip_max_ratio"].as_f64().unwrap_or(100.0);
+    let Ok(file) = std::fs::File::open(path) else { return Value::Null };
+    let mut z = match zip::ZipArchive::new(file) {
+        Ok(z) => z,
+        Err(e) => {
+            p.add("damaged_archive", format!("the zip cannot be read: {}", e));
+            return Value::Null;
+        }
+    };
+    let (mut total, mut packed, mut nested, mut macros) = (0u64, 0u64, vec![], false);
+    if z.len() as u64 > max_entries {
+        p.add("too_many_entries", format!("the zip holds {} files, more than {}", z.len(), max_entries));
+    }
+    for i in 0..z.len().min(max_entries as usize + 1) {
+        let Ok(mut f) = z.by_index(i) else {
+            p.add("damaged_archive", format!("entry {} cannot be read (encrypted, or a method this check does not read)", i + 1));
+            continue;
+        };
+        let name = f.name().to_string();
+        if f.enclosed_name().is_none() {
+            p.add("zip_slip", format!("`{}` would be written outside the folder it is unpacked in", name));
+        }
+        if f.is_symlink() {
+            p.add("zip_symlink", format!("`{}` is a symbolic link, which can point anywhere once unpacked", name));
+        }
+        let lower = name.to_lowercase();
+        if ARCHIVE_EXTS.iter().any(|e| lower.ends_with(&format!(".{}", e))) {
+            nested.push(name.clone());
+        }
+        if lower.ends_with("vbaproject.bin") {
+            macros = true;
+        }
+        packed += f.compressed_size();
+        // Unpack for real, up to the limit: a bomb's headers can lie about its size.
+        let left = max_total.saturating_sub(total) + 1;
+        let n = std::io::copy(&mut (&mut f).take(left), &mut std::io::sink()).unwrap_or(0);
+        total += n;
+        if total > max_total {
+            p.add("zip_bomb", format!("the zip unpacks to more than {} bytes", max_total));
+            break;
+        }
+    }
+    let ratio = if packed > 0 { total as f64 / packed as f64 } else { 0.0 };
+    if ratio > max_ratio && total > 1_000_000 && !p.0.iter().any(|x| x["code"] == "zip_bomb") {
+        p.add("zip_bomb", format!("the zip unpacks to {:.0} times its size ({} bytes from {}), more than {:.0}", ratio, total, packed, max_ratio));
+    }
+    if !nested.is_empty() {
+        p.add("nested_archive", format!("archives inside the archive: {}", nested.join(", ")));
+    }
+    if macros {
+        p.add("macros", "the document holds VBA macros".into());
+    }
+    json!({ "entries": z.len(), "unpacked_bytes": total, "packed_bytes": packed, "ratio": (ratio * 10.0).round() / 10.0 })
+}
+
+/// Checks an uploaded file saved at `path`, sent with the name `filename` (`request.files.x.filename`). `options` may hold
+/// `allowed` (MIME types, `image/*`, or extensions), `max_bytes`, `allow_svg` (false by default: SVGs can hold scripts),
+/// and for zips `zip_max_entries`, `zip_max_bytes`, `zip_max_ratio`. Gives `{ ok, mime, extension, kind, claimed_extension,
+/// size, problems: [{ code, message }], archive }`; `ok` is true when there is no problem.
+pub fn upload_check(path: &str, filename: &str, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let opts = Value::Object(options.into_iter().collect());
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?;
+    let size = meta.len();
+    let max = opts["max_bytes"].as_u64().unwrap_or(25 * 1024 * 1024);
+    let mut p = Problems(vec![]);
+    if size == 0 {
+        p.add("empty", "the file is empty".into());
+    }
+    if size > max {
+        p.add("too_large", format!("{} bytes, more than the {} allowed", size, max));
+    }
+    // Enough to sniff and scan; a file over the limit is not read whole.
+    let mut bytes = vec![];
+    std::fs::File::open(path).and_then(|f| f.take(max.min(64 * 1024 * 1024) + 1).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
+    let (mime, ext, kind) = sniff(&bytes);
+
+    let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename).trim().to_string();
+    let parts: Vec<String> = name.split('.').map(|s| s.to_lowercase()).collect();
+    let claimed = if parts.len() > 1 { parts.last().cloned().unwrap_or_default() } else { String::new() };
+    if parts.len() > 2 && parts[1..parts.len() - 1].iter().any(|e| SCRIPT_EXTS.contains(&e.as_str())) {
+        p.add("double_extension", format!("`{}` hides a script's extension inside its name: some servers run such files", name));
+    }
+    if SCRIPT_EXTS.contains(&claimed.as_str()) && claimed != "js" {
+        p.add("script_name", format!("`.{}` files may be run by a web server", claimed));
+    }
+    if name.contains('\0') || name.starts_with('.') || name.contains("..") {
+        p.add("bad_name", format!("`{}` is not a safe file name", name.escape_debug()));
+    }
+    if kind == "app" {
+        p.add("executable", format!("the file is a program ({})", mime));
+    }
+
+    let office = ["docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "jar", "apk"];
+    let text_like = ["txt", "csv", "tsv", "json", "md", "xml", "log", "ics", "vcf", "yaml", "yml"];
+    let same = canonical_ext(&claimed) == canonical_ext(&ext)
+        || (ext == "zip" && office.contains(&claimed.as_str()))
+        || (ext == "txt" && text_like.contains(&claimed.as_str()))
+        || (ext == "xml" && claimed == "svg");
+    if !claimed.is_empty() && !same {
+        p.add("type_mismatch", format!("named .{} but the bytes are {} ({})", claimed, ext, mime));
+    }
+
+    if let Some(list) = opts["allowed"].as_array() {
+        let rules: Vec<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+        if !rules.is_empty() && !rules.iter().any(|r| allowed(r, &mime, &ext)) {
+            p.add("not_allowed", format!("{} is not among the allowed types ({})", mime, rules.join(", ")));
+        }
+    }
+
+    if mime == "image/svg+xml" {
+        let scripted = find_ci(&bytes, "<script") || find_ci(&bytes, "javascript:") || find_ci(&bytes, "<foreignobject") || find_ci(&bytes, "<!entity")
+            || String::from_utf8_lossy(&bytes).to_lowercase().split(|c: char| c.is_whitespace()).any(|w| w.starts_with("on") && w.contains('=') && w[2..].split('=').next().is_some_and(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphabetic())));
+        if scripted {
+            p.add("svg_script", "the SVG holds a script, an event handler, a javascript: link, foreign HTML or an XML entity".into());
+        } else if !opts["allow_svg"].as_bool().unwrap_or(false) {
+            p.add("svg", "SVGs are refused unless allow_svg is set: serve them with Content-Security-Policy, or convert them to PNG".into());
+        }
+    }
+    if mime == "text/html" && claimed != "html" {
+        p.add("html_content", "the file is an HTML page, which a browser would run on your domain".into());
+    }
+
+    if (kind == "image" && mime != "image/svg+xml") || mime == "application/pdf" || kind == "audio" || kind == "video" {
+        for (needle, what) in [("<?php", "PHP code"), ("<script", "a script tag"), ("<%@", "a JSP or ASP page"), ("<html", "an HTML page")] {
+            if find_ci(&bytes, needle) {
+                p.add("polyglot", format!("the {} also holds {}", ext, what));
+            }
+        }
+        if ext != "zip" && find(&bytes[4.min(bytes.len())..], b"PK\x03\x04").is_some() && find(&bytes, b"PK\x05\x06").is_some() {
+            p.add("polyglot", format!("the {} also holds a zip archive", ext));
+        }
+    }
+    if mime == "application/pdf" {
+        let active: Vec<&str> = ["/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/OpenAction", "/AA", "/RichMedia", "/XFA"].into_iter().filter(|k| find(&bytes, k.as_bytes()).is_some_and(|i| !bytes.get(i + k.len()).is_some_and(|b| b.is_ascii_alphanumeric()))).collect();
+        if !active.is_empty() {
+            p.add("pdf_active", format!("the PDF can run actions or carry files: {}", active.join(", ")));
+        }
+    }
+
+    let archive = if ext == "zip" || office.contains(&ext.as_str()) { check_zip(path, &opts, &mut p) } else { Value::Null };
+    Ok(json!({
+        "ok": p.0.is_empty(),
+        "mime": mime,
+        "extension": ext,
+        "kind": kind,
+        "claimed_extension": claimed,
+        "size": size,
+        "problems": p.0,
+        "archive": archive,
+    }))
+}
+
+/// What a file is from its first bytes: `{ mime, extension, kind }`, `kind` being "image", "video", "audio", "archive", "doc",
+/// "font", "book", "app" (programs), "text" or "unknown".
+pub fn upload_sniff(path: &str) -> Result<Value, String> {
+    let mut head = vec![];
+    std::fs::File::open(path).and_then(|f| f.take(8192).read_to_end(&mut head)).map_err(|e| format!("{}: {}", path, e))?;
+    let (mime, extension, kind) = sniff(&head);
+    Ok(json!({ "mime": mime, "extension": extension, "kind": kind }))
+}

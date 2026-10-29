@@ -1,0 +1,234 @@
+//! Esri Shapefiles, the GIS world's oldest exchange format, read to GeoJSON (from the .shp and .dbf files or from the .zip they come in) with their attributes, and written from GeoJSON for the people who ask for one.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! shapefile = "=0.9.0"
+//! dbase = "=0.8.0"
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use shapefile::{Point, PolygonRing, Shape};
+use std::io::{Cursor, Read};
+
+const MAX_MEMBER: u64 = 512 * 1024 * 1024;
+
+struct Files { shp: Vec<u8>, dbf: Option<Vec<u8>>, prj: Option<String> }
+
+fn load(path: &str) -> Result<Files, String> {
+    if path.to_lowercase().ends_with(".zip") {
+        let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+        let mut z = zip::ZipArchive::new(f).map_err(|e| format!("{}: {}", path, e))?;
+        let names: Vec<String> = z.file_names().map(|s| s.to_string()).filter(|n| !n.contains("__MACOSX")).collect();
+        let shp = names.iter().find(|n| n.to_lowercase().ends_with(".shp")).ok_or_else(|| format!("{}: the zip holds no .shp file", path))?.clone();
+        let stem = shp[..shp.len() - 4].to_string();
+        let mut member = |ext: &str| -> Option<Vec<u8>> {
+            let name = names.iter().find(|n| n.len() == stem.len() + 4 && n.starts_with(&stem) && n.to_lowercase().ends_with(ext))?.clone();
+            let mut buf = Vec::new();
+            z.by_name(&name).ok()?.take(MAX_MEMBER).read_to_end(&mut buf).ok()?;
+            Some(buf)
+        };
+        let shp_bytes = member(".shp").ok_or_else(|| format!("{}: {} could not be read", path, shp))?;
+        let dbf = member(".dbf");
+        let prj = member(".prj").map(|b| String::from_utf8_lossy(&b).to_string());
+        return Ok(Files { shp: shp_bytes, dbf, prj });
+    }
+    let p = std::path::Path::new(path);
+    let shp = std::fs::read(p).map_err(|e| format!("{}: {}", path, e))?;
+    let sibling = |ext: &str| [ext.to_string(), ext.to_uppercase()].iter().find_map(|e| std::fs::read(p.with_extension(e)).ok());
+    Ok(Files { shp, dbf: sibling("dbf"), prj: sibling("prj").map(|b| String::from_utf8_lossy(&b).to_string()) })
+}
+
+fn pt(p: &Point) -> Value { json!([p.x, p.y]) }
+
+fn ring_coords<P: Copy>(pts: &[P], f: impl Fn(&P) -> Value) -> Value {
+    // Shapefile rings go clockwise; GeoJSON's outer rings go anticlockwise (RFC 7946).
+    Value::Array(pts.iter().rev().map(|p| f(p)).collect())
+}
+
+fn polygon_json<P: Copy>(rings: &[PolygonRing<P>], f: impl Fn(&P) -> Value + Copy) -> Value {
+    let mut polys: Vec<Vec<Value>> = Vec::new();
+    for r in rings {
+        match r {
+            PolygonRing::Outer(v) => polys.push(vec![ring_coords(v, f)]),
+            PolygonRing::Inner(v) => match polys.last_mut() { Some(p) => p.push(ring_coords(v, f)), None => polys.push(vec![ring_coords(v, f)]) },
+        }
+    }
+    if polys.len() == 1 { json!({"type": "Polygon", "coordinates": polys.pop().unwrap()}) } else { json!({"type": "MultiPolygon", "coordinates": polys}) }
+}
+
+fn lines_json<P>(parts: &[Vec<P>], f: impl Fn(&P) -> Value) -> Value {
+    let ls: Vec<Value> = parts.iter().map(|p| Value::Array(p.iter().map(&f).collect())).collect();
+    if ls.len() == 1 { json!({"type": "LineString", "coordinates": ls[0]}) } else { json!({"type": "MultiLineString", "coordinates": ls}) }
+}
+
+fn geometry(s: &Shape) -> Value {
+    let z = |p: &shapefile::PointZ| json!([p.x, p.y, p.z]);
+    let m = |p: &shapefile::PointM| json!([p.x, p.y]);
+    match s {
+        Shape::NullShape => Value::Null,
+        Shape::Point(p) => json!({"type": "Point", "coordinates": pt(p)}),
+        Shape::PointM(p) => json!({"type": "Point", "coordinates": m(p)}),
+        Shape::PointZ(p) => json!({"type": "Point", "coordinates": z(p)}),
+        Shape::Polyline(l) => lines_json(l.parts(), pt),
+        Shape::PolylineM(l) => lines_json(l.parts(), m),
+        Shape::PolylineZ(l) => lines_json(l.parts(), z),
+        Shape::Polygon(p) => polygon_json(p.rings(), pt),
+        Shape::PolygonM(p) => polygon_json(p.rings(), m),
+        Shape::PolygonZ(p) => polygon_json(p.rings(), z),
+        Shape::Multipoint(p) => json!({"type": "MultiPoint", "coordinates": p.points().iter().map(pt).collect::<Vec<_>>()}),
+        Shape::MultipointM(p) => json!({"type": "MultiPoint", "coordinates": p.points().iter().map(m).collect::<Vec<_>>()}),
+        Shape::MultipointZ(p) => json!({"type": "MultiPoint", "coordinates": p.points().iter().map(z).collect::<Vec<_>>()}),
+        Shape::Multipatch(_) => Value::Null,
+    }
+}
+
+fn field_json(v: &dbase::FieldValue) -> Value {
+    use dbase::FieldValue as F;
+    match v {
+        F::Character(s) => s.as_ref().map(|s| json!(s.trim_end())).unwrap_or(Value::Null),
+        F::Numeric(n) => n.map(|n| if n.fract() == 0.0 && n.abs() < 9e15 { json!(n as i64) } else { json!(n) }).unwrap_or(Value::Null),
+        F::Float(n) => n.map(|n| json!(n as f64)).unwrap_or(Value::Null),
+        F::Logical(b) => b.map(|b| json!(b)).unwrap_or(Value::Null),
+        F::Date(d) => d.map(|d| json!(format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day()))).unwrap_or(Value::Null),
+        F::Integer(i) => json!(i),
+        F::Double(d) | F::Currency(d) => json!(d),
+        F::Memo(s) => json!(s),
+        other => json!(format!("{:?}", other)),
+    }
+}
+
+fn read_all(path: &str, limit: usize) -> Result<(Value, Value), String> {
+    let f = load(path)?;
+    let mut sr = shapefile::ShapeReader::new(Cursor::new(f.shp)).map_err(|e| format!("{}: {}", path, e))?;
+    let h = sr.header().clone();
+    let shapes: Vec<Shape> = sr.iter_shapes().take(limit).collect::<Result<_, _>>().map_err(|e| format!("{}: {}", path, e))?;
+    let (mut fields, mut records) = (Vec::new(), Vec::new());
+    if let Some(dbf) = f.dbf {
+        let mut dr = dbase::Reader::new(Cursor::new(dbf)).map_err(|e| format!("{}: the .dbf: {}", path, e))?;
+        fields = dr.fields().iter().filter(|fi| fi.name() != "DeletionFlag").map(|fi| (fi.name().to_string(), format!("{:?}", fi.field_type()))).collect();
+        for r in dr.iter_records().take(limit) {
+            records.push(r.map_err(|e| format!("{}: the .dbf: {}", path, e))?);
+        }
+    }
+    let mut feats = Vec::new();
+    for (i, s) in shapes.iter().enumerate() {
+        let mut props = Map::new();
+        if let Some(r) = records.get(i) {
+            for (name, _) in &fields { props.insert(name.clone(), r.get(name).map(field_json).unwrap_or(Value::Null)); }
+        }
+        feats.push(json!({"type": "Feature", "properties": props, "geometry": geometry(s)}));
+    }
+    let crs = f.prj.as_ref().map(|p| {
+        let name = p.split('"').nth(1).unwrap_or("").to_string();
+        json!({ "name": name, "wgs84": p.contains("WGS_1984") || p.contains("WGS 84") })
+    });
+    let info = json!({
+        "shape_type": format!("{}", h.shape_type),
+        "bbox": [h.bbox.min.x, h.bbox.min.y, h.bbox.max.x, h.bbox.max.y],
+        "fields": fields.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),
+        "crs": crs,
+        "prj": f.prj,
+    });
+    Ok((json!({"type": "FeatureCollection", "features": feats}), info))
+}
+
+/// A shapefile read to a GeoJSON FeatureCollection, its .dbf attributes as each feature's properties: `path` is the .shp (the .dbf beside it) or a .zip holding them. Coordinates stay in the file's projection: see `shapefile_info`'s `crs`.
+pub fn shapefile_to_geojson(path: &str) -> Result<Value, String> {
+    Ok(read_all(path, usize::MAX)?.0)
+}
+
+/// What a shapefile holds, without its shapes: `{ shape_type, count, bbox, fields: [{ name, type }], crs: { name, wgs84 }, prj }`, for checking an upload before importing it.
+pub fn shapefile_info(path: &str) -> Result<Value, String> {
+    let (fc, mut info) = read_all(path, usize::MAX)?;
+    info["count"] = json!(fc["features"].as_array().map(|a| a.len()).unwrap_or(0));
+    Ok(info)
+}
+
+fn to_pts(v: &Value) -> Result<Vec<Point>, String> {
+    v.as_array().ok_or("coordinates are a list")?.iter().map(|p| {
+        let a = p.as_array().filter(|a| a.len() >= 2).ok_or_else(|| format!("{} is not a position", p))?;
+        Ok(Point::new(a[0].as_f64().ok_or("a coordinate is a number")?, a[1].as_f64().ok_or("a coordinate is a number")?))
+    }).collect()
+}
+
+fn family(t: &str) -> Option<&'static str> {
+    match t { "Point" | "MultiPoint" => Some("point"), "LineString" | "MultiLineString" => Some("line"), "Polygon" | "MultiPolygon" => Some("polygon"), _ => None }
+}
+
+/// GeoJSON features saved as a shapefile at `path` (.shp, with the .shx, .dbf and a WGS 84 .prj beside it), folders made: every feature of one kind (points, lines or polygons). Properties become .dbf fields (names cut to 10 characters): numbers, true/false, and text. The number of features written.
+pub fn shapefile_from_geojson(geojson: serde_json::Value, path: &str) -> Result<i64, String> {
+    let feats = geojson["features"].as_array().ok_or("a GeoJSON FeatureCollection has `features`")?;
+    if feats.is_empty() { return Err("there are no features to write".into()) }
+    let kinds: Vec<&str> = feats.iter().map(|f| f["geometry"]["type"].as_str().and_then(family).ok_or("each feature has a point, line or polygon geometry")).collect::<Result<_, _>>()?;
+    if kinds.iter().any(|k| *k != kinds[0]) { return Err("a shapefile holds one kind of shape: points, lines or polygons, not a mix".into()) }
+    let multi_points = feats.iter().any(|f| f["geometry"]["type"] == "MultiPoint");
+    // The fields, in the order first met, and their types.
+    let mut names: Vec<(String, String, &'static str, u8)> = Vec::new();
+    for f in feats {
+        if let Some(props) = f["properties"].as_object() {
+            for (k, v) in props {
+                let kind = match v { Value::Number(n) => if n.is_i64() { "int" } else { "float" }, Value::Bool(_) => "bool", Value::Null => continue, _ => "text" };
+                match names.iter_mut().find(|n| &n.0 == k) {
+                    Some(n) => { if n.2 != kind { n.2 = if (n.2 == "int" && kind == "float") || (n.2 == "float" && kind == "int") { "float" } else { "text" } } }
+                    None => {
+                        let mut short: String = k.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(10).collect();
+                        if short.is_empty() { short = "FIELD".into() }
+                        let mut n = 2;
+                        while names.iter().any(|x| x.1 == short) { let s = format!("{}{}", &short[..short.len().min(8)], n); short = s; n += 1 }
+                        names.push((k.clone(), short, kind, 0));
+                    }
+                }
+            }
+        }
+    }
+    let mut tb = dbase::TableWriterBuilder::new();
+    for (_, short, kind, _) in &names {
+        let fname = dbase::FieldName::try_from(short.as_str()).map_err(|e| format!("field `{}`: {}", short, e))?;
+        tb = match *kind { "int" => tb.add_numeric_field(fname, 18, 0), "float" => tb.add_numeric_field(fname, 24, 8), "bool" => tb.add_logical_field(fname), _ => tb.add_character_field(fname, 254) };
+    }
+    if names.is_empty() { tb = tb.add_numeric_field(dbase::FieldName::try_from("ID").unwrap(), 10, 0) }
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    let mut w = shapefile::Writer::from_path(path, tb).map_err(|e| format!("{}: {}", path, e))?;
+    for (i, f) in feats.iter().enumerate() {
+        let mut rec = dbase::Record::default();
+        let props = f["properties"].as_object().cloned().unwrap_or_default();
+        for (k, short, kind, _) in &names {
+            let v = props.get(k).cloned().unwrap_or(Value::Null);
+            let fv = match *kind {
+                "int" | "float" => dbase::FieldValue::Numeric(v.as_f64()),
+                "bool" => dbase::FieldValue::Logical(v.as_bool()),
+                _ => dbase::FieldValue::Character(match v { Value::Null => None, Value::String(s) => Some(s.chars().take(254).collect()), o => Some(o.to_string()) }),
+            };
+            rec.insert(short.clone(), fv);
+        }
+        if names.is_empty() { rec.insert("ID".into(), dbase::FieldValue::Numeric(Some(i as f64 + 1.0))); }
+        let g = &f["geometry"];
+        let c = &g["coordinates"];
+        let res = match g["type"].as_str().unwrap_or("") {
+            "Point" if !multi_points => { let p = to_pts(&json!([c]))?; w.write_shape_and_record(&p[0], &rec) }
+            "Point" => w.write_shape_and_record(&shapefile::Multipoint::new(to_pts(&json!([c]))?), &rec),
+            "MultiPoint" => w.write_shape_and_record(&shapefile::Multipoint::new(to_pts(c)?), &rec),
+            "LineString" => w.write_shape_and_record(&shapefile::Polyline::with_parts(vec![to_pts(c)?]), &rec),
+            "MultiLineString" => w.write_shape_and_record(&shapefile::Polyline::with_parts(c.as_array().ok_or("lines are a list")?.iter().map(to_pts).collect::<Result<_, _>>()?), &rec),
+            t => {
+                let polys: Vec<&Value> = if t == "Polygon" { vec![c] } else { c.as_array().ok_or("polygons are a list")?.iter().collect() };
+                let mut rings = Vec::new();
+                for p in polys {
+                    for (j, r) in p.as_array().ok_or("rings are a list")?.iter().enumerate() {
+                        let pts = to_pts(r)?;
+                        rings.push(if j == 0 { PolygonRing::Outer(pts) } else { PolygonRing::Inner(pts) });
+                    }
+                }
+                w.write_shape_and_record(&shapefile::Polygon::with_rings(rings), &rec)
+            }
+        };
+        res.map_err(|e| format!("{}: feature {}: {}", path, i + 1, e))?;
+    }
+    drop(w);
+    let prj = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+    std::fs::write(std::path::Path::new(path).with_extension("prj"), prj).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(feats.len() as i64)
+}

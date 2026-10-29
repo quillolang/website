@@ -1,0 +1,472 @@
+//! Epson ESC/P and ESC/P2 for dot-matrix printers (LQ, FX and LX series, OKI and Brother in Epson mode): pre-printed and multipart forms filled by line and column, reports with bold, double width, condensed and underlined text, pitch, line spacing, page length and perforation skip, in code page 437 with its box-drawing lines; sent to port 9100 or a parallel or USB port.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! image = { version = "0.25", default-features = false, features = ["png"] }
+
+use serde_json::Value;
+
+const ESC: u8 = 0x1b;
+
+/// Code page 437, which every ESC/P printer has (ESC t 1): accents, box drawing, a few Greek letters; others print as `?`.
+fn cp437(c: char) -> u8 {
+    if (c as u32) < 0x80 {
+        return c as u8;
+    }
+    const HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+    if let Some(i) = HIGH.chars().position(|h| h == c) {
+        return 0x80 + i as u8;
+    }
+    match c {
+        '€' => b'E',
+        '–' | '—' => b'-',
+        '‘' | '’' => b'\'',
+        '“' | '”' => b'"',
+        '…' => b'.',
+        _ => b'?',
+    }
+}
+
+/// An ESC command: its bytes sent, and shown as `<ESC>${86,1}` with the parameters in decimal.
+fn esc(o: &mut Out, name: &[u8], params: &[u8]) {
+    o.bytes.push(ESC);
+    o.bytes.extend_from_slice(name);
+    o.bytes.extend_from_slice(params);
+    o.note(&format!("<ESC>{}", String::from_utf8_lossy(name)));
+    if !params.is_empty() {
+        o.note(&format!("{{{}}}", params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")));
+    }
+}
+
+fn text(o: &mut Out, s: &str) {
+    let clean: String = s.chars().filter(|c| *c != '\r' && *c != '\n' && *c != '\x0c').collect();
+    let enc: Vec<u8> = clean.chars().map(cp437).collect();
+    o.t(&clean, &enc);
+}
+
+/// Characters per inch for a pitch name: 10, 12, 15 or 17 (condensed 10), 20 (condensed 12).
+fn cpi(options: &Value) -> f64 {
+    options["cpi"].as_f64().unwrap_or(10.0)
+}
+
+fn setup(o: &mut Out, options: &Value) -> Result<(), String> {
+    esc(o, b"@", &[]);
+    // Code page 437 graphics, and the international set (0 USA).
+    esc(o, b"t", &[1]);
+    esc(o, b"R", &[options["country"].as_u64().unwrap_or(0).min(13) as u8]);
+    match options["cpi"].as_i64().unwrap_or(10) {
+        10 => esc(o, b"P", &[]),
+        12 => esc(o, b"M", &[]),
+        15 => esc(o, b"g", &[]),
+        17 => esc(o, b"P", &[0x0f]),
+        20 => esc(o, b"M", &[0x0f]),
+        other => return Err(format!("cpi {}: 10, 12, 15, 17 or 20", other)),
+    }
+    if options["draft"] == true {
+        esc(o, b"x", &[0]);
+    } else {
+        esc(o, b"x", &[1]);
+    }
+    let lpi = options["lpi"].as_i64().unwrap_or(6);
+    match lpi {
+        6 => esc(o, b"2", &[]),
+        8 => esc(o, b"0", &[]),
+        other => return Err(format!("lpi {}: 6 or 8 lines an inch", other)),
+    }
+    // The page's length: in lines, or in inches (ESC C 0 n) for a form 11 or 12 inches long.
+    if let Some(inches) = options["page_inches"].as_f64() {
+        esc(o, b"C", &[0, inches.round().clamp(1.0, 22.0) as u8]);
+    } else {
+        esc(o, b"C", &[options["page_lines"].as_u64().unwrap_or(66).clamp(1, 127) as u8]);
+    }
+    if let Some(skip) = options["skip_perforation"].as_u64() {
+        esc(o, b"N", &[skip.clamp(1, 127) as u8]);
+    }
+    if let Some(l) = options["left_margin"].as_u64() {
+        esc(o, b"l", &[l.min(255) as u8]);
+    }
+    Ok(())
+}
+
+fn style(o: &mut Out, f: &Value, on: bool) {
+    if f["bold"] == true {
+        esc(o, if on { b"E" } else { b"F" }, &[]);
+    }
+    if f["double_strike"] == true {
+        esc(o, if on { b"G" } else { b"H" }, &[]);
+    }
+    if f["underline"] == true {
+        esc(o, b"-", &[on as u8]);
+    }
+    if f["double_width"] == true {
+        esc(o, b"W", &[on as u8]);
+    }
+    if f["double_height"] == true {
+        esc(o, b"w", &[on as u8]);
+    }
+    if f["italic"] == true {
+        esc(o, if on { b"4" } else { b"5" }, &[]);
+    }
+    if f["condensed"] == true {
+        o.b(&[if on { 0x0f } else { 0x12 }]);
+    }
+}
+
+/// Moves the head to `col` (from 1) at the page's pitch, by ESC $ in 1/60 inch.
+fn column(o: &mut Out, col: f64, cpi: f64) {
+    let pos = (((col - 1.0).max(0.0)) * 60.0 / cpi).round() as u16;
+    esc(o, b"$", &[(pos & 0xff) as u8, (pos >> 8) as u8]);
+}
+
+fn form(fields: &[Value], options: &Value) -> Result<Out, String> {
+    if fields.len() > 5000 {
+        return Err("at most 5,000 fields".into());
+    }
+    let mut o = Out::new();
+    setup(&mut o, options)?;
+    o.note("\n");
+    let pitch = cpi(options);
+    let mut fs: Vec<(i64, f64, &Value)> = vec![];
+    for f in fields {
+        let line = f["line"].as_i64().ok_or_else(|| format!("a field needs its `line` (from 1): {}", f))?;
+        if line < 1 {
+            return Err("lines count from 1".into());
+        }
+        let col = match (f["col"].as_f64(), f["x_mm"].as_f64()) {
+            (Some(c), _) => c,
+            (None, Some(mm)) => mm / 25.4 * pitch + 1.0,
+            _ => 1.0,
+        };
+        fs.push((line, col, f));
+    }
+    fs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
+    let mut at = 1i64;
+    for (line, col, f) in fs {
+        if line > at {
+            // Line feeds down to the field's line (across page ends: the printer's form feed keeps forms aligned).
+            for _ in at..line {
+                o.b(&[0x0d, 0x0a]);
+            }
+            at = line;
+        }
+        column(&mut o, col, pitch);
+        style(&mut o, f, true);
+        let t = match &f["text"] {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        let t = match f["width"].as_u64() {
+            Some(w) => {
+                let w = w as usize;
+                let n = t.chars().count();
+                match f["align"].as_str() {
+                    Some("right") if n < w => format!("{}{}", " ".repeat(w - n), t),
+                    _ => t.chars().take(w).collect(),
+                }
+            }
+            None => t,
+        };
+        text(&mut o, &t);
+        style(&mut o, f, false);
+    }
+    o.b(&[0x0d, 0x0c]);
+    o.note("\n");
+    Ok(o)
+}
+
+fn document(lines: &[Value], options: &Value) -> Result<Out, String> {
+    if lines.len() > 50_000 {
+        return Err("at most 50,000 lines".into());
+    }
+    let mut o = Out::new();
+    setup(&mut o, options)?;
+    o.note("\n");
+    let width = options["width"].as_u64().unwrap_or(80) as usize;
+    for l in lines {
+        let l = match l {
+            Value::String(s) => serde_json::json!({ "text": s }),
+            Value::Object(_) => l.clone(),
+            other => return Err(format!("a line is text or a map, not {}", other)),
+        };
+        if l["page_break"] == true {
+            o.b(&[0x0c]);
+            o.note("\n");
+            continue;
+        }
+        let mut t = match &l["text"] {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        if let Some(cols) = l["columns"].as_array() {
+            let left = cols.first().and_then(Value::as_str).unwrap_or("");
+            let right = cols.get(1).and_then(Value::as_str).unwrap_or("");
+            let w = if l["double_width"] == true { width / 2 } else { width };
+            let gap = w.saturating_sub(left.chars().count() + right.chars().count()).max(1);
+            t = format!("{}{}{}", left, " ".repeat(gap), right);
+        }
+        if let Some(ch) = l["divider"].as_str() {
+            t = ch.chars().next().unwrap_or('-').to_string().repeat(width);
+        }
+        let w = if l["double_width"] == true { width / 2 } else { width };
+        let n = t.chars().count();
+        match l["align"].as_str() {
+            Some("center") | Some("centre") if n < w => t = format!("{}{}", " ".repeat((w - n) / 2), t),
+            Some("right") if n < w => t = format!("{}{}", " ".repeat(w - n), t),
+            _ => {}
+        }
+        style(&mut o, &l, true);
+        text(&mut o, &t);
+        style(&mut o, &l, false);
+        o.b(&[0x0d, 0x0a]);
+    }
+    if options["form_feed"] != false {
+        o.b(&[0x0c]);
+    }
+    Ok(o)
+}
+
+/// A pre-printed or multipart form filled in: each field is `{ line, col (from 1, at the pitch) or x_mm, text, width, align: "right", bold, double_width, condensed, underline }`, placed by line feeds and ESC $.
+/// `options`: `{ cpi: 10 | 12 | 15 | 17 | 20, lpi: 6 | 8, page_lines: 66 or page_inches: 11, skip_perforation, left_margin, draft, country: 0 }`. Gives the job written for people (ESC shown).
+pub fn escp_form(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(form(&fields, &options)?.view())
+}
+
+/// A report or listing, line by line: each line is text or `{ text, align: "center", bold, double_width, underline, condensed, columns: [left, right], divider: "=", page_break: true }`, `width` characters a line (80 at 10 cpi).
+pub fn escp_document(lines: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    Ok(document(&lines, &options)?.view())
+}
+
+/// The bytes of a form (`kind` "form") or a document ("document"), in base64.
+pub fn escp_job(kind: &str, items: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    let o = match kind {
+        "form" => form(&items, &options)?,
+        "document" => document(&items, &options)?,
+        other => return Err(format!("{:?}: form or document", other)),
+    };
+    Ok(b64(&o.bytes))
+}
+
+/// Sends a form or a document to a printer's raw port (a print server's 9100) or writes it to a port (`/dev/lp0`, `/dev/usb/lp0`) when `target` starts with `/`. Gives the bytes.
+pub fn escp_print(kind: &str, items: Vec<serde_json::Value>, options: serde_json::Value, target: &str, timeout_ms: i64) -> Result<i64, String> {
+    let o = match kind {
+        "form" => form(&items, &options)?,
+        "document" => document(&items, &options)?,
+        other => return Err(format!("{:?}: form or document", other)),
+    };
+    if target.starts_with('/') {
+        write_bytes(&o.bytes, target)
+    } else {
+        send_bytes(&o.bytes, target, timeout_ms)
+    }
+}
+
+// ---- Shared by the printer plugins: the job's bytes and a readable copy, pictures as bits, the network.
+
+/// A job's bytes, and the same job written for people: control bytes as `<ESC>`, graphics as `<N bytes>`.
+struct Out {
+    bytes: Vec<u8>,
+    text: String,
+}
+
+fn control_name(c: u8) -> String {
+    match c {
+        0x00 => "<NUL>".into(),
+        0x02 => "<STX>".into(),
+        0x03 => "<ETX>".into(),
+        0x0a => "\n".into(),
+        0x0c => "<FF>".into(),
+        0x0d => "<CR>".into(),
+        0x17 => "<ETB>".into(),
+        0x18 => "<CAN>".into(),
+        0x1b => "<ESC>".into(),
+        0x1e => "<RS>".into(),
+        c if c < 0x20 || c == 0x7f => format!("<{:02X}>", c),
+        c => (c as char).to_string(),
+    }
+}
+
+impl Out {
+    fn new() -> Out {
+        Out { bytes: vec![], text: String::new() }
+    }
+    /// Command bytes, shown as they are with control bytes named.
+    fn b(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        for c in data {
+            self.text.push_str(&control_name(*c));
+        }
+    }
+    /// ASCII command text.
+    fn s(&mut self, s: &str) {
+        self.b(s.as_bytes());
+    }
+    /// Text already encoded for the printer (`enc`), shown as written.
+    fn t(&mut self, shown: &str, enc: &[u8]) {
+        self.bytes.extend_from_slice(enc);
+        for c in shown.chars() {
+            if (c as u32) < 0x20 {
+                self.text.push_str(&control_name(c as u8));
+            } else {
+                self.text.push(c);
+            }
+        }
+    }
+    /// Text for the readable copy only (a line break between commands), not sent.
+    fn note(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+    /// The job for people: CR LF line ends shown as plain line breaks.
+    fn view(&self) -> String {
+        self.text.replace("<CR>\n", "\n")
+    }
+    /// Binary data (a picture), shown by its size.
+    fn blob(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        self.text.push_str(&format!("<{} bytes>", data.len()));
+    }
+}
+
+/// Dots per millimetre for a resolution in dpi.
+fn dots_per_mm(dpi: i64) -> f64 {
+    dpi.clamp(100, 1200) as f64 / 25.4
+}
+
+/// A length given in `units` ("mm", the default, "in" or "dots") as dots.
+fn to_dots(v: &Value, default: f64, dpmm: f64, units: &str) -> i64 {
+    let x = v.as_f64().unwrap_or(default);
+    let d = match units {
+        "dots" => x,
+        "in" | "inch" | "inches" => x * 25.4 * dpmm,
+        _ => x * dpmm,
+    };
+    d.round().max(0.0) as i64
+}
+
+/// A picture as rows of bits, true for black: scaled to `width` dots when given, dithered or cut at a threshold, transparency as white.
+fn bitmap(path: &str, width: Option<u32>, threshold: u8, dither: bool) -> Result<(usize, usize, Vec<Vec<bool>>), String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let img = match width {
+        Some(w) if w > 0 && w != img.width() => {
+            let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+            img.resize_exact(w, h, image::imageops::FilterType::Triangle)
+        }
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w * h > 8_000_000 {
+        return Err("the picture is over 8 million dots: give a width".into());
+    }
+    let mut lum: Vec<f32> = rgba
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold as f32;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                for (dx, dy, f) in [(1isize, 0usize, 7.0f32 / 16.0), (-1, 1, 3.0 / 16.0), (0, 1, 5.0 / 16.0), (1, 1, 1.0 / 16.0)] {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                }
+            }
+        }
+    }
+    Ok((w, h, rows))
+}
+
+/// Rows of bits packed 8 dots to a byte, the first dot in the high bit; `black_is_one` false for printers where 0 prints.
+fn pack_rows(w: usize, rows: &[Vec<bool>], black_is_one: bool) -> (usize, Vec<u8>) {
+    let bpr = (w + 7) / 8;
+    let mut out = Vec::with_capacity(bpr * rows.len());
+    for r in rows {
+        for b in 0..bpr {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = b * 8 + bit;
+                let black = x < w && r[x];
+                if black == black_is_one {
+                    byte |= 0x80 >> bit;
+                }
+            }
+            out.push(byte);
+        }
+    }
+    (bpr, out)
+}
+
+/// `host`, `host:port` or `[v6]:port` as an address; `port` when none is written.
+fn printer_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64);
+    let addr = printer_addr(host, 9100)?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", addr, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends bytes to a printer's raw port and closes it.
+fn send_bytes(bytes: &[u8], host: &str, timeout_ms: i64) -> Result<i64, String> {
+    use std::io::Write;
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(bytes).map_err(|e| format!("sending to the printer: {}", e))?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(bytes.len() as i64)
+}
+
+/// Writes bytes to a file or a device (`/dev/usb/lp0`), folders made for a file.
+fn write_bytes(bytes: &[u8], path: &str) -> Result<i64, String> {
+    use std::io::Write;
+    let p = std::path::Path::new(path);
+    let device = path.starts_with("/dev/");
+    if !device {
+        if let Some(dir) = p.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(!device).truncate(!device).open(p).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(bytes).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(bytes.len() as i64)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}

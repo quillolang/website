@@ -1,0 +1,208 @@
+//! Traces, logs and metrics sent as OpenTelemetry OTLP/HTTP JSON to a collector, Grafana, Honeycomb, Jaeger or any OTLP endpoint: spans with parents, attributes, events and status, W3C traceparent headers made and read, log records tied to their trace, and gauges and counters.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! rand = "0.8"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use rand::RngCore;
+use serde_json::{json, Map, Value};
+
+fn hex(n: usize) -> String {
+    let mut b = vec![0u8; n];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn nanos(ms: &Value) -> String {
+    match ms {
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => format!("{}", i.saturating_mul(1_000_000)),
+            None => {
+                let f = n.as_f64().unwrap_or(0.0);
+                format!("{}", (f.trunc() as i64).saturating_mul(1_000_000) + (f.fract() * 1_000_000.0).round() as i64)
+            }
+        },
+        _ => format!("{}", now_ms() * 1_000_000),
+    }
+}
+
+fn any_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) => json!({ "stringValue": s }),
+        Value::Bool(b) => json!({ "boolValue": b }),
+        Value::Number(n) if n.is_i64() => json!({ "intValue": n.to_string() }),
+        Value::Number(n) => json!({ "doubleValue": n.as_f64() }),
+        Value::Array(a) => json!({ "arrayValue": { "values": a.iter().map(any_value).collect::<Vec<_>>() } }),
+        Value::Object(m) => json!({ "kvlistValue": { "values": attributes(&Value::Object(m.clone())) } }),
+        Value::Null => json!({ "stringValue": "" }),
+    }
+}
+
+fn attributes(m: &Value) -> Vec<Value> {
+    m.as_object().map(|o| o.iter().map(|(k, v)| json!({ "key": k, "value": any_value(v) })).collect()).unwrap_or_default()
+}
+
+fn id_ok(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit()) && s.chars().any(|c| c != '0')
+}
+
+/// A new trace id (32 hex digits) and span id (16): `{ trace_id, span_id }`.
+pub fn otlp_ids() -> Value {
+    json!({ "trace_id": hex(16), "span_id": hex(8) })
+}
+
+/// The W3C `traceparent` header for a span, to pass the trace to the next service: `00-<trace_id>-<span_id>-01`.
+pub fn otlp_traceparent(trace_id: &str, span_id: &str, sampled: bool) -> Result<String, String> {
+    if !id_ok(trace_id, 32) || !id_ok(span_id, 16) {
+        return Err("a trace id is 32 hex digits and a span id 16, not all zero".into());
+    }
+    Ok(format!("00-{}-{}-{}", trace_id.to_lowercase(), span_id.to_lowercase(), if sampled { "01" } else { "00" }))
+}
+
+/// A `traceparent` header read: `{ trace_id, parent_span_id, sampled }`, so a request's spans join the caller's trace.
+pub fn otlp_parse_traceparent(header: &str) -> Result<Value, String> {
+    let p: Vec<&str> = header.trim().split('-').collect();
+    if p.len() < 4 || p[0].len() != 2 || p[0] == "ff" || !id_ok(p[1], 32) || !id_ok(p[2], 16) || p[3].len() != 2 {
+        return Err(format!("`{}` is not a W3C traceparent", header));
+    }
+    let flags = u8::from_str_radix(p[3], 16).map_err(|_| "the flags are not hex".to_string())?;
+    Ok(json!({ "trace_id": p[1].to_lowercase(), "parent_span_id": p[2].to_lowercase(), "sampled": flags & 1 == 1 }))
+}
+
+/// A span for `otlp_send_traces`: `name`, its start and end in Unix milliseconds, and `options`: `trace_id` and `parent_span_id`
+/// (from a parent span or `otlp_parse_traceparent`; a new trace otherwise), `span_id`, `kind` ("server", "client", "internal",
+/// "producer", "consumer"), `attributes` (a map), `events` (`[{ name, time_ms, attributes }]`), `status` ("ok" or "error") and
+/// `status_message`. Gives the span with its ids, `trace_id` and `span_id` included for children.
+pub fn otlp_span(name: &str, start_ms: i64, end_ms: i64, options: std::collections::HashMap<String, serde_json::Value>) -> Result<Value, String> {
+    let o = |k: &str| options.get(k).and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty());
+    let trace_id = o("trace_id").unwrap_or_else(|| hex(16));
+    let span_id = o("span_id").unwrap_or_else(|| hex(8));
+    if !id_ok(&trace_id, 32) || !id_ok(&span_id, 16) {
+        return Err("a trace id is 32 hex digits and a span id 16".into());
+    }
+    if end_ms < start_ms {
+        return Err("the span ends before it starts".into());
+    }
+    let kind = match o("kind").as_deref().unwrap_or("internal") {
+        "internal" => 1,
+        "server" => 2,
+        "client" => 3,
+        "producer" => 4,
+        "consumer" => 5,
+        other => return Err(format!("kind `{}` is internal, server, client, producer or consumer", other)),
+    };
+    let mut s = Map::new();
+    s.insert("traceId".into(), json!(trace_id));
+    s.insert("spanId".into(), json!(span_id));
+    if let Some(p) = o("parent_span_id") {
+        s.insert("parentSpanId".into(), json!(p));
+    }
+    s.insert("name".into(), json!(name));
+    s.insert("kind".into(), json!(kind));
+    s.insert("startTimeUnixNano".into(), json!(nanos(&json!(start_ms))));
+    s.insert("endTimeUnixNano".into(), json!(nanos(&json!(end_ms))));
+    s.insert("attributes".into(), json!(attributes(options.get("attributes").unwrap_or(&Value::Null))));
+    if let Some(ev) = options.get("events").and_then(|e| e.as_array()) {
+        s.insert("events".into(), json!(ev.iter().map(|e| json!({ "name": e["name"], "timeUnixNano": nanos(&e["time_ms"]), "attributes": attributes(&e["attributes"]) })).collect::<Vec<_>>()));
+    }
+    let status = match o("status").as_deref() {
+        Some("ok") => json!({ "code": 1 }),
+        Some("error") => json!({ "code": 2, "message": o("status_message").unwrap_or_default() }),
+        _ => json!({ "code": 0 }),
+    };
+    s.insert("status".into(), status);
+    s.insert("trace_id".into(), json!(trace_id));
+    s.insert("span_id".into(), json!(span_id));
+    Ok(Value::Object(s))
+}
+
+fn resource(service: &str, config: &Value) -> Value {
+    let mut attrs = json!({ "service.name": service, "telemetry.sdk.name": "quillo-otlp", "telemetry.sdk.language": "quillo" });
+    if let Some(extra) = config["resource"].as_object() {
+        for (k, v) in extra {
+            attrs[k] = v.clone();
+        }
+    }
+    json!({ "attributes": attributes(&attrs) })
+}
+
+fn post(config: &Value, signal: &str, body: Value) -> Result<Value, String> {
+    let endpoint = config["endpoint"].as_str().map(str::to_string).filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "http://localhost:4318".into());
+    let url = format!("{}/v1/{}", endpoint.trim_end_matches('/'), signal);
+    let mut req = ureq::post(&url).timeout(std::time::Duration::from_secs(10)).set("Content-Type", "application/json");
+    let mut headers: Vec<(String, String)> = std::env::var("OTEL_EXPORTER_OTLP_HEADERS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+    if let Some(h) = config["headers"].as_object() {
+        headers.extend(h.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())));
+    }
+    for (k, v) in &headers {
+        req = req.set(k, v);
+    }
+    let (status, text) = match req.send_string(&body.to_string()) {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("{}: {}", url, e)),
+    };
+    let ok = (200..300).contains(&status);
+    Ok(json!({ "ok": ok, "status": status, "error": if ok { Value::Null } else { json!(text.chars().take(300).collect::<String>()) } }))
+}
+
+/// Sends spans (from `otlp_span`) for `service` to `<endpoint>/v1/traces`. `config` may hold `endpoint` (else
+/// OTEL_EXPORTER_OTLP_ENDPOINT, else http://localhost:4318), `headers` (added to OTEL_EXPORTER_OTLP_HEADERS, `k=v,k2=v2`: an API
+/// key) and `resource` (more attributes, `deployment.environment`). Gives `{ ok, status, error }`.
+pub fn otlp_send_traces(service: &str, spans: Vec<serde_json::Value>, config: serde_json::Value) -> Result<Value, String> {
+    let spans: Vec<Value> = spans.into_iter().map(|mut s| {
+        if let Some(o) = s.as_object_mut() {
+            o.remove("trace_id");
+            o.remove("span_id");
+        }
+        s
+    }).collect();
+    post(&config, "traces", json!({ "resourceSpans": [{ "resource": resource(service, &config), "scopeSpans": [{ "scope": { "name": "quillo" }, "spans": spans }] }] }))
+}
+
+/// Sends log records for `service` to `<endpoint>/v1/logs`: each `{ body, severity, attributes, time_ms, trace_id, span_id }`,
+/// `severity` "TRACE", "DEBUG", "INFO", "WARN", "ERROR" or "FATAL"; a record with a trace id shows beside its trace. `config` as for traces.
+pub fn otlp_send_logs(service: &str, records: Vec<serde_json::Value>, config: serde_json::Value) -> Result<Value, String> {
+    let mut out = vec![];
+    for r in records {
+        let sev = r["severity"].as_str().unwrap_or("INFO").to_uppercase();
+        let num = match sev.as_str() { "TRACE" => 1, "DEBUG" => 5, "INFO" => 9, "WARN" => 13, "ERROR" => 17, "FATAL" => 21, other => return Err(format!("severity `{}` is TRACE, DEBUG, INFO, WARN, ERROR or FATAL", other)) };
+        let mut l = json!({ "timeUnixNano": nanos(&r["time_ms"]), "severityNumber": num, "severityText": sev, "body": any_value(&r["body"]), "attributes": attributes(&r["attributes"]) });
+        if let Some(t) = r["trace_id"].as_str() { l["traceId"] = json!(t); }
+        if let Some(s) = r["span_id"].as_str() { l["spanId"] = json!(s); }
+        out.push(l);
+    }
+    post(&config, "logs", json!({ "resourceLogs": [{ "resource": resource(service, &config), "scopeLogs": [{ "scope": { "name": "quillo" }, "logRecords": out }] }] }))
+}
+
+/// Sends metric points for `service` to `<endpoint>/v1/metrics`: each `{ name, value, kind, unit, attributes, description }`,
+/// `kind` "gauge" (a level now: queue length) or "counter" (a running total that only grows: orders since start). `config` as for traces.
+pub fn otlp_send_metrics(service: &str, metrics: Vec<serde_json::Value>, config: serde_json::Value) -> Result<Value, String> {
+    let t = format!("{}", now_ms() * 1_000_000);
+    let mut out = vec![];
+    for m in metrics {
+        let name = m["name"].as_str().ok_or("a metric has a name")?;
+        let mut point = json!({ "timeUnixNano": t, "attributes": attributes(&m["attributes"]) });
+        match &m["value"] {
+            Value::Number(n) if n.is_i64() => point["asInt"] = json!(n.to_string()),
+            Value::Number(n) => point["asDouble"] = json!(n.as_f64()),
+            _ => return Err(format!("metric `{}` needs a number value", name)),
+        }
+        let mut metric = json!({ "name": name, "unit": m["unit"].as_str().unwrap_or(""), "description": m["description"].as_str().unwrap_or("") });
+        match m["kind"].as_str().unwrap_or("gauge") {
+            "gauge" => metric["gauge"] = json!({ "dataPoints": [point] }),
+            "counter" | "sum" => metric["sum"] = json!({ "dataPoints": [point], "aggregationTemporality": 2, "isMonotonic": true }),
+            other => return Err(format!("kind `{}` is gauge or counter", other)),
+        }
+        out.push(metric);
+    }
+    post(&config, "metrics", json!({ "resourceMetrics": [{ "resource": resource(service, &config), "scopeMetrics": [{ "scope": { "name": "quillo" }, "metrics": out }] }] }))
+}

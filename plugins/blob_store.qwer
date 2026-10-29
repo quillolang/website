@@ -1,0 +1,241 @@
+//! A content-addressed file store in a folder, as Git keeps objects: uploads saved once by their SHA-256 (the same file twice takes the room once), names pointing at contents ("avatars/42.png"), written atomically, verified against their hashes, and contents no name points at swept away.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha2 = "0.10"
+//! base64 = "0.22"
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn valid_hash(h: &str) -> Result<(), String> {
+    if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        Ok(())
+    } else {
+        Err(format!("{:?} is not a SHA-256 in lower-case hex", h))
+    }
+}
+
+fn object(root: &str, h: &str) -> PathBuf {
+    Path::new(root).join("objects").join(&h[..2]).join(&h[2..])
+}
+
+fn name_file(root: &str, name: &str) -> PathBuf {
+    Path::new(root).join("names").join(hex(&Sha256::digest(name.as_bytes())))
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename, so a crash leaves the old file or the new one, never half of one.
+fn atomic(root: &str, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp_dir = Path::new(root).join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = tmp_dir.join(format!("{}-{}-{}", std::process::id(), now(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn sniff(b: &[u8], name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    if b.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if b.starts_with(b"GIF8") {
+        "image/gif"
+    } else if b.len() > 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        "image/webp"
+    } else if b.starts_with(b"%PDF") {
+        "application/pdf"
+    } else if b.starts_with(b"PK\x03\x04") {
+        "application/zip"
+    } else {
+        match ext.as_str() {
+            "txt" | "md" => "text/plain",
+            "json" => "application/json",
+            "csv" => "text/csv",
+            "html" => "text/html",
+            "svg" => "image/svg+xml",
+            _ if std::str::from_utf8(b).is_ok() => "text/plain",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+fn put(root: &str, bytes: &[u8], name: Option<&str>) -> Result<Value, String> {
+    if bytes.len() > 2_000_000_000 {
+        return Err("at most 2 GB in one blob".into());
+    }
+    let h = hex(&Sha256::digest(bytes));
+    let path = object(root, &h);
+    let new = !path.exists();
+    if new {
+        atomic(root, &path, bytes)?;
+    }
+    let kind = sniff(bytes, name.unwrap_or(""));
+    if let Some(n) = name {
+        link(root, n, &h, kind)?;
+    }
+    Ok(json!({ "hash": h, "size": bytes.len(), "new": new, "type": kind, "name": name }))
+}
+
+fn link(root: &str, name: &str, h: &str, kind: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 1024 {
+        return Err("a name is 1 to 1,024 characters".into());
+    }
+    let rec = json!({ "name": name, "hash": h, "type": kind, "at": now() });
+    atomic(root, &name_file(root, name), rec.to_string().as_bytes())
+}
+
+/// Stores a file's bytes in the store at `root` (a folder, made when missing), and points `name` at them when it is not empty. Gives `{ hash, size, new (false when the same bytes were there already), type, name }`.
+pub fn blob_put_file(root: &str, path: &str, name: &str) -> Result<serde_json::Value, String> {
+    let mut b = vec![];
+    std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut b)).map_err(|e| format!("{}: {}", path, e))?;
+    put(root, &b, if name.is_empty() { None } else { Some(name) })
+}
+
+/// Stores text (UTF-8), as `blob_put_file` does.
+pub fn blob_put_text(root: &str, text: &str, name: &str) -> Result<serde_json::Value, String> {
+    put(root, text.as_bytes(), if name.is_empty() { None } else { Some(name) })
+}
+
+/// Stores bytes given in base64 (an upload's body), as `blob_put_file` does.
+pub fn blob_put_base64(root: &str, data: &str, name: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| format!("not base64: {}", e))?;
+    put(root, &b, if name.is_empty() { None } else { Some(name) })
+}
+
+/// Where the contents with this hash are on disk, to serve with `file(...)`; an error when the store does not have them.
+pub fn blob_path(root: &str, hash: &str) -> Result<String, String> {
+    valid_hash(hash)?;
+    let p = object(root, hash);
+    if !p.exists() {
+        return Err(format!("no blob {}", hash));
+    }
+    Ok(p.to_string_lossy().into_owned())
+}
+
+/// The contents with this hash as text (bytes that are not UTF-8 replaced).
+pub fn blob_get_text(root: &str, hash: &str) -> Result<String, String> {
+    let p = blob_path(root, hash)?;
+    let b = std::fs::read(&p).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// What a name points at: `{ name, hash, type, at (Unix seconds), size, path }`, or null when the name is free.
+pub fn blob_resolve(root: &str, name: &str) -> Result<serde_json::Value, String> {
+    let f = name_file(root, name);
+    let Ok(s) = std::fs::read_to_string(&f) else { return Ok(Value::Null) };
+    let mut v: Value = serde_json::from_str(&s).map_err(|e| format!("a damaged name record: {}", e))?;
+    let h = v["hash"].as_str().unwrap_or("").to_string();
+    let p = object(root, &h);
+    v["size"] = json!(std::fs::metadata(&p).map(|m| m.len()).ok());
+    v["path"] = json!(p.to_string_lossy());
+    Ok(v)
+}
+
+/// Points `name` at contents already in the store (a second name for the same file, or a rename). Gives the hash.
+pub fn blob_link(root: &str, name: &str, hash: &str) -> Result<String, String> {
+    let p = blob_path(root, hash)?;
+    let mut head = vec![0u8; 16];
+    let n = std::fs::File::open(&p).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    link(root, name, hash, sniff(&head[..n], name))?;
+    Ok(hash.to_string())
+}
+
+/// Removes a name (the contents stay until `blob_gc` finds no name pointing at them). Gives whether the name was there.
+pub fn blob_unlink(root: &str, name: &str) -> Result<bool, String> {
+    match std::fs::remove_file(name_file(root, name)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn names(root: &str) -> Vec<Value> {
+    let Ok(rd) = std::fs::read_dir(Path::new(root).join("names")) else { return vec![] };
+    rd.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).filter_map(|s| serde_json::from_str(&s).ok()).collect()
+}
+
+fn objects(root: &str) -> Vec<(String, PathBuf)> {
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir(Path::new(root).join("objects")) else { return out };
+    for d in rd.flatten() {
+        let pre = d.file_name().to_string_lossy().into_owned();
+        if let Ok(inner) = std::fs::read_dir(d.path()) {
+            for f in inner.flatten() {
+                out.push((format!("{}{}", pre, f.file_name().to_string_lossy()), f.path()));
+            }
+        }
+    }
+    out
+}
+
+/// The names starting with `prefix`, sorted: `[{ name, hash, type, at }]`, at most `limit`.
+pub fn blob_list(root: &str, prefix: &str, limit: i64) -> Vec<serde_json::Value> {
+    let mut v: Vec<Value> = names(root).into_iter().filter(|n| n["name"].as_str().map_or(false, |s| s.starts_with(prefix))).collect();
+    v.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    v.truncate(limit.clamp(1, 100_000) as usize);
+    v
+}
+
+/// Deletes the contents no name points at (older than `min_age_s` seconds, so an upload being named is spared). Gives `{ removed, freed_bytes, kept }`.
+pub fn blob_gc(root: &str, min_age_s: i64) -> Result<serde_json::Value, String> {
+    let live: std::collections::HashSet<String> = names(root).iter().filter_map(|n| n["hash"].as_str().map(str::to_string)).collect();
+    let (mut removed, mut freed, mut kept) = (0, 0u64, 0);
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(min_age_s.max(0) as u64);
+    for (h, p) in objects(root) {
+        if live.contains(&h) {
+            kept += 1;
+            continue;
+        }
+        let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+        if meta.modified().map(|m| m > cutoff).unwrap_or(true) {
+            kept += 1;
+            continue;
+        }
+        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+        removed += 1;
+        freed += meta.len();
+    }
+    Ok(json!({ "removed": removed, "freed_bytes": freed, "kept": kept }))
+}
+
+/// Every stored file read again and its SHA-256 compared with its name: `{ checked, bytes, corrupt: [hashes], dangling_names: [names whose contents are gone] }`.
+pub fn blob_verify(root: &str) -> Result<serde_json::Value, String> {
+    let mut corrupt = vec![];
+    let mut bytes = 0u64;
+    let objs = objects(root);
+    for (h, p) in &objs {
+        let b = std::fs::read(p).map_err(|e| e.to_string())?;
+        bytes += b.len() as u64;
+        if hex(&Sha256::digest(&b)) != *h {
+            corrupt.push(h.clone());
+        }
+    }
+    let have: std::collections::HashSet<&String> = objs.iter().map(|(h, _)| h).collect();
+    let dangling: Vec<Value> = names(root).into_iter().filter(|n| !have.contains(&n["hash"].as_str().unwrap_or("").to_string())).map(|n| n["name"].clone()).collect();
+    Ok(json!({ "checked": objs.len(), "bytes": bytes, "corrupt": corrupt, "dangling_names": dangling }))
+}
+
+/// The store's size: `{ blobs, bytes, names }`.
+pub fn blob_stats(root: &str) -> serde_json::Value {
+    let objs = objects(root);
+    let bytes: u64 = objs.iter().filter_map(|(_, p)| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    json!({ "blobs": objs.len(), "bytes": bytes, "names": names(root).len() })
+}

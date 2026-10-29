@@ -1,0 +1,237 @@
+//! Feature flags kept as data: on and off, users named outright, rules on their attributes, and percentage roll-outs and variants that stay the same for each user.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha2 = "0.10"
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// Where a user falls, from 0 (included) to 100: the first 8 bytes of SHA-256 of "salt.flag.user".
+fn bucket_of(salt: &str, flag: &str, user: &str) -> f64 {
+    let h = Sha256::digest(format!("{}.{}.{}", salt, flag, user).as_bytes());
+    let n = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+    (n as f64 / (u64::MAX as f64 + 1.0)) * 100.0
+}
+
+fn attr<'a>(user: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut v = user;
+    for p in path.split('.') {
+        v = v.get(p)?;
+    }
+    if v.is_null() { None } else { Some(v) }
+}
+
+fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) if !(a.is_string() && b.is_string()) => x.partial_cmp(&y),
+        _ => Some(text(a).cmp(&text(b))),
+    }
+}
+
+fn same(a: &Value, b: &Value) -> bool {
+    a == b || (num(a).is_some() && num(a) == num(b) && !(a.is_string() && b.is_string())) || (a.is_string() != b.is_string() && text(a) == text(b))
+}
+
+const OPS: [&str; 14] = ["eq", "neq", "in", "not_in", "contains", "starts_with", "ends_with", "lt", "lte", "gt", "gte", "exists", "missing", "percent"];
+
+fn condition(c: &Value, user: &Value, flag: &str, salt: &str) -> Result<bool, String> {
+    let a = c.get("attr").and_then(Value::as_str).ok_or("a condition needs `attr`, the user's field")?;
+    let op = c.get("op").and_then(Value::as_str).unwrap_or("eq");
+    let want = c.get("value").unwrap_or(&Value::Null);
+    let got = attr(user, a);
+    let list = || want.as_array().cloned().unwrap_or_else(|| vec![want.clone()]);
+    Ok(match op {
+        "exists" => got.is_some(),
+        "missing" => got.is_none(),
+        "percent" => {
+            let key = got.map(text).ok_or_else(|| format!("`percent` on `{}`, which the user lacks", a))?;
+            bucket_of(salt, &format!("{}#rule", flag), &key) < num(want).unwrap_or(0.0)
+        }
+        _ => {
+            let Some(got) = got else { return Ok(op == "neq" || op == "not_in") };
+            match op {
+                "eq" => same(got, want),
+                "neq" => !same(got, want),
+                "in" => list().iter().any(|w| same(got, w)),
+                "not_in" => !list().iter().any(|w| same(got, w)),
+                "contains" => match got {
+                    Value::Array(xs) => xs.iter().any(|x| same(x, want)),
+                    other => text(other).contains(&text(want)),
+                },
+                "starts_with" => text(got).starts_with(&text(want)),
+                "ends_with" => text(got).to_lowercase().ends_with(&text(want).to_lowercase()),
+                "lt" => cmp(got, want) == Some(std::cmp::Ordering::Less),
+                "lte" => matches!(cmp(got, want), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+                "gt" => cmp(got, want) == Some(std::cmp::Ordering::Greater),
+                "gte" => matches!(cmp(got, want), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+                other => return Err(format!("unknown op `{}`: eq, neq, in, not_in, contains, starts_with, ends_with, lt, lte, gt, gte, exists, missing, percent", other)),
+            }
+        }
+    })
+}
+
+/// What a `serve` gives: a plain value, or `{ rollout: [{ value, weight }...] }` picked by the user's bucket.
+fn serve(s: &Value, bucket: f64) -> Result<(Value, Option<String>), String> {
+    if let Some(r) = s.get("rollout") {
+        let arms = r.as_array().ok_or("`rollout` is a list of { value, weight }")?;
+        let total: f64 = arms.iter().map(|a| a.get("weight").and_then(num).unwrap_or(0.0)).sum();
+        if total <= 0.0 {
+            return Err("a rollout's weights add up to 0".into());
+        }
+        let at = bucket / 100.0 * total;
+        let mut acc = 0.0;
+        for arm in arms {
+            acc += arm.get("weight").and_then(num).unwrap_or(0.0);
+            if at < acc {
+                return Ok((arm.get("value").cloned().unwrap_or(Value::Null), Some("rollout".into())));
+            }
+        }
+        return Ok((arms.last().and_then(|a| a.get("value")).cloned().unwrap_or(Value::Null), Some("rollout".into())));
+    }
+    Ok((s.clone(), None))
+}
+
+fn eval(flag: &Value, user: &Value) -> Result<Value, String> {
+    let key = flag.get("key").and_then(Value::as_str).ok_or("a flag needs a `key`")?;
+    let salt = flag.get("salt").and_then(Value::as_str).unwrap_or("");
+    let by = flag.get("by").and_then(Value::as_str).unwrap_or("key");
+    let off = flag.get("off").cloned().unwrap_or(Value::Bool(false));
+    if flag.get("on").and_then(Value::as_bool) == Some(false) {
+        return Ok(json!({ "key": key, "value": off, "reason": "off", "rule": null, "bucket": null }));
+    }
+    let id = attr(user, by).map(text);
+    if let (Some(id), Some(t)) = (&id, flag.get("targets").and_then(Value::as_object)) {
+        if let Some(v) = t.get(id) {
+            return Ok(json!({ "key": key, "value": v, "reason": "target", "rule": null, "bucket": null }));
+        }
+    }
+    let bucket = id.as_deref().map(|id| bucket_of(salt, key, id));
+    let pick = |s: &Value, reason: &str, rule: Value| -> Result<Value, String> {
+        let is_rollout = s.get("rollout").is_some();
+        if is_rollout && bucket.is_none() {
+            return Ok(json!({ "key": key, "value": off, "reason": "no_user", "rule": rule, "bucket": null }));
+        }
+        let (v, r) = serve(s, bucket.unwrap_or(0.0))?;
+        let b = bucket.map(|b| (b * 100.0).round() / 100.0);
+        Ok(json!({ "key": key, "value": v, "reason": r.unwrap_or_else(|| reason.to_string()), "rule": rule, "bucket": b }))
+    };
+    for (i, rule) in flag.get("rules").and_then(Value::as_array).into_iter().flatten().enumerate() {
+        let conds = match rule.get("when") {
+            Some(Value::Array(cs)) => cs.clone(),
+            Some(c) => vec![c.clone()],
+            None => vec![],
+        };
+        let mut all = true;
+        for c in &conds {
+            if !condition(c, user, key, salt)? {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            let s = rule.get("serve").ok_or_else(|| format!("rule {} of `{}` has no `serve`", i, key))?;
+            let name = rule.get("name").cloned().unwrap_or(json!(i));
+            return pick(s, "rule", name);
+        }
+    }
+    match flag.get("serve") {
+        Some(s) => pick(s, "default", Value::Null),
+        None => Ok(json!({ "key": key, "value": flag.get("default").cloned().unwrap_or(off), "reason": "default", "rule": null, "bucket": null })),
+    }
+}
+
+/// A flag's value for `user` (a map of attributes; `key` identifies the user unless the flag says `by`): `{ key, value, reason, rule, bucket }`.
+/// A flag is `{ key, on, off, targets, rules, serve, salt, by }`: `on: false` gives `off` (false unless set); `targets` maps user keys to values;
+/// each rule is `{ when: [{ attr, op, value }], serve }`, tried in order; `serve` is a value or `{ rollout: [{ value, weight }] }`. `reason` is
+/// "off", "target", "rule", "rollout", "default" or "no_user" (a rollout for a user without a key).
+pub fn flag_eval(flag: serde_json::Value, user: serde_json::Value) -> Result<Value, String> {
+    eval(&flag, &user)
+}
+
+/// Every flag's value for one user, as a map from key to value: what a page or an app gets on sign-in.
+pub fn flag_values(flags: Vec<serde_json::Value>, user: serde_json::Value) -> Result<Value, String> {
+    let mut out = serde_json::Map::new();
+    for f in &flags {
+        let r = eval(f, &user)?;
+        out.insert(r["key"].as_str().unwrap_or("").to_string(), r["value"].clone());
+    }
+    Ok(Value::Object(out))
+}
+
+/// Whether a flag is on for `user`: its value is true (or any value but false, null, 0 and "off").
+pub fn flag_on(flag: serde_json::Value, user: serde_json::Value) -> Result<bool, String> {
+    let v = eval(&flag, &user)?["value"].clone();
+    Ok(!matches!(v, Value::Null | Value::Bool(false)) && v != json!(0) && v != json!("off") && v != json!(""))
+}
+
+/// The user's bucket for a flag, from 0 to 100 (two decimals): a 25% roll-out serves those below 25, and raising it to 50 keeps them.
+pub fn flag_bucket(flag_key: &str, user_key: &str, salt: &str) -> f64 {
+    (bucket_of(salt, flag_key, user_key) * 100.0).round() / 100.0
+}
+
+/// How the users in `users` (each a map with the flag's `by` field) spread over the flag's values: `{ value: count }`, values as text.
+/// To see a roll-out's share before turning it on.
+pub fn flag_spread(flag: serde_json::Value, users: Vec<serde_json::Value>) -> Result<Value, String> {
+    let mut out = serde_json::Map::new();
+    for u in &users {
+        let v = text(&eval(&flag, u)?["value"]);
+        let n = out.get(&v).and_then(Value::as_i64).unwrap_or(0);
+        out.insert(v, json!(n + 1));
+    }
+    Ok(Value::Object(out))
+}
+
+/// The problems in a list of flags, as sentences (empty when all is well): missing keys, keys twice, unknown ops, weights that add up to 0.
+pub fn flag_check(flags: Vec<serde_json::Value>) -> Vec<String> {
+    let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    for (i, f) in flags.iter().enumerate() {
+        let Some(k) = f.get("key").and_then(Value::as_str) else {
+            out.push(format!("flag {} has no `key`", i));
+            continue;
+        };
+        if !seen.insert(k.to_string()) {
+            out.push(format!("`{}` is there twice", k));
+        }
+        for (j, r) in f.get("rules").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            if r.get("serve").is_none() {
+                out.push(format!("`{}` rule {} has no `serve`", k, j));
+            }
+            for c in r.get("when").and_then(Value::as_array).into_iter().flatten() {
+                let op = c.get("op").and_then(Value::as_str).unwrap_or("eq");
+                if c.get("attr").and_then(Value::as_str).is_none() {
+                    out.push(format!("`{}` rule {}: a condition has no `attr`", k, j));
+                } else if !OPS.contains(&op) {
+                    out.push(format!("`{}` rule {}: unknown op `{}`", k, j, op));
+                }
+            }
+            if let Some(s) = r.get("serve") {
+                if let Err(e) = serve(s, 0.0) {
+                    out.push(format!("`{}` rule {}: {}", k, j, e));
+                }
+            }
+        }
+        if let Some(s) = f.get("serve") {
+            if let Err(e) = serve(s, 0.0) {
+                out.push(format!("`{}`: {}", k, e));
+            }
+        }
+    }
+    out
+}

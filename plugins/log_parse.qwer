@@ -1,0 +1,375 @@
+//! Log lines into rows: nginx and Apache access logs, syslog (RFC 3164 and 5424), logfmt and JSON lines, the format found by itself, with counts by any field.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+
+use serde_json::{json, Map, Value};
+use std::io::BufRead;
+
+const FORMATS: &str = "auto, combined (nginx and Apache), common, syslog, logfmt or json";
+
+/// Splits on spaces, keeping "quoted strings" (with \" inside) and [bracketed parts] whole, without their marks.
+fn tokens(line: &str) -> Option<Vec<String>> {
+    let mut out = vec![];
+    let mut it = line.chars().peekable();
+    loop {
+        while it.peek() == Some(&' ') {
+            it.next();
+        }
+        let Some(&c) = it.peek() else { break };
+        let mut t = String::new();
+        if c == '"' {
+            it.next();
+            loop {
+                match it.next()? {
+                    '\\' => {
+                        if let Some(n) = it.next() {
+                            t.push(n)
+                        }
+                    }
+                    '"' => break,
+                    ch => t.push(ch),
+                }
+            }
+        } else if c == '[' {
+            it.next();
+            loop {
+                match it.next()? {
+                    ']' => break,
+                    ch => t.push(ch),
+                }
+            }
+        } else {
+            while let Some(&ch) = it.peek() {
+                if ch == ' ' {
+                    break;
+                }
+                t.push(ch);
+                it.next();
+            }
+        }
+        out.push(t);
+    }
+    Some(out)
+}
+
+fn dash(s: &str) -> Value {
+    if s == "-" || s.is_empty() { Value::Null } else { json!(s) }
+}
+
+fn int_or(s: &str) -> Value {
+    s.parse::<i64>().map(Value::from).unwrap_or_else(|_| dash(s))
+}
+
+fn number_or_text(s: &str) -> Value {
+    if let Ok(i) = s.parse::<i64>() {
+        return json!(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        if f.is_finite() && s.contains('.') {
+            return json!(f);
+        }
+    }
+    match s {
+        "true" => json!(true),
+        "false" => json!(false),
+        _ => json!(s),
+    }
+}
+
+fn clf_time(s: &str) -> Value {
+    chrono::DateTime::parse_from_str(s, "%d/%b/%Y:%H:%M:%S %z").map(|t| json!(t.to_rfc3339())).unwrap_or_else(|_| json!(s))
+}
+
+fn access(line: &str, combined: bool) -> Option<Value> {
+    let t = tokens(line)?;
+    if t.len() < 7 || !t[3].contains('/') {
+        return None;
+    }
+    let req: Vec<&str> = t[4].splitn(3, ' ').collect();
+    let mut m = Map::new();
+    m.insert("ip".into(), json!(t[0]));
+    m.insert("user".into(), dash(&t[2]));
+    m.insert("time".into(), clf_time(&t[3]));
+    m.insert("method".into(), if req.len() >= 2 { json!(req[0]) } else { Value::Null });
+    m.insert("path".into(), json!(if req.len() >= 2 { req[1] } else { t[4].as_str() }));
+    m.insert("protocol".into(), req.get(2).map(|p| json!(p)).unwrap_or(Value::Null));
+    m.insert("status".into(), int_or(&t[5]));
+    m.insert("bytes".into(), t[6].parse::<i64>().map(Value::from).unwrap_or(json!(0)));
+    if combined || t.len() >= 9 {
+        m.insert("referer".into(), t.get(7).map(|s| dash(s)).unwrap_or(Value::Null));
+        m.insert("user_agent".into(), t.get(8).map(|s| dash(s)).unwrap_or(Value::Null));
+        if t.len() > 9 {
+            m.insert("extra".into(), json!(t[9..].iter().map(|s| number_or_text(s)).collect::<Vec<_>>()));
+        }
+    }
+    if !m["status"].is_i64() {
+        return None;
+    }
+    Some(Value::Object(m))
+}
+
+const FACILITIES: [&str; 24] = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron", "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"];
+const SEVERITIES: [&str; 8] = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
+
+fn syslog(line: &str) -> Option<Value> {
+    let mut m = Map::new();
+    let mut rest = line;
+    if let Some(r) = rest.strip_prefix('<') {
+        let end = r.find('>')?;
+        let pri: usize = r[..end].parse().ok()?;
+        m.insert("facility".into(), json!(FACILITIES.get(pri / 8).copied().unwrap_or("unknown")));
+        m.insert("severity".into(), json!(SEVERITIES[pri % 8]));
+        rest = &r[end + 1..];
+    }
+    // RFC 5424: VERSION TIMESTAMP HOST APP PROCID MSGID [SD] MSG
+    if let Some(r) = rest.strip_prefix("1 ") {
+        let mut parts = r.splitn(6, ' ');
+        let (ts, host, app, pid, msgid, tail) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?, parts.next()?, parts.next().unwrap_or(""));
+        let (sd, msg) = if let Some(t) = tail.strip_prefix("- ") {
+            (Value::Null, t)
+        } else if tail == "-" {
+            (Value::Null, "")
+        } else if tail.starts_with('[') {
+            let end = tail.find("] ").map(|i| i + 1).unwrap_or(tail.len());
+            (json!(&tail[..end]), tail[end..].trim_start())
+        } else {
+            (Value::Null, tail)
+        };
+        m.insert("time".into(), dash(ts));
+        m.insert("host".into(), dash(host));
+        m.insert("app".into(), dash(app));
+        m.insert("pid".into(), int_or(pid));
+        m.insert("msgid".into(), dash(msgid));
+        m.insert("data".into(), sd);
+        m.insert("message".into(), json!(msg.trim_start_matches('\u{feff}')));
+        return Some(Value::Object(m));
+    }
+    // RFC 3164: "Oct 29 13:55:36 host app[123]: message"
+    let b: Vec<&str> = rest.splitn(5, ' ').filter(|s| !s.is_empty()).collect();
+    let (month, day, clock) = (rest.get(0..3)?, rest.get(4..6)?.trim(), rest.get(7..15)?);
+    if !["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].contains(&month) || clock.matches(':').count() != 2 || b.len() < 3 {
+        return None;
+    }
+    let after = rest.get(16..)?;
+    let (host, tail) = after.split_once(' ')?;
+    let (tag, msg) = match tail.split_once(": ") {
+        Some((tag, msg)) if !tag.contains(' ') => (tag, msg),
+        _ => ("", tail),
+    };
+    let (app, pid) = match tag.split_once('[') {
+        Some((a, p)) => (a, int_or(p.trim_end_matches(']'))),
+        None => (tag, Value::Null),
+    };
+    m.insert("time".into(), json!(format!("{} {:>2} {}", month, day, clock)));
+    m.insert("host".into(), json!(host));
+    m.insert("app".into(), dash(app));
+    m.insert("pid".into(), pid);
+    m.insert("message".into(), json!(msg));
+    Some(Value::Object(m))
+}
+
+fn logfmt(line: &str) -> Option<Value> {
+    let mut m = Map::new();
+    let mut it = line.trim().chars().peekable();
+    loop {
+        while it.peek() == Some(&' ') {
+            it.next();
+        }
+        if it.peek().is_none() {
+            break;
+        }
+        let mut key = String::new();
+        while let Some(&c) = it.peek() {
+            if c == '=' || c == ' ' {
+                break;
+            }
+            key.push(c);
+            it.next();
+        }
+        if key.is_empty() {
+            return None;
+        }
+        if it.peek() != Some(&'=') {
+            m.insert(key, json!(true));
+            continue;
+        }
+        it.next();
+        let mut val = String::new();
+        if it.peek() == Some(&'"') {
+            it.next();
+            loop {
+                match it.next()? {
+                    '\\' => {
+                        if let Some(n) = it.next() {
+                            val.push(match n {
+                                'n' => '\n',
+                                't' => '\t',
+                                o => o,
+                            })
+                        }
+                    }
+                    '"' => break,
+                    c => val.push(c),
+                }
+            }
+            m.insert(key, json!(val));
+        } else {
+            while let Some(&c) = it.peek() {
+                if c == ' ' {
+                    break;
+                }
+                val.push(c);
+                it.next();
+            }
+            m.insert(key, number_or_text(&val));
+        }
+    }
+    if m.is_empty() || !m.values().any(|v| !v.is_boolean()) { None } else { Some(Value::Object(m)) }
+}
+
+fn one(line: &str, format: &str) -> Result<Option<Value>, String> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(match format {
+        "json" => serde_json::from_str::<Value>(line).ok().filter(Value::is_object),
+        "combined" => access(line, true),
+        "common" => access(line, false),
+        "syslog" => syslog(line),
+        "logfmt" => logfmt(line),
+        "auto" => {
+            let f = detect_line(line);
+            if f == "unknown" { None } else { one(line, f)? }
+        }
+        other => return Err(format!("unknown format `{}`: {}", other, FORMATS)),
+    })
+}
+
+fn detect_line(line: &str) -> &'static str {
+    let l = line.trim_start();
+    if l.starts_with('{') && serde_json::from_str::<Value>(l).is_ok_and(|v| v.is_object()) {
+        "json"
+    } else if access(l, true).is_some() {
+        if tokens(l).is_some_and(|t| t.len() >= 9) { "combined" } else { "common" }
+    } else if syslog(l).is_some() {
+        "syslog"
+    } else if logfmt(l).is_some_and(|v| v.as_object().is_some_and(|o| o.len() >= 2)) {
+        "logfmt"
+    } else {
+        "unknown"
+    }
+}
+
+/// One log line as a map, or null when it does not read in that format. `format` is "auto", "combined" (nginx's and Apache's usual
+/// access log: `ip, user, time, method, path, protocol, status, bytes, referer, user_agent`, and `extra` for fields after those),
+/// "common", "syslog" (`facility, severity, time, host, app, pid, message`), "logfmt" (`key=value`, numbers as numbers) or "json".
+/// Times of access logs become ISO 8601 ("2026-10-29T13:55:36+02:00").
+pub fn log_parse_line(line: &str, format: &str) -> Result<Option<Value>, String> {
+    one(line, format)
+}
+
+/// Every line of `text` read: `{ format, rows, skipped }`, `skipped` the numbers (from 1) of lines that did not read. With "auto" the
+/// format is found from the first lines and kept for the rest.
+pub fn log_parse_text(text: &str, format: &str) -> Result<Value, String> {
+    let f = if format == "auto" { detect(text) } else { format };
+    let mut rows = vec![];
+    let mut skipped = vec![];
+    for (i, l) in text.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        match one(l, if f == "unknown" { "auto" } else { f })? {
+            Some(r) => rows.push(r),
+            None => skipped.push(i + 1),
+        }
+    }
+    Ok(json!({ "format": f, "rows": rows, "skipped": skipped }))
+}
+
+/// The lines of the log file at `path` as rows (as `log_parse_text` reads them), at most `limit` (1 to 1,000,000), from the start;
+/// `{ format, rows, skipped }`. Lines that are not UTF-8 are read with replacement characters.
+pub fn log_parse_file(path: &str, format: &str, limit: i64) -> Result<Value, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let r = std::io::BufReader::new(f);
+    let mut head = String::new();
+    let mut lines = vec![];
+    for (i, l) in r.split(b'\n').enumerate() {
+        let l = String::from_utf8_lossy(&l.map_err(|e| e.to_string())?).into_owned();
+        if i < 20 {
+            head.push_str(&l);
+            head.push('\n');
+        }
+        lines.push(l);
+        if lines.len() as i64 >= limit.clamp(1, 1_000_000) {
+            break;
+        }
+    }
+    let fmt = if format == "auto" { detect(&head) } else { format };
+    let mut rows = vec![];
+    let mut skipped = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        match one(l, if fmt == "unknown" { "auto" } else { fmt })? {
+            Some(r) => rows.push(r),
+            None => skipped.push(i + 1),
+        }
+    }
+    Ok(json!({ "format": fmt, "rows": rows, "skipped": skipped }))
+}
+
+fn detect(text: &str) -> &'static str {
+    let mut counts: Vec<(&str, usize)> = vec![];
+    for l in text.lines().filter(|l| !l.trim().is_empty()).take(20) {
+        let f = detect_line(l);
+        match counts.iter_mut().find(|(k, _)| *k == f) {
+            Some(c) => c.1 += 1,
+            None => counts.push((f, 1)),
+        }
+    }
+    counts.into_iter().filter(|(k, _)| *k != "unknown").max_by_key(|(_, n)| *n).map(|(k, _)| k).unwrap_or("unknown")
+}
+
+/// The format of a log, from its first 20 lines: "combined", "common", "syslog", "logfmt", "json" or "unknown".
+pub fn log_detect(text: &str) -> String {
+    detect(text).to_string()
+}
+
+/// The most frequent values of `field` in `rows` (a dotted path goes into maps: "req.method"; "status_class" groups access-log statuses
+/// as "2xx", "4xx"...): `[{ value, count }]`, the `n` most frequent first. For the busiest paths, the errors, or the noisiest app.
+pub fn log_top(rows: Vec<serde_json::Value>, field: &str, n: i64) -> Vec<Value> {
+    let mut counts: Vec<(Value, i64)> = vec![];
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in &rows {
+        let v = if field == "status_class" {
+            r.get("status").and_then(Value::as_i64).map(|s| json!(format!("{}xx", s / 100))).unwrap_or(Value::Null)
+        } else {
+            let mut v = r;
+            let mut found = true;
+            for p in field.split('.') {
+                match v.get(p) {
+                    Some(x) => v = x,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                }
+            }
+            if found { v.clone() } else { Value::Null }
+        };
+        let k = v.to_string();
+        match index.get(&k) {
+            Some(&i) => counts[i].1 += 1,
+            None => {
+                index.insert(k, counts.len());
+                counts.push((v, 1));
+            }
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.into_iter().take(n.max(0) as usize).map(|(value, count)| json!({ "value": value, "count": count })).collect()
+}

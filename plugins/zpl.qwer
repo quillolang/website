@@ -1,0 +1,708 @@
+//! Zebra ZPL II labels built from fields in millimetres: text in UTF-8 (^CI28), Code 128, GS1-128, Code 39, EAN-13, UPC-A, ITF, QR, Data Matrix and PDF417 barcodes, boxes, lines, circles, images as ^GF graphics (compressed), serial numbers, quantity, darkness, speed and media settings; sent to the printer on port 9100.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+use serde_json::{json, Value};
+use std::fmt::Write as _;
+use std::io::{Read, Write};
+
+/// Dots per millimetre for a printer's resolution, as Zebra counts them (203 dpi is 8, 300 is 12, 600 is 24).
+fn dpmm(dpi: i64) -> f64 {
+    match dpi {
+        0..=152 => 6.0,
+        153..=250 => 8.0,
+        251..=450 => 12.0,
+        _ => 24.0,
+    }
+}
+
+struct Ctx {
+    dpmm: f64,
+    units: String,
+}
+
+impl Ctx {
+    /// A length in the label's units (millimetres, inches or dots) as dots.
+    fn dots(&self, v: &Value, default: f64) -> i64 {
+        let x = v.as_f64().unwrap_or(default);
+        let d = match self.units.as_str() {
+            "dots" => x,
+            "in" | "inch" | "inches" => x * 25.4 * self.dpmm,
+            _ => x * self.dpmm,
+        };
+        d.round().max(0.0) as i64
+    }
+}
+
+/// Field data for ^FH: `ind` (the hex indicator), ^, ~ and control characters written as hex (`_5E`, `_7E`); other UTF-8 passes as it is (^CI28).
+/// In a text block a line break is ZPL's `\&`.
+fn fh(data: &str, ind: char, block: bool) -> (bool, String) {
+    let mut out = String::with_capacity(data.len());
+    let mut hex = false;
+    for c in data.chars() {
+        if block && c == '\n' {
+            out.push_str("\\&");
+        } else if c == '^' || c == '~' || c == ind || (c as u32) < 0x20 {
+            hex = true;
+            let _ = write!(out, "{}{:02X}", ind, c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    (hex, out)
+}
+
+fn fd_with(data: &str, ind: char, block: bool) -> String {
+    let (hex, s) = fh(data, ind, block);
+    if !hex {
+        format!("^FD{}^FS", s)
+    } else if ind == '_' {
+        format!("^FH^FD{}^FS", s)
+    } else {
+        format!("^FH{}^FD{}^FS", ind, s)
+    }
+}
+
+fn fd(data: &str) -> String {
+    fd_with(data, '_', false)
+}
+
+fn orient(v: &Value) -> char {
+    match v.as_i64().unwrap_or(0).rem_euclid(360) {
+        90 => 'R',
+        180 => 'I',
+        270 => 'B',
+        _ => 'N',
+    }
+}
+
+/// Code 128 data for ^BC in mode N, subsets chosen here: runs of 4 or more digits in subset C, the rest in B; `\u{1d}` (or FNC1 in a GS1 string) as `>8`, `>` as `><`.
+fn code128_invocations(tokens: &[Option<char>], gs1: bool) -> Result<String, String> {
+    // A token is Some(char) or None for FNC1.
+    let is_digit = |t: &Option<char>| matches!(t, Some(c) if c.is_ascii_digit());
+    let digit_run = |from: usize| tokens[from..].iter().take_while(|t| is_digit(t)).count();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_c;
+    let first_run = digit_run(0);
+    if gs1 || first_run >= 4 || (first_run == tokens.len() && first_run >= 2 && first_run % 2 == 0) {
+        out.push_str(">;");
+        in_c = true;
+        if gs1 {
+            out.push_str(">8");
+        }
+    } else {
+        out.push_str(">:");
+        in_c = false;
+    }
+    while i < tokens.len() {
+        let run = digit_run(i);
+        if in_c {
+            if run >= 2 {
+                for _ in 0..run / 2 {
+                    out.push(tokens[i].unwrap());
+                    out.push(tokens[i + 1].unwrap());
+                    i += 2;
+                }
+                continue;
+            }
+            if tokens[i].is_none() {
+                out.push_str(">8");
+                i += 1;
+                continue;
+            }
+            out.push_str(">6");
+            in_c = false;
+            continue;
+        }
+        // Subset B: switch to C for a run of 4 or more digits (an odd one keeps its first digit in B).
+        if run >= 4 {
+            if run % 2 == 1 {
+                out.push(tokens[i].unwrap());
+                i += 1;
+            }
+            out.push_str(">5");
+            in_c = true;
+            continue;
+        }
+        match tokens[i] {
+            None => out.push_str(">8"),
+            Some('>') => out.push_str("><"),
+            Some(c) if (' '..='~').contains(&c) => out.push(c),
+            Some(c) => return Err(format!("Code 128 takes printable ASCII; {:?} is not", c)),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// GS1 application identifiers whose data has a fixed length, by their first two digits: the total length of AI and data. Others end with FNC1.
+fn gs1_fixed(ai2: &str) -> Option<usize> {
+    Some(match ai2 {
+        "00" => 20,
+        "01" | "02" | "03" => 16,
+        "04" => 18,
+        "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" => 8,
+        "20" => 4,
+        "31" | "32" | "33" | "34" | "35" | "36" => 10,
+        "41" => 16,
+        _ => return None,
+    })
+}
+
+/// `(01)09501101530003(17)270101(10)AB-12` as AI/data pairs.
+fn gs1_pairs(s: &str) -> Result<Vec<(String, String)>, String> {
+    let s = s.trim();
+    if !s.starts_with('(') {
+        return Err("GS1 data is written with its AIs in brackets: (01)09501101530003(10)LOT7".into());
+    }
+    let mut out = vec![];
+    let mut rest = s;
+    while let Some(r) = rest.strip_prefix('(') {
+        let end = r.find(')').ok_or("a ( without its )")?;
+        let ai = &r[..end];
+        if ai.len() < 2 || ai.len() > 4 || !ai.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("({}) is not an application identifier", ai));
+        }
+        let r = &r[end + 1..];
+        let next = r.find('(').unwrap_or(r.len());
+        let data = &r[..next];
+        if data.is_empty() {
+            return Err(format!("({}) has no data", ai));
+        }
+        if let Some(total) = gs1_fixed(&ai[..2]) {
+            if ai.len() + data.len() != total {
+                return Err(format!("({}) takes {} characters of data, not {}", ai, total - ai.len(), data.len()));
+            }
+        }
+        out.push((ai.to_string(), data.to_string()));
+        rest = &r[next..];
+    }
+    if !rest.is_empty() {
+        return Err(format!("unexpected text {:?}", rest));
+    }
+    Ok(out)
+}
+
+fn gs1_tokens(pairs: &[(String, String)]) -> Vec<Option<char>> {
+    let mut t = vec![];
+    for (k, (ai, data)) in pairs.iter().enumerate() {
+        t.extend(ai.chars().map(Some));
+        t.extend(data.chars().map(Some));
+        if gs1_fixed(&ai[..2]).is_none() && k + 1 < pairs.len() {
+            t.push(None);
+        }
+    }
+    t
+}
+
+fn mod10(digits: &str) -> u32 {
+    let s: u32 = digits.chars().rev().enumerate().map(|(i, c)| c.to_digit(10).unwrap() * if i % 2 == 0 { 3 } else { 1 }).sum();
+    (10 - s % 10) % 10
+}
+
+/// The digits of an EAN/UPC code without its check digit, which is checked when given.
+fn without_check(data: &str, n: usize, name: &str) -> Result<String, String> {
+    if !data.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("{} takes digits only", name));
+    }
+    if data.len() == n {
+        return Ok(data.into());
+    }
+    if data.len() == n + 1 {
+        if mod10(&data[..n]) != data[n..].parse::<u32>().unwrap() {
+            return Err(format!("{}: the check digit of {} should be {}", name, data, mod10(&data[..n])));
+        }
+        return Ok(data[..n].into());
+    }
+    Err(format!("{} takes {} digits (or {} with the check digit)", name, n, n + 1))
+}
+
+/// A picture as rows of bits, 1 for black: scaled to `width` dots when given, dithered or cut at a threshold.
+fn bitmap(path: &str, width: Option<u32>, threshold: u8, dither: bool) -> Result<(usize, usize, Vec<Vec<bool>>), String> {
+    let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let img = match width {
+        Some(w) if w > 0 && w != img.width() => {
+            let h = ((img.height() as f64) * (w as f64) / (img.width() as f64)).round().max(1.0) as u32;
+            img.resize_exact(w, h, image::imageops::FilterType::Triangle)
+        }
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w * h > 4_000_000 {
+        return Err("the picture is over 4 million dots: give a width".into());
+    }
+    // Luma on white, transparency counting as white.
+    let mut lum: Vec<f32> = rgba
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            let l = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+            l * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let mut rows = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let old = lum[y * w + x];
+            let black = old < threshold as f32;
+            rows[y][x] = black;
+            if dither {
+                let err = old - if black { 0.0 } else { 255.0 };
+                let mut spread = |dx: isize, dy: usize, f: f32| {
+                    let nx = x as isize + dx;
+                    if nx >= 0 && (nx as usize) < w && y + dy < h {
+                        lum[(y + dy) * w + nx as usize] += err * f;
+                    }
+                };
+                spread(1, 0, 7.0 / 16.0);
+                spread(-1, 1, 3.0 / 16.0);
+                spread(0, 1, 5.0 / 16.0);
+                spread(1, 1, 1.0 / 16.0);
+            }
+        }
+    }
+    Ok((w, h, rows))
+}
+
+/// Rows of bits as ZPL's compressed ASCII hex: repeat counts G–Y (1–19) and g–z (20–400), `,` for a row ending in zeros, `!` for one ending in ones, `:` for a row like the one before.
+fn gf_data(w: usize, rows: &[Vec<bool>]) -> (usize, String) {
+    let bpr = (w + 7) / 8;
+    let mut out = String::new();
+    let mut prev: Option<String> = None;
+    for r in rows {
+        let mut hex = String::with_capacity(bpr * 2);
+        for b in 0..bpr {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = b * 8 + bit;
+                if x < w && r[x] {
+                    byte |= 0x80 >> bit;
+                }
+            }
+            let _ = write!(hex, "{:02X}", byte);
+        }
+        if prev.as_deref() == Some(hex.as_str()) {
+            out.push(':');
+            continue;
+        }
+        let trimmed0 = hex.trim_end_matches('0');
+        let trimmedf = hex.trim_end_matches('F');
+        let (body, tail) = if trimmed0.len() < hex.len() && trimmed0.len() <= trimmedf.len() {
+            (trimmed0, Some(','))
+        } else if trimmedf.len() < hex.len() {
+            (trimmedf, Some('!'))
+        } else {
+            (hex.as_str(), None)
+        };
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let mut n = 1;
+            while i + n < chars.len() && chars[i + n] == chars[i] {
+                n += 1;
+            }
+            let mut left = n;
+            while left > 1 {
+                let take = left.min(419);
+                if take >= 20 {
+                    out.push((b'g' + (take / 20 - 1) as u8) as char);
+                }
+                if take % 20 > 0 {
+                    out.push((b'G' + (take % 20 - 1) as u8) as char);
+                }
+                out.push(chars[i]);
+                left -= take;
+            }
+            if left == 1 {
+                out.push(chars[i]);
+            }
+            i += n;
+        }
+        if let Some(t) = tail {
+            out.push(t);
+        }
+        prev = Some(hex);
+    }
+    (bpr, out)
+}
+
+fn graphic_field(path: &str, width_dots: Option<u32>, f: &Value) -> Result<String, String> {
+    let threshold = f["threshold"].as_u64().unwrap_or(128).clamp(1, 255) as u8;
+    let dither = f["dither"].as_bool().unwrap_or(false);
+    let (w, h, rows) = bitmap(path, width_dots, threshold, dither)?;
+    let (bpr, data) = gf_data(w, &rows);
+    let total = bpr * h;
+    Ok(format!("^GFA,{},{},{},{}", total, total, bpr, data))
+}
+
+fn field(f: &Value, ctx: &Ctx, out: &mut String) -> Result<(), String> {
+    if let Some(raw) = f["raw"].as_str() {
+        out.push_str(raw);
+        out.push('\n');
+        return Ok(());
+    }
+    let x = ctx.dots(&f["x"], 0.0);
+    let y = ctx.dots(&f["y"], 0.0);
+    let o = orient(&f["rotate"]);
+    let pos = if f["baseline"] == true { "^FT" } else { "^FO" };
+    let _ = write!(out, "{}{},{}", pos, x, y);
+    if f["reverse"] == true {
+        out.push_str("^FR");
+    }
+    let data = || -> Result<String, String> {
+        match &f["data"] {
+            Value::String(s) => Ok(s.clone()),
+            Value::Number(n) => Ok(n.to_string()),
+            _ => Err("a barcode needs its `data`".into()),
+        }
+    };
+    if !f["text"].is_null() {
+        let text = match &f["text"] {
+            Value::String(s) => s.clone(),
+            v => v.to_string(),
+        };
+        let h = ctx.dots(&f["size"], 3.0).max(1);
+        let w = if f["width"].is_null() { h } else { ctx.dots(&f["width"], 3.0).max(1) };
+        let font = f["font"].as_str().unwrap_or("0");
+        if font.chars().count() != 1 && !font.contains(':') {
+            return Err(format!("font {:?}: a font is one letter or digit (0 is Zebra's scalable font), or a path like E:ARIAL.TTF", font));
+        }
+        if font.contains(':') {
+            let _ = write!(out, "^A@{},{},{},{}", o, h, w, font);
+        } else {
+            let _ = write!(out, "^A{}{},{},{}", font, o, h, w);
+        }
+        if !f["block"].is_null() {
+            let bw = ctx.dots(&f["block"], 50.0);
+            let lines = f["lines"].as_u64().unwrap_or(1).clamp(1, 9999);
+            let spacing = ctx.dots(&f["spacing"], 0.0);
+            let j = match f["align"].as_str().unwrap_or("left") {
+                "center" | "centre" => 'C',
+                "right" => 'R',
+                "justify" => 'J',
+                _ => 'L',
+            };
+            let _ = write!(out, "^FB{},{},{},{},0", bw, lines, spacing, j);
+        }
+        if let Some(step) = f["serial"].as_i64() {
+            if !text.chars().any(|c| c.is_ascii_digit()) || text.contains(['^', '~']) {
+                return Err("a serial field's text ends in the number to count from".into());
+            }
+            let _ = write!(out, "^SN{},{},Y^FS", text, step);
+        } else {
+            out.push_str(&fd_with(&text, '_', !f["block"].is_null()));
+        }
+    } else if let Some(kind) = f["barcode"].as_str() {
+        let h = ctx.dots(&f["height"], 15.0).max(1);
+        let module = f["module"].as_i64().unwrap_or(2).clamp(1, 10);
+        let ratio = f["ratio"].as_f64().unwrap_or(3.0).clamp(2.0, 3.0);
+        let yn = |b: bool| if b { 'Y' } else { 'N' };
+        let readable = f["readable"].as_bool().unwrap_or(true);
+        match kind {
+            "code128" => {
+                let d = data()?;
+                if d.is_empty() {
+                    return Err("Code 128 needs data".into());
+                }
+                let tokens: Vec<Option<char>> = d.chars().map(|c| if c == '\u{1d}' { None } else { Some(c) }).collect();
+                let inv = code128_invocations(&tokens, false)?;
+                let _ = write!(out, "^BY{}^BC{},{},{},N,N,N{}", module, o, h, yn(readable), fd(&inv));
+            }
+            "gs1_128" | "gs1-128" | "ucc128" => {
+                let d = data()?;
+                let pairs = gs1_pairs(&d)?;
+                let inv = code128_invocations(&gs1_tokens(&pairs), true)?;
+                let _ = write!(out, "^BY{}^BC{},{},N,N,N,N{}", module, o, h, fd(&inv));
+                if readable {
+                    // The text under it, with the AIs in brackets, as GS1 asks.
+                    let size = ((h as f64) / 5.0).clamp(16.0, 40.0) as i64;
+                    let _ = write!(out, "\n^FO{},{}^A0N,{},{}{}", x, y + h + size / 3, size, size, fd(&d));
+                }
+            }
+            "code39" => {
+                let d = data()?.to_uppercase();
+                if !d.chars().all(|c| c.is_ascii_alphanumeric() || " -.$/+%".contains(c)) {
+                    return Err("Code 39 takes A-Z, 0-9 and - . $ / + % and space".into());
+                }
+                let _ = write!(out, "^BY{},{:.1}^B3{},N,{},{},N{}", module, ratio, o, h, yn(readable), fd(&d));
+            }
+            "ean13" => {
+                let d = without_check(&data()?, 12, "EAN-13")?;
+                let _ = write!(out, "^BY{}^BE{},{},{},N{}", module, o, h, yn(readable), fd(&d));
+            }
+            "upca" => {
+                let d = without_check(&data()?, 11, "UPC-A")?;
+                let _ = write!(out, "^BY{}^BU{},{},{},N,Y{}", module, o, h, yn(readable), fd(&d));
+            }
+            "itf" | "itf14" | "i2of5" => {
+                let mut d = data()?;
+                if !d.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("ITF takes digits only".into());
+                }
+                if kind == "itf14" {
+                    d = without_check(&d, 13, "ITF-14")?;
+                    d.push(char::from_digit(mod10(&d), 10).unwrap());
+                } else if d.len() % 2 == 1 {
+                    return Err("Interleaved 2 of 5 takes an even number of digits".into());
+                }
+                let _ = write!(out, "^BY{},{:.1}^B2{},{},{},N,N{}", module, ratio, o, h, yn(readable), fd(&d));
+            }
+            "qr" => {
+                let d = data()?;
+                let mag = f["magnification"].as_i64().unwrap_or(4).clamp(1, 10);
+                let ecc = match f["ecc"].as_str().unwrap_or("Q") {
+                    "L" => 'L',
+                    "M" => 'M',
+                    "H" => 'H',
+                    _ => 'Q',
+                };
+                let _ = write!(out, "^BQ{},2,{}{}", 'N', mag, fd(&format!("{}A,{}", ecc, d)));
+            }
+            "datamatrix" => {
+                let d = data()?;
+                let module = f["module"].as_i64().unwrap_or(5).clamp(1, 40);
+                // ECC 200, `_` as the escape character: `_1` is FNC1, `__` an underscore.
+                let body = if f["gs1"] == true {
+                    let pairs = gs1_pairs(&d)?;
+                    let mut s = String::from("_1");
+                    for (k, (ai, v)) in pairs.iter().enumerate() {
+                        s.push_str(ai);
+                        s.push_str(&v.replace('_', "__"));
+                        if gs1_fixed(&ai[..2]).is_none() && k + 1 < pairs.len() {
+                            s.push_str("_1");
+                        }
+                    }
+                    s
+                } else {
+                    d.replace('_', "__")
+                };
+                let _ = write!(out, "^BX{},{},200,0,0,6,_{}", o, module, fd_with(&body, '\\', false));
+            }
+            "pdf417" => {
+                let d = data()?;
+                let row = f["row_height"].as_i64().unwrap_or(module * 3).clamp(1, 255);
+                let security = f["security"].as_i64().unwrap_or(2).clamp(0, 8);
+                let cols = f["columns"].as_i64().unwrap_or(0).clamp(0, 30);
+                let _ = write!(out, "^BY{}^B7{},{},{},{},0,N{}", module, o, row, security, if cols == 0 { String::new() } else { cols.to_string() }, fd(&d));
+            }
+            other => return Err(format!("unknown barcode {:?}: code128, gs1_128, code39, ean13, upca, itf, itf14, qr, datamatrix or pdf417", other)),
+        }
+    } else if f["box"] == true || f["line"] == true {
+        let t = ctx.dots(&f["thickness"], 0.3).max(1);
+        let w = ctx.dots(&f["width"], 0.0).max(t);
+        let h = if f["line"] == true && f["height"].is_null() { t } else { ctx.dots(&f["height"], 0.0).max(t) };
+        let color = if f["color"].as_str() == Some("white") { 'W' } else { 'B' };
+        let round = f["rounding"].as_i64().unwrap_or(0).clamp(0, 8);
+        let _ = write!(out, "^GB{},{},{},{},{}^FS", w, h, t, color, round);
+    } else if !f["circle"].is_null() {
+        let d = ctx.dots(&f["circle"], 10.0).max(3);
+        let t = ctx.dots(&f["thickness"], 0.3).max(1);
+        let _ = write!(out, "^GC{},{},B^FS", d, t);
+    } else if let Some(path) = f["image"].as_str() {
+        let w = if f["width"].is_null() { None } else { Some(ctx.dots(&f["width"], 0.0) as u32) };
+        out.push_str(&graphic_field(path, w, f)?);
+        out.push_str("^FS");
+    } else if let Some(name) = f["graphic"].as_str() {
+        let _ = write!(out, "^XG{},1,1^FS", name);
+    } else {
+        return Err(format!("a field is text, barcode, box, line, circle, image, graphic or raw: {}", f));
+    }
+    out.push('\n');
+    Ok(())
+}
+
+fn build(fields: &[Value], options: &Value) -> Result<String, String> {
+    if fields.len() > 2000 {
+        return Err("at most 2,000 fields on a label".into());
+    }
+    let dpi = options["dpi"].as_i64().unwrap_or(203);
+    let ctx = Ctx { dpmm: dpmm(dpi), units: options["units"].as_str().unwrap_or("mm").to_string() };
+    let mut out = String::new();
+    if let Some(d) = options["darkness"].as_i64() {
+        let _ = writeln!(out, "~SD{:02}", d.clamp(0, 30));
+    }
+    out.push_str("^XA\n");
+    if options["utf8"] != false {
+        out.push_str("^CI28\n");
+    }
+    if !options["width"].is_null() {
+        let _ = writeln!(out, "^PW{}", ctx.dots(&options["width"], 100.0));
+    }
+    if !options["height"].is_null() {
+        let _ = writeln!(out, "^LL{}", ctx.dots(&options["height"], 150.0));
+    }
+    if let Some(h) = options["home"].as_array() {
+        let _ = writeln!(out, "^LH{},{}", ctx.dots(&h.first().cloned().unwrap_or(json!(0)), 0.0), ctx.dots(&h.get(1).cloned().unwrap_or(json!(0)), 0.0));
+    }
+    if let Some(m) = options["media"].as_str() {
+        let c = match m {
+            "gap" | "web" => 'Y',
+            "mark" | "black_mark" => 'M',
+            "continuous" => 'N',
+            other => return Err(format!("media {:?}: gap, mark or continuous", other)),
+        };
+        let _ = writeln!(out, "^MN{}", c);
+    }
+    if let Some(m) = options["method"].as_str() {
+        let _ = writeln!(out, "^MT{}", if m == "direct" { 'D' } else { 'T' });
+    }
+    if let Some(m) = options["after"].as_str() {
+        let c = match m {
+            "tear" => 'T',
+            "peel" => 'P',
+            "cut" => 'C',
+            "rewind" => 'R',
+            other => return Err(format!("after {:?}: tear, peel, cut or rewind", other)),
+        };
+        let _ = writeln!(out, "^MM{}", c);
+    }
+    if let Some(s) = options["speed"].as_i64() {
+        let s = s.clamp(1, 14);
+        let _ = writeln!(out, "^PR{},{},{}", s, s, s);
+    }
+    if options["invert"] == true {
+        out.push_str("^POI\n");
+    }
+    for f in fields {
+        field(f, &ctx, &mut out)?;
+    }
+    let q = options["quantity"].as_i64().unwrap_or(1).clamp(1, 99_999_999);
+    if q > 1 || options["quantity"].is_i64() {
+        let _ = writeln!(out, "^PQ{},0,1,Y", q);
+    }
+    out.push_str("^XZ\n");
+    Ok(out)
+}
+
+/// A label as ZPL II text. Each field is a map placed at `x`, `y` (millimetres from the top left, or `units: "dots"` / `"in"`):
+/// `{ text, size: 4, width, font: "0", rotate: 90, block: 60, lines: 2, align: "center", reverse, serial: 1, baseline }`,
+/// `{ barcode: "code128" | "gs1_128" | "code39" | "ean13" | "upca" | "itf" | "itf14" | "qr" | "datamatrix" | "pdf417", data, height: 15, module: 2, readable, ecc, magnification, gs1 }`,
+/// `{ box: true, width, height, thickness, rounding, color: "white" }`, `{ line: true, width, thickness }`, `{ circle: 10 }`, `{ image: "logo.png", width: 30, dither }`, `{ graphic: "R:LOGO.GRF" }` or `{ raw: "^FO..." }`.
+/// `options`: `{ dpi: 203, width, height, darkness: 0-30, speed: 2-14 (inches a second), quantity, media: "gap" | "mark" | "continuous", method: "direct" | "transfer", after: "tear" | "peel" | "cut", home: [x, y], invert, utf8: true }`.
+pub fn zpl_label(fields: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    build(&fields, &options)
+}
+
+/// Many labels from one layout: each row's values replace `{{name}}` in the fields' text and data, one ^XA…^XZ per row (a pallet's cartons, a shelf's bins).
+pub fn zpl_labels(fields: Vec<serde_json::Value>, rows: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    if rows.len() > 10_000 {
+        return Err("at most 10,000 labels at once".into());
+    }
+    let mut out = String::new();
+    for row in &rows {
+        let filled: Vec<Value> = fields
+            .iter()
+            .map(|f| {
+                let mut f = f.clone();
+                for key in ["text", "data"] {
+                    if let Some(s) = f[key].as_str() {
+                        let mut s = s.to_string();
+                        if let Some(m) = row.as_object() {
+                            for (k, v) in m {
+                                let v = match v {
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                s = s.replace(&format!("{{{{{}}}}}", k), &v);
+                            }
+                        }
+                        f[key] = Value::String(s);
+                    }
+                }
+                f
+            })
+            .collect();
+        out.push_str(&build(&filled, &options)?);
+    }
+    Ok(out)
+}
+
+/// A picture as a ^GFA graphic field (compressed hex), `width` in dots (null keeps its size), cut at `threshold` (0-255, 128) or dithered; put it after a ^FO.
+pub fn zpl_image(path: &str, width: Option<i64>, threshold: i64, dither: bool) -> Result<String, String> {
+    graphic_field(path, width.map(|w| w.clamp(1, 10_000) as u32), &json!({ "threshold": threshold, "dither": dither }))
+}
+
+/// A picture stored in the printer's memory once (~DG, `name` like `R:LOGO.GRF`), for labels that print it with `{ graphic: "R:LOGO.GRF" }`.
+pub fn zpl_store_image(path: &str, name: &str, width: Option<i64>) -> Result<String, String> {
+    let name = name.to_uppercase();
+    if !name.ends_with(".GRF") || !name.contains(':') {
+        return Err("a stored graphic is named like R:LOGO.GRF (R: is RAM, E: flash)".into());
+    }
+    let (w, h, rows) = bitmap(path, width.map(|w| w.clamp(1, 10_000) as u32), 128, false)?;
+    let (bpr, data) = gf_data(w, &rows);
+    Ok(format!("~DG{},{},{},{}\n", name, bpr * h, bpr, data))
+}
+
+/// Printer settings sent once and saved (^JUS): `{ darkness: 0-30, speed, width (mm), dpi, media: "gap" | "mark" | "continuous", method: "direct" | "transfer", after: "tear" | "cut", calibrate: true }`.
+pub fn zpl_setup(options: serde_json::Value) -> Result<String, String> {
+    let mut s = build(&[], &options)?.replace("^XZ\n", "^JUS\n^XZ\n");
+    if options["calibrate"] == true {
+        s.push_str("~JC\n");
+    }
+    Ok(s)
+}
+
+/// Text for a ZPL field with ^, ~ and _ escaped as hex, as `^FH^FD...^FS`.
+pub fn zpl_field_data(text: &str) -> String {
+    fd(text)
+}
+
+fn connect(host: &str, timeout_ms: i64) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let t = std::time::Duration::from_millis(timeout_ms.clamp(100, 60_000) as u64);
+    let target = if host.rsplit_once(':').map_or(false, |(h, p)| !h.ends_with(':') && p.parse::<u16>().is_ok() && (!h.contains(':') || h.ends_with(']'))) {
+        host.to_string()
+    } else if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:9100", host)
+    } else {
+        format!("{}:9100", host)
+    };
+    let addr = target.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    let s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach the printer at {}: {}", target, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Sends ZPL to a printer's raw port (`host` or `host:port`, 9100 when not given), waiting at most `timeout_ms`. Gives the bytes sent.
+pub fn zpl_send(zpl: &str, host: &str, timeout_ms: i64) -> Result<i64, String> {
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(zpl.as_bytes()).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+    Ok(zpl.len() as i64)
+}
+
+/// The printer's host status (~HS) read: `{ ready, paper_out, paused, head_open, ribbon_out, buffer_full, labels_remaining, formats_waiting, under_temperature, over_temperature }`.
+pub fn zpl_status(host: &str, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let mut s = connect(host, timeout_ms)?;
+    s.write_all(b"~HS\r\n").map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    while buf.iter().filter(|b| **b == 0x03).count() < 3 {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if buf.is_empty() => return Err(format!("no status from the printer: {}", e)),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<Vec<&str>> = text.split('\x02').skip(1).map(|l| l.split('\x03').next().unwrap_or("").split(',').map(str::trim).collect()).collect();
+    if lines.len() < 2 || lines[0].len() < 12 || lines[1].len() < 9 {
+        return Err(format!("not a ~HS answer: {:?}", text));
+    }
+    let flag = |l: usize, i: usize| lines[l].get(i).map_or(false, |v| *v == "1");
+    let st = json!({
+        "paper_out": flag(0, 1), "paused": flag(0, 2), "formats_waiting": lines[0][4].parse::<i64>().unwrap_or(0),
+        "buffer_full": flag(0, 5), "under_temperature": flag(0, 10), "over_temperature": flag(0, 11),
+        "head_open": flag(1, 2), "ribbon_out": flag(1, 3), "labels_remaining": lines[1][8].parse::<i64>().unwrap_or(0),
+    });
+    let ready = !(st["paper_out"] == true || st["paused"] == true || st["head_open"] == true || st["ribbon_out"] == true || st["buffer_full"] == true || st["over_temperature"] == true);
+    let mut st = st;
+    st["ready"] = json!(ready);
+    Ok(st)
+}

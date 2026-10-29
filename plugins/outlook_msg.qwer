@@ -1,0 +1,416 @@
+//! Outlook .msg emails read: sender, recipients, subject, date, the text and HTML bodies (and the RTF one), the attachments saved, and the whole message turned into a standard .eml.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! cfb = "0.7"
+//! encoding_rs = "0.8"
+//! base64 = "0.22"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::Read;
+
+const MAX_STREAM: u64 = 64 * 1024 * 1024;
+const MAX_ATTACHMENTS: usize = 500;
+
+type Cfb = cfb::CompoundFile<std::fs::File>;
+
+// One storage's properties: the fixed ones from __properties_version1.0, the others from their __substg1.0_ streams.
+struct Props {
+    fixed: HashMap<u16, (u16, [u8; 8])>,
+    var: HashMap<u16, (u16, Vec<u8>)>,
+    cp: &'static encoding_rs::Encoding,
+}
+
+impl Props {
+    fn read(c: &mut Cfb, dir: &str, header: usize, cp: &'static encoding_rs::Encoding) -> Result<Props, String> {
+        let mut fixed = HashMap::new();
+        let mut var = HashMap::new();
+        let names: Vec<(String, String)> = c
+            .read_storage(if dir.is_empty() { "/" } else { dir })
+            .map_err(|e| e.to_string())?
+            .filter(|e| e.is_stream())
+            .map(|e| (e.name().to_string(), e.path().to_string_lossy().into_owned()))
+            .collect();
+        for (name, path) in names {
+            if name == "__properties_version1.0" {
+                let d = read(c, &path)?;
+                for e in d.get(header..).unwrap_or(&[]).chunks(16).filter(|e| e.len() == 16) {
+                    let ty = u16::from_le_bytes([e[0], e[1]]);
+                    let id = u16::from_le_bytes([e[2], e[3]]);
+                    let mut v = [0u8; 8];
+                    v.copy_from_slice(&e[8..16]);
+                    fixed.insert(id, (ty, v));
+                }
+            } else if let Some(tag) = name.strip_prefix("__substg1.0_").filter(|t| t.len() == 8) {
+                let (Ok(id), Ok(ty)) = (u16::from_str_radix(&tag[..4], 16), u16::from_str_radix(&tag[4..], 16)) else { continue };
+                // Multi-valued properties (0x1000 bit) come in streams of their own per value: not read here.
+                if ty & 0x1000 == 0 {
+                    var.insert(id, (ty, read(c, &path)?));
+                }
+            }
+        }
+        let mut p = Props { fixed, var, cp };
+        // The message's code page, for its 8-bit strings.
+        for id in [0x3FFD, 0x3FDE] {
+            if let Some(n) = p.int(id) {
+                p.cp = codepage(n);
+                break;
+            }
+        }
+        Ok(p)
+    }
+
+    fn str(&self, id: u16) -> Option<String> {
+        let (ty, d) = self.var.get(&id)?;
+        let s = match ty {
+            0x001F => {
+                let u: Vec<u16> = d.chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                String::from_utf16_lossy(&u)
+            }
+            0x001E => self.cp.decode(d).0.into_owned(),
+            0x0102 => self.cp.decode(d).0.into_owned(),
+            _ => return None,
+        };
+        let s = s.trim_end_matches('\0').to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    fn bin(&self, id: u16) -> Option<&[u8]> {
+        self.var.get(&id).filter(|(t, _)| *t == 0x0102).map(|(_, d)| d.as_slice())
+    }
+
+    fn int(&self, id: u16) -> Option<i64> {
+        let (ty, v) = self.fixed.get(&id)?;
+        match ty {
+            0x0003 => Some(i32::from_le_bytes([v[0], v[1], v[2], v[3]]) as i64),
+            0x0002 => Some(i16::from_le_bytes([v[0], v[1]]) as i64),
+            0x0014 => Some(i64::from_le_bytes(*v)),
+            0x000B => Some((v[0] != 0) as i64),
+            _ => None,
+        }
+    }
+
+    fn time(&self, id: u16) -> Option<String> {
+        let (ty, v) = self.fixed.get(&id)?;
+        if *ty != 0x0040 {
+            return None;
+        }
+        let ft = u64::from_le_bytes(*v);
+        if ft == 0 {
+            return None;
+        }
+        Some(rfc3339(ft as i64 / 10_000_000 - 11_644_473_600))
+    }
+}
+
+fn codepage(n: i64) -> &'static encoding_rs::Encoding {
+    let label = match n {
+        65001 => "utf-8".to_string(),
+        20127 => "us-ascii".to_string(),
+        28591 => "iso-8859-1".to_string(),
+        932 => "shift_jis".to_string(),
+        936 => "gbk".to_string(),
+        949 => "euc-kr".to_string(),
+        950 => "big5".to_string(),
+        n => format!("windows-{}", n),
+    };
+    encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252)
+}
+
+fn read(c: &mut Cfb, path: &str) -> Result<Vec<u8>, String> {
+    let s = c.open_stream(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut d = Vec::new();
+    s.take(MAX_STREAM + 1).read_to_end(&mut d).map_err(|e| e.to_string())?;
+    if d.len() as u64 > MAX_STREAM {
+        return Err(format!("{}: more than 64 MB", path));
+    }
+    Ok(d)
+}
+
+fn rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let s = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, s / 3600, s / 60 % 60, s % 60)
+}
+
+// Compressed RTF (MS-OXRTFCP): LZ77 over a 4 KB dictionary that starts with this text.
+const RTF_PREBUF: &[u8] = b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx";
+
+fn rtf_decompress(d: &[u8]) -> Option<String> {
+    if d.len() < 16 {
+        return None;
+    }
+    let raw = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
+    let body = &d[16..];
+    if &d[8..12] == b"MELA" {
+        return Some(String::from_utf8_lossy(&body[..raw.min(body.len())]).into_owned());
+    }
+    if &d[8..12] != b"LZFu" {
+        return None;
+    }
+    let mut dict = [0u8; 4096];
+    dict[..RTF_PREBUF.len()].copy_from_slice(RTF_PREBUF);
+    let mut w = RTF_PREBUF.len();
+    let mut out = Vec::with_capacity(raw.min(MAX_STREAM as usize));
+    let mut i = 0;
+    'outer: while i < body.len() {
+        let ctl = body[i];
+        i += 1;
+        for bit in 0..8 {
+            if i >= body.len() {
+                break 'outer;
+            }
+            if ctl & (1 << bit) == 0 {
+                let b = body[i];
+                i += 1;
+                out.push(b);
+                dict[w] = b;
+                w = (w + 1) % 4096;
+            } else {
+                if i + 1 >= body.len() {
+                    break 'outer;
+                }
+                let r = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+                i += 2;
+                let (off, len) = (r >> 4, (r & 0xF) + 2);
+                if off == w {
+                    break 'outer;
+                }
+                for k in 0..len {
+                    let b = dict[(off + k) % 4096];
+                    out.push(b);
+                    dict[w] = b;
+                    w = (w + 1) % 4096;
+                }
+            }
+            if out.len() >= raw {
+                break 'outer;
+            }
+        }
+    }
+    out.truncate(raw);
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+struct Attachment {
+    name: String,
+    mime: Option<String>,
+    content_id: Option<String>,
+    data: Vec<u8>,
+    embedded: bool,
+}
+
+struct Msg {
+    p: Props,
+    recipients: Vec<(i64, Option<String>, Option<String>)>,
+    attachments: Vec<Attachment>,
+}
+
+fn open(path: &str) -> Result<Msg, String> {
+    let mut c = cfb::open(path).map_err(|e| format!("{}: not an Outlook .msg file ({})", path, e))?;
+    if !c.exists("/__properties_version1.0") {
+        return Err(format!("{}: a compound file, but not an Outlook message", path));
+    }
+    let p = Props::read(&mut c, "/", 32, encoding_rs::WINDOWS_1252)?;
+    let dirs: Vec<(String, String)> = c.read_root_storage().filter(|e| e.is_storage()).map(|e| (e.name().to_string(), e.path().to_string_lossy().into_owned())).collect();
+    let mut recipients = vec![];
+    let mut attachments = vec![];
+    let mut dirs = dirs;
+    dirs.sort();
+    for (name, path) in dirs {
+        if name.starts_with("__recip_version1.0_") {
+            let r = Props::read(&mut c, &path, 8, p.cp)?;
+            let email = r.str(0x39FE).or_else(|| r.str(0x3003).filter(|e| e.contains('@')));
+            recipients.push((r.int(0x0C15).unwrap_or(1), r.str(0x3001), email));
+        } else if name.starts_with("__attach_version1.0_") && attachments.len() < MAX_ATTACHMENTS {
+            let a = Props::read(&mut c, &path, 8, p.cp)?;
+            let method = a.int(0x3705).unwrap_or(1);
+            let embedded = method == 5;
+            // A message attached to the message: its own storage; given here as the inner message's subject, as an .msg name.
+            let name = a.str(0x3707).or_else(|| a.str(0x3704)).or_else(|| a.str(0x3001)).unwrap_or_else(|| format!("attachment-{}", attachments.len() + 1));
+            let data = if embedded { vec![] } else { a.bin(0x3701).map(|d| d.to_vec()).unwrap_or_default() };
+            if method == 6 && data.is_empty() {
+                continue;
+            }
+            attachments.push(Attachment { name, mime: a.str(0x370E), content_id: a.str(0x3712), data, embedded });
+        }
+    }
+    Ok(Msg { p, recipients, attachments })
+}
+
+fn person(name: Option<String>, email: Option<String>) -> Value {
+    json!({ "name": name, "email": email })
+}
+
+fn html(m: &Msg) -> Option<String> {
+    m.p.str(0x1013)
+}
+
+/// The .msg file at `path` read: `{ subject, from, to, cc, bcc, date, message_id, in_reply_to, text, html, rtf, headers, attachments, class }`.
+/// `from` and each recipient are `{ name, email }` (the SMTP address, not Exchange's internal one, when the file has it); `date` is when it
+/// was sent, RFC 3339; `html` and `rtf` are null when the message has none (`rtf` is the RTF body, unpacked: `rtf_to_text` from the rtf
+/// plugin reads it); `headers` the internet headers it came with; `attachments` `[{ name, type, size, content_id, embedded }]`.
+pub fn outlook_msg_read(path: &str) -> Result<Value, String> {
+    let m = open(path)?;
+    let p = &m.p;
+    let sender_email = p.str(0x5D01).or_else(|| p.str(0x0C1F).filter(|e| e.contains('@'))).or_else(|| p.str(0x0065).filter(|e| e.contains('@')));
+    let sender_name = p.str(0x0C1A).or_else(|| p.str(0x0042));
+    let who = |t: i64| -> Vec<Value> { m.recipients.iter().filter(|r| r.0 == t).map(|r| person(r.1.clone(), r.2.clone())).collect() };
+    Ok(json!({
+        "subject": p.str(0x0037),
+        "from": person(sender_name, sender_email),
+        "to": who(1),
+        "cc": who(2),
+        "bcc": who(3),
+        "date": p.time(0x0039).or_else(|| p.time(0x0E06)),
+        "message_id": p.str(0x1035),
+        "in_reply_to": p.str(0x1042),
+        "text": p.str(0x1000),
+        "html": html(&m),
+        "rtf": p.bin(0x1009).and_then(rtf_decompress),
+        "headers": p.str(0x007D),
+        "class": p.str(0x001A),
+        "attachments": m.attachments.iter().map(|a| json!({ "name": a.name, "type": a.mime, "size": a.data.len(), "content_id": a.content_id, "embedded": a.embedded })).collect::<Vec<_>>(),
+    }))
+}
+
+fn safe_name(name: &str, i: usize) -> String {
+    let s: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') { c } else { '_' }).collect();
+    let s = s.trim().trim_start_matches('.').to_string();
+    if s.is_empty() {
+        format!("attachment-{}", i + 1)
+    } else {
+        s
+    }
+}
+
+/// Saves the message's attachments into `folder` (made when missing), each under its own name with anything but letters, digits, dots,
+/// dashes and spaces made `_` (a second file of the same name gets `-2`): the paths written. Messages attached inside are skipped.
+pub fn outlook_msg_save_attachments(path: &str, folder: &str) -> Result<Vec<String>, String> {
+    let m = open(path)?;
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {}", folder, e))?;
+    let mut out: Vec<String> = vec![];
+    for (i, a) in m.attachments.iter().enumerate().filter(|(_, a)| !a.embedded) {
+        let base = safe_name(&a.name, i);
+        let mut p = std::path::Path::new(folder).join(&base);
+        let mut n = 2;
+        while out.contains(&p.to_string_lossy().into_owned()) {
+            let (stem, ext) = base.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{}", e))).unwrap_or((base.clone(), String::new()));
+            p = std::path::Path::new(folder).join(format!("{}-{}{}", stem, n, ext));
+            n += 1;
+        }
+        std::fs::write(&p, &a.data).map_err(|e| format!("{}: {}", p.display(), e))?;
+        out.push(p.to_string_lossy().into_owned());
+    }
+    Ok(out)
+}
+
+fn enc_header(s: &str) -> String {
+    let s = s.replace(['\r', '\n'], " ");
+    if s.is_ascii() {
+        s
+    } else {
+        format!("=?UTF-8?B?{}?=", STANDARD.encode(s.as_bytes()))
+    }
+}
+
+fn addr(v: &Value) -> Option<String> {
+    let email = v["email"].as_str()?;
+    Some(match v["name"].as_str().filter(|n| !n.is_empty() && *n != email) {
+        Some(n) if n.is_ascii() => format!("\"{}\" <{}>", n.replace(['"', '\\'], ""), email),
+        Some(n) => format!("{} <{}>", enc_header(n), email),
+        None => email.to_string(),
+    })
+}
+
+fn b64_lines(d: &[u8]) -> String {
+    let s = STANDARD.encode(d);
+    s.as_bytes().chunks(76).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("\r\n")
+}
+
+/// The message written to `out` as a standard .eml (MIME): headers, the text and HTML bodies, and the attachments, for any mail program,
+/// a helpdesk import, or the email_parse plugin. Gives the file's size in bytes.
+pub fn outlook_msg_to_eml(path: &str, out: &str) -> Result<i64, String> {
+    let v = outlook_msg_read(path)?;
+    let m = open(path)?;
+    let mut h = vec![];
+    if let Some(f) = addr(&v["from"]) {
+        h.push(format!("From: {}", f));
+    }
+    for (k, name) in [("to", "To"), ("cc", "Cc")] {
+        let list: Vec<String> = v[k].as_array().into_iter().flatten().filter_map(addr).collect();
+        if !list.is_empty() {
+            h.push(format!("{}: {}", name, list.join(", ")));
+        }
+    }
+    h.push(format!("Subject: {}", enc_header(v["subject"].as_str().unwrap_or(""))));
+    if let Some(d) = v["date"].as_str() {
+        // RFC 3339 to RFC 5322: "2026-10-27T14:05:00Z" is "27 Oct 2026 14:05:00 +0000".
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let mo: usize = d[5..7].parse().unwrap_or(1);
+        h.push(format!("Date: {} {} {} {} +0000", &d[8..10], months[mo.clamp(1, 12) - 1], &d[0..4], &d[11..19]));
+    }
+    for (k, name) in [("message_id", "Message-ID"), ("in_reply_to", "In-Reply-To")] {
+        if let Some(x) = v[k].as_str() {
+            h.push(format!("{}: {}", name, x.replace(['\r', '\n'], "")));
+        }
+    }
+    h.push("MIME-Version: 1.0".into());
+    let text = v["text"].as_str().unwrap_or("").to_string();
+    let body_html = v["html"].as_str().map(String::from);
+    let alt = |b: &str| -> String {
+        let mut s = format!("Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n", b);
+        s.push_str(&format!("--{}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n", b, b64_lines(text.as_bytes())));
+        if let Some(hb) = &body_html {
+            s.push_str(&format!("--{}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n", b, b64_lines(hb.as_bytes())));
+        }
+        s.push_str(&format!("--{}--\r\n", b));
+        s
+    };
+    let files: Vec<&Attachment> = m.attachments.iter().filter(|a| !a.embedded).collect();
+    let mut eml = h.join("\r\n");
+    eml.push_str("\r\n");
+    if files.is_empty() {
+        eml.push_str(&alt("=_quillo_alt"));
+    } else {
+        let b = "=_quillo_mixed";
+        eml.push_str(&format!("Content-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n--{}\r\n", b, b));
+        eml.push_str(&alt("=_quillo_alt"));
+        for a in files {
+            let name = enc_header(&a.name).replace('"', "");
+            eml.push_str(&format!(
+                "--{}\r\nContent-Type: {}; name=\"{}\"\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n",
+                b,
+                a.mime.as_deref().unwrap_or("application/octet-stream"),
+                name,
+                name
+            ));
+            if let Some(cid) = &a.content_id {
+                eml.push_str(&format!("Content-ID: <{}>\r\n", cid.trim_matches(['<', '>'])));
+            }
+            eml.push_str(&format!("\r\n{}\r\n", b64_lines(&a.data)));
+        }
+        eml.push_str(&format!("--{}--\r\n", b));
+    }
+    if let Some(dir) = std::path::Path::new(out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    std::fs::write(out, &eml).map_err(|e| format!("{}: {}", out, e))?;
+    Ok(eml.len() as i64)
+}

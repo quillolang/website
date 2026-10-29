@@ -1,0 +1,241 @@
+//! KML and KMZ, Google Earth's and My Maps' files: placemarks read to GeoJSON with their names, descriptions, folders and extended data, and GeoJSON written back as KML or KMZ.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! roxmltree = "0.20"
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{Read, Write};
+
+const MAX_KML: u64 = 50 * 1024 * 1024;
+
+fn local(n: &roxmltree::Node) -> String {
+    n.tag_name().name().to_string()
+}
+
+fn child<'a>(n: &roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
+    n.children().find(|c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn text_of(n: &roxmltree::Node) -> String {
+    n.descendants().filter(|d| d.is_text()).map(|d| d.text().unwrap_or("")).collect::<String>().trim().to_string()
+}
+
+fn coords(text: &str) -> Vec<Value> {
+    text.split_whitespace().filter_map(|t| {
+        let nums: Vec<f64> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        match nums.len() {
+            2 => Some(json!([nums[0], nums[1]])),
+            n if n >= 3 => Some(if nums[2] == 0.0 { json!([nums[0], nums[1]]) } else { json!([nums[0], nums[1], nums[2]]) }),
+            _ => None,
+        }
+    }).collect()
+}
+
+fn ring(n: &roxmltree::Node) -> Option<Value> {
+    n.descendants().find(|d| d.is_element() && d.tag_name().name() == "coordinates").map(|c| Value::Array(coords(&text_of(&c))))
+}
+
+fn geometry(n: &roxmltree::Node) -> Option<Value> {
+    match local(n).as_str() {
+        "Point" => ring(n).and_then(|c| c.as_array().and_then(|a| a.first().cloned())).map(|p| json!({"type": "Point", "coordinates": p})),
+        "LineString" | "LinearRing" => ring(n).map(|c| json!({"type": "LineString", "coordinates": c})),
+        "Polygon" => {
+            let mut rings = Vec::new();
+            if let Some(o) = child(n, "outerBoundaryIs") { rings.extend(ring(&o)) }
+            for i in n.children().filter(|c| c.is_element() && c.tag_name().name() == "innerBoundaryIs") { rings.extend(ring(&i)) }
+            if rings.is_empty() { None } else { Some(json!({"type": "Polygon", "coordinates": rings})) }
+        }
+        "Track" => {
+            let pts: Vec<Value> = n.children().filter(|c| c.is_element() && c.tag_name().name() == "coord").filter_map(|c| {
+                let v: Vec<f64> = text_of(&c).split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if v.len() >= 2 { Some(json!([v[0], v[1]])) } else { None }
+            }).collect();
+            if pts.is_empty() { None } else { Some(json!({"type": "LineString", "coordinates": pts})) }
+        }
+        "MultiGeometry" | "MultiTrack" => {
+            let parts: Vec<Value> = n.children().filter(|c| c.is_element()).filter_map(|c| geometry(&c)).collect();
+            if parts.is_empty() { return None }
+            let t0 = parts[0]["type"].as_str().unwrap_or("").to_string();
+            if parts.iter().all(|p| p["type"] == t0.as_str()) && t0 != "GeometryCollection" {
+                Some(json!({"type": format!("Multi{}", t0), "coordinates": parts.iter().map(|p| p["coordinates"].clone()).collect::<Vec<_>>()}))
+            } else {
+                Some(json!({"type": "GeometryCollection", "geometries": parts}))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn placemarks(n: roxmltree::Node, folders: &mut Vec<String>, out: &mut Vec<Value>) {
+    for c in n.children().filter(|c| c.is_element()) {
+        match local(&c).as_str() {
+            "Folder" | "Document" => {
+                let name = child(&c, "name").map(|x| text_of(&x));
+                let pushed = local(&c) == "Folder" && name.is_some();
+                if pushed { folders.push(name.unwrap()) }
+                placemarks(c, folders, out);
+                if pushed { folders.pop(); }
+            }
+            "Placemark" => {
+                let mut props = Map::new();
+                props.insert("name".into(), child(&c, "name").map(|x| json!(text_of(&x))).unwrap_or(Value::Null));
+                props.insert("description".into(), child(&c, "description").map(|x| json!(text_of(&x))).unwrap_or(Value::Null));
+                if !folders.is_empty() { props.insert("folder".into(), json!(folders.join("/"))); }
+                if let Some(s) = child(&c, "styleUrl") { props.insert("style".into(), json!(text_of(&s))); }
+                if let Some(ts) = child(&c, "TimeStamp").and_then(|t| child(&t, "when")) { props.insert("time".into(), json!(text_of(&ts))); }
+                if let Some(ext) = child(&c, "ExtendedData") {
+                    for d in ext.descendants().filter(|d| d.is_element()) {
+                        match local(&d).as_str() {
+                            "Data" => { if let Some(k) = d.attribute("name") { props.insert(k.to_string(), json!(child(&d, "value").map(|v| text_of(&v)).unwrap_or_default())); } }
+                            "SimpleData" => { if let Some(k) = d.attribute("name") { props.insert(k.to_string(), json!(text_of(&d))); } }
+                            _ => {}
+                        }
+                    }
+                }
+                let geom = c.children().filter(|g| g.is_element()).find_map(|g| geometry(&g)).unwrap_or(Value::Null);
+                out.push(json!({"type": "Feature", "properties": props, "geometry": geom}));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_kml(text: &str) -> Result<Value, String> {
+    let opt = roxmltree::ParsingOptions { allow_dtd: false, ..Default::default() };
+    let doc = roxmltree::Document::parse_with_options(text, opt).map_err(|e| format!("the KML is not well-formed XML: {}", e))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "kml" {
+        return Err(format!("the document is <{}>, not <kml>", root.tag_name().name()));
+    }
+    let mut out = Vec::new();
+    placemarks(root, &mut Vec::new(), &mut out);
+    let name = root.descendants().find(|d| d.is_element() && local(d) == "Document").and_then(|d| child(&d, "name")).map(|n| text_of(&n));
+    Ok(json!({"type": "FeatureCollection", "name": name, "features": out}))
+}
+
+fn kmz_text(bytes: &[u8]) -> Result<String, String> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("the KMZ is not a zip: {}", e))?;
+    let names: Vec<String> = z.file_names().map(|s| s.to_string()).collect();
+    let pick = names.iter().find(|n| n.as_str() == "doc.kml").or_else(|| names.iter().find(|n| n.to_lowercase().ends_with(".kml"))).ok_or("the KMZ holds no .kml file")?.clone();
+    let f = z.by_name(&pick).map_err(|e| e.to_string())?;
+    let mut s = String::new();
+    f.take(MAX_KML).read_to_string(&mut s).map_err(|e| format!("{}: {}", pick, e))?;
+    Ok(s)
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn pos(p: &Value) -> Result<String, String> {
+    let a = p.as_array().filter(|a| a.len() >= 2).ok_or_else(|| format!("{} is not a position", p))?;
+    let n: Vec<String> = a.iter().take(3).map(|x| x.as_f64().map(|f| f.to_string()).ok_or_else(|| format!("{} is not a number", x))).collect::<Result<_, _>>()?;
+    Ok(n.join(","))
+}
+
+fn seq(v: &Value) -> Result<String, String> {
+    Ok(v.as_array().ok_or("coordinates are a list")?.iter().map(pos).collect::<Result<Vec<_>, _>>()?.join(" "))
+}
+
+fn write_geom(g: &Value, o: &mut String) -> Result<(), String> {
+    let c = &g["coordinates"];
+    let poly = |rings: &Value, o: &mut String| -> Result<(), String> {
+        let r = rings.as_array().ok_or("polygon rings are a list")?;
+        o.push_str("<Polygon>");
+        for (i, ring) in r.iter().enumerate() {
+            let tag = if i == 0 { "outerBoundaryIs" } else { "innerBoundaryIs" };
+            o.push_str(&format!("<{tag}><LinearRing><coordinates>{}</coordinates></LinearRing></{tag}>", seq(ring)?));
+        }
+        o.push_str("</Polygon>");
+        Ok(())
+    };
+    match g["type"].as_str().unwrap_or("") {
+        "Point" => o.push_str(&format!("<Point><coordinates>{}</coordinates></Point>", pos(c)?)),
+        "LineString" => o.push_str(&format!("<LineString><tessellate>1</tessellate><coordinates>{}</coordinates></LineString>", seq(c)?)),
+        "Polygon" => poly(c, o)?,
+        t @ ("MultiPoint" | "MultiLineString" | "MultiPolygon") => {
+            o.push_str("<MultiGeometry>");
+            for part in c.as_array().ok_or("coordinates are a list")? { write_geom(&json!({"type": &t[5..], "coordinates": part}), o)? }
+            o.push_str("</MultiGeometry>");
+        }
+        "GeometryCollection" => {
+            o.push_str("<MultiGeometry>");
+            for part in g["geometries"].as_array().ok_or("geometries are a list")? { write_geom(part, o)? }
+            o.push_str("</MultiGeometry>");
+        }
+        t => return Err(format!("`{}` is not a GeoJSON geometry type", t)),
+    }
+    Ok(())
+}
+
+fn write_kml(geojson: &Value, name: &str) -> Result<String, String> {
+    let feats: Vec<Value> = match geojson["type"].as_str() {
+        Some("FeatureCollection") => geojson["features"].as_array().cloned().unwrap_or_default(),
+        Some("Feature") => vec![geojson.clone()],
+        Some(_) => vec![json!({"type": "Feature", "properties": {}, "geometry": geojson})],
+        None => return Err("GeoJSON has a `type`".into()),
+    };
+    let mut o = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n");
+    o.push_str(&format!("<name>{}</name>\n", esc(name)));
+    for f in feats {
+        o.push_str("<Placemark>");
+        let props = f["properties"].as_object().cloned().unwrap_or_default();
+        if let Some(n) = props.get("name").and_then(|v| v.as_str()) { o.push_str(&format!("<name>{}</name>", esc(n))) }
+        if let Some(d) = props.get("description").and_then(|v| v.as_str()) { o.push_str(&format!("<description>{}</description>", esc(d))) }
+        let extra: Vec<(&String, &Value)> = props.iter().filter(|(k, v)| k.as_str() != "name" && k.as_str() != "description" && !v.is_null()).collect();
+        if !extra.is_empty() {
+            o.push_str("<ExtendedData>");
+            for (k, v) in extra {
+                let s = match v { Value::String(s) => s.clone(), other => other.to_string() };
+                o.push_str(&format!("<Data name=\"{}\"><value>{}</value></Data>", esc(k), esc(&s)));
+            }
+            o.push_str("</ExtendedData>");
+        }
+        if !f["geometry"].is_null() { write_geom(&f["geometry"], &mut o)? }
+        o.push_str("</Placemark>\n");
+    }
+    o.push_str("</Document>\n</kml>\n");
+    Ok(o)
+}
+
+/// KML text read: a GeoJSON FeatureCollection, one feature per placemark, with `name`, `description`, `folder` (the folders it is in, joined with `/`), `style`, `time` and its ExtendedData as properties. gx:Track becomes a line.
+pub fn kml_to_geojson(kml: &str) -> Result<Value, String> {
+    read_kml(kml)
+}
+
+/// A .kml or .kmz file read, as `kml_to_geojson` reads KML text: for uploads from Google Earth and Google My Maps.
+pub fn kml_file_to_geojson(path: &str) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    if bytes.starts_with(b"PK") {
+        read_kml(&kmz_text(&bytes)?)
+    } else {
+        read_kml(&String::from_utf8_lossy(&bytes))
+    }
+}
+
+/// GeoJSON (a FeatureCollection, a feature or a geometry) as KML text named `name`: `name` and `description` properties become the placemark's, the others its ExtendedData.
+pub fn kml_from_geojson(geojson: serde_json::Value, name: &str) -> Result<String, String> {
+    write_kml(&geojson, name)
+}
+
+/// GeoJSON saved as a .kml file, or a .kmz (zipped, smaller) when `path` ends with .kmz, folders made: the path written.
+pub fn kml_save(geojson: serde_json::Value, name: &str, path: &str) -> Result<String, String> {
+    let text = write_kml(&geojson, name)?;
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    if path.to_lowercase().ends_with(".kmz") {
+        let f = std::fs::File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("doc.kml", opts).map_err(|e| e.to_string())?;
+        z.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        z.finish().map_err(|e| e.to_string())?;
+    } else {
+        std::fs::write(path, text).map_err(|e| format!("{}: {}", path, e))?;
+    }
+    Ok(path.to_string())
+}

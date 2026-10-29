@@ -1,0 +1,5 @@
+^XA
+^CI28
+^FO40,40^A0N,60,60^FDRaw job, sent as is^FS
+^FO40,120^BY3^BCN,100,Y,N,N^FDRAW-0001^FS
+^XZ

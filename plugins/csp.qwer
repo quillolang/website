@@ -1,0 +1,257 @@
+//! Content-Security-Policy headers built from a map, read back, given a fresh nonce per page, checked for the holes that let scripts in, and asked whether a URL would load.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! rand = "0.8"
+//! sha2 = "0.10"
+//! url = "2"
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use rand::RngCore;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256, Sha384, Sha512};
+use std::collections::HashMap;
+
+const FETCH: &[&str] = &["script-src", "style-src", "img-src", "connect-src", "font-src", "object-src", "media-src", "frame-src", "child-src", "worker-src", "manifest-src"];
+
+fn parse(policy: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = vec![];
+    // Several policies joined by commas all apply; directives within one are separated by `;`.
+    for d in policy.split(';') {
+        let mut words = d.split_whitespace();
+        let Some(name) = words.next() else { continue };
+        let name = name.to_ascii_lowercase();
+        if out.iter().any(|(n, _)| *n == name) {
+            continue; // browsers keep the first of a directive given twice
+        }
+        out.push((name, words.map(|w| w.to_string()).collect()));
+    }
+    out
+}
+
+fn write(ds: &[(String, Vec<String>)]) -> String {
+    ds.iter().map(|(n, v)| if v.is_empty() { n.clone() } else { format!("{} {}", n, v.join(" ")) }).collect::<Vec<_>>().join("; ")
+}
+
+fn words(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(xs) => xs.iter().filter_map(|x| x.as_str()).map(quote).collect(),
+        Value::String(s) => s.split_whitespace().map(quote).collect(),
+        Value::Bool(true) => vec![],
+        _ => vec![],
+    }
+}
+
+/// Keywords are written quoted in a policy: `self` becomes `'self'`, as `none`, `unsafe-inline`, `strict-dynamic` and the others.
+fn quote(w: &str) -> String {
+    const KEYWORDS: &[&str] = &["self", "none", "unsafe-inline", "unsafe-eval", "strict-dynamic", "unsafe-hashes", "report-sample", "wasm-unsafe-eval", "inline-speculation-rules"];
+    if KEYWORDS.contains(&w) || w.starts_with("nonce-") || w.starts_with("sha256-") || w.starts_with("sha384-") || w.starts_with("sha512-") {
+        format!("'{}'", w)
+    } else {
+        w.to_string()
+    }
+}
+
+/// A policy from a map of directives to their sources, as a list or one string: `{ "default-src": ["self"], "img-src": "self data:",
+/// "upgrade-insecure-requests": true }`. Keywords may be written without quotes. `default-src` comes first, the rest in name order.
+pub fn csp_build(directives: std::collections::HashMap<String, serde_json::Value>) -> String {
+    let mut names: Vec<&String> = directives.keys().filter(|k| !matches!(directives[*k], Value::Null | Value::Bool(false))).collect();
+    names.sort_by_key(|n| (n.as_str() != "default-src", n.to_string()));
+    let ds: Vec<(String, Vec<String>)> = names.into_iter().map(|n| (n.to_ascii_lowercase(), words(&directives[n]))).collect();
+    write(&ds)
+}
+
+/// A policy read into a map of each directive to its sources (`{ "script-src": ["'self'", "https://cdn.example"] }`).
+pub fn csp_parse(policy: &str) -> HashMap<String, Vec<String>> {
+    parse(policy).into_iter().collect()
+}
+
+/// A fresh nonce, 16 random bytes in base64: make one per response, put it in the policy and on each `<script nonce=...>`.
+pub fn csp_nonce() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    STANDARD.encode(b)
+}
+
+/// `policy` with `'nonce-<nonce>'` added to `script-src` and `style-src` (each made from `default-src` when it is missing).
+pub fn csp_with_nonce(policy: &str, nonce: &str) -> String {
+    let mut ds = parse(policy);
+    let default = ds.iter().find(|(n, _)| n == "default-src").map(|(_, v)| v.clone()).unwrap_or_else(|| vec!["'self'".into()]);
+    for name in ["script-src", "style-src"] {
+        let tag = format!("'nonce-{}'", nonce);
+        match ds.iter_mut().find(|(n, _)| n == name) {
+            Some((_, v)) => {
+                v.retain(|w| w != "'none'");
+                v.push(tag)
+            }
+            None => {
+                let mut v: Vec<String> = default.iter().filter(|w| *w != "'none'").cloned().collect();
+                v.push(tag);
+                ds.push((name.to_string(), v));
+            }
+        }
+    }
+    write(&ds)
+}
+
+/// The source for an inline script or style allowed by its hash: `'sha256-...'` (`algorithm` "sha256", "sha384" or "sha512").
+pub fn csp_hash(content: &str, algorithm: &str) -> Result<String, String> {
+    let digest = match algorithm.to_lowercase().as_str() {
+        "sha256" => Sha256::digest(content.as_bytes()).to_vec(),
+        "sha384" => Sha384::digest(content.as_bytes()).to_vec(),
+        "sha512" => Sha512::digest(content.as_bytes()).to_vec(),
+        a => return Err(format!("unknown algorithm `{}`: sha256, sha384 or sha512", a)),
+    };
+    Ok(format!("'{}-{}'", algorithm.to_lowercase(), STANDARD.encode(digest)))
+}
+
+fn effective<'a>(ds: &'a [(String, Vec<String>)], name: &str) -> Option<&'a Vec<String>> {
+    let fallback: &[&str] = match name {
+        "script-src-elem" | "script-src-attr" => &["script-src", "default-src"],
+        "style-src-elem" | "style-src-attr" => &["style-src", "default-src"],
+        "frame-src" | "worker-src" => &["child-src", "script-src", "default-src"],
+        _ => &["default-src"],
+    };
+    std::iter::once(name).chain(fallback.iter().copied()).find_map(|n| ds.iter().find(|(d, _)| d == n).map(|(_, v)| v))
+}
+
+/// What is weak or missing in a policy: `{ grade, problems: [{ directive, severity, message, fix }] }`, `grade` "A" with no
+/// high or medium problems down to "F". It looks for what lets an injected script run: `'unsafe-inline'` without a nonce or
+/// hash, `'unsafe-eval'`, wildcards and whole schemes, no `object-src` or `base-uri`, no `frame-ancestors`.
+pub fn csp_check(policy: &str) -> Value {
+    let ds = parse(policy);
+    let mut problems: Vec<Value> = vec![];
+    let mut add = |d: &str, sev: &str, msg: &str, fix: &str| problems.push(json!({ "directive": d, "severity": sev, "message": msg, "fix": fix }));
+    if ds.is_empty() {
+        add("", "high", "the policy is empty", "start from default-src 'self'; object-src 'none'; base-uri 'none'");
+    }
+    if !ds.iter().any(|(n, _)| n == "default-src") {
+        add("default-src", "medium", "no default-src: whatever is not named (fonts, media, frames) may load from anywhere", "add default-src 'self'");
+    }
+    match effective(&ds, "script-src") {
+        None => add("script-src", "high", "scripts may load from anywhere", "add script-src 'self' with a nonce"),
+        Some(v) => {
+            let nonce_or_hash = v.iter().any(|w| w.starts_with("'nonce-") || w.starts_with("'sha"));
+            if v.iter().any(|w| w == "'unsafe-inline'") && !nonce_or_hash {
+                add("script-src", "high", "'unsafe-inline' lets any injected <script> or onclick run", "use a nonce or hashes, and drop 'unsafe-inline'");
+            }
+            if v.iter().any(|w| w == "'unsafe-eval'") {
+                add("script-src", "medium", "'unsafe-eval' lets strings run as code (eval, new Function)", "remove it, or use 'wasm-unsafe-eval' if only WebAssembly needs it");
+            }
+            if v.iter().any(|w| w == "*" || w == "https:" || w == "http:" || w == "data:" || w == "blob:") && !v.iter().any(|w| w == "'strict-dynamic'") {
+                add("script-src", "high", "a wildcard or a whole scheme lets scripts from any site in", "name the hosts, or use a nonce with 'strict-dynamic'");
+            }
+            if v.iter().any(|w| w == "'strict-dynamic'") && !nonce_or_hash {
+                add("script-src", "high", "'strict-dynamic' without a nonce or hash blocks every script", "add a nonce or hashes");
+            }
+        }
+    }
+    let object = effective(&ds, "object-src");
+    if !object.is_some_and(|v| v.len() == 1 && v[0] == "'none'") {
+        add("object-src", "medium", "plugins (<object>, <embed>) may load: an old way around script-src", "add object-src 'none'");
+    }
+    if !ds.iter().any(|(n, _)| n == "base-uri") {
+        add("base-uri", "medium", "an injected <base> can point the page's relative scripts at another site", "add base-uri 'none' (or 'self')");
+    }
+    if !ds.iter().any(|(n, _)| n == "frame-ancestors") {
+        add("frame-ancestors", "low", "other sites may frame the page (clickjacking)", "add frame-ancestors 'none' (or 'self')");
+    }
+    if !ds.iter().any(|(n, _)| n == "form-action") {
+        add("form-action", "low", "an injected form may post to any site", "add form-action 'self'");
+    }
+    for (n, v) in &ds {
+        if FETCH.contains(&n.as_str()) || n == "default-src" {
+            if v.iter().any(|w| w.starts_with("http://") || w == "http:") {
+                add(n, "low", "a source over plain http can be changed on the way", "use https");
+            }
+        }
+        if n == "report-uri" && !ds.iter().any(|(d, _)| d == "report-to") {
+            add(n, "low", "report-uri is deprecated", "add report-to with a Reporting-Endpoints header, and keep report-uri for older browsers");
+        }
+    }
+    let count = |s: &str| problems.iter().filter(|p| p["severity"] == s).count();
+    let grade = match (count("high"), count("medium"), count("low")) {
+        (0, 0, 0) => "A+",
+        (0, 0, _) => "A",
+        (0, 1, _) => "B",
+        (0, _, _) => "C",
+        (1, _, _) => "D",
+        _ => "F",
+    };
+    json!({ "grade": grade, "problems": problems })
+}
+
+fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(rest) => host.ends_with(&format!(".{}", rest)),
+        None => pattern.eq_ignore_ascii_case(host),
+    }
+}
+
+fn source_matches(src: &str, u: &url::Url, page: &url::Url) -> bool {
+    let scheme = u.scheme();
+    match src {
+        "*" => !matches!(scheme, "data" | "blob" | "filesystem"),
+        "'self'" => u.origin() == page.origin() || (page.scheme() == "http" && scheme == "https" && u.host_str() == page.host_str()),
+        "'none'" => false,
+        s if s.ends_with(':') && !s.contains('/') => {
+            let s = &s[..s.len() - 1];
+            s.eq_ignore_ascii_case(scheme) || (s == "http" && scheme == "https")
+        }
+        s if s.starts_with('\'') => false,
+        s => {
+            let (sch, rest) = match s.split_once("://") {
+                Some((a, b)) => (Some(a), b),
+                None => (None, s),
+            };
+            if let Some(sch) = sch {
+                if !(sch.eq_ignore_ascii_case(scheme) || (sch == "http" && scheme == "https")) {
+                    return false;
+                }
+            } else if !(scheme == page.scheme() || (page.scheme() == "http" && scheme == "https")) {
+                return false;
+            }
+            let (hostport, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let (h, port) = match hostport.rsplit_once(':') {
+                Some((h, p)) if !h.is_empty() => (h, Some(p)),
+                _ => (hostport, None),
+            };
+            let Some(uh) = u.host_str() else { return false };
+            if !host_matches(h, uh) {
+                return false;
+            }
+            match port {
+                Some("*") => {}
+                Some(p) => {
+                    if u.port_or_known_default().map(|x| x.to_string()) != Some(p.to_string()) {
+                        return false;
+                    }
+                }
+                None => {
+                    if u.port().is_some() && u.port() != url::Url::parse(&format!("{}://x", scheme)).ok().and_then(|d| d.port_or_known_default()) {
+                        return false;
+                    }
+                }
+            }
+            path.is_empty() || if path.ends_with('/') { u.path().starts_with(path) } else { u.path() == path }
+        }
+    }
+}
+
+/// Whether `url` may load as `directive` (`"script-src"`, `"img-src"`, ...) under `policy`, on a page at `page_url`
+/// (for `'self'` and relative URLs). Falls back to `default-src` as browsers do; nonces and hashes are for inline code, not URLs.
+pub fn csp_allows(policy: &str, directive: &str, url: &str, page_url: &str) -> Result<bool, String> {
+    let page = url::Url::parse(page_url).map_err(|e| format!("page_url: {}", e))?;
+    let u = page.join(url).map_err(|e| format!("url: {}", e))?;
+    let ds = parse(policy);
+    let Some(sources) = effective(&ds, &directive.to_ascii_lowercase()) else { return Ok(true) };
+    if sources.iter().any(|w| w == "'strict-dynamic'") && directive.starts_with("script-src") {
+        return Ok(false); // with 'strict-dynamic', URLs load only from trusted scripts
+    }
+    Ok(sources.iter().any(|s| source_matches(s, &u, &page)))
+}

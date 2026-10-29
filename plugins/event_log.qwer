@@ -1,0 +1,225 @@
+//! An append-only event log in one file, for event sourcing and audit trails: events appended to streams ("order-42") with optimistic concurrency (the version you expect), read back by stream or for the whole log from a position (to build projections), snapshots so a long stream need not be replayed from its start, and a hash chain that shows if any past line was changed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha2 = "0.10"
+
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::sync::{Mutex, OnceLock};
+
+struct Index {
+    len: u64,
+    seq: u64,
+    last_hash: String,
+    versions: HashMap<String, u64>,
+}
+
+fn lock() -> &'static Mutex<HashMap<String, Index>> {
+    static L: OnceLock<Mutex<HashMap<String, Index>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60, ms.rem_euclid(1000))
+}
+
+/// The log's lines that are whole (a line cut by a crash, without its newline, is left out).
+fn lines(path: &str) -> Result<(Vec<Value>, u64), String> {
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], 0)),
+        Err(e) => return Err(format!("{}: {}", path, e)),
+    };
+    let mut r = std::io::BufReader::new(f);
+    let mut out = vec![];
+    let mut good = 0u64;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = r.read_line(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 || !buf.ends_with('\n') {
+            break;
+        }
+        let v: Value = serde_json::from_str(buf.trim_end()).map_err(|e| format!("{}: line {} is damaged: {}", path, out.len() + 1, e))?;
+        out.push(v);
+        good += n as u64;
+    }
+    Ok((out, good))
+}
+
+/// The index, rebuilt when the file changed outside this process.
+fn index<'a>(m: &'a mut HashMap<String, Index>, path: &str) -> Result<&'a mut Index, String> {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let stale = m.get(path).map_or(true, |i| i.len != len);
+    if stale {
+        let (ls, good) = lines(path)?;
+        if good < len {
+            // A torn last line: cut it off so the next append starts clean.
+            let f = std::fs::OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
+            f.set_len(good).map_err(|e| e.to_string())?;
+        }
+        let mut versions = HashMap::new();
+        for l in &ls {
+            if let (Some(s), Some(v)) = (l["stream"].as_str(), l["version"].as_u64()) {
+                versions.insert(s.to_string(), v);
+            }
+        }
+        let seq = ls.last().and_then(|l| l["seq"].as_u64()).unwrap_or(0);
+        let last_hash = ls.last().and_then(|l| l["hash"].as_str()).unwrap_or("").to_string();
+        m.insert(path.to_string(), Index { len: good, seq, last_hash, versions });
+    }
+    Ok(m.get_mut(path).unwrap())
+}
+
+/// The hash of an event: SHA-256 over the previous hash and the event's own fields.
+fn chain(prev: &str, e: &Value) -> String {
+    let mut h = Sha256::new();
+    h.update(prev.as_bytes());
+    for k in ["seq", "stream", "version", "type", "at"] {
+        h.update(e[k].to_string().as_bytes());
+    }
+    h.update(e["data"].to_string().as_bytes());
+    h.update(e["meta"].to_string().as_bytes());
+    hex(&h.finalize())
+}
+
+/// Appends events to `stream` in the log file at `path` (made when missing): each `{ type, data, meta }`. `expected_version`: the stream's version you read (0 or -1: it must not exist yet), or null to append whatever it is.
+/// Gives `{ stream, first_seq, last_seq, version }`; a stream moved on since you read it is an error (reload and try again), never a lost update.
+pub fn elog_append(path: &str, stream: &str, events: Vec<serde_json::Value>, expected_version: Option<i64>) -> Result<serde_json::Value, String> {
+    if stream.is_empty() || stream.len() > 200 {
+        return Err("a stream's name is 1 to 200 characters".into());
+    }
+    if events.is_empty() || events.len() > 10_000 {
+        return Err("1 to 10,000 events at once".into());
+    }
+    let mut m = lock().lock().map_err(|_| "the log's lock is poisoned")?;
+    let idx = index(&mut m, path)?;
+    let current = idx.versions.get(stream).copied().unwrap_or(0);
+    if let Some(e) = expected_version {
+        let want = e.max(0) as u64;
+        if want != current {
+            return Err(format!("{} is at version {}, not {}: someone else wrote to it; read it again", stream, current, want));
+        }
+    }
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let mut out = String::new();
+    let (mut seq, mut ver, mut prev) = (idx.seq, current, idx.last_hash.clone());
+    let first = seq + 1;
+    for ev in &events {
+        let t = ev["type"].as_str().ok_or("each event has a `type`")?;
+        seq += 1;
+        ver += 1;
+        let mut e = json!({ "seq": seq, "stream": stream, "version": ver, "type": t, "at": utc(now), "data": ev.get("data").cloned().unwrap_or(Value::Null), "meta": ev.get("meta").cloned().unwrap_or(Value::Null) });
+        let h = chain(&prev, &e);
+        e["hash"] = json!(h);
+        prev = h;
+        out.push_str(&e.to_string());
+        out.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(out.as_bytes()).map_err(|e| e.to_string())?;
+    f.sync_data().map_err(|e| e.to_string())?;
+    idx.len += out.len() as u64;
+    idx.seq = seq;
+    idx.last_hash = prev;
+    idx.versions.insert(stream.to_string(), ver);
+    Ok(json!({ "stream": stream, "first_seq": first, "last_seq": seq, "version": ver }))
+}
+
+fn clean(mut e: Value) -> Value {
+    if let Value::Object(m) = &mut e {
+        m.remove("hash");
+    }
+    e
+}
+
+/// A stream's events from `from_version` (1 for all), at most `limit`: `[{ seq, stream, version, type, at, data, meta }]`.
+pub fn elog_read_stream(path: &str, stream: &str, from_version: i64, limit: i64) -> Result<Vec<serde_json::Value>, String> {
+    let (ls, _) = lines(path)?;
+    Ok(ls.into_iter().filter(|e| e["stream"] == stream && e["version"].as_i64().unwrap_or(0) >= from_version).take(limit.clamp(1, 1_000_000) as usize).map(clean).collect())
+}
+
+/// The whole log after position `after_seq` (0 for the start), at most `limit`, only `types` when given (empty: all): what a projection or a subscriber reads, remembering the last `seq` it saw.
+pub fn elog_read_all(path: &str, after_seq: i64, limit: i64, types: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
+    let (ls, _) = lines(path)?;
+    Ok(ls
+        .into_iter()
+        .filter(|e| e["seq"].as_i64().unwrap_or(0) > after_seq && (types.is_empty() || types.iter().any(|t| e["type"] == t.as_str())))
+        .take(limit.clamp(1, 1_000_000) as usize)
+        .map(clean)
+        .collect())
+}
+
+/// The streams and their versions, those starting with `prefix`: `[{ stream, version }]`.
+pub fn elog_streams(path: &str, prefix: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut m = lock().lock().map_err(|_| "the log's lock is poisoned")?;
+    let idx = index(&mut m, path)?;
+    let mut v: Vec<(String, u64)> = idx.versions.iter().filter(|(k, _)| k.starts_with(prefix)).map(|(k, v)| (k.clone(), *v)).collect();
+    v.sort();
+    Ok(v.into_iter().map(|(s, n)| json!({ "stream": s, "version": n })).collect())
+}
+
+fn snap_path(path: &str) -> String {
+    format!("{}.snapshots", path)
+}
+
+/// Saves a stream's state as of `version` (what you folded its events into), in a file beside the log, so loading it later replays only the events after it.
+pub fn elog_snapshot(path: &str, stream: &str, version: i64, state: serde_json::Value) -> Result<i64, String> {
+    let rec = json!({ "stream": stream, "version": version, "state": state });
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(snap_path(path)).map_err(|e| e.to_string())?;
+    f.write_all(format!("{}\n", rec).as_bytes()).map_err(|e| e.to_string())?;
+    f.sync_data().map_err(|e| e.to_string())?;
+    Ok(version)
+}
+
+/// What rebuilding a stream needs: its latest snapshot (`{ version, state }`, or null) and the events after it; fold `events` into `snapshot.state` to get the present. Also `version`, the stream's latest, for `elog_append`'s `expected_version`.
+pub fn elog_load(path: &str, stream: &str) -> Result<serde_json::Value, String> {
+    let (snaps, _) = lines(&snap_path(path))?;
+    let snap = snaps.into_iter().filter(|s| s["stream"] == stream).max_by_key(|s| s["version"].as_i64().unwrap_or(0));
+    let from = snap.as_ref().and_then(|s| s["version"].as_i64()).unwrap_or(0) + 1;
+    let events = elog_read_stream(path, stream, from, 1_000_000)?;
+    let version = events.last().and_then(|e| e["version"].as_i64()).unwrap_or(from - 1);
+    Ok(json!({ "snapshot": snap.map(|s| json!({ "version": s["version"], "state": s["state"] })), "events": events, "version": version }))
+}
+
+/// Checks the hash chain from the first event: `{ ok, events, broken_at (the first seq whose hash does not follow), streams }`. A changed, removed or reordered past event breaks it.
+pub fn elog_verify(path: &str) -> Result<serde_json::Value, String> {
+    let (ls, _) = lines(path)?;
+    let mut prev = String::new();
+    let mut streams: Map<String, Value> = Map::new();
+    for (i, e) in ls.iter().enumerate() {
+        let want = chain(&prev, e);
+        if e["hash"].as_str() != Some(want.as_str()) || e["seq"].as_u64() != Some(i as u64 + 1) {
+            return Ok(json!({ "ok": false, "events": ls.len(), "broken_at": e["seq"] }));
+        }
+        prev = want;
+        if let Some(s) = e["stream"].as_str() {
+            streams.insert(s.to_string(), e["version"].clone());
+        }
+    }
+    Ok(json!({ "ok": true, "events": ls.len(), "broken_at": null, "streams": streams.len() }))
+}
