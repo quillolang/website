@@ -1,0 +1,889 @@
+//! MQTT 3.1.1 and 5 clients for IoT brokers (Mosquitto, EMQX, HiveMQ, AWS IoT): connect with a client id, credentials, TLS and a last will, publish with QoS 0, 1 or 2 and retain and wait for the broker's acknowledgement, subscribe with `+` and `#` wildcards into a buffer the program drains, and unsubscribe.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rumqttc = { version = "=0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+//! base64 = "0.22"
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Each connection is a rumqttc client and a thread that drives its event loop: the thread keeps
+// what arrives in a bounded buffer (`buffer`, 10000 messages by default; when it is full the oldest
+// is dropped and counted), records the acknowledgements calls wait for, reconnects after an error
+// (1 s, then up to 10 s apart) and subscribes again when the broker kept no session.
+
+enum Client {
+    V4(rumqttc::Client),
+    V5(rumqttc::v5::Client),
+}
+
+#[derive(Clone, Debug)]
+enum Ev {
+    OutPub(u16),
+    Acked(u16, Option<String>),
+    OutSub(u16),
+    SubAck(u16, Vec<Result<i64, String>>),
+    OutUnsub(u16),
+    UnsubAck(u16),
+}
+
+struct State {
+    connected: bool,
+    ever_connected: bool,
+    refused: Option<String>,
+    last_error: Option<String>,
+    connects: u64,
+    seq: u64,
+    events: VecDeque<(u64, Ev)>,
+    inbox: VecDeque<Value>,
+    cap: usize,
+    received: u64,
+    dropped: u64,
+    filters: Vec<(String, u8)>,
+    stop: bool,
+}
+
+struct Shared {
+    st: Mutex<State>,
+    cv: Condvar,
+}
+
+struct Conn {
+    client: Client,
+    shared: Arc<Shared>,
+    op: Mutex<()>,
+    timeout: Duration,
+    client_id: String,
+    version: u8,
+    url: String,
+}
+
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn get(name: &str) -> Result<Arc<Conn>, String> {
+    lock(&CONNS).as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no MQTT connection named `{}`: call mqtt_connect(\"{}\", url, options) first", name, name))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+impl Shared {
+    fn push(&self, ev: Ev) {
+        let mut st = lock(&self.st);
+        st.seq += 1;
+        let s = st.seq;
+        st.events.push_back((s, ev));
+        while st.events.len() > 2000 {
+            st.events.pop_front();
+        }
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    fn message(&self, m: Value) {
+        let mut st = lock(&self.st);
+        if st.inbox.len() >= st.cap {
+            st.inbox.pop_front();
+            st.dropped += 1;
+        }
+        st.inbox.push_back(m);
+        st.received += 1;
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    /// Waits for the first event after `after` that `f` picks, until `deadline`.
+    fn wait<T>(&self, after: u64, deadline: Instant, what: &str, f: impl Fn(&Ev) -> Option<T>) -> Result<(u64, T), String> {
+        let mut st = lock(&self.st);
+        loop {
+            for (s, e) in st.events.iter() {
+                if *s > after {
+                    if let Some(t) = f(e) {
+                        return Ok((*s, t));
+                    }
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let why = if st.connected { String::new() } else { format!(" (not connected: {})", st.last_error.clone().unwrap_or("connecting".into())) };
+                return Err(format!("the broker did not {} in time{}; a longer timeout_ms, or check the broker", what, why));
+            }
+            st = self.cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    fn seq(&self) -> u64 {
+        lock(&self.st).seq
+    }
+}
+
+fn opt_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn opt_i64(o: &Value, k: &str) -> Result<Option<i64>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(format!("`{}` must be a whole number", k)),
+        Some(Value::String(s)) => s.trim().parse::<i64>().map(Some).map_err(|_| format!("`{}` must be a whole number, not {:?}", k, s)),
+        Some(v) => Err(format!("`{}` must be a whole number, not {}", k, v)),
+    }
+}
+
+fn opt_bool(o: &Value, k: &str) -> Result<Option<bool>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(format!("`{}` must be true or false, not {}", k, v)),
+    }
+}
+
+fn check_keys(o: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
+    match o {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(format!("{} has no option `{}`; it takes {}", what, k, allowed.join(", ")));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("{} options must be a map, like {{ qos: 1 }}", what)),
+    }
+}
+
+fn qos_of(q: i64) -> Result<u8, String> {
+    if (0..=2).contains(&q) { Ok(q as u8) } else { Err(format!("qos must be 0, 1 or 2, not {}", q)) }
+}
+
+fn q4(q: u8) -> rumqttc::QoS {
+    match q { 0 => rumqttc::QoS::AtMostOnce, 1 => rumqttc::QoS::AtLeastOnce, _ => rumqttc::QoS::ExactlyOnce }
+}
+
+fn q5(q: u8) -> rumqttc::v5::mqttbytes::QoS {
+    use rumqttc::v5::mqttbytes::QoS;
+    match q { 0 => QoS::AtMostOnce, 1 => QoS::AtLeastOnce, _ => QoS::ExactlyOnce }
+}
+
+/// The payload: text as it is, `{ base64: "..." }` for bytes, anything else as JSON.
+fn payload_bytes(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
+        Value::Null => Ok(vec![]),
+        Value::Object(m) if m.len() == 1 && m.contains_key("base64") => {
+            let b = m.get("base64").and_then(|x| x.as_str()).ok_or("`base64` must be text")?;
+            base64::engine::general_purpose::STANDARD.decode(b.trim()).map_err(|e| format!("the payload's base64 is not valid: {}", e))
+        }
+        other => Ok(other.to_string().into_bytes()),
+    }
+}
+
+fn payload_json(b: &[u8], m: &mut serde_json::Map<String, Value>) {
+    match std::str::from_utf8(b) {
+        Ok(s) => {
+            m.insert("payload".into(), Value::String(s.to_string()));
+        }
+        Err(_) => {
+            m.insert("payload".into(), Value::Null);
+            m.insert("payload_base64".into(), Value::String(base64::engine::general_purpose::STANDARD.encode(b)));
+        }
+    }
+}
+
+/// Whether an MQTT topic filter is well formed: `+` a whole level, `#` the last level.
+fn valid_filter(f: &str) -> Result<(), String> {
+    if f.is_empty() {
+        return Err("a topic filter cannot be empty".into());
+    }
+    let levels: Vec<&str> = f.split('/').collect();
+    for (i, l) in levels.iter().enumerate() {
+        if l.contains('#') && (*l != "#" || i != levels.len() - 1) {
+            return Err(format!("`#` must be a whole level and the last one, as in `sensors/#`: {:?}", f));
+        }
+        if l.contains('+') && *l != "+" {
+            return Err(format!("`+` must be a whole level, as in `sensors/+/temp`: {:?}", f));
+        }
+    }
+    Ok(())
+}
+
+fn valid_topic(t: &str) -> Result<(), String> {
+    if t.is_empty() {
+        return Err("a topic cannot be empty".into());
+    }
+    if t.contains('+') || t.contains('#') {
+        return Err(format!("a topic to publish to cannot hold the wildcards `+` or `#`: {:?}", t));
+    }
+    Ok(())
+}
+
+/// Whether `topic` matches the MQTT filter `filter`.
+fn matches(filter: &str, topic: &str) -> bool {
+    let f: Vec<&str> = filter.split('/').collect();
+    let t: Vec<&str> = topic.split('/').collect();
+    if topic.starts_with('$') && (f[0] == "+" || f[0] == "#") {
+        return false;
+    }
+    for (i, l) in f.iter().enumerate() {
+        if *l == "#" {
+            return true;
+        }
+        if i >= t.len() {
+            return false;
+        }
+        if *l != "+" && *l != t[i] {
+            return false;
+        }
+    }
+    f.len() == t.len()
+}
+
+fn tls_config(o: &Value) -> Result<rumqttc::tokio_rustls::rustls::ClientConfig, String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(ca) = opt_str(o, "ca_file") {
+        for c in CertificateDer::pem_file_iter(&ca).map_err(|e| format!("cannot read ca_file {}: {}", ca, e))? {
+            roots.add(c.map_err(|e| format!("ca_file {}: {}", ca, e))?).map_err(|e| format!("ca_file {}: {}", ca, e))?;
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let b = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots);
+    match (opt_str(o, "cert_file"), opt_str(o, "key_file")) {
+        (Some(c), Some(k)) => {
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&c).map_err(|e| format!("cannot read cert_file {}: {}", c, e))?.collect::<Result<_, _>>().map_err(|e| format!("cert_file {}: {}", c, e))?;
+            let key = PrivateKeyDer::from_pem_file(&k).map_err(|e| format!("cannot read key_file {}: {}", k, e))?;
+            b.with_client_auth_cert(certs, key).map_err(|e| format!("the client certificate: {}", e))
+        }
+        (None, None) => Ok(b.with_no_client_auth()),
+        _ => Err("give both cert_file and key_file for a client certificate".into()),
+    }
+}
+
+struct Url {
+    tls: bool,
+    host: String,
+    port: u16,
+    user: Option<String>,
+    pass: Option<String>,
+}
+
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(x) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(x);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_url(url: &str) -> Result<Url, String> {
+    let u = url.trim();
+    let (scheme, rest) = u.split_once("://").ok_or(format!("{:?} is not an MQTT address: write mqtt://host:1883 or mqtts://host:8883", url))?;
+    let tls = match scheme.to_ascii_lowercase().as_str() {
+        "mqtt" | "tcp" => false,
+        "mqtts" | "ssl" | "tls" => true,
+        s => return Err(format!("{}:// is not MQTT: write mqtt:// or mqtts:// (WebSockets are not supported)", s)),
+    };
+    let rest = rest.split(['/', '?']).next().unwrap_or("");
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((a, h)) => (Some(a), h),
+        None => (None, rest),
+    };
+    let (user, pass) = match auth {
+        Some(a) => match a.split_once(':') {
+            Some((u, p)) => (Some(pct(u)), Some(pct(p))),
+            None => (Some(pct(a)), None),
+        },
+        None => (None, None),
+    };
+    let (host, port) = if let Some(h) = hostport.strip_prefix('[') {
+        let (h, p) = h.split_once(']').ok_or(format!("{:?}: an IPv6 address needs its closing ]", url))?;
+        (h.to_string(), p.strip_prefix(':').map(|s| s.to_string()))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p.to_string())),
+            None => (hostport.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("{:?} has no host", url));
+    }
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("{:?}: the port {:?} is not a number from 1 to 65535", url, p))?,
+        None => if tls { 8883 } else { 1883 },
+    };
+    Ok(Url { tls, host, port, user, pass })
+}
+
+fn conn_error(e: &dyn std::fmt::Display) -> String {
+    let s = e.to_string();
+    if s.contains("Connection refused (os error") || s.contains("os error 61") || s.contains("os error 111") {
+        format!("no MQTT broker answers there ({})", s)
+    } else {
+        s
+    }
+}
+
+fn refused4(c: &rumqttc::ConnectReturnCode) -> String {
+    use rumqttc::ConnectReturnCode as C;
+    match c {
+        C::RefusedProtocolVersion => "the broker refused MQTT 3.1.1: try version 5".into(),
+        C::BadClientId => "the broker refused the client id: give another `client_id`".into(),
+        C::ServiceUnavailable => "the broker is unavailable".into(),
+        C::BadUserNamePassword => "the broker refused the username or password".into(),
+        C::NotAuthorized => "the broker says this client is not authorized".into(),
+        C::Success => "connected".into(),
+    }
+}
+
+fn refused5(c: &rumqttc::v5::mqttbytes::v5::ConnectReturnCode) -> String {
+    use rumqttc::v5::mqttbytes::v5::ConnectReturnCode as C;
+    match c {
+        C::BadUserNamePassword => "the broker refused the username or password".into(),
+        C::NotAuthorized => "the broker says this client is not authorized".into(),
+        C::UnsupportedProtocolVersion => "the broker does not speak MQTT 5: try version 4 (3.1.1)".into(),
+        C::ClientIdentifierNotValid => "the broker refused the client id: give another `client_id`".into(),
+        C::Banned => "the broker has banned this client".into(),
+        other => format!("the broker refused the connection: {:?}", other),
+    }
+}
+
+/// The thread that drives a 3.1.1 connection.
+fn run4(mut conn: rumqttc::Connection, client: rumqttc::Client, sh: Arc<Shared>) {
+    use rumqttc::{Event, Outgoing, Packet, SubscribeReasonCode};
+    let mut backoff = 1000u64;
+    loop {
+        if lock(&sh.st).stop {
+            return;
+        }
+        let ev = match conn.recv() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        match ev {
+            Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                backoff = 1000;
+                let filters = {
+                    let mut st = lock(&sh.st);
+                    st.connected = true;
+                    st.ever_connected = true;
+                    st.connects += 1;
+                    st.last_error = None;
+                    if ack.session_present { vec![] } else { st.filters.clone() }
+                };
+                sh.cv.notify_all();
+                for (f, q) in filters {
+                    let _ = client.try_subscribe(f, q4(q));
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(p))) => {
+                let mut m = serde_json::Map::new();
+                m.insert("topic".into(), json!(p.topic));
+                payload_json(&p.payload, &mut m);
+                m.insert("qos".into(), json!(p.qos as u8));
+                m.insert("retain".into(), json!(p.retain));
+                m.insert("dup".into(), json!(p.dup));
+                m.insert("at".into(), json!(now_ms()));
+                sh.message(Value::Object(m));
+            }
+            Ok(Event::Incoming(Packet::PubAck(a))) => sh.push(Ev::Acked(a.pkid, None)),
+            Ok(Event::Incoming(Packet::PubComp(a))) => sh.push(Ev::Acked(a.pkid, None)),
+            Ok(Event::Incoming(Packet::SubAck(a))) => sh.push(Ev::SubAck(
+                a.pkid,
+                a.return_codes.iter().map(|c| match c {
+                    SubscribeReasonCode::Success(q) => Ok(*q as u8 as i64),
+                    SubscribeReasonCode::Failure => Err("refused".to_string()),
+                }).collect(),
+            )),
+            Ok(Event::Incoming(Packet::UnsubAck(a))) => sh.push(Ev::UnsubAck(a.pkid)),
+            Ok(Event::Outgoing(Outgoing::Publish(id))) => sh.push(Ev::OutPub(id)),
+            Ok(Event::Outgoing(Outgoing::Subscribe(id))) => sh.push(Ev::OutSub(id)),
+            Ok(Event::Outgoing(Outgoing::Unsubscribe(id))) => sh.push(Ev::OutUnsub(id)),
+            Ok(Event::Outgoing(Outgoing::Disconnect)) => {
+                lock(&sh.st).connected = false;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let refused = match &e {
+                    rumqttc::ConnectionError::ConnectionRefused(c) => Some(refused4(c)),
+                    _ => None,
+                };
+                let stop = {
+                    let mut st = lock(&sh.st);
+                    st.connected = false;
+                    st.last_error = Some(refused.clone().unwrap_or_else(|| conn_error(&e)));
+                    if !st.ever_connected && refused.is_some() {
+                        st.refused = refused.clone();
+                        st.stop = true;
+                    }
+                    st.stop
+                };
+                sh.cv.notify_all();
+                if stop {
+                    return;
+                }
+                nap(&sh, backoff);
+                backoff = (backoff * 2).min(10_000);
+            }
+        }
+    }
+}
+
+/// The thread that drives an MQTT 5 connection.
+fn run5(mut conn: rumqttc::v5::Connection, client: rumqttc::v5::Client, sh: Arc<Shared>) {
+    use rumqttc::v5::mqttbytes::v5::{Packet, PubAckReason, PubCompReason, PubRecReason, SubscribeReasonCode};
+    use rumqttc::v5::Event;
+    use rumqttc::Outgoing;
+    let mut backoff = 1000u64;
+    loop {
+        if lock(&sh.st).stop {
+            return;
+        }
+        let ev = match conn.recv() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        match ev {
+            Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                backoff = 1000;
+                let filters = {
+                    let mut st = lock(&sh.st);
+                    st.connected = true;
+                    st.ever_connected = true;
+                    st.connects += 1;
+                    st.last_error = None;
+                    if ack.session_present { vec![] } else { st.filters.clone() }
+                };
+                sh.cv.notify_all();
+                for (f, q) in filters {
+                    let _ = client.try_subscribe(f, q5(q));
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(p))) => {
+                let mut m = serde_json::Map::new();
+                m.insert("topic".into(), json!(String::from_utf8_lossy(&p.topic)));
+                payload_json(&p.payload, &mut m);
+                m.insert("qos".into(), json!(p.qos as u8));
+                m.insert("retain".into(), json!(p.retain));
+                m.insert("dup".into(), json!(p.dup));
+                m.insert("at".into(), json!(now_ms()));
+                if let Some(pr) = &p.properties {
+                    let mut props = serde_json::Map::new();
+                    if let Some(c) = &pr.content_type { props.insert("content_type".into(), json!(c)); }
+                    if let Some(r) = &pr.response_topic { props.insert("response_topic".into(), json!(r)); }
+                    if let Some(c) = &pr.correlation_data { props.insert("correlation_data".into(), json!(String::from_utf8_lossy(c))); }
+                    if let Some(e) = pr.message_expiry_interval { props.insert("message_expiry_s".into(), json!(e)); }
+                    if !pr.user_properties.is_empty() {
+                        let up: serde_json::Map<String, Value> = pr.user_properties.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                        props.insert("user_properties".into(), Value::Object(up));
+                    }
+                    m.insert("properties".into(), Value::Object(props));
+                }
+                sh.message(Value::Object(m));
+            }
+            Ok(Event::Incoming(Packet::PubAck(a))) => sh.push(Ev::Acked(a.pkid, match a.reason {
+                PubAckReason::Success | PubAckReason::NoMatchingSubscribers => None,
+                r => Some(format!("{:?}", r)),
+            })),
+            Ok(Event::Incoming(Packet::PubRec(a))) => {
+                if !matches!(a.reason, PubRecReason::Success | PubRecReason::NoMatchingSubscribers) {
+                    sh.push(Ev::Acked(a.pkid, Some(format!("{:?}", a.reason))));
+                }
+            }
+            Ok(Event::Incoming(Packet::PubComp(a))) => sh.push(Ev::Acked(a.pkid, match a.reason {
+                PubCompReason::Success => None,
+                r => Some(format!("{:?}", r)),
+            })),
+            Ok(Event::Incoming(Packet::SubAck(a))) => sh.push(Ev::SubAck(
+                a.pkid,
+                a.return_codes.iter().map(|c| match c {
+                    SubscribeReasonCode::Success(q) => Ok(*q as u8 as i64),
+                    other => Err(format!("{:?}", other)),
+                }).collect(),
+            )),
+            Ok(Event::Incoming(Packet::UnsubAck(a))) => sh.push(Ev::UnsubAck(a.pkid)),
+            Ok(Event::Incoming(Packet::Disconnect(d))) => {
+                lock(&sh.st).last_error = Some(format!("the broker disconnected: {:?}", d.reason_code));
+            }
+            Ok(Event::Outgoing(Outgoing::Publish(id))) => sh.push(Ev::OutPub(id)),
+            Ok(Event::Outgoing(Outgoing::Subscribe(id))) => sh.push(Ev::OutSub(id)),
+            Ok(Event::Outgoing(Outgoing::Unsubscribe(id))) => sh.push(Ev::OutUnsub(id)),
+            Ok(Event::Outgoing(Outgoing::Disconnect)) => {
+                lock(&sh.st).connected = false;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let refused = match &e {
+                    rumqttc::v5::ConnectionError::ConnectionRefused(c) => Some(refused5(c)),
+                    _ => None,
+                };
+                let stop = {
+                    let mut st = lock(&sh.st);
+                    st.connected = false;
+                    st.last_error = Some(refused.clone().unwrap_or_else(|| conn_error(&e)));
+                    if !st.ever_connected && refused.is_some() {
+                        st.refused = refused.clone();
+                        st.stop = true;
+                    }
+                    st.stop
+                };
+                sh.cv.notify_all();
+                if stop {
+                    return;
+                }
+                nap(&sh, backoff);
+                backoff = (backoff * 2).min(10_000);
+            }
+        }
+    }
+}
+
+/// Sleeps `ms`, or less when the connection is closed meanwhile.
+fn nap(sh: &Shared, ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    let mut st = lock(&sh.st);
+    while !st.stop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        st = sh.cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// Connects to an MQTT broker and keeps the connection as `name`: `url` is mqtt://user:pass@host:1883 or mqtts://host:8883; options: client_id, username, password, version (4 for 3.1.1, the default, or 5), keep_alive_s (30), clean_session (true), session_expiry_s (5), will { topic, payload, qos, retain }, ca_file, cert_file, key_file, max_packet (1 MB), buffer (10000 messages kept), timeout_ms (10000). Waits until the broker accepts it.
+pub fn mqtt_connect(name: &str, url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["client_id", "username", "password", "version", "keep_alive_s", "clean_session", "session_expiry_s", "will", "ca_file", "cert_file", "key_file", "max_packet", "buffer", "timeout_ms", "tls"], "mqtt_connect")?;
+    if name.is_empty() {
+        return Err("give the connection a name, like \"main\"".into());
+    }
+    let u = parse_url(url)?;
+    let tls = opt_bool(o, "tls")?.unwrap_or(u.tls);
+    let version = match o.get("version") {
+        None | Some(Value::Null) => 4,
+        Some(Value::String(s)) if s == "3.1.1" || s == "4" => 4,
+        Some(Value::String(s)) if s == "5" || s == "5.0" => 5,
+        Some(Value::Number(n)) if n.as_i64() == Some(4) || n.as_f64() == Some(3.11) => 4,
+        Some(Value::Number(n)) if n.as_i64() == Some(5) => 5,
+        Some(v) => return Err(format!("version must be 4 (MQTT 3.1.1) or 5, not {}", v)),
+    };
+    let client_id = opt_str(o, "client_id").unwrap_or_else(|| {
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        format!("quillo-{:x}{:x}", std::process::id(), n & 0xffff_ffff)
+    });
+    if client_id.len() > 65535 || client_id.starts_with(' ') {
+        return Err("the client_id must be under 64 KB and not start with a space".into());
+    }
+    let user = opt_str(o, "username").or(u.user.clone());
+    let pass = opt_str(o, "password").or(u.pass.clone());
+    let keep_alive = opt_i64(o, "keep_alive_s")?.unwrap_or(30).clamp(5, 65535) as u64;
+    let clean = opt_bool(o, "clean_session")?.unwrap_or(true);
+    if !clean && client_id.is_empty() {
+        return Err("a session kept by the broker (clean_session: false) needs a client_id".into());
+    }
+    let timeout = Duration::from_millis(opt_i64(o, "timeout_ms")?.unwrap_or(10_000).clamp(100, 600_000) as u64);
+    let cap = opt_i64(o, "buffer")?.unwrap_or(10_000).clamp(1, 1_000_000) as usize;
+    let max_packet = opt_i64(o, "max_packet")?.unwrap_or(1 << 20).clamp(1024, 256 << 20) as usize;
+    let will = match o.get("will") {
+        None | Some(Value::Null) => None,
+        Some(w @ Value::Object(_)) => {
+            check_keys(w, &["topic", "payload", "qos", "retain"], "the will")?;
+            let t = opt_str(w, "topic").ok_or("the will needs a topic")?;
+            valid_topic(&t)?;
+            Some((t, payload_bytes(w.get("payload").unwrap_or(&Value::Null))?, qos_of(opt_i64(w, "qos")?.unwrap_or(0))?, opt_bool(w, "retain")?.unwrap_or(false)))
+        }
+        Some(_) => return Err("the will must be a map: { topic, payload, qos, retain }".into()),
+    };
+    let tls_cfg = if tls { Some(Arc::new(tls_config(o)?)) } else { None };
+
+    // A connection already open under this name is closed first.
+    let _ = mqtt_close(name);
+
+    let shared = Arc::new(Shared {
+        st: Mutex::new(State {
+            connected: false, ever_connected: false, refused: None, last_error: None, connects: 0, seq: 0,
+            events: VecDeque::new(), inbox: VecDeque::new(), cap, received: 0, dropped: 0, filters: vec![], stop: false,
+        }),
+        cv: Condvar::new(),
+    });
+    let client = if version == 4 {
+        let mut mo = rumqttc::MqttOptions::new(client_id.clone(), u.host.clone(), u.port);
+        mo.set_keep_alive(Duration::from_secs(keep_alive));
+        mo.set_clean_session(clean);
+        mo.set_max_packet_size(max_packet, max_packet);
+        mo.set_request_channel_capacity(1000);
+        if let Some(u) = &user {
+            mo.set_credentials(u.clone(), pass.clone().unwrap_or_default());
+        }
+        if let Some((t, p, q, r)) = &will {
+            mo.set_last_will(rumqttc::LastWill::new(t.clone(), p.clone(), q4(*q), *r));
+        }
+        if let Some(c) = &tls_cfg {
+            mo.set_transport(rumqttc::Transport::tls_with_config(rumqttc::TlsConfiguration::Rustls(c.clone())));
+        }
+        let (c, mut conn) = rumqttc::Client::new(mo, 1000);
+        let mut no = rumqttc::NetworkOptions::new();
+        no.set_connection_timeout(timeout.as_secs().max(1));
+        conn.eventloop.set_network_options(no);
+        let (c2, sh) = (c.clone(), shared.clone());
+        std::thread::Builder::new().name(format!("mqtt-{}", name)).spawn(move || run4(conn, c2, sh)).map_err(|e| e.to_string())?;
+        Client::V4(c)
+    } else {
+        let mut mo = rumqttc::v5::MqttOptions::new(client_id.clone(), u.host.clone(), u.port);
+        mo.set_keep_alive(Duration::from_secs(keep_alive));
+        mo.set_clean_start(clean);
+        if !clean {
+            mo.set_session_expiry_interval(Some(opt_i64(o, "session_expiry_s")?.unwrap_or(300).clamp(0, u32::MAX as i64) as u32));
+        }
+        mo.set_max_packet_size(Some(max_packet as u32));
+        mo.set_request_channel_capacity(1000);
+        mo.set_connection_timeout(timeout.as_secs().max(1));
+        if let Some(u) = &user {
+            mo.set_credentials(u.clone(), pass.clone().unwrap_or_default());
+        }
+        if let Some((t, p, q, r)) = &will {
+            mo.set_last_will(rumqttc::v5::mqttbytes::v5::LastWill::new(t.clone(), p.clone(), q5(*q), *r, None));
+        }
+        if let Some(c) = &tls_cfg {
+            mo.set_transport(rumqttc::Transport::tls_with_config(rumqttc::TlsConfiguration::Rustls(c.clone())));
+        }
+        let (c, conn) = rumqttc::v5::Client::new(mo, 1000);
+        let (c2, sh) = (c.clone(), shared.clone());
+        std::thread::Builder::new().name(format!("mqtt-{}", name)).spawn(move || run5(conn, c2, sh)).map_err(|e| e.to_string())?;
+        Client::V5(c)
+    };
+    let conn = Arc::new(Conn { client, shared: shared.clone(), op: Mutex::new(()), timeout, client_id: client_id.clone(), version, url: format!("{}://{}:{}", if tls { "mqtts" } else { "mqtt" }, u.host, u.port) });
+
+    // Waits for the broker's CONNACK, or its refusal.
+    let deadline = Instant::now() + timeout;
+    let mut st = lock(&shared.st);
+    loop {
+        if st.connected {
+            break;
+        }
+        if let Some(r) = &st.refused {
+            return Err(format!("{} (client id {})", r, client_id));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let why = st.last_error.clone().unwrap_or("no answer".into());
+            st.stop = true;
+            drop(st);
+            shared.cv.notify_all();
+            match &conn.client {
+                Client::V4(c) => { let _ = c.try_disconnect(); }
+                Client::V5(c) => { let _ = c.try_disconnect(); }
+            }
+            return Err(format!("could not connect to the MQTT broker at {}:{}: {}", u.host, u.port, why));
+        }
+        st = shared.cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(st);
+    lock(&CONNS).get_or_insert_with(HashMap::new).insert(name.to_string(), conn);
+    Ok(json!({ "name": name, "connected": true, "client_id": client_id, "version": if version == 4 { "3.1.1" } else { "5" }, "url": format!("{}://{}:{}", if tls { "mqtts" } else { "mqtt" }, u.host, u.port) }))
+}
+
+/// Publishes `payload` (text, `{ base64 }` for bytes, anything else as JSON) to `topic`; options: qos (0, 1 or 2), retain, and for MQTT 5 content_type, response_topic, correlation_data, message_expiry_s and user_properties (a map). With QoS 1 or 2 it waits for the broker's PUBACK or PUBCOMP.
+pub fn mqtt_publish(name: &str, topic: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["qos", "retain", "content_type", "response_topic", "correlation_data", "message_expiry_s", "user_properties", "timeout_ms"], "mqtt_publish")?;
+    valid_topic(topic)?;
+    let c = get(name)?;
+    let qos = qos_of(opt_i64(o, "qos")?.unwrap_or(0))?;
+    let retain = opt_bool(o, "retain")?.unwrap_or(false);
+    let body = payload_bytes(&payload)?;
+    let bytes = body.len();
+    let timeout = opt_i64(o, "timeout_ms")?.map(|t| Duration::from_millis(t.clamp(100, 600_000) as u64)).unwrap_or(c.timeout);
+    let deadline = Instant::now() + timeout;
+    let _g = lock(&c.op);
+    let before = c.shared.seq();
+    match &c.client {
+        Client::V4(cl) => {
+            for k in ["content_type", "response_topic", "correlation_data", "message_expiry_s", "user_properties"] {
+                if o.get(k).is_some() {
+                    return Err(format!("`{}` is an MQTT 5 property: connect with version: 5", k));
+                }
+            }
+            cl.try_publish(topic, q4(qos), retain, body).map_err(|e| format!("cannot queue the message: {}", e))?;
+        }
+        Client::V5(cl) => {
+            let mut p = rumqttc::v5::mqttbytes::v5::PublishProperties::default();
+            p.content_type = opt_str(o, "content_type");
+            p.response_topic = opt_str(o, "response_topic");
+            p.correlation_data = opt_str(o, "correlation_data").map(|s| s.into_bytes().into());
+            p.message_expiry_interval = opt_i64(o, "message_expiry_s")?.map(|x| x.clamp(0, u32::MAX as i64) as u32);
+            if let Some(up) = o.get("user_properties") {
+                let m = up.as_object().ok_or("user_properties must be a map of texts")?;
+                p.user_properties = m.iter().map(|(k, v)| (k.clone(), v.as_str().map(|s| s.to_string()).unwrap_or(v.to_string()))).collect();
+            }
+            cl.try_publish_with_properties(topic, q5(qos), retain, body, p).map_err(|e| format!("cannot queue the message: {}", e))?;
+        }
+    }
+    let (s1, pkid) = c.shared.wait(before, deadline, "take the message", |e| if let Ev::OutPub(id) = e { Some(*id) } else { None })?;
+    if qos == 0 {
+        return Ok(json!({ "topic": topic, "qos": 0, "retain": retain, "bytes": bytes, "acked": false }));
+    }
+    let (_, reason) = c.shared.wait(s1, deadline, if qos == 1 { "acknowledge the message (PUBACK)" } else { "complete the message (PUBCOMP)" }, |e| match e {
+        Ev::Acked(id, r) if *id == pkid => Some(r.clone()),
+        _ => None,
+    })?;
+    if let Some(r) = reason {
+        return Err(format!("the broker refused the message to {}: {}", topic, r));
+    }
+    Ok(json!({ "topic": topic, "qos": qos, "retain": retain, "bytes": bytes, "acked": true, "packet_id": pkid }))
+}
+
+/// Subscribes to `filter` (`+` matches one level, `#` the rest: `sensors/+/temp`, `site/#`) at `qos`; what arrives waits in the connection's buffer for mqtt_receive. Gives the QoS the broker granted.
+pub fn mqtt_subscribe(name: &str, filter: &str, qos: i64) -> Result<serde_json::Value, String> {
+    valid_filter(filter)?;
+    let q = qos_of(qos)?;
+    let c = get(name)?;
+    let deadline = Instant::now() + c.timeout;
+    let _g = lock(&c.op);
+    let before = c.shared.seq();
+    match &c.client {
+        Client::V4(cl) => cl.try_subscribe(filter, q4(q)).map_err(|e| format!("cannot queue the subscription: {}", e))?,
+        Client::V5(cl) => cl.try_subscribe(filter, q5(q)).map_err(|e| format!("cannot queue the subscription: {}", e))?,
+    }
+    let (s1, pkid) = c.shared.wait(before, deadline, "take the subscription", |e| if let Ev::OutSub(id) = e { Some(*id) } else { None })?;
+    let (_, codes) = c.shared.wait(s1, deadline, "acknowledge the subscription (SUBACK)", |e| match e {
+        Ev::SubAck(id, codes) if *id == pkid => Some(codes.clone()),
+        _ => None,
+    })?;
+    match codes.first() {
+        Some(Ok(granted)) => {
+            let mut st = lock(&c.shared.st);
+            st.filters.retain(|(f, _)| f != filter);
+            st.filters.push((filter.to_string(), q));
+            Ok(json!({ "filter": filter, "granted_qos": granted }))
+        }
+        Some(Err(why)) => Err(format!("the broker refused the subscription to {:?} ({}): check the filter and this client's rights", filter, why)),
+        None => Err("the broker's SUBACK had no answer for the filter".into()),
+    }
+}
+
+/// Stops the subscription to `filter`; messages it already brought stay in the buffer.
+pub fn mqtt_unsubscribe(name: &str, filter: &str) -> Result<bool, String> {
+    valid_filter(filter)?;
+    let c = get(name)?;
+    let deadline = Instant::now() + c.timeout;
+    let _g = lock(&c.op);
+    let had = {
+        let mut st = lock(&c.shared.st);
+        let n = st.filters.len();
+        st.filters.retain(|(f, _)| f != filter);
+        n != st.filters.len()
+    };
+    let before = c.shared.seq();
+    match &c.client {
+        Client::V4(cl) => cl.try_unsubscribe(filter).map_err(|e| e.to_string())?,
+        Client::V5(cl) => cl.try_unsubscribe(filter).map_err(|e| e.to_string())?,
+    }
+    let (s1, pkid) = c.shared.wait(before, deadline, "take the unsubscribe", |e| if let Ev::OutUnsub(id) = e { Some(*id) } else { None })?;
+    c.shared.wait(s1, deadline, "acknowledge the unsubscribe (UNSUBACK)", |e| match e {
+        Ev::UnsubAck(id) if *id == pkid => Some(()),
+        _ => None,
+    })?;
+    Ok(had)
+}
+
+/// Takes up to `max` messages from the buffer, oldest first, waiting up to `wait_ms` for the first one (0: only what is there): each { topic, payload, qos, retain, dup, at }, and `properties` under MQTT 5. A payload that is not UTF-8 comes as null with `payload_base64`.
+pub fn mqtt_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let c = get(name)?;
+    let max = max.clamp(1, 100_000) as usize;
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut st = lock(&c.shared.st);
+    while st.inbox.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || st.stop {
+            break;
+        }
+        st = c.shared.cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = max.min(st.inbox.len());
+    Ok(st.inbox.drain(..n).collect())
+}
+
+/// How the connection is: connected, the client id, the version, its subscriptions, messages buffered, received and dropped (the buffer was full), connects (more than 1: it reconnected) and the last error.
+pub fn mqtt_status(name: &str) -> Result<serde_json::Value, String> {
+    let c = get(name)?;
+    let st = lock(&c.shared.st);
+    Ok(json!({
+        "connected": st.connected,
+        "url": c.url,
+        "client_id": c.client_id,
+        "version": if c.version == 4 { "3.1.1" } else { "5" },
+        "subscriptions": st.filters.iter().map(|(f, q)| json!({ "filter": f, "qos": q })).collect::<Vec<_>>(),
+        "buffered": st.inbox.len(),
+        "received": st.received,
+        "dropped": st.dropped,
+        "connects": st.connects,
+        "last_error": st.last_error,
+    }))
+}
+
+/// Whether `topic` matches the subscription filter `filter`, as a broker decides it (`+` one level, `#` the rest, `$` topics only by name).
+pub fn mqtt_matches(filter: &str, topic: &str) -> Result<bool, String> {
+    valid_filter(filter)?;
+    Ok(matches(filter, topic))
+}
+
+/// Disconnects cleanly (the broker drops the last will) and forgets the connection; whether there was one.
+pub fn mqtt_close(name: &str) -> Result<bool, String> {
+    let c = match lock(&CONNS).as_mut().and_then(|m| m.remove(name)) {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    let connected = lock(&c.shared.st).connected;
+    let before = c.shared.seq();
+    match &c.client {
+        Client::V4(cl) => { let _ = cl.try_disconnect(); }
+        Client::V5(cl) => { let _ = cl.try_disconnect(); }
+    }
+    if connected {
+        // Gives the event loop a moment to send DISCONNECT before it stops.
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        let mut st = lock(&c.shared.st);
+        while st.connected && st.seq == before {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            st = c.shared.cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+    lock(&c.shared.st).stop = true;
+    c.shared.cv.notify_all();
+    Ok(true)
+}

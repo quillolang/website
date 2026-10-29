@@ -1,0 +1,544 @@
+//! JSON-RPC 2.0 both ways: calls, notifications and batches sent over HTTP or a WebSocket kept open (with the server's own notifications buffered to read), error objects read; and for a route serving JSON-RPC, requests and batches checked against a table of methods, answers and errors written as the specification says.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! ureq = "2"
+//! tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "1"
+
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{Message, WebSocket};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> Value {
+    json!(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn error_obj(code: i64, message: &str, data: Option<Value>) -> Value {
+    let mut e = json!({ "code": code, "message": message });
+    if let Some(d) = data {
+        e["data"] = d;
+    }
+    e
+}
+
+fn response_err(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+    json!({ "jsonrpc": "2.0", "error": error_obj(code, message, data), "id": id })
+}
+
+fn request_obj(method: &str, params: &Value, id: Option<Value>) -> Result<Value, String> {
+    if method.is_empty() {
+        return Err("a method name is not empty".into());
+    }
+    let mut r = json!({ "jsonrpc": "2.0", "method": method });
+    match params {
+        Value::Null => {}
+        Value::Array(_) | Value::Object(_) => r["params"] = params.clone(),
+        other => return Err(format!("params are a list (by position) or a map (by name), not {}", other)),
+    }
+    if let Some(id) = id {
+        r["id"] = id;
+    }
+    Ok(r)
+}
+
+// ---------------------------------------------------------------- server side
+
+/// Checks one request object; gives the call, or the error response to send (None: send nothing).
+fn check_call(v: &Value, methods: &Value) -> Result<Value, Option<Value>> {
+    let o = match v.as_object() {
+        Some(o) => o,
+        None => return Err(Some(response_err(Value::Null, -32600, "Invalid Request", None))),
+    };
+    // An id is a string, a number or null; a request without one is a notification.
+    let id = o.get("id").cloned();
+    let id_ok = matches!(id, None | Some(Value::String(_)) | Some(Value::Number(_)) | Some(Value::Null));
+    let reply_id = if id_ok { id.clone().unwrap_or(Value::Null) } else { Value::Null };
+    let notification = id.is_none();
+    if o.get("jsonrpc") != Some(&json!("2.0")) || !id_ok {
+        return Err(Some(response_err(reply_id, -32600, "Invalid Request", Some(json!("jsonrpc must be \"2.0\", and id a string, a number or null")))));
+    }
+    let method = match o.get("method") {
+        Some(Value::String(m)) => m.clone(),
+        _ => return Err(Some(response_err(reply_id, -32600, "Invalid Request", Some(json!("method must be a string"))))),
+    };
+    let params = o.get("params").cloned().unwrap_or(Value::Null);
+    if !matches!(params, Value::Null | Value::Array(_) | Value::Object(_)) || o.contains_key("params") && params.is_null() {
+        return Err(Some(response_err(reply_id, -32600, "Invalid Request", Some(json!("params must be an array or an object")))));
+    }
+    let quiet = |e: Value| if notification { None } else { Some(e) };
+    if method.starts_with("rpc.") && methods.get(&method).is_none() {
+        return Err(quiet(response_err(reply_id, -32601, "Method not found", None)));
+    }
+    let mut args = Value::Null;
+    if methods.is_object() {
+        let spec = match methods.get(&method) {
+            Some(s) => s,
+            None => return Err(quiet(response_err(reply_id, -32601, "Method not found", None))),
+        };
+        // ["a", "b?"]: parameters by name, `?` when it may be left out; "any": anything.
+        let names: Option<Vec<String>> = match spec {
+            Value::Array(a) => Some(a.iter().filter_map(|n| n.as_str().map(|s| s.to_string())).collect()),
+            Value::Object(m) => m.get("params").and_then(|p| p.as_array()).map(|a| a.iter().filter_map(|n| n.as_str().map(|s| s.to_string())).collect()),
+            _ => None,
+        };
+        if let Some(names) = names {
+            let bare: Vec<&str> = names.iter().map(|n| n.trim_end_matches('?')).collect();
+            let required = names.iter().filter(|n| !n.ends_with('?')).count();
+            let mut a = Map::new();
+            match &params {
+                Value::Array(list) => {
+                    if list.len() < required || list.len() > names.len() {
+                        return Err(quiet(response_err(reply_id, -32602, "Invalid params", Some(json!(format!("{} takes {} ({})", method, if required == names.len() { format!("{}", required) } else { format!("{} to {}", required, names.len()) }, bare.join(", ")))))));
+                    }
+                    for (n, v) in bare.iter().zip(list) {
+                        a.insert(n.to_string(), v.clone());
+                    }
+                }
+                Value::Object(m) => {
+                    if let Some(k) = m.keys().find(|k| !bare.contains(&k.as_str())) {
+                        return Err(quiet(response_err(reply_id, -32602, "Invalid params", Some(json!(format!("{} has no parameter {:?}", method, k))))));
+                    }
+                    for (n, full) in bare.iter().zip(&names) {
+                        match m.get(*n) {
+                            Some(v) => { a.insert(n.to_string(), v.clone()); }
+                            None if !full.ends_with('?') => return Err(quiet(response_err(reply_id, -32602, "Invalid params", Some(json!(format!("{} needs {:?}", method, n)))))),
+                            None => {}
+                        }
+                    }
+                }
+                _ => {
+                    if required > 0 {
+                        return Err(quiet(response_err(reply_id, -32602, "Invalid params", Some(json!(format!("{} needs {}", method, bare.join(", ")))))));
+                    }
+                }
+            }
+            for n in &bare {
+                a.entry(n.to_string()).or_insert(Value::Null);
+            }
+            args = Value::Object(a);
+        }
+    }
+    Ok(json!({ "id": id.unwrap_or(Value::Null), "method": method, "params": params, "args": args, "notification": notification }))
+}
+
+/// A JSON-RPC request body read, as a route serving JSON-RPC gets it (`request.body`): `{ batch, calls: [{ id, method, params, args, notification, at }], errors, error_at }`. `calls` are the requests to run; `errors` the answers already made for what was wrong (not JSON: -32700; not a request: -32600; a method `methods` lacks: -32601; wrong params: -32602; none for a notification). `methods` is a table, `{ subtract: ["minuend", "subtrahend"], log: ["message", "level?"], ping: [] }`: params by position or by name both come as `args` by name (`?`: may be left out, then null). Null `methods` takes any method, with no `args`.
+pub fn jsonrpc_parse(body: &str, methods: serde_json::Value) -> Value {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json!({ "batch": false, "calls": [], "errors": [response_err(Value::Null, -32700, "Parse error", Some(json!(e.to_string())))] }),
+    };
+    let mut calls = vec![];
+    let mut errors = vec![];
+    let batch = v.is_array();
+    let items: Vec<Value> = match v {
+        Value::Array(a) if a.is_empty() => {
+            return json!({ "batch": false, "calls": [], "errors": [response_err(Value::Null, -32600, "Invalid Request", Some(json!("an empty batch")))] });
+        }
+        Value::Array(a) => a,
+        other => vec![other],
+    };
+    // Where each error stood in the batch, so the answers keep the requests' order.
+    let mut error_at = vec![];
+    for (i, item) in items.iter().enumerate() {
+        match check_call(item, &methods) {
+            Ok(mut c) => {
+                c["at"] = json!(i);
+                calls.push(c)
+            }
+            Err(Some(e)) => {
+                errors.push(e);
+                error_at.push(json!(i));
+            }
+            Err(None) => {}
+        }
+    }
+    json!({ "batch": batch, "calls": calls, "errors": errors, "error_at": error_at })
+}
+
+/// A success answer for the call with `id`.
+pub fn jsonrpc_result(id: serde_json::Value, result: serde_json::Value) -> Value {
+    json!({ "jsonrpc": "2.0", "result": result, "id": id })
+}
+
+/// An error answer: `code` (-32602 Invalid params, -32603 Internal error, -32000 to -32099 for the server's own, any other for the application's), `message`, and `data` (null to leave it out).
+pub fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str, data: serde_json::Value) -> Value {
+    response_err(id, code, message, if data.is_null() { None } else { Some(data) })
+}
+
+fn is_response(v: &Value) -> bool {
+    v.get("jsonrpc") == Some(&json!("2.0")) && (v.get("result").is_some() || v.get("error").is_some()) && v.get("method").is_none()
+}
+
+/// The body to answer with, or null when there is nothing to send (only notifications: answer 204). `parsed` is what `jsonrpc_parse` gave; `answers` has one item per `parsed.calls`, in order: a `jsonrpc_result` or `jsonrpc_error`, or any other value, taken as the result. Answers to notifications are left out, as the specification says.
+pub fn jsonrpc_reply(parsed: serde_json::Value, answers: Vec<serde_json::Value>) -> Result<Option<String>, String> {
+    let calls = parsed["calls"].as_array().cloned().unwrap_or_default();
+    if answers.len() != calls.len() {
+        return Err(format!("{} answers for {} calls: give one per call (anything for a notification)", answers.len(), calls.len()));
+    }
+    let mut placed: Vec<(i64, Value)> = vec![];
+    let errors = parsed["errors"].as_array().cloned().unwrap_or_default();
+    let at = parsed["error_at"].as_array().cloned().unwrap_or_default();
+    for (i, e) in errors.into_iter().enumerate() {
+        placed.push((at.get(i).and_then(|x| x.as_i64()).unwrap_or(-1), e));
+    }
+    for (c, a) in calls.iter().zip(answers) {
+        if c["notification"] == true {
+            continue;
+        }
+        placed.push((c["at"].as_i64().unwrap_or(i64::MAX), if is_response(&a) { a } else { jsonrpc_result(c["id"].clone(), a) }));
+    }
+    placed.sort_by_key(|p| p.0);
+    let mut out: Vec<Value> = placed.into_iter().map(|p| p.1).collect();
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(if parsed["batch"] == true { Value::Array(out).to_string() } else { out.swap_remove(0).to_string() }))
+}
+
+/// A request object as JSON text, to send another way: `id` null makes a notification.
+pub fn jsonrpc_request(method: &str, params: serde_json::Value, id: serde_json::Value) -> Result<String, String> {
+    Ok(request_obj(method, &params, if id.is_null() { None } else { Some(id) })?.to_string())
+}
+
+// ---------------------------------------------------------------- client: transports
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self { Stream::Plain(s) => s, Stream::Tls(s) => &s.sock }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self { Stream::Plain(s) => s.read(b), Stream::Tls(s) => s.read(b) }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self { Stream::Plain(s) => s.write(b), Stream::Tls(s) => s.write(b) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self { Stream::Plain(s) => s.flush(), Stream::Tls(s) => s.flush() }
+    }
+}
+
+fn tls_config(ca_file: Option<&str>) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_file {
+        Some(f) => {
+            let data = std::fs::read(f).map_err(|e| format!("cannot read the CA file {}: {}", f, e))?;
+            for c in rustls_pemfile::certs(&mut &data[..]) {
+                roots.add(c.map_err(|e| format!("{}: {}", f, e))?).map_err(|e| format!("{}: {}", f, e))?;
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+struct WsConn {
+    ws: WebSocket<Stream>,
+    inbox: VecDeque<Value>,
+    dropped: u64,
+}
+
+static SOCKETS: Mutex<Option<HashMap<String, Arc<Mutex<WsConn>>>>> = Mutex::new(None);
+
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 300_000) as u64)
+}
+
+fn ws_open(url: &str, o: &Value) -> Result<WsConn, String> {
+    let t = timeout_of(o);
+    let mut req = url.into_client_request().map_err(|e| format!("{:?} is not a WebSocket URL: {}", url, e))?;
+    if let Some(h) = o["headers"].as_object() {
+        for (k, v) in h {
+            let name = tungstenite::http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("{:?} is not a header name", k))?;
+            let val = tungstenite::http::HeaderValue::from_str(v.as_str().unwrap_or(&v.to_string())).map_err(|_| format!("bad value for header {}", k))?;
+            req.headers_mut().insert(name, val);
+        }
+    }
+    let uri = req.uri().clone();
+    let tls = uri.scheme_str() == Some("wss");
+    let host = uri.host().ok_or("the URL has no host")?.trim_matches(|c| c == '[' || c == ']').to_string();
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    let tcp = TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot connect to {}: {}", addr, e))?;
+    tcp.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    let stream = if tls {
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| e.to_string())?;
+        let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(tls_config(o["ca_file"].as_str())?, name).map_err(|e| e.to_string())?, tcp);
+        while s.conn.is_handshaking() {
+            s.conn.complete_io(&mut s.sock).map_err(|e| format!("TLS with {} failed: {}", host, e))?;
+        }
+        Stream::Tls(Box::new(s))
+    } else {
+        Stream::Plain(tcp)
+    };
+    let (ws, _) = tungstenite::client::client(req, stream).map_err(|e| match e {
+        tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) => format!("{} refused the WebSocket upgrade: HTTP {}", url, r.status()),
+        e => format!("the WebSocket handshake with {} failed: {}", url, e),
+    })?;
+    ws.get_ref().tcp().set_read_timeout(Some(Duration::from_millis(20))).map_err(|e| e.to_string())?;
+    Ok(WsConn { ws, inbox: VecDeque::new(), dropped: 0 })
+}
+
+fn socket(url: &str, o: &Value) -> Result<Arc<Mutex<WsConn>>, String> {
+    let mut g = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(c) = m.get(url) {
+        return Ok(c.clone());
+    }
+    let c = Arc::new(Mutex::new(ws_open(url, o)?));
+    m.insert(url.to_string(), c.clone());
+    Ok(c)
+}
+
+fn forget(url: &str) {
+    SOCKETS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(url);
+}
+
+fn keep(c: &mut WsConn, v: Value) {
+    if c.inbox.len() >= 1000 {
+        c.inbox.pop_front();
+        c.dropped += 1;
+    }
+    c.inbox.push_back(v);
+}
+
+/// Reads one message within `until`: Ok(None) when the time is up.
+fn ws_read(c: &mut WsConn, until: Instant) -> Result<Option<Value>, String> {
+    loop {
+        match c.ws.read() {
+            Ok(Message::Text(t)) => return Ok(Some(serde_json::from_str(t.as_str()).unwrap_or_else(|_| json!({ "text": t.as_str() })))),
+            Ok(Message::Binary(b)) => return Ok(Some(serde_json::from_slice(&b).unwrap_or_else(|_| json!({ "binary_bytes": b.len() })))),
+            Ok(Message::Close(f)) => return Err(format!("the server closed the WebSocket{}", f.map(|f| format!(" ({} {})", u16::from(f.code), f.reason.as_str())).unwrap_or_default())),
+            Ok(_) => { let _ = c.ws.flush(); }
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("the WebSocket failed: {}", e)),
+        }
+        // At least one read (20 ms) even when the time is already up.
+        if Instant::now() >= until {
+            return Ok(None);
+        }
+    }
+}
+
+fn matches_id(v: &Value, ids: &[Value]) -> bool {
+    match v {
+        Value::Array(a) => !a.is_empty() && a.iter().any(|r| is_response(r) && ids.contains(&r["id"])),
+        r => is_response(r) && (ids.contains(&r["id"]) || r["id"].is_null() && r.get("error").is_some()),
+    }
+}
+
+/// Sends `payload` over the URL's transport; waits for the answer naming one of `ids` (none: a notification).
+fn exchange(url: &str, payload: &Value, ids: &[Value], o: &Value) -> Result<Option<Value>, String> {
+    let t = timeout_of(o);
+    if url.starts_with("ws://") || url.starts_with("wss://") {
+        let text = payload.to_string();
+        for attempt in 0..2 {
+            let c = socket(url, o)?;
+            let mut c = c.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = c.ws.send(Message::text(text.clone())) {
+                // A socket the server dropped since the last call: open it again once.
+                drop(c);
+                forget(url);
+                if attempt == 1 {
+                    return Err(format!("sending over {}: {}", url, e));
+                }
+                continue;
+            }
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let until = Instant::now() + t;
+            loop {
+                match ws_read(&mut c, until) {
+                    Ok(Some(v)) if matches_id(&v, ids) => return Ok(Some(v)),
+                    // The server's own notifications, kept for jsonrpc_receive; answers to calls
+                    // that gave up waiting are dropped.
+                    Ok(Some(v)) => {
+                        if !is_response(&v) && !v.is_array() {
+                            keep(&mut c, v);
+                        }
+                    }
+                    Ok(None) => return Err(format!("no answer from {} within {} ms", url, t.as_millis())),
+                    Err(e) => {
+                        drop(c);
+                        forget(url);
+                        return Err(format!("{} (the call may or may not have run)", e));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        let agent = ureq::AgentBuilder::new().timeout(t).build();
+        let mut req = agent.post(url).set("Content-Type", "application/json").set("Accept", "application/json");
+        if let Some(h) = o["headers"].as_object() {
+            for (k, v) in h {
+                req = req.set(k, v.as_str().unwrap_or(&v.to_string()));
+            }
+        }
+        let body = match req.send_string(&payload.to_string()) {
+            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+            // Some servers answer an error object with a 4xx or 5xx.
+            Err(ureq::Error::Status(code, r)) => {
+                let b = r.into_string().unwrap_or_default();
+                if serde_json::from_str::<Value>(&b).map(|v| matches_id(&v, ids) || is_response(&v)).unwrap_or(false) {
+                    b
+                } else {
+                    return Err(format!("the JSON-RPC server answered HTTP {}{}", code, if code == 401 || code == 403 { " (check the authorization header)" } else { "" }));
+                }
+            }
+            Err(e) => return Err(format!("cannot reach {}: {}", url, e)),
+        };
+        if ids.is_empty() || body.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&body).map(Some).map_err(|_| format!("the server's answer is not JSON: {}", body.chars().take(200).collect::<String>()))
+    } else {
+        Err(format!("{:?}: a JSON-RPC URL is http(s):// or ws(s)://", url))
+    }
+}
+
+fn error_text(e: &Value) -> String {
+    let mut s = format!("error {}: {}", e["code"], e["message"].as_str().unwrap_or(""));
+    match &e["data"] {
+        Value::Null => {}
+        Value::String(d) => s.push_str(&format!(" ({})", d)),
+        d => s.push_str(&format!(" ({})", d)),
+    }
+    s
+}
+
+/// Calls `method` at `url` (http(s):// for a POST each time, ws(s):// for a socket kept open) with `params` (a list, a map, or null) and gives the result; an error object is an error value, `error -32601: Method not found`. `options`: `{ timeout_ms (10000), headers, ca_file (a PEM file to trust for wss://) }`.
+pub fn jsonrpc_call(url: &str, method: &str, params: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let id = next_id();
+    let r = exchange(url, &request_obj(method, &params, Some(id.clone()))?, &[id], &options)?.ok_or("the server answered nothing")?;
+    if let Some(e) = r.get("error") {
+        return Err(error_text(e));
+    }
+    Ok(r["result"].clone())
+}
+
+/// Sends a notification (no answer is expected, nor waited for).
+pub fn jsonrpc_notify(url: &str, method: &str, params: serde_json::Value, options: serde_json::Value) -> Result<(), String> {
+    exchange(url, &request_obj(method, &params, None)?, &[], &options).map(|_| ())
+}
+
+/// Several calls in one batch: `calls` is `[{ method, params, notify: true for a notification }]`. Gives one item per call, in the order given whatever order the server answered in: `{ result }`, `{ error: { code, message, data } }`, or null for a notification.
+pub fn jsonrpc_batch(url: &str, calls: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    if calls.is_empty() {
+        return Err("a batch needs at least one call".into());
+    }
+    let mut reqs = vec![];
+    let mut ids = vec![];
+    for c in &calls {
+        let method = c["method"].as_str().ok_or("each call has a `method`")?;
+        let id = if c["notify"] == true { None } else { Some(next_id()) };
+        reqs.push(request_obj(method, &c["params"], id.clone())?);
+        ids.push(id);
+    }
+    let wanted: Vec<Value> = ids.iter().flatten().cloned().collect();
+    let answer = exchange(url, &Value::Array(reqs), &wanted, &options)?;
+    if wanted.is_empty() {
+        return Ok(vec![Value::Null; calls.len()]);
+    }
+    let answer = answer.ok_or("the server answered nothing")?;
+    let list = match answer {
+        Value::Array(a) => a,
+        // A server that could not read the batch at all answers one error.
+        single if single.get("error").is_some() => return Err(error_text(&single["error"])),
+        other => return Err(format!("a batch's answer is a list, not {}", other)),
+    };
+    Ok(ids
+        .iter()
+        .map(|id| match id {
+            None => Value::Null,
+            Some(id) => match list.iter().find(|r| &r["id"] == id) {
+                Some(r) if r.get("error").is_some() => json!({ "error": r["error"] }),
+                Some(r) => json!({ "result": r["result"] }),
+                None => json!({ "error": { "code": null, "message": "the server sent no answer for this call" } }),
+            },
+        })
+        .collect())
+}
+
+/// What the server sent on the WebSocket at `url` by itself (its notifications, such as a subscription's updates), up to `max`, oldest first, waiting up to `wait_ms` for one when none is kept (1000 are kept; then the oldest go).
+pub fn jsonrpc_receive(url: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = {
+        let g = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|m| m.get(url)).cloned().ok_or(format!("no WebSocket open to {}: make a call first", url))?
+    };
+    let mut c = c.lock().unwrap_or_else(|e| e.into_inner());
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 300_000) as u64);
+    // Take what has arrived, then wait for more if there is nothing.
+    loop {
+        let deadline = if c.inbox.is_empty() { until } else { Instant::now() + Duration::from_millis(20) };
+        match ws_read(&mut c, deadline) {
+            Ok(Some(v)) => {
+                if !is_response(&v) {
+                    keep(&mut c, v);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                drop(c);
+                forget(url);
+                return Err(e);
+            }
+        }
+        if Instant::now() >= until && !c.inbox.is_empty() {
+            break;
+        }
+    }
+    let n = (max.max(1) as usize).min(c.inbox.len());
+    Ok(c.inbox.drain(..n).collect())
+}
+
+/// Closes the WebSocket kept for `url`; whether one was open.
+pub fn jsonrpc_close(url: &str) -> bool {
+    let c = SOCKETS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(url);
+    match c {
+        Some(c) => {
+            let mut c = c.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = c.ws.close(None);
+            let until = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < until {
+                match c.ws.read() {
+                    Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}

@@ -1,0 +1,498 @@
+//! HAProxy's PROXY protocol, versions 1 and 2: headers built and read (TCP4, TCP6, UDP, UNIX, and TLVs: ALPN, authority, unique id, SSL, network namespace, CRC32C and the AWS, Azure and Google Cloud ones), for programs behind a load balancer and for sending through one.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+
+const SIG: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+
+fn b64() -> base64::engine::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    b64().decode(&t).or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&t)).map_err(|e| format!("not base64: {}", e))
+}
+
+fn b64_encode(b: &[u8]) -> String {
+    use base64::Engine;
+    b64().encode(b)
+}
+
+/// CRC-32C (Castagnoli), as the v2 checksum TLV uses it.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for i in 0..256u32 {
+        let mut c = i;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0x82F6_3B78 ^ (c >> 1) } else { c >> 1 };
+        }
+        table[i as usize] = c;
+    }
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn text_or_null(b: &[u8]) -> Value {
+    match std::str::from_utf8(b) {
+        Ok(s) => json!(s),
+        Err(_) => Value::Null,
+    }
+}
+
+// ---------------------------------------------------------------- reading
+
+fn parse_v1(b: &[u8]) -> Result<(Value, usize), String> {
+    let end = b.windows(2).position(|w| w == b"\r\n").ok_or("a PROXY v1 line ends with CRLF, and none came in the first 107 bytes")?;
+    if end + 2 > 107 {
+        return Err("a PROXY v1 line is at most 107 bytes".into());
+    }
+    let line = std::str::from_utf8(&b[..end]).map_err(|_| "the PROXY v1 line is not ASCII")?;
+    let parts: Vec<&str> = line.split(' ').collect();
+    if parts[0] != "PROXY" || parts.len() < 2 {
+        return Err(format!("not a PROXY v1 line: {:?}", line));
+    }
+    let proto = parts[1];
+    if proto == "UNKNOWN" {
+        return Ok((json!({ "version": 1, "command": "proxy", "protocol": "UNKNOWN", "source": null, "source_port": null, "destination": null, "destination_port": null, "tlvs": {} }), end + 2));
+    }
+    if proto != "TCP4" && proto != "TCP6" {
+        return Err(format!("PROXY v1 knows TCP4, TCP6 and UNKNOWN, not {:?}", proto));
+    }
+    if parts.len() != 6 {
+        return Err(format!("a PROXY v1 {} line has 6 fields (PROXY, protocol, two addresses, two ports), this one {}", proto, parts.len()));
+    }
+    let ip = |s: &str| -> Result<IpAddr, String> {
+        let a: IpAddr = s.parse().map_err(|_| format!("{:?} is not an IP address", s))?;
+        if (proto == "TCP4") != a.is_ipv4() {
+            return Err(format!("{} is not an {} address", s, if proto == "TCP4" { "IPv4" } else { "IPv6" }));
+        }
+        Ok(a)
+    };
+    let port = |s: &str| -> Result<u16, String> {
+        if s.is_empty() || s.len() > 5 || !s.bytes().all(|c| c.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+            return Err(format!("{:?} is not a port (0 to 65535, no leading zeros)", s));
+        }
+        s.parse::<u16>().map_err(|_| format!("{:?} is not a port (0 to 65535)", s))
+    };
+    let (src, dst, sp, dp) = (ip(parts[2])?, ip(parts[3])?, port(parts[4])?, port(parts[5])?);
+    Ok((json!({ "version": 1, "command": "proxy", "protocol": proto, "source": src.to_string(), "source_port": sp, "destination": dst.to_string(), "destination_port": dp, "tlvs": {} }), end + 2))
+}
+
+fn parse_tlvs(mut t: &[u8], out: &mut serde_json::Map<String, Value>, inside_ssl: bool) -> Result<(), String> {
+    let mut other = vec![];
+    while !t.is_empty() {
+        if t.len() < 3 {
+            return Err("a TLV is cut short (fewer than 3 bytes left)".into());
+        }
+        let ty = t[0];
+        let len = u16::from_be_bytes([t[1], t[2]]) as usize;
+        if t.len() < 3 + len {
+            return Err(format!("TLV 0x{:02X} says {} bytes, {} are left", ty, len, t.len() - 3));
+        }
+        let v = &t[3..3 + len];
+        t = &t[3 + len..];
+        let s = |v: &[u8]| text_or_null(v);
+        match (ty, inside_ssl) {
+            (0x01, false) => { out.insert("alpn".into(), s(v)); }
+            (0x02, false) => { out.insert("authority".into(), s(v)); }
+            (0x03, false) => { /* checked by the caller */ out.insert("crc32c".into(), json!(hex(v))); }
+            (0x04, false) => { out.insert("noop".into(), json!(len)); }
+            (0x05, false) => {
+                if len > 128 { return Err("a unique id is at most 128 bytes".into()); }
+                out.insert("unique_id".into(), s(v));
+                out.insert("unique_id_hex".into(), json!(hex(v)));
+            }
+            (0x20, false) => {
+                if len < 5 { return Err("the SSL TLV is at least 5 bytes (client flags and verify)".into()); }
+                let client = v[0];
+                let verify = u32::from_be_bytes([v[1], v[2], v[3], v[4]]);
+                let mut ssl = serde_json::Map::new();
+                ssl.insert("client_ssl".into(), json!(client & 1 != 0));
+                ssl.insert("client_cert_conn".into(), json!(client & 2 != 0));
+                ssl.insert("client_cert_sess".into(), json!(client & 4 != 0));
+                ssl.insert("verify".into(), json!(verify));
+                ssl.insert("verified".into(), json!(verify == 0 && client & 6 != 0));
+                parse_tlvs(&v[5..], &mut ssl, true)?;
+                out.insert("ssl".into(), Value::Object(ssl));
+            }
+            (0x21, true) => { out.insert("version".into(), s(v)); }
+            (0x22, true) => { out.insert("cn".into(), s(v)); }
+            (0x23, true) => { out.insert("cipher".into(), s(v)); }
+            (0x24, true) => { out.insert("sig_alg".into(), s(v)); }
+            (0x25, true) => { out.insert("key_alg".into(), s(v)); }
+            (0x30, false) => { out.insert("netns".into(), s(v)); }
+            // Cloud load balancers' own TLVs.
+            (0xEA, false) if !v.is_empty() && v[0] == 0x01 => { out.insert("aws_vpce_id".into(), s(&v[1..])); }
+            (0xEE, false) if len == 5 && v[0] == 0x01 => { out.insert("azure_link_id".into(), json!(u32::from_le_bytes([v[1], v[2], v[3], v[4]]))); }
+            (0xE0, false) if len == 8 => {
+                let n = u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
+                out.insert("gcp_psc_id".into(), json!(n.to_string()));
+            }
+            _ => other.push(json!({ "type": ty, "base64": b64_encode(v) })),
+        }
+    }
+    if !other.is_empty() {
+        out.insert("custom".into(), Value::Array(other));
+    }
+    Ok(())
+}
+
+fn parse_v2(b: &[u8]) -> Result<(Value, usize), String> {
+    if b.len() < 16 {
+        return Err(format!("a PROXY v2 header is at least 16 bytes, {} came", b.len()));
+    }
+    let ver = b[12] >> 4;
+    if ver != 2 {
+        return Err(format!("PROXY v2's version nibble is 2, this one is {}", ver));
+    }
+    let command = match b[12] & 0x0F { 0 => "local", 1 => "proxy", c => return Err(format!("unknown PROXY v2 command {}", c)) };
+    let fam = b[13] >> 4;
+    let tr = b[13] & 0x0F;
+    let len = u16::from_be_bytes([b[14], b[15]]) as usize;
+    if b.len() < 16 + len {
+        return Err(format!("the PROXY v2 header says {} more bytes, {} came", len, b.len() - 16));
+    }
+    let body = &b[16..16 + len];
+    let transport = match tr { 0 => "unspec", 1 => "stream", 2 => "dgram", _ => return Err(format!("unknown PROXY v2 transport {}", tr)) };
+    let (family, alen) = match fam { 0 => ("unspec", 0), 1 => ("inet", 12), 2 => ("inet6", 36), 3 => ("unix", 216), _ => return Err(format!("unknown PROXY v2 address family {}", fam)) };
+    if body.len() < alen {
+        return Err(format!("the {} addresses take {} bytes, the header has {}", family, alen, body.len()));
+    }
+    let a = &body[..alen];
+    let protocol = match (fam, tr) {
+        (1, 1) => "TCP4", (1, 2) => "UDP4", (2, 1) => "TCP6", (2, 2) => "UDP6", (3, 1) => "UNIX", (3, 2) => "UNIX_DGRAM", _ => "UNSPEC",
+    };
+    let (mut src, mut dst, mut sp, mut dp) = (Value::Null, Value::Null, Value::Null, Value::Null);
+    match fam {
+        1 => {
+            src = json!(Ipv4Addr::new(a[0], a[1], a[2], a[3]).to_string());
+            dst = json!(Ipv4Addr::new(a[4], a[5], a[6], a[7]).to_string());
+            sp = json!(u16::from_be_bytes([a[8], a[9]]));
+            dp = json!(u16::from_be_bytes([a[10], a[11]]));
+        }
+        2 => {
+            let s: [u8; 16] = a[0..16].try_into().unwrap();
+            let d: [u8; 16] = a[16..32].try_into().unwrap();
+            src = json!(Ipv6Addr::from(s).to_string());
+            dst = json!(Ipv6Addr::from(d).to_string());
+            sp = json!(u16::from_be_bytes([a[32], a[33]]));
+            dp = json!(u16::from_be_bytes([a[34], a[35]]));
+        }
+        3 => {
+            let path = |p: &[u8]| text_or_null(&p[..p.iter().position(|&c| c == 0).unwrap_or(p.len())]);
+            src = path(&a[0..108]);
+            dst = path(&a[108..216]);
+        }
+        _ => {}
+    }
+    let mut tlvs = serde_json::Map::new();
+    parse_tlvs(&body[alen..], &mut tlvs, false)?;
+    if tlvs.contains_key("crc32c") {
+        // Find the checksum TLV again, zero it, and check the whole header.
+        let mut copy = b[..16 + len].to_vec();
+        let mut i = 16 + alen;
+        while i + 3 <= copy.len() {
+            let l = u16::from_be_bytes([copy[i + 1], copy[i + 2]]) as usize;
+            if copy[i] == 0x03 && l == 4 {
+                let want = u32::from_be_bytes([copy[i + 3], copy[i + 4], copy[i + 5], copy[i + 6]]);
+                for k in 0..4 { copy[i + 3 + k] = 0; }
+                let got = crc32c(&copy);
+                if got != want {
+                    return Err(format!("the header's CRC32C is {:08x} but its bytes give {:08x}: it was changed on the way; drop the connection", want, got));
+                }
+                tlvs.insert("crc32c_valid".into(), json!(true));
+            }
+            i += 3 + l;
+        }
+    }
+    Ok((json!({
+        "version": 2, "command": command, "protocol": protocol, "family": family, "transport": transport,
+        "source": src, "source_port": sp, "destination": dst, "destination_port": dp, "tlvs": Value::Object(tlvs),
+    }), 16 + len))
+}
+
+fn parse_any(b: &[u8]) -> Result<Value, String> {
+    let (mut v, used) = if b.len() >= 12 && b[..12] == SIG {
+        parse_v2(b)?
+    } else if b.starts_with(b"PROXY ") {
+        parse_v1(b)?
+    } else if b.len() < 12 && (SIG.starts_with(b) || b"PROXY ".starts_with(b)) {
+        return Err(format!("only {} bytes: read more before parsing the PROXY header", b.len()));
+    } else {
+        return Err("no PROXY header: the bytes start with neither \"PROXY \" (v1) nor the v2 signature".into());
+    };
+    let rest = &b[used..];
+    v["header_length"] = json!(used);
+    v["rest_base64"] = json!(b64_encode(rest));
+    v["rest_text"] = text_or_null(rest);
+    Ok(v)
+}
+
+/// The PROXY header (v1 or v2, found by itself) at the start of `base64` (bytes as a load balancer sent them): `{ version, command: "proxy" | "local", protocol: "TCP4" | "TCP6" | "UDP4" | "UDP6" | "UNIX" | "UNIX_DGRAM" | "UNSPEC" | "UNKNOWN", source, source_port, destination, destination_port, tlvs, header_length, rest_base64, rest_text }`. `tlvs` may have `alpn`, `authority`, `unique_id` (and `unique_id_hex`), `ssl: { client_ssl, client_cert_conn, client_cert_sess, verify, verified, version, cn, cipher, sig_alg, key_alg }`, `netns`, `noop` (its length), `crc32c` (checked: a wrong one is an error), `aws_vpce_id`, `azure_link_id`, `gcp_psc_id`, and `custom: [{ type, base64 }]`.
+pub fn proxy_parse(base64: &str) -> Result<Value, String> {
+    parse_any(&b64_decode(base64)?)
+}
+
+/// The same from bytes as a list of numbers, such as a `udp.listen` packet's `p.bytes`: the payload after the header is in `rest_text` (or `rest_base64`).
+pub fn proxy_parse_bytes(bytes: Vec<i64>) -> Result<Value, String> {
+    let b: Vec<u8> = bytes.iter().map(|&x| u8::try_from(x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect::<Result<_, _>>()?;
+    parse_any(&b)
+}
+
+/// A version 1 line as text (`PROXY TCP4 203.0.113.7 10.0.0.2 51234 443\r\n`, CRLF optional here), read as `proxy_parse` reads it.
+pub fn proxy_parse_text(text: &str) -> Result<Value, String> {
+    let mut t = text.to_string();
+    if !t.contains("\r\n") {
+        t = match t.find('\n') { Some(i) => format!("{}\r\n{}", &t[..i], &t[i + 1..]), None => format!("{}\r\n", t) };
+    }
+    parse_any(t.as_bytes())
+}
+
+// ---------------------------------------------------------------- building
+
+fn field<'a>(info: &'a Value, names: &[&str]) -> &'a Value {
+    for n in names {
+        if !info[*n].is_null() {
+            return &info[*n];
+        }
+    }
+    &Value::Null
+}
+
+fn port_of(info: &Value, names: &[&str]) -> Result<u16, String> {
+    let v = field(info, names);
+    v.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or(format!("`{}` must be a port from 0 to 65535, not {}", names[0], v))
+}
+
+fn protocol_of(info: &Value) -> Result<String, String> {
+    if let Some(p) = info["protocol"].as_str() {
+        return Ok(p.to_uppercase());
+    }
+    match field(info, &["source", "src"]).as_str().map(|s| s.parse::<IpAddr>()) {
+        Some(Ok(IpAddr::V4(_))) => Ok("TCP4".into()),
+        Some(Ok(IpAddr::V6(_))) => Ok("TCP6".into()),
+        Some(Err(_)) => Ok("UNIX".into()),
+        None => Ok("UNKNOWN".into()),
+    }
+}
+
+fn v1(info: &Value) -> Result<String, String> {
+    let proto = protocol_of(info)?;
+    if proto == "UNKNOWN" || proto == "UNSPEC" {
+        return Ok("PROXY UNKNOWN\r\n".into());
+    }
+    if proto != "TCP4" && proto != "TCP6" {
+        return Err(format!("PROXY v1 carries TCP4, TCP6 or UNKNOWN; {} needs version 2", proto));
+    }
+    let ip = |names: &[&str]| -> Result<IpAddr, String> {
+        let s = field(info, names).as_str().ok_or(format!("`{}` is missing: the address, as text", names[0]))?;
+        let a: IpAddr = s.parse().map_err(|_| format!("`{}`: {:?} is not an IP address", names[0], s))?;
+        if a.is_ipv4() != (proto == "TCP4") {
+            return Err(format!("`{}`: {} is not an {} address", names[0], s, if proto == "TCP4" { "IPv4" } else { "IPv6" }));
+        }
+        Ok(a)
+    };
+    Ok(format!("PROXY {} {} {} {} {}\r\n", proto, ip(&["source", "src"])?, ip(&["destination", "dest", "dst"])?, port_of(info, &["source_port", "src_port"])?, port_of(info, &["destination_port", "dest_port", "dst_port"])?))
+}
+
+fn tlv(out: &mut Vec<u8>, ty: u8, v: &[u8]) -> Result<(), String> {
+    if v.len() > 65535 - 3 {
+        return Err(format!("TLV 0x{:02X} is too long", ty));
+    }
+    out.push(ty);
+    out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+    out.extend_from_slice(v);
+    Ok(())
+}
+
+fn text_tlv(out: &mut Vec<u8>, t: &Value, name: &str, ty: u8) -> Result<(), String> {
+    match &t[name] {
+        Value::Null => Ok(()),
+        Value::String(s) => tlv(out, ty, s.as_bytes()),
+        other => Err(format!("TLV `{}` is text, not {}", name, other)),
+    }
+}
+
+fn v2(info: &Value) -> Result<Vec<u8>, String> {
+    let command = match info["command"].as_str().unwrap_or("proxy").to_lowercase().as_str() { "proxy" => 1u8, "local" => 0u8, c => return Err(format!("`command` is \"proxy\" or \"local\", not {:?}", c)) };
+    let proto = protocol_of(info)?;
+    let (fam, tr) = match proto.as_str() {
+        "TCP4" => (1u8, 1u8), "UDP4" => (1, 2), "TCP6" => (2, 1), "UDP6" => (2, 2), "UNIX" => (3, 1), "UNIX_DGRAM" => (3, 2), "UNSPEC" | "UNKNOWN" => (0, 0),
+        p => return Err(format!("`protocol` is one of TCP4, TCP6, UDP4, UDP6, UNIX, UNIX_DGRAM or UNSPEC, not {:?}", p)),
+    };
+    let mut body = vec![];
+    let addr = |names: &[&str]| field(info, names).as_str().map(|s| s.to_string()).ok_or(format!("`{}` is missing", names[0]));
+    match fam {
+        1 | 2 => {
+            let s: IpAddr = addr(&["source", "src"])?.parse().map_err(|_| "`source` is not an IP address".to_string())?;
+            let d: IpAddr = addr(&["destination", "dest", "dst"])?.parse().map_err(|_| "`destination` is not an IP address".to_string())?;
+            match (s, d, fam) {
+                (IpAddr::V4(s), IpAddr::V4(d), 1) => { body.extend_from_slice(&s.octets()); body.extend_from_slice(&d.octets()); }
+                (IpAddr::V6(s), IpAddr::V6(d), 2) => { body.extend_from_slice(&s.octets()); body.extend_from_slice(&d.octets()); }
+                _ => return Err(format!("{} needs two {} addresses", proto, if fam == 1 { "IPv4" } else { "IPv6" })),
+            }
+            body.extend_from_slice(&port_of(info, &["source_port", "src_port"])?.to_be_bytes());
+            body.extend_from_slice(&port_of(info, &["destination_port", "dest_port", "dst_port"])?.to_be_bytes());
+        }
+        3 => {
+            for names in [&["source", "src"][..], &["destination", "dest", "dst"][..]] {
+                let p = addr(names)?;
+                if p.len() > 107 { return Err(format!("`{}`: a UNIX socket path is at most 107 bytes", names[0])); }
+                let mut b = p.into_bytes();
+                b.resize(108, 0);
+                body.extend_from_slice(&b);
+            }
+        }
+        _ => {}
+    }
+    let t = &info["tlvs"];
+    if !t.is_null() && !t.is_object() {
+        return Err("`tlvs` is a map".into());
+    }
+    text_tlv(&mut body, t, "alpn", 0x01)?;
+    text_tlv(&mut body, t, "authority", 0x02)?;
+    if let Some(u) = t["unique_id"].as_str() {
+        if u.len() > 128 { return Err("`unique_id` is at most 128 bytes".into()); }
+        tlv(&mut body, 0x05, u.as_bytes())?;
+    }
+    if t["ssl"].is_object() {
+        let s = &t["ssl"];
+        let flag = |k: &str| s[k].as_bool().unwrap_or(false);
+        let client = (if flag("client_ssl") || s["client_ssl"].is_null() { 1u8 } else { 0 }) | (if flag("client_cert_conn") { 2 } else { 0 }) | (if flag("client_cert_sess") { 4 } else { 0 });
+        let verify: u32 = match (&s["verify"], &s["verified"]) {
+            (Value::Number(n), _) => n.as_u64().and_then(|x| u32::try_from(x).ok()).ok_or("`ssl.verify` is a number from 0 up")?,
+            (_, Value::Bool(b)) => if *b { 0 } else { 1 },
+            _ => if client & 6 != 0 { 0 } else { 1 },
+        };
+        let mut v = vec![client];
+        v.extend_from_slice(&verify.to_be_bytes());
+        for (k, ty) in [("version", 0x21u8), ("cn", 0x22), ("cipher", 0x23), ("sig_alg", 0x24), ("key_alg", 0x25)] {
+            text_tlv(&mut v, s, k, ty)?;
+        }
+        tlv(&mut body, 0x20, &v)?;
+    }
+    text_tlv(&mut body, t, "netns", 0x30)?;
+    if let Some(id) = t["aws_vpce_id"].as_str() {
+        let mut v = vec![0x01];
+        v.extend_from_slice(id.as_bytes());
+        tlv(&mut body, 0xEA, &v)?;
+    }
+    if let Some(id) = t["azure_link_id"].as_u64() {
+        let mut v = vec![0x01];
+        v.extend_from_slice(&u32::try_from(id).map_err(|_| "`azure_link_id` is a 32-bit number")?.to_le_bytes());
+        tlv(&mut body, 0xEE, &v)?;
+    }
+    match &t["gcp_psc_id"] {
+        Value::Null => {}
+        v => {
+            let n: u64 = match v { Value::String(s) => s.parse().map_err(|_| "`gcp_psc_id` is a 64-bit number")?, Value::Number(n) => n.as_u64().ok_or("`gcp_psc_id` is a 64-bit number")?, _ => return Err("`gcp_psc_id` is a 64-bit number".into()) };
+            tlv(&mut body, 0xE0, &n.to_be_bytes())?;
+        }
+    }
+    if let Some(list) = t["custom"].as_array() {
+        for c in list {
+            let ty = c["type"].as_u64().filter(|&x| x <= 255).ok_or("each `custom` TLV has a `type` from 0 to 255")? as u8;
+            let v = match (&c["base64"], &c["text"]) { (Value::String(b), _) => b64_decode(b)?, (_, Value::String(s)) => s.as_bytes().to_vec(), _ => vec![] };
+            tlv(&mut body, ty, &v)?;
+        }
+    }
+    if let Some(n) = t["noop"].as_u64() {
+        tlv(&mut body, 0x04, &vec![0u8; n.min(1024) as usize])?;
+    }
+    let want_crc = t["crc32c"].as_bool().unwrap_or(false);
+    let crc_at = if want_crc { body.len() + 16 + 3 } else { 0 };
+    if want_crc {
+        tlv(&mut body, 0x03, &[0, 0, 0, 0])?;
+    }
+    if body.len() > 65535 {
+        return Err("the header is longer than 65535 bytes".into());
+    }
+    let mut out = SIG.to_vec();
+    out.push(0x20 | command);
+    out.push((fam << 4) | tr);
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(&body);
+    if want_crc {
+        let c = crc32c(&out);
+        out[crc_at..crc_at + 4].copy_from_slice(&c.to_be_bytes());
+    }
+    Ok(out)
+}
+
+fn header(info: &Value) -> Result<Vec<u8>, String> {
+    match info["version"].as_i64().unwrap_or(2) {
+        1 => Ok(v1(info)?.into_bytes()),
+        2 => v2(info),
+        v => Err(format!("`version` is 1 or 2, not {}", v)),
+    }
+}
+
+/// A version 1 header line: `info` is `{ protocol: "TCP4" | "TCP6" | "UNKNOWN" (found from the address when left out), source, source_port, destination, destination_port }`.
+pub fn proxy_v1(info: serde_json::Value) -> Result<String, String> {
+    v1(&info)
+}
+
+/// A version 2 header, in base64: `info` is `{ command: "proxy" (default) | "local", protocol: "TCP4" | "TCP6" | "UDP4" | "UDP6" | "UNIX" | "UNIX_DGRAM" | "UNSPEC", source, source_port, destination, destination_port, tlvs: { alpn, authority, unique_id, ssl: { client_ssl, client_cert_conn, client_cert_sess, verified, version, cn, cipher, sig_alg, key_alg }, netns, aws_vpce_id, azure_link_id, gcp_psc_id, custom: [{ type, base64 | text }], noop: padding bytes, crc32c: true } }`.
+pub fn proxy_v2(info: serde_json::Value) -> Result<String, String> {
+    Ok(b64_encode(&v2(&info)?))
+}
+
+/// A header (`info.version` 1 or 2, 2 when left out) followed by `payload`, as a list of byte values for `udp.send`: a datagram sent through to a server that expects the PROXY protocol.
+pub fn proxy_packet(info: serde_json::Value, payload: &str) -> Result<Vec<i64>, String> {
+    let mut b = header(&info)?;
+    b.extend_from_slice(payload.as_bytes());
+    Ok(b.into_iter().map(|x| x as i64).collect())
+}
+
+fn resolve(addr: &str) -> Result<SocketAddr, String> {
+    addr.to_socket_addrs().map_err(|e| format!("{}: {} (write host:port)", addr, e))?.next().ok_or(format!("{} has no address", addr))
+}
+
+/// Connects to `addr` (`host:port`, a server behind which the PROXY protocol is on, such as nginx's `listen ... proxy_protocol`), sends the header for `info` (version 1 or 2) and then `data`, and reads the answer until the server closes or `timeout_ms` (100 to 60000) passes: `{ header_bytes, sent, reply, reply_base64 }`.
+pub fn proxy_send(addr: &str, info: serde_json::Value, data: &str, timeout_ms: i64) -> Result<Value, String> {
+    let t = Duration::from_millis(timeout_ms.clamp(100, 60_000) as u64);
+    let a = resolve(addr)?;
+    let h = header(&info)?;
+    let mut s = TcpStream::connect_timeout(&a, t).map_err(|e| format!("cannot connect to {}: {}", a, e))?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    let mut all = h.clone();
+    all.extend_from_slice(data.as_bytes());
+    s.write_all(&all).map_err(|e| format!("sending to {}: {}", a, e))?;
+    let until = Instant::now() + t;
+    let mut out = vec![];
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || out.len() > 16 << 20 {
+            break;
+        }
+        let _ = s.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => {
+                if out.is_empty() {
+                    return Err(format!("{} closed the connection: {} (does it expect this PROXY version?)", a, e));
+                }
+                break;
+            }
+        }
+    }
+    Ok(json!({ "header_bytes": h.len(), "sent": all.len(), "reply": String::from_utf8_lossy(&out), "reply_base64": b64_encode(&out) }))
+}

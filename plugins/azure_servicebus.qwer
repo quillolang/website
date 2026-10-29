@@ -1,0 +1,296 @@
+//! Azure Service Bus over its REST API, signed with SAS tokens made from a connection string: messages sent to queues and topics (one or a batch) with their properties, received from queues and subscriptions either deleted at once or peek-locked, then completed, unlocked or their lock renewed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Map, Value};
+use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct Cfg {
+    base: String,
+    key_name: String,
+    key: String,
+    entity: Option<String>,
+    ttl: i64,
+    timeout: Duration,
+}
+
+/// The namespaces, by the name given to `servicebus_connect`.
+static SPACES: Mutex<Option<HashMap<String, Cfg>>> = Mutex::new(None);
+
+fn cfg(name: &str) -> Result<Cfg, String> {
+    SPACES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(name).cloned().ok_or(format!(
+        "no Service Bus namespace named `{}`: call servicebus_connect(\"{}\", connection_string, {{}}) first",
+        name, name
+    ))
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Percent-encoding as .NET's WebUtility.UrlEncode does for SAS tokens: letters, digits and -_.!*() kept.
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.!*()".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn parse_conn(cs: &str) -> Result<(String, String, String, Option<String>), String> {
+    let mut parts: HashMap<String, String> = HashMap::new();
+    for p in cs.split(';').filter(|p| !p.trim().is_empty()) {
+        let (k, v) = p.split_once('=').ok_or(format!("`{}` in the connection string is not key=value", p))?;
+        parts.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+    }
+    let endpoint = parts.get("endpoint").ok_or("the connection string has no Endpoint=sb://<namespace>.servicebus.windows.net/")?;
+    let host = endpoint.trim_start_matches("sb://").trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string();
+    let emulator = parts.get("usedevelopmentemulator").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let base = format!("{}://{}", if emulator { "http" } else { "https" }, host);
+    let key_name = parts.get("sharedaccesskeyname").ok_or("the connection string has no SharedAccessKeyName")?.clone();
+    let key = parts.get("sharedaccesskey").ok_or("the connection string has no SharedAccessKey")?.clone();
+    Ok((base, key_name, key, parts.get("entitypath").cloned()))
+}
+
+fn sas(resource: &str, key_name: &str, key: &str, expiry: i64) -> String {
+    let sr = enc(resource);
+    let mut m = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any size");
+    m.update(format!("{}\n{}", sr, expiry).as_bytes());
+    let sig = base64::engine::general_purpose::STANDARD.encode(m.finalize().into_bytes());
+    format!("SharedAccessSignature sr={}&sig={}&se={}&skn={}", sr, enc(&sig), expiry, key_name)
+}
+
+fn entity_path(c: &Cfg, entity: &str) -> Result<String, String> {
+    let e = if entity.is_empty() { c.entity.clone().ok_or("give a queue, topic or topic/subscriptions/name (the connection string has no EntityPath)")? } else { entity.to_string() };
+    let e = e.trim_matches('/').to_string();
+    if e.is_empty() || e.split('/').any(|p| p.is_empty() || p.chars().any(|ch| !(ch.is_ascii_alphanumeric() || "-._~$".contains(ch)))) {
+        return Err(format!("`{}` is not a queue, topic or topic/subscriptions/name", e));
+    }
+    Ok(e)
+}
+
+/// One request, with the SAS token for the namespace's URL, the right status codes taken as success.
+fn request(c: &Cfg, method: &str, url: &str, headers: &[(String, String)], body: Option<&[u8]>, wait: Duration, what: &str) -> Result<Option<ureq::Response>, String> {
+    let agent = ureq::AgentBuilder::new().timeout(c.timeout + wait).build();
+    let mut req = agent.request(method, url).set("Authorization", &sas(&format!("{}/", c.base), &c.key_name, &c.key, now() + c.ttl));
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let r = match body {
+        Some(b) => req.send_bytes(b),
+        None => req.call(),
+    };
+    match r {
+        Ok(r) if r.status() == 204 => Ok(None),
+        Ok(r) => Ok(Some(r)),
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            let detail = t.split("<Detail>").nth(1).and_then(|d| d.split("</Detail>").next()).unwrap_or(t.trim()).to_string();
+            let hint = match code {
+                401 => " (check the connection string's key, and that its policy has the Send or Listen right)",
+                404 => " (no such queue, topic or subscription: make it in the portal or with az servicebus)",
+                410 => " (the lock was lost: the message comes again)",
+                413 => " (the message is larger than the entity takes: 256 KB on Standard)",
+                _ => "",
+            };
+            Err(format!("Service Bus refused {}: {} {}{}", what, code, detail.trim(), hint))
+        }
+        Err(e) => Err(format!("cannot reach Service Bus at {}: {}", c.base, e)),
+    }
+}
+
+/// The SAS token Service Bus takes for `resource` (a URL, like https://ns.servicebus.windows.net/orders), signed with the connection string's key and good for `ttl_seconds`.
+pub fn servicebus_sas_token(connection_string: &str, resource: &str, ttl_seconds: i64) -> Result<String, String> {
+    let (_, key_name, key, _) = parse_conn(connection_string)?;
+    Ok(sas(resource, &key_name, &key, now() + ttl_seconds.clamp(1, 365 * 86400)))
+}
+
+/// Remembers a namespace as `name` from its connection string (`Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=...`, with `EntityPath` or not; `UseDevelopmentEmulator=true` for plain HTTP). Options: `token_ttl_seconds` (3600), `timeout_ms` (10000, added to a receive's wait).
+pub fn servicebus_connect(name: &str, connection_string: &str, options: serde_json::Value) -> Result<Value, String> {
+    let (base, key_name, key, entity) = parse_conn(connection_string)?;
+    let c = Cfg {
+        base: base.clone(),
+        key_name: key_name.clone(),
+        key,
+        entity: entity.clone(),
+        ttl: options["token_ttl_seconds"].as_i64().unwrap_or(3600).clamp(60, 365 * 86400),
+        timeout: Duration::from_millis(options["timeout_ms"].as_u64().unwrap_or(10_000).clamp(100, 120_000)),
+    };
+    SPACES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c);
+    Ok(json!({ "name": name, "endpoint": base, "key_name": key_name, "entity": entity }))
+}
+
+fn rfc1123(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let r = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m - 1) as usize];
+    format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT", wd, d, mon, y, r / 3600, r % 3600 / 60, r % 60)
+}
+
+/// The BrokerProperties and user properties of a message to send, from the options.
+fn broker(o: &Value) -> Result<(Map<String, Value>, Map<String, Value>), String> {
+    let mut b = Map::new();
+    for (opt, prop) in [("message_id", "MessageId"), ("label", "Label"), ("subject", "Label"), ("correlation_id", "CorrelationId"), ("session_id", "SessionId"), ("reply_to", "ReplyTo"), ("to", "To"), ("partition_key", "PartitionKey"), ("reply_to_session_id", "ReplyToSessionId")] {
+        if let Some(v) = o[opt].as_str() {
+            b.insert(prop.into(), json!(v));
+        }
+    }
+    if let Some(t) = o["time_to_live"].as_f64() {
+        b.insert("TimeToLive".into(), json!(t));
+    }
+    if let Some(at) = o["scheduled_at"].as_i64() {
+        b.insert("ScheduledEnqueueTimeUtc".into(), json!(rfc1123(at)));
+    }
+    let mut props = Map::new();
+    if let Some(p) = o["properties"].as_object() {
+        for (k, v) in p {
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)) {
+                return Err(format!("the property `{}` must be letters, digits, - and _ (it travels as an HTTP header)", k));
+            }
+            props.insert(k.clone(), v.clone());
+        }
+    }
+    Ok((b, props))
+}
+
+/// Sends one message to a queue or topic (`entity`; "" for the connection string's EntityPath). Options: `properties` (your own, a map), `message_id`, `label`, `correlation_id`, `session_id`, `reply_to`, `to`, `partition_key`, `time_to_live` (seconds), `scheduled_at` (Unix seconds: enqueued then), `content_type` ("text/plain"). True once Service Bus has it.
+pub fn servicebus_send(name: &str, entity: &str, body: &str, options: serde_json::Value) -> Result<bool, String> {
+    let c = cfg(name)?;
+    let e = entity_path(&c, entity)?;
+    let (b, props) = broker(&options)?;
+    let mut headers = vec![("Content-Type".to_string(), options["content_type"].as_str().unwrap_or("text/plain; charset=utf-8").to_string())];
+    if !b.is_empty() {
+        headers.push(("BrokerProperties".into(), Value::Object(b).to_string()));
+    }
+    for (k, v) in props {
+        // Text travels quoted, as Service Bus gives it back; numbers and true/false as they are.
+        headers.push((k, match v { Value::String(s) => json!(s).to_string(), other => other.to_string() }));
+    }
+    request(&c, "POST", &format!("{}/{}/messages?timeout=60", c.base, e), &headers, Some(body.as_bytes()), Duration::ZERO, "the message")?;
+    Ok(true)
+}
+
+/// Sends many messages in one request: each is text or `{ body, properties, message_id, label, ... }` (the options `servicebus_send` takes). Gives how many.
+pub fn servicebus_send_batch(name: &str, entity: &str, messages: Vec<serde_json::Value>) -> Result<i64, String> {
+    let c = cfg(name)?;
+    let e = entity_path(&c, entity)?;
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let mut list = vec![];
+    for m in &messages {
+        let (body, o) = match m {
+            Value::String(s) => (s.clone(), json!({})),
+            Value::Object(_) => (m["body"].as_str().ok_or("each message is text or { body, ... }")?.to_string(), m.clone()),
+            _ => return Err("each message is text or { body, ... }".into()),
+        };
+        let (b, props) = broker(&o)?;
+        let mut item = json!({ "Body": body });
+        if !b.is_empty() {
+            item["BrokerProperties"] = Value::Object(b);
+        }
+        if !props.is_empty() {
+            item["UserProperties"] = Value::Object(props);
+        }
+        list.push(item);
+    }
+    let headers = vec![("Content-Type".to_string(), "application/vnd.microsoft.servicebus.json".to_string())];
+    request(&c, "POST", &format!("{}/{}/messages?timeout=60", c.base, e), &headers, Some(Value::Array(list).to_string().as_bytes()), Duration::ZERO, "the batch")?;
+    Ok(messages.len() as i64)
+}
+
+const PLAIN_HEADERS: [&str; 14] = ["content-type", "content-length", "date", "server", "transfer-encoding", "location", "brokerproperties", "strict-transport-security", "connection", "keep-alive", "x-ms-request-id", "vary", "cache-control", "expires"];
+
+fn received(r: ureq::Response, entity: &str) -> Result<Value, String> {
+    let broker: Value = r.header("BrokerProperties").and_then(|b| serde_json::from_str(b).ok()).unwrap_or(json!({}));
+    let location = r.header("Location").map(str::to_string);
+    let mut props = Map::new();
+    for h in r.headers_names() {
+        let lower = h.to_ascii_lowercase();
+        if PLAIN_HEADERS.contains(&lower.as_str()) || lower.starts_with("access-control") {
+            continue;
+        }
+        if let Some(v) = r.header(&h) {
+            props.insert(h.clone(), serde_json::from_str(v).unwrap_or(json!(v)));
+        }
+    }
+    let content_type = r.header("Content-Type").map(str::to_string);
+    let body = r.into_string().map_err(|e| e.to_string())?;
+    Ok(json!({
+        "body": body, "entity": entity, "message_id": broker["MessageId"], "sequence_number": broker["SequenceNumber"],
+        "delivery_count": broker["DeliveryCount"], "lock_token": broker["LockToken"], "locked_until": broker["LockedUntilUtc"],
+        "enqueued_at": broker["EnqueuedTimeUtc"], "label": broker["Label"], "correlation_id": broker["CorrelationId"],
+        "session_id": broker["SessionId"], "content_type": content_type, "properties": props, "location": location, "broker": broker,
+    }))
+}
+
+/// Receives up to `max` messages from a queue or a subscription (`topic/subscriptions/name`), waiting up to `wait_seconds` for the first. Options: `mode` ("peek_lock": locked until completed, unlocked or the lock runs out; "receive_and_delete": gone at once). Each is `{ body, message_id, sequence_number, delivery_count, lock_token, locked_until, label, correlation_id, properties }`.
+pub fn servicebus_receive(name: &str, entity: &str, max: i64, wait_seconds: i64, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let c = cfg(name)?;
+    let e = entity_path(&c, entity)?;
+    let method = match options["mode"].as_str().unwrap_or("peek_lock") {
+        "peek_lock" | "peeklock" | "lock" => "POST",
+        "receive_and_delete" | "delete" => "DELETE",
+        m => return Err(format!("the mode is \"peek_lock\" or \"receive_and_delete\", not \"{}\"", m)),
+    };
+    let mut out = vec![];
+    let until = Instant::now() + Duration::from_secs(wait_seconds.clamp(0, 230) as u64);
+    while (out.len() as i64) < max.clamp(1, 1000) {
+        // The first waits; the rest take only what is there now.
+        let wait = if out.is_empty() { until.saturating_duration_since(Instant::now()).as_secs() } else { 0 };
+        let url = format!("{}/{}/messages/head?timeout={}", c.base, e, wait);
+        match request(&c, method, &url, &[], if method == "POST" { Some(b"") } else { None }, Duration::from_secs(wait), "the receive")? {
+            Some(r) => out.push(received(r, &e)?),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+fn locked(c: &Cfg, m: &Value) -> Result<String, String> {
+    if let Some(l) = m["location"].as_str() {
+        return Ok(l.to_string());
+    }
+    let (Some(entity), Some(id), Some(lock)) = (m["entity"].as_str(), m["message_id"].as_str(), m["lock_token"].as_str()) else {
+        return Err("give a message from servicebus_receive in peek_lock mode".into());
+    };
+    Ok(format!("{}/{}/messages/{}/{}", c.base, entity, enc(id), lock))
+}
+
+/// Completes a peek-locked message: it is deleted.
+pub fn servicebus_complete(name: &str, message: serde_json::Value) -> Result<bool, String> {
+    let c = cfg(name)?;
+    request(&c, "DELETE", &locked(&c, &message)?, &[], None, Duration::ZERO, "the completion")?;
+    Ok(true)
+}
+
+/// Unlocks a peek-locked message without completing it (abandon): it can be received again at once, its delivery count one more.
+pub fn servicebus_unlock(name: &str, message: serde_json::Value) -> Result<bool, String> {
+    let c = cfg(name)?;
+    request(&c, "PUT", &locked(&c, &message)?, &[], Some(b""), Duration::ZERO, "the unlock")?;
+    Ok(true)
+}
+
+/// Renews a peek-locked message's lock, for work that takes longer than the lock lasts.
+pub fn servicebus_renew_lock(name: &str, message: serde_json::Value) -> Result<bool, String> {
+    let c = cfg(name)?;
+    request(&c, "POST", &locked(&c, &message)?, &[], Some(b""), Duration::ZERO, "the lock renewal")?;
+    Ok(true)
+}

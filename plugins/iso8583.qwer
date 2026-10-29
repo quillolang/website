@@ -1,0 +1,983 @@
+//! ISO 8583 card payment messages packed and unpacked by a field specification given as data (fixed, LLVAR and LLLVAR fields in ASCII, BCD or binary, primary and secondary bitmaps), with the 1987 fields built in, MTIs and response codes explained, card data masked, and messages sent to a host over TCP with a length header.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ---- Options, TCP with timeouts, and TLS by rustls (ring) ----
+
+fn o_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn o_i64(o: &Value, k: &str, d: i64) -> i64 {
+    match o.get(k) {
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).unwrap_or(d),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
+        _ => d,
+    }
+}
+
+fn o_bool(o: &Value, k: &str, d: bool) -> bool {
+    match o.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        _ => d,
+    }
+}
+
+/// `timeout_ms` from the options (10 s when not given).
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o_i64(o, "timeout_ms", 10_000).clamp(100, 600_000) as u64)
+}
+
+/// `host`, `host:port`, `[v6]:port` or a bare IPv6 address, with the protocol's port when none is given.
+fn split_host(host: &str, default_port: u16) -> Result<(String, u16), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given: write host or host:port".into());
+    }
+    let (name, port) = if let Some(rest) = h.strip_prefix('[') {
+        let end = rest.find(']').ok_or(format!("{}: a [ without its ]", host))?;
+        let after = &rest[end + 1..];
+        (rest[..end].to_string(), after.strip_prefix(':').map(|p| p.to_string()))
+    } else if h.matches(':').count() == 1 {
+        let (a, b) = h.split_once(':').unwrap();
+        (a.to_string(), Some(b.to_string()))
+    } else {
+        (h.to_string(), None)
+    };
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("{}: the port is not a number from 1 to 65535", host))?,
+        None => default_port,
+    };
+    Ok((name, port))
+}
+
+/// Connects with a time limit to each address the name has, and keeps the limit on reads and writes.
+fn connect(name: &str, port: u16, t: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = (name, port).to_socket_addrs().map_err(|e| format!("{}: {}", name, e))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{} has no address", name));
+    }
+    let mut last = String::new();
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, t) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(t));
+                let _ = s.set_write_timeout(Some(t));
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = format!("cannot reach {}: {}", a, e),
+        }
+    }
+    Err(last)
+}
+
+/// Takes any certificate: for `insecure: true`, on a test bench only.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The certificates in PEM text.
+fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[a + 27..];
+        let Some(b) = body.find("-----END CERTIFICATE-----") else { break };
+        out.push(b64_decode(&body[..b]));
+        rest = &body[b + 25..];
+    }
+    out
+}
+
+/// A rustls client set up from the options: Mozilla's roots, plus `ca` (PEM text, or a PEM file's path); `insecure: true` takes any certificate.
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let config = if o_bool(o, "insecure", false) {
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAny(provider))).with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        if let Some(ca) = o_str(o, "ca").filter(|s| !s.trim().is_empty()) {
+            let text = if ca.contains("-----BEGIN") { ca.clone() } else { std::fs::read_to_string(&ca).map_err(|e| format!("cannot read the ca file {}: {}", ca, e))? };
+            let certs = pem_certs(&text);
+            if certs.is_empty() {
+                return Err("`ca` holds no PEM certificate (-----BEGIN CERTIFICATE-----)".into());
+            }
+            for c in certs {
+                roots.add(rustls::pki_types::CertificateDer::from(c)).map_err(|e| format!("a `ca` certificate cannot be used: {}", e))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(s) => match s.read(b) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                r => r,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// TLS over a connected socket, the handshake done now so a bad certificate is said at once. `server_name` in the options overrides the name checked.
+fn tls_wrap(mut tcp: TcpStream, name: &str, o: &Value) -> Result<Stream, String> {
+    let config = tls_config(o)?;
+    let sni = o_str(o, "server_name").unwrap_or_else(|| name.to_string());
+    let server = rustls::pki_types::ServerName::try_from(sni.clone()).map_err(|_| format!("{} is not a name TLS can check", sni))?;
+    let mut conn = rustls::ClientConnection::new(config, server).map_err(|e| e.to_string())?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).map_err(|e| format!("TLS with {} failed: {} (a private CA? pass its PEM as `ca`)", name, e))?;
+    }
+    Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+
+// ---- The field specification ----
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Enc {
+    Ascii,
+    Bcd,
+    Bin,
+    Hex,
+}
+
+#[derive(Clone, Debug)]
+struct Field {
+    name: String,
+    kind: String,
+    max: usize,
+    prefix: usize,
+    data: Enc,
+    length: Enc,
+    pad: String,
+}
+
+#[derive(Clone, Debug)]
+struct Spec {
+    mti: Enc,
+    bitmap: Enc,
+    fields: Vec<Option<Field>>,
+}
+
+/// The 1987 data elements: number, type, maximum length, length prefix digits (0: fixed), name.
+const ISO1987: &[(usize, &str, usize, usize, &str)] = &[
+    (2, "n", 19, 2, "Primary account number (PAN)"),
+    (3, "n", 6, 0, "Processing code"),
+    (4, "n", 12, 0, "Amount, transaction"),
+    (5, "n", 12, 0, "Amount, settlement"),
+    (6, "n", 12, 0, "Amount, cardholder billing"),
+    (7, "n", 10, 0, "Transmission date and time"),
+    (8, "n", 8, 0, "Amount, cardholder billing fee"),
+    (9, "n", 8, 0, "Conversion rate, settlement"),
+    (10, "n", 8, 0, "Conversion rate, cardholder billing"),
+    (11, "n", 6, 0, "System trace audit number (STAN)"),
+    (12, "n", 6, 0, "Time, local transaction (hhmmss)"),
+    (13, "n", 4, 0, "Date, local transaction (MMDD)"),
+    (14, "n", 4, 0, "Date, expiration (YYMM)"),
+    (15, "n", 4, 0, "Date, settlement"),
+    (16, "n", 4, 0, "Date, conversion"),
+    (17, "n", 4, 0, "Date, capture"),
+    (18, "n", 4, 0, "Merchant type (MCC)"),
+    (19, "n", 3, 0, "Acquiring institution country code"),
+    (20, "n", 3, 0, "PAN extended, country code"),
+    (21, "n", 3, 0, "Forwarding institution country code"),
+    (22, "n", 3, 0, "Point of service entry mode"),
+    (23, "n", 3, 0, "Card sequence number"),
+    (24, "n", 3, 0, "Network international identifier (NII)"),
+    (25, "n", 2, 0, "Point of service condition code"),
+    (26, "n", 2, 0, "Point of service capture code"),
+    (27, "n", 1, 0, "Authorizing identification response length"),
+    (28, "xn", 9, 0, "Amount, transaction fee"),
+    (29, "xn", 9, 0, "Amount, settlement fee"),
+    (30, "xn", 9, 0, "Amount, transaction processing fee"),
+    (31, "xn", 9, 0, "Amount, settlement processing fee"),
+    (32, "n", 11, 2, "Acquiring institution identification code"),
+    (33, "n", 11, 2, "Forwarding institution identification code"),
+    (34, "ns", 28, 2, "Primary account number, extended"),
+    (35, "z", 37, 2, "Track 2 data"),
+    (36, "n", 104, 3, "Track 3 data"),
+    (37, "an", 12, 0, "Retrieval reference number"),
+    (38, "an", 6, 0, "Authorization identification response"),
+    (39, "an", 2, 0, "Response code"),
+    (40, "an", 3, 0, "Service restriction code"),
+    (41, "ans", 8, 0, "Card acceptor terminal identification"),
+    (42, "ans", 15, 0, "Card acceptor identification code"),
+    (43, "ans", 40, 0, "Card acceptor name/location"),
+    (44, "an", 25, 2, "Additional response data"),
+    (45, "an", 76, 2, "Track 1 data"),
+    (46, "an", 999, 3, "Additional data (ISO)"),
+    (47, "an", 999, 3, "Additional data (national)"),
+    (48, "an", 999, 3, "Additional data (private)"),
+    (49, "an", 3, 0, "Currency code, transaction"),
+    (50, "an", 3, 0, "Currency code, settlement"),
+    (51, "an", 3, 0, "Currency code, cardholder billing"),
+    (52, "b", 8, 0, "Personal identification number data (PIN block)"),
+    (53, "n", 16, 0, "Security related control information"),
+    (54, "an", 120, 3, "Additional amounts"),
+    (55, "b", 255, 3, "ICC data (EMV)"),
+    (56, "ans", 999, 3, "Reserved (ISO)"),
+    (57, "ans", 999, 3, "Reserved (national)"),
+    (58, "ans", 999, 3, "Reserved (national)"),
+    (59, "ans", 999, 3, "Reserved (national)"),
+    (60, "ans", 999, 3, "Reserved (national)"),
+    (61, "ans", 999, 3, "Reserved (private)"),
+    (62, "ans", 999, 3, "Reserved (private)"),
+    (63, "ans", 999, 3, "Reserved (private)"),
+    (64, "b", 8, 0, "Message authentication code (MAC)"),
+    (65, "b", 8, 0, "Bitmap, extended"),
+    (66, "n", 1, 0, "Settlement code"),
+    (67, "n", 2, 0, "Extended payment code"),
+    (68, "n", 3, 0, "Receiving institution country code"),
+    (69, "n", 3, 0, "Settlement institution country code"),
+    (70, "n", 3, 0, "Network management information code"),
+    (71, "n", 4, 0, "Message number"),
+    (72, "n", 4, 0, "Message number, last"),
+    (73, "n", 6, 0, "Date, action (YYMMDD)"),
+    (74, "n", 10, 0, "Credits, number"),
+    (75, "n", 10, 0, "Credits, reversal number"),
+    (76, "n", 10, 0, "Debits, number"),
+    (77, "n", 10, 0, "Debits, reversal number"),
+    (78, "n", 10, 0, "Transfer, number"),
+    (79, "n", 10, 0, "Transfer, reversal number"),
+    (80, "n", 10, 0, "Inquiries, number"),
+    (81, "n", 10, 0, "Authorizations, number"),
+    (82, "n", 12, 0, "Credits, processing fee amount"),
+    (83, "n", 12, 0, "Credits, transaction fee amount"),
+    (84, "n", 12, 0, "Debits, processing fee amount"),
+    (85, "n", 12, 0, "Debits, transaction fee amount"),
+    (86, "n", 16, 0, "Credits, amount"),
+    (87, "n", 16, 0, "Credits, reversal amount"),
+    (88, "n", 16, 0, "Debits, amount"),
+    (89, "n", 16, 0, "Debits, reversal amount"),
+    (90, "n", 42, 0, "Original data elements"),
+    (91, "an", 1, 0, "File update code"),
+    (92, "an", 2, 0, "File security code"),
+    (93, "an", 5, 0, "Response indicator"),
+    (94, "an", 7, 0, "Service indicator"),
+    (95, "an", 42, 0, "Replacement amounts"),
+    (96, "b", 8, 0, "Message security code"),
+    (97, "xn", 17, 0, "Amount, net settlement"),
+    (98, "ans", 25, 0, "Payee"),
+    (99, "n", 11, 2, "Settlement institution identification code"),
+    (100, "n", 11, 2, "Receiving institution identification code"),
+    (101, "ans", 17, 2, "File name"),
+    (102, "ans", 28, 2, "Account identification 1"),
+    (103, "ans", 28, 2, "Account identification 2"),
+    (104, "ans", 100, 3, "Transaction description"),
+    (105, "ans", 999, 3, "Reserved (ISO)"),
+    (106, "ans", 999, 3, "Reserved (ISO)"),
+    (107, "ans", 999, 3, "Reserved (ISO)"),
+    (108, "ans", 999, 3, "Reserved (ISO)"),
+    (109, "ans", 999, 3, "Reserved (ISO)"),
+    (110, "ans", 999, 3, "Reserved (ISO)"),
+    (111, "ans", 999, 3, "Reserved (ISO)"),
+    (112, "ans", 999, 3, "Reserved (national)"),
+    (113, "ans", 999, 3, "Reserved (national)"),
+    (114, "ans", 999, 3, "Reserved (national)"),
+    (115, "ans", 999, 3, "Reserved (national)"),
+    (116, "ans", 999, 3, "Reserved (national)"),
+    (117, "ans", 999, 3, "Reserved (national)"),
+    (118, "ans", 999, 3, "Reserved (national)"),
+    (119, "ans", 999, 3, "Reserved (national)"),
+    (120, "ans", 999, 3, "Reserved (private)"),
+    (121, "ans", 999, 3, "Reserved (private)"),
+    (122, "ans", 999, 3, "Reserved (private)"),
+    (123, "ans", 999, 3, "Reserved (private)"),
+    (124, "ans", 999, 3, "Reserved (private)"),
+    (125, "ans", 999, 3, "Reserved (private)"),
+    (126, "ans", 999, 3, "Reserved (private)"),
+    (127, "ans", 999, 3, "Reserved (private)"),
+    (128, "b", 8, 0, "Message authentication code (MAC)"),
+];
+
+fn enc_name(e: Enc) -> &'static str {
+    match e {
+        Enc::Ascii => "ascii",
+        Enc::Bcd => "bcd",
+        Enc::Bin => "binary",
+        Enc::Hex => "hex",
+    }
+}
+
+fn enc_of(s: &str, what: &str) -> Result<Enc, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "ascii" | "a" => Ok(Enc::Ascii),
+        "bcd" | "packed" => Ok(Enc::Bcd),
+        "binary" | "bin" | "b" => Ok(Enc::Bin),
+        "hex" => Ok(Enc::Hex),
+        _ => Err(format!("{}: {} is not an encoding (ascii, bcd, binary or hex)", what, s)),
+    }
+}
+
+/// A built-in spec: "ascii" (ASCII data and lengths, a binary bitmap: the most common), "ascii-hex" (the bitmap and binary fields as hex text too) or "bcd" (numbers, lengths and the MTI packed two digits a byte).
+fn builtin(name: &str) -> Result<Spec, String> {
+    let (mti, bitmap, num, len, bin) = match name {
+        "ascii" | "1987" | "1987-ascii" | "" => (Enc::Ascii, Enc::Bin, Enc::Ascii, Enc::Ascii, Enc::Bin),
+        "ascii-hex" | "1987-ascii-hex" => (Enc::Ascii, Enc::Hex, Enc::Ascii, Enc::Ascii, Enc::Hex),
+        "bcd" | "1987-bcd" => (Enc::Bcd, Enc::Bin, Enc::Bcd, Enc::Bcd, Enc::Bin),
+        _ => return Err(format!("no built-in spec {}: ascii, ascii-hex or bcd, or give the spec as data", name)),
+    };
+    let mut fields = vec![None; 129];
+    for &(n, kind, max, prefix, label) in ISO1987 {
+        let data = match kind {
+            "b" => bin,
+            "n" | "z" => num,
+            _ => Enc::Ascii,
+        };
+        fields[n] = Some(Field { name: label.to_string(), kind: kind.to_string(), max, prefix, data, length: len, pad: if kind == "z" { "rightF".into() } else { "left".into() } });
+    }
+    Ok(Spec { mti, bitmap, fields })
+}
+
+fn spec_of(v: &Value) -> Result<Spec, String> {
+    match v {
+        Value::Null => builtin("ascii"),
+        Value::String(s) => builtin(s),
+        Value::Object(m) => {
+            let mut spec = builtin(m.get("base").and_then(|b| b.as_str()).unwrap_or("ascii"))?;
+            if let Some(s) = m.get("mti").and_then(|x| x.as_str()) {
+                spec.mti = enc_of(s, "mti")?;
+            }
+            if let Some(s) = m.get("bitmap").and_then(|x| x.as_str()) {
+                spec.bitmap = enc_of(s, "bitmap")?;
+            }
+            if let Some(Value::Object(fs)) = m.get("fields") {
+                for (k, f) in fs {
+                    let n: usize = k.parse().ok().filter(|n| (2..=128).contains(n)).ok_or(format!("spec field {}: fields are numbered 2 to 128", k))?;
+                    if f.is_null() {
+                        spec.fields[n] = None;
+                        continue;
+                    }
+                    let old = spec.fields[n].clone();
+                    let kind = o_str(f, "type").or(old.as_ref().map(|o| o.kind.clone())).ok_or(format!("spec field {}: give its type (n, an, ans, b, z, ns or xn)", n))?;
+                    if !["n", "an", "ans", "as", "a", "b", "z", "ns", "xn"].contains(&kind.as_str()) {
+                        return Err(format!("spec field {}: {} is not a type (n, a, an, ans, as, b, z, ns or xn)", n, kind));
+                    }
+                    let max = o_i64(f, "max", old.as_ref().map_or(-1, |o| o.max as i64));
+                    if max < 1 {
+                        return Err(format!("spec field {}: give its max length", n));
+                    }
+                    let prefix = o_i64(f, "prefix", old.as_ref().map_or(0, |o| o.prefix as i64));
+                    if ![0, 1, 2, 3, 4].contains(&prefix) {
+                        return Err(format!("spec field {}: prefix is the length's digits: 0 (fixed), 2 (LLVAR) or 3 (LLLVAR)", n));
+                    }
+                    let default_data = if kind == "b" { Enc::Bin } else { Enc::Ascii };
+                    let data = match o_str(f, "data") {
+                        Some(s) => enc_of(&s, &format!("spec field {} data", n))?,
+                        None => old.as_ref().filter(|o| o.kind == kind).map_or(default_data, |o| o.data),
+                    };
+                    let length = match o_str(f, "length") {
+                        Some(s) => enc_of(&s, &format!("spec field {} length", n))?,
+                        None => old.as_ref().map_or(Enc::Ascii, |o| o.length),
+                    };
+                    spec.fields[n] = Some(Field {
+                        name: o_str(f, "name").or(old.as_ref().map(|o| o.name.clone())).unwrap_or_else(|| format!("Field {}", n)),
+                        kind,
+                        max: max as usize,
+                        prefix: prefix as usize,
+                        data,
+                        length,
+                        pad: o_str(f, "pad").or(old.as_ref().map(|o| o.pad.clone())).unwrap_or_else(|| "left".into()),
+                    });
+                }
+            }
+            Ok(spec)
+        }
+        _ => Err("the spec is a name (ascii, ascii-hex, bcd) or a map: { base, mti, bitmap, fields: { \"2\": { type, max, prefix, data, length } } }".into()),
+    }
+}
+
+fn spec_value(s: &Spec) -> Value {
+    let mut fields = serde_json::Map::new();
+    for (n, f) in s.fields.iter().enumerate() {
+        if let Some(f) = f {
+            fields.insert(n.to_string(), json!({ "name": f.name, "type": f.kind, "max": f.max, "prefix": f.prefix, "data": enc_name(f.data), "length": enc_name(f.length), "pad": f.pad }));
+        }
+    }
+    json!({ "mti": enc_name(s.mti), "bitmap": enc_name(s.bitmap), "fields": fields })
+}
+
+// ---- Packing ----
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02X}", x)).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.len() % 2 != 0 {
+        return Err("hex text of an odd length".into());
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("{} is not hex", &s[i..i + 2]))).collect()
+}
+
+fn nibble(c: char) -> Result<u8, String> {
+    match c {
+        '0'..='9' => Ok(c as u8 - b'0'),
+        '=' | 'D' | 'd' => Ok(0xD),
+        'F' | 'f' => Ok(0xF),
+        _ => Err(format!("{:?} cannot be packed in BCD", c)),
+    }
+}
+
+fn bcd(digits: &str, pad: &str) -> Result<Vec<u8>, String> {
+    let mut d: Vec<char> = digits.chars().collect();
+    if d.len() % 2 == 1 {
+        match pad {
+            "right" => d.push('0'),
+            "rightF" | "F" => d.push('F'),
+            _ => d.insert(0, '0'),
+        }
+    }
+    d.chunks(2).map(|p| Ok(nibble(p[0])? << 4 | nibble(p[1])?)).collect()
+}
+
+fn unbcd(b: &[u8], count: usize, pad: &str) -> String {
+    let mut s: String = b.iter().flat_map(|x| [x >> 4, x & 15]).map(|n| match n {
+        0..=9 => (b'0' + n) as char,
+        0xD => '=',
+        _ => 'F',
+    }).collect();
+    if s.len() > count {
+        if pad == "left" {
+            s.remove(0);
+        } else {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn len_bytes(n: usize, digits: usize, e: Enc) -> Result<Vec<u8>, String> {
+    Ok(match e {
+        Enc::Ascii | Enc::Hex => format!("{:0w$}", n, w = digits).into_bytes(),
+        Enc::Bcd => bcd(&format!("{:0w$}", n, w = digits + digits % 2), "left")?,
+        Enc::Bin => {
+            let k = (digits + 1) / 2;
+            (0..k).rev().map(|i| (n >> (8 * i)) as u8).collect()
+        }
+    })
+}
+
+fn len_size(digits: usize, e: Enc) -> usize {
+    match e {
+        Enc::Ascii | Enc::Hex => digits,
+        Enc::Bcd | Enc::Bin => (digits + 1) / 2,
+    }
+}
+
+fn text_value(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn pack_field(n: usize, f: &Field, v: &Value) -> Result<Vec<u8>, String> {
+    let mut s = text_value(v).ok_or(format!("field {} ({}): give text or a number", n, f.name))?;
+    let numeric = f.kind == "n";
+    if numeric && !s.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("field {} ({}) takes digits only: {:?}", n, f.name, s));
+    }
+    if f.kind == "xn" && !(s.starts_with('C') || s.starts_with('D')) {
+        return Err(format!("field {} ({}) starts with C (credit) or D (debit): {:?}", n, f.name, s));
+    }
+    let binary = f.kind == "b";
+    let bytes_in = if binary { Some(unhex(&s).map_err(|e| format!("field {} ({}) is binary, written as hex: {}", n, f.name, e))?) } else { None };
+    // The length that counts: bytes for binary data, characters (digits) for the rest.
+    let mut count = bytes_in.as_ref().map_or(s.chars().count(), |b| b.len());
+    if f.prefix == 0 && count < f.max {
+        if binary {
+            return Err(format!("field {} ({}) is {} bytes, not {}", n, f.name, f.max, count));
+        }
+        let fill = f.max - count;
+        s = if numeric {
+            format!("{}{}", "0".repeat(fill), s)
+        } else if f.kind == "xn" {
+            format!("{}{}{}", &s[..1], "0".repeat(fill), &s[1..])
+        } else {
+            format!("{}{}", s, " ".repeat(fill))
+        };
+        count = f.max;
+    }
+    if count > f.max {
+        return Err(format!("field {} ({}) is at most {} {}, not {}", n, f.name, f.max, if binary { "bytes" } else { "characters" }, count));
+    }
+    let data = match (f.data, &bytes_in) {
+        (Enc::Bin, Some(b)) => b.clone(),
+        (Enc::Hex, Some(b)) => hex(b).into_bytes(),
+        (Enc::Bcd, _) if numeric || f.kind == "z" => bcd(&s, &f.pad)?,
+        (Enc::Bin | Enc::Bcd | Enc::Hex, None) => s.clone().into_bytes(),
+        (Enc::Ascii, Some(_)) => s.to_ascii_uppercase().into_bytes(),
+        (Enc::Ascii, None) => {
+            if !s.is_ascii() {
+                return Err(format!("field {} ({}) holds characters outside ASCII", n, f.name));
+            }
+            s.clone().into_bytes()
+        }
+        (Enc::Bcd, _) => s.clone().into_bytes(),
+    };
+    let mut out = vec![];
+    if f.prefix > 0 {
+        // A hex-written binary field counts the characters on the wire.
+        let shown = if f.data == Enc::Hex && binary { count * 2 } else { count };
+        out.extend(len_bytes(shown, f.prefix, f.length)?);
+    }
+    out.extend(data);
+    Ok(out)
+}
+
+fn field_no(k: &str) -> Option<usize> {
+    k.trim().parse::<usize>().ok().filter(|n| (1..=128).contains(n))
+}
+
+fn pack(msg: &Value, spec: &Spec) -> Result<Vec<u8>, String> {
+    let m = msg.as_object().ok_or("the message is a map: { mti: \"0200\", \"2\": \"4761...\", \"3\": \"000000\", ... }")?;
+    let mti = m.get("mti").and_then(text_value).ok_or("the message has no mti (\"0200\", \"0800\", ...)")?;
+    if mti.len() != 4 || !mti.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("the MTI is four digits, not {:?}", mti));
+    }
+    let mut present = BTreeMap::new();
+    for (k, v) in m {
+        if k == "mti" || k == "bitmap" || v.is_null() {
+            continue;
+        }
+        let n = field_no(k).ok_or(format!("{:?} is not a field number (2 to 128) or mti", k))?;
+        if n == 1 {
+            continue;
+        }
+        present.insert(n, v);
+    }
+    let secondary = present.keys().any(|&n| n > 64);
+    let mut bits = [0u8; 16];
+    if secondary {
+        bits[0] |= 0x80;
+    }
+    for &n in present.keys() {
+        bits[(n - 1) / 8] |= 0x80 >> ((n - 1) % 8);
+    }
+    let mut out = match spec.mti {
+        Enc::Bcd | Enc::Bin => bcd(&mti, "left")?,
+        _ => mti.into_bytes(),
+    };
+    let map = &bits[..if secondary { 16 } else { 8 }];
+    match spec.bitmap {
+        Enc::Hex | Enc::Ascii => out.extend(hex(map).into_bytes()),
+        _ => out.extend_from_slice(map),
+    }
+    for (n, v) in present {
+        let f = spec.fields[n].as_ref().ok_or(format!("field {} is not in the spec: add it under fields", n))?;
+        out.extend(pack_field(n, f, v)?);
+    }
+    Ok(out)
+}
+
+fn unpack(b: &[u8], spec: &Spec) -> Result<Value, String> {
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize, what: &str| -> Result<Vec<u8>, String> {
+        if *at + n > b.len() {
+            return Err(format!("the message ends inside {} (byte {} of {})", what, *at, b.len()));
+        }
+        let r = b[*at..*at + n].to_vec();
+        *at += n;
+        Ok(r)
+    };
+    let mti = match spec.mti {
+        Enc::Bcd | Enc::Bin => unbcd(&take(&mut at, 2, "the MTI")?, 4, "left"),
+        _ => String::from_utf8_lossy(&take(&mut at, 4, "the MTI")?).to_string(),
+    };
+    let read_map = |at: &mut usize| -> Result<Vec<u8>, String> {
+        match spec.bitmap {
+            Enc::Hex | Enc::Ascii => unhex(&String::from_utf8_lossy(&take(at, 16, "the bitmap")?)),
+            _ => take(at, 8, "the bitmap"),
+        }
+    };
+    let mut bits = read_map(&mut at)?;
+    if bits[0] & 0x80 != 0 {
+        bits.extend(read_map(&mut at)?);
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("mti".into(), json!(mti));
+    out.insert("bitmap".into(), json!(hex(&bits)));
+    for n in 2..=bits.len() * 8 {
+        if bits[(n - 1) / 8] & (0x80 >> ((n - 1) % 8)) == 0 {
+            continue;
+        }
+        let f = spec.fields.get(n).and_then(|f| f.as_ref()).ok_or(format!("field {} is in the bitmap, and the spec does not say how it is written: add it under fields", n))?;
+        let what = format!("field {} ({})", n, f.name);
+        let count = if f.prefix > 0 {
+            let raw = take(&mut at, len_size(f.prefix, f.length), &what)?;
+            match f.length {
+                Enc::Bin => raw.iter().fold(0usize, |a, x| a << 8 | *x as usize),
+                Enc::Bcd => unbcd(&raw, 99, "left").parse().map_err(|_| format!("{}: its length is not BCD", what))?,
+                _ => String::from_utf8_lossy(&raw).parse().map_err(|_| format!("{}: its length {:?} is not a number", what, String::from_utf8_lossy(&raw)))?,
+            }
+        } else if f.kind == "b" && f.data == Enc::Hex {
+            f.max * 2
+        } else {
+            f.max
+        };
+        let wire_max = if f.kind == "b" && f.data == Enc::Hex { f.max * 2 } else { f.max };
+        if count > wire_max {
+            return Err(format!("{} says {} long, more than its {}: is the spec right?", what, count, wire_max));
+        }
+        let value = match f.data {
+            Enc::Bcd if f.kind == "n" || f.kind == "z" => unbcd(&take(&mut at, (count + 1) / 2, &what)?, count, &f.pad),
+            Enc::Bin if f.kind == "b" => hex(&take(&mut at, count, &what)?),
+            _ => {
+                let raw = take(&mut at, count, &what)?;
+                String::from_utf8_lossy(&raw).to_string()
+            }
+        };
+        out.insert(n.to_string(), json!(value));
+    }
+    if at != b.len() {
+        return Err(format!("{} bytes left after the last field: is the spec right?", b.len() - at));
+    }
+    Ok(Value::Object(out))
+}
+
+// ---- Meanings ----
+
+fn mti_meaning(mti: &str) -> Value {
+    let d: Vec<u32> = mti.chars().filter_map(|c| c.to_digit(10)).collect();
+    if d.len() != 4 {
+        return json!(null);
+    }
+    let version = match d[0] {
+        0 => "ISO 8583:1987",
+        1 => "ISO 8583:1993",
+        2 => "ISO 8583:2003",
+        8 => "national",
+        9 => "private",
+        _ => "reserved",
+    };
+    let class = ["reserved", "authorization", "financial", "file action", "reversal or chargeback", "reconciliation", "administrative", "fee collection", "network management", "reserved"][d[1] as usize];
+    let function = ["request", "request response", "advice", "advice response", "notification", "notification acknowledgement", "instruction", "instruction acknowledgement", "reserved", "reserved"][d[2] as usize];
+    let origin = ["acquirer", "acquirer repeat", "issuer", "issuer repeat", "other", "other repeat", "reserved", "reserved", "reserved", "reserved"][d[3] as usize];
+    let reply = if d[2] % 2 == 0 && d[2] < 8 { Some(format!("{}{}{}{}", d[0], d[1], d[2] + 1, d[3])) } else { None };
+    json!({ "version": version, "class": class, "function": function, "origin": origin, "reply": reply })
+}
+
+fn response_meaning(code: &str) -> &'static str {
+    match code {
+        "00" => "approved",
+        "01" => "refer to card issuer",
+        "02" => "refer to card issuer, special condition",
+        "03" => "invalid merchant",
+        "04" => "pick up card",
+        "05" => "do not honour",
+        "06" => "error",
+        "07" => "pick up card, special condition",
+        "08" => "honour with identification",
+        "10" => "approved for partial amount",
+        "11" => "approved (VIP)",
+        "12" => "invalid transaction",
+        "13" => "invalid amount",
+        "14" => "invalid card number",
+        "15" => "no such issuer",
+        "19" => "re-enter transaction",
+        "21" => "no action taken",
+        "25" => "unable to locate record",
+        "30" => "format error",
+        "39" => "no credit account",
+        "41" => "lost card, pick up",
+        "43" => "stolen card, pick up",
+        "51" => "insufficient funds",
+        "52" => "no checking account",
+        "53" => "no savings account",
+        "54" => "expired card",
+        "55" => "incorrect PIN",
+        "57" => "transaction not permitted to cardholder",
+        "58" => "transaction not permitted to terminal",
+        "59" => "suspected fraud",
+        "61" => "exceeds withdrawal amount limit",
+        "62" => "restricted card",
+        "63" => "security violation",
+        "65" => "exceeds withdrawal frequency limit",
+        "68" => "response received too late",
+        "75" => "allowable number of PIN tries exceeded",
+        "76" => "invalid account",
+        "78" => "card not activated",
+        "85" => "no reason to decline",
+        "91" => "issuer or switch inoperative",
+        "92" => "destination cannot be found for routing",
+        "94" => "duplicate transmission",
+        "96" => "system malfunction",
+        _ => "unknown",
+    }
+}
+
+fn masked(pan: &str) -> String {
+    let n = pan.len();
+    if n <= 10 {
+        return "*".repeat(n);
+    }
+    format!("{}{}{}", &pan[..6], "*".repeat(n - 10), &pan[n - 4..])
+}
+
+fn explain(msg: &Value, spec: &Spec) -> Value {
+    let mti = msg.get("mti").and_then(text_value).unwrap_or_default();
+    let mut fields = vec![];
+    let mut keys: Vec<(usize, &Value)> = msg.as_object().map(|m| m.iter().filter_map(|(k, v)| field_no(k).map(|n| (n, v))).collect()).unwrap_or_default();
+    keys.sort_by_key(|k| k.0);
+    for (n, v) in keys {
+        let name = spec.fields.get(n).and_then(|f| f.as_ref()).map_or(format!("Field {}", n), |f| f.name.clone());
+        let mut value = text_value(v).unwrap_or_default();
+        // Card data is never shown whole.
+        match n {
+            2 | 34 => value = masked(&value),
+            35 | 45 | 36 => value = format!("({} characters, hidden)", value.len()),
+            52 => value = "(PIN block, hidden)".into(),
+            _ => {}
+        }
+        let mut e = json!({ "field": n, "name": name, "value": value });
+        if n == 39 {
+            e["meaning"] = json!(response_meaning(&value));
+        }
+        if n == 4 {
+            if let Ok(minor) = value.parse::<i64>() {
+                e["amount"] = json!(format!("{}.{:02}", minor / 100, minor % 100));
+            }
+        }
+        fields.push(e);
+    }
+    let code = msg.get("39").and_then(text_value);
+    json!({
+        "mti": mti,
+        "meaning": mti_meaning(&mti),
+        "approved": code.as_deref().map(|c| c == "00" || c == "10" || c == "11"),
+        "response": code.as_deref().map(response_meaning),
+        "fields": fields,
+    })
+}
+
+// ---- Sending ----
+
+static LINKS: Mutex<Option<HashMap<String, Stream>>> = Mutex::new(None);
+
+fn frame_header(len: usize, kind: &str) -> Result<Vec<u8>, String> {
+    match kind {
+        "2" | "2b" | "binary" | "" => {
+            if len > 0xffff {
+                return Err("a message over 65535 bytes does not fit a 2-byte length".into());
+            }
+            Ok(vec![(len >> 8) as u8, len as u8])
+        }
+        "4" | "4a" | "ascii" => Ok(format!("{:04}", len).into_bytes()),
+        "4b" => Ok((len as u32).to_be_bytes().to_vec()),
+        "none" => Ok(vec![]),
+        _ => Err(format!("header {}: 2 (two bytes, the default), 4b (four bytes), 4a (four ASCII digits) or none", kind)),
+    }
+}
+
+fn read_frame(s: &mut Stream, kind: &str, t: Duration) -> Result<Vec<u8>, String> {
+    let _ = s.tcp().set_read_timeout(Some(t));
+    let mut exact = |n: usize| -> Result<Vec<u8>, String> {
+        let mut b = vec![0u8; n];
+        s.read_exact(&mut b).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "no answer in time (timeout_ms)".to_string(),
+            std::io::ErrorKind::UnexpectedEof => "the host closed the connection".to_string(),
+            _ => e.to_string(),
+        })?;
+        Ok(b)
+    };
+    let n = match kind {
+        "4" | "4a" | "ascii" => String::from_utf8_lossy(&exact(4)?).trim().parse::<usize>().map_err(|_| "the length header is not four digits".to_string())?,
+        "4b" => exact(4)?.iter().fold(0usize, |a, x| a << 8 | *x as usize),
+        "none" => return Err("header none: the answer cannot be told apart from the next; use a length header".into()),
+        _ => exact(2)?.iter().fold(0usize, |a, x| a << 8 | *x as usize),
+    };
+    exact(n)
+}
+
+/// Packs `message` by `spec` (a name: "ascii", the 1987 fields in ASCII with a binary bitmap; "ascii-hex"; "bcd"; or a spec as data, see `iso8583_spec`) and gives its bytes as hex.
+pub fn iso8583_pack(message: serde_json::Value, spec: serde_json::Value) -> Result<String, String> {
+    Ok(hex(&pack(&message, &spec_of(&spec)?)?))
+}
+
+/// Unpacks a message's bytes (as hex) by `spec`: `{ mti, bitmap, "2": ..., "3": ... }`, the fields as text (binary ones as hex).
+pub fn iso8583_unpack(hex_bytes: &str, spec: serde_json::Value) -> Result<Value, String> {
+    unpack(&unhex(hex_bytes)?, &spec_of(&spec)?)
+}
+
+/// A built-in spec as data ("ascii", "ascii-hex" or "bcd"), to change and pass back: `{ mti, bitmap, fields: { "2": { name, type, max, prefix, data, length, pad } } }`. A spec of your own can also be `{ base: "bcd", fields: { "48": { type: "ans", max: 50, prefix: 3 } } }`.
+pub fn iso8583_spec(name: &str) -> Result<Value, String> {
+    Ok(spec_value(&builtin(name)?))
+}
+
+/// What an MTI means: `{ version, class, function, origin, reply }` ("0200": a 1987 financial request from the acquirer, answered by 0210).
+pub fn iso8583_mti(mti: &str) -> Value {
+    mti_meaning(mti)
+}
+
+/// A message read for people and logs: the MTI's meaning, each field named, the response code's meaning, the amount, and card data masked.
+pub fn iso8583_explain(message: serde_json::Value, spec: serde_json::Value) -> Result<Value, String> {
+    Ok(explain(&message, &spec_of(&spec)?))
+}
+
+/// Sends `message` to `host` (host:port) and gives the answer unpacked, with `explain`. Each message goes with a 2-byte length first (options: `header` "2", "4b", "4a"; `prefix_hex`, bytes such as a TPDU sent after the length and taken off the answer). The answer is the first one with the same STAN (field 11) and the reply MTI; others are skipped. Options also `timeout_ms` (10000), `tls`, `ca`, `insecure`, `keep` (true: the connection stays open).
+pub fn iso8583_send(host: &str, message: serde_json::Value, spec: serde_json::Value, opts: serde_json::Value) -> Result<Value, String> {
+    let sp = spec_of(&spec)?;
+    let body = pack(&message, &sp)?;
+    let header = o_str(&opts, "header").unwrap_or_else(|| "2".into());
+    let prefix = unhex(&o_str(&opts, "prefix_hex").unwrap_or_default())?;
+    let mut framed = frame_header(body.len() + prefix.len(), &header)?;
+    framed.extend(&prefix);
+    framed.extend(&body);
+    let t = timeout_of(&opts);
+    let keep = o_bool(&opts, "keep", true);
+    let tls = o_bool(&opts, "tls", false);
+    let key = format!("{}|{}", host, tls);
+    let open = || -> Result<Stream, String> {
+        let (name, port) = split_host(host, 0)?;
+        if port == 0 {
+            return Err(format!("{}: give the port (host:port)", host));
+        }
+        let tcp = connect(&name, port, t)?;
+        if tls { tls_wrap(tcp, &name, &opts) } else { Ok(Stream::Plain(tcp)) }
+    };
+    let kept = if keep { LINKS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(&key) } else { None };
+    let reused = kept.is_some();
+    let mut s = match kept {
+        Some(s) => s,
+        None => open()?,
+    };
+    if s.write_all(&framed).and_then(|_| s.flush()).is_err() {
+        if !reused {
+            return Err(format!("cannot write to {}", host));
+        }
+        s = open()?;
+        s.write_all(&framed).and_then(|_| s.flush()).map_err(|e| format!("cannot write to {}: {}", host, e))?;
+    }
+    let mti = message.get("mti").and_then(text_value).unwrap_or_default();
+    let want_mti = mti_meaning(&mti)["reply"].as_str().map(|s| s.to_string());
+    let stan = message.get("11").and_then(text_value);
+    let until = Instant::now() + t;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("{}: no answer to {} in time (timeout_ms)", host, mti));
+        }
+        let raw = match read_frame(&mut s, &header, left) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("{}: {}", host, e)),
+        };
+        if raw.len() < prefix.len() {
+            continue;
+        }
+        let got = unpack(&raw[prefix.len()..], &sp)?;
+        let same_stan = match &stan {
+            Some(x) => got.get("11").and_then(text_value).map_or(true, |y| y.trim_start_matches('0') == x.trim_start_matches('0')),
+            None => true,
+        };
+        let same_mti = want_mti.as_ref().map_or(true, |w| got["mti"].as_str() == Some(w.as_str()));
+        if same_stan && same_mti {
+            if keep {
+                LINKS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, s);
+            }
+            let mut out = got.clone();
+            out["explain"] = explain(&got, &sp);
+            return Ok(out);
+        }
+    }
+}
+
+/// Closes the kept connection to `host`; whether there was one.
+pub fn iso8583_close(host: &str) -> bool {
+    let mut g = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let before = m.len();
+    m.retain(|k, _| !k.starts_with(&format!("{}|", host)));
+    before != m.len()
+}

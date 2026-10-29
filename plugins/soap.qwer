@@ -1,0 +1,529 @@
+//! SOAP 1.1 and 1.2 clients: envelopes built from an operation's name, namespace and parameters (with WS-Security UsernameToken, text or digest), calls over HTTP with the SOAPAction, answers and faults read into maps, and WSDL files read for their services, operations, endpoints and parameters, so a call can be made by the operation's name alone.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! roxmltree = "0.20"
+//! ureq = "2"
+//! sha1 = "0.10"
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+use serde_json::{json, Map, Value};
+
+const SOAP11: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const SOAP12: &str = "http://www.w3.org/2003/05/soap-envelope";
+const WSSE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
+const WSU: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+const PROFILE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0";
+const B64BIN: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary";
+const WSDL_SOAP11: &str = "http://schemas.xmlsoap.org/wsdl/soap/";
+const WSDL_SOAP12: &str = "http://schemas.xmlsoap.org/wsdl/soap12/";
+
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\r' => o.push_str("&#13;"),
+            c if (c as u32) < 0x20 && c != '\n' && c != '\t' => {}
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn check_name(n: &str) -> Result<(), String> {
+    let ok = !n.is_empty()
+        && n.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+        && n.chars().all(|c| c.is_alphanumeric() || "_-.:".contains(c));
+    if ok { Ok(()) } else { Err(format!("{:?} is not an XML element name", n)) }
+}
+
+fn scalar(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// `name` holding `v`: a map is child elements (`@x` keys are attributes, `#text` text), a list
+/// the element repeated, null `xsi:nil`, anything else text.
+fn element(name: &str, v: &Value, out: &mut String, depth: usize) -> Result<(), String> {
+    if depth > 64 {
+        return Err("parameters nested more than 64 deep".into());
+    }
+    check_name(name)?;
+    match v {
+        Value::Array(a) => {
+            for x in a {
+                element(name, x, out, depth + 1)?;
+            }
+        }
+        Value::Null => out.push_str(&format!("<{} xsi:nil=\"true\"/>", name)),
+        Value::Object(m) => {
+            out.push('<');
+            out.push_str(name);
+            for (k, x) in m {
+                if let Some(a) = k.strip_prefix('@') {
+                    check_name(a)?;
+                    out.push_str(&format!(" {}=\"{}\"", a, esc(&scalar(x))));
+                }
+            }
+            out.push('>');
+            for (k, x) in m {
+                if k == "#text" {
+                    out.push_str(&esc(&scalar(x)));
+                } else if !k.starts_with('@') {
+                    element(k, x, out, depth + 1)?;
+                }
+            }
+            out.push_str(&format!("</{}>", name));
+        }
+        other => out.push_str(&format!("<{}>{}</{}>", name, esc(&scalar(other)), name)),
+    }
+    Ok(())
+}
+
+fn now_iso(offset_s: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(offset_s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn security_header(s: &Value, env_prefix: &str) -> Result<String, String> {
+    use base64::Engine;
+    use sha1::Digest;
+    let user = s["username"].as_str().ok_or("`security` needs `username` and `password`")?;
+    let password = s["password"].as_str().ok_or("`security` needs `username` and `password`")?;
+    let digest = s["digest"].as_bool().unwrap_or(true);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let nonce: Vec<u8> = match s["nonce"].as_str() {
+        Some(n) => b64.decode(n).map_err(|_| "`security.nonce` is base64")?,
+        None => {
+            let mut b = [0u8; 16];
+            getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+            b.to_vec()
+        }
+    };
+    let created = s["created"].as_str().map(|c| c.to_string()).unwrap_or_else(|| now_iso(0));
+    let mut out = format!("<wsse:Security {}:mustUnderstand=\"{}\" xmlns:wsse=\"{}\" xmlns:wsu=\"{}\">", env_prefix, if env_prefix == "soap12" { "true" } else { "1" }, WSSE, WSU);
+    if let Some(ttl) = s["timestamp"].as_i64() {
+        out.push_str(&format!("<wsu:Timestamp wsu:Id=\"TS-1\"><wsu:Created>{}</wsu:Created><wsu:Expires>{}</wsu:Expires></wsu:Timestamp>", now_iso(0), now_iso(ttl.clamp(1, 86_400))));
+    }
+    out.push_str(&format!("<wsse:UsernameToken wsu:Id=\"UsernameToken-1\"><wsse:Username>{}</wsse:Username>", esc(user)));
+    if digest {
+        // Password_Digest = Base64(SHA-1(nonce + created + password)), WSS UsernameToken Profile 1.0.
+        let mut h = sha1::Sha1::new();
+        h.update(&nonce);
+        h.update(created.as_bytes());
+        h.update(password.as_bytes());
+        out.push_str(&format!("<wsse:Password Type=\"{}#PasswordDigest\">{}</wsse:Password>", PROFILE, b64.encode(h.finalize())));
+    } else {
+        out.push_str(&format!("<wsse:Password Type=\"{}#PasswordText\">{}</wsse:Password>", PROFILE, esc(password)));
+    }
+    out.push_str(&format!("<wsse:Nonce EncodingType=\"{}\">{}</wsse:Nonce><wsu:Created>{}</wsu:Created></wsse:UsernameToken></wsse:Security>", B64BIN, b64.encode(&nonce), esc(&created)));
+    Ok(out)
+}
+
+struct Built {
+    xml: String,
+    version: String,
+    action: String,
+}
+
+fn build(op: &Value) -> Result<Built, String> {
+    let name = op["operation"].as_str().ok_or("give the `operation`'s name")?;
+    check_name(name)?;
+    let ns = op["namespace"].as_str().unwrap_or("");
+    let version = match op["version"].as_str().unwrap_or("1.1") { "1.1" | "11" => "1.1", "1.2" | "12" => "1.2", v => return Err(format!("`version` is \"1.1\" or \"1.2\", not {:?}", v)) };
+    let (env_ns, p) = if version == "1.1" { (SOAP11, "soap") } else { (SOAP12, "soap12") };
+    let mut xml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{p}:Envelope xmlns:{p}=\"{}\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">", env_ns);
+    let mut header = String::new();
+    if op["security"].is_object() {
+        header.push_str(&security_header(&op["security"], p)?);
+    }
+    if let Some(h) = op["headers"].as_object() {
+        // Header elements, in the operation's namespace unless they name their own.
+        for (k, v) in h {
+            let mut e = String::new();
+            element(k, v, &mut e, 0)?;
+            if !ns.is_empty() && !k.contains(':') {
+                e = e.replacen(&format!("<{}", k), &format!("<{} xmlns=\"{}\"", k, esc(ns)), 1);
+            }
+            header.push_str(&e);
+        }
+    }
+    if let Some(raw) = op["header_xml"].as_str() {
+        header.push_str(raw);
+    }
+    if !header.is_empty() {
+        xml.push_str(&format!("<{p}:Header>{}</{p}:Header>", header));
+    }
+    xml.push_str(&format!("<{p}:Body>"));
+    let params = if op["params"].is_null() { json!({}) } else { op["params"].clone() };
+    if !params.is_object() {
+        return Err("`params` is a map of the operation's parameters".into());
+    }
+    let qualified = op["qualified"].as_bool().unwrap_or(true);
+    let mut inner = String::new();
+    for (k, v) in params.as_object().unwrap() {
+        if !k.starts_with('@') {
+            element(k, v, &mut inner, 1)?;
+        }
+    }
+    if ns.is_empty() {
+        xml.push_str(&format!("<{}>{}</{}>", name, inner, name));
+    } else if qualified {
+        // Children in the namespace too (elementFormDefault="qualified", as .NET and most WSDLs).
+        xml.push_str(&format!("<{} xmlns=\"{}\">{}</{}>", name, esc(ns), inner, name));
+    } else {
+        xml.push_str(&format!("<m:{} xmlns:m=\"{}\">{}</m:{}>", name, esc(ns), inner, name));
+    }
+    xml.push_str(&format!("</{p}:Body></{p}:Envelope>"));
+    let action = match op["action"].as_str() {
+        Some(a) => a.to_string(),
+        None if ns.is_empty() => String::new(),
+        None if ns.ends_with('/') => format!("{}{}", ns, name),
+        None => format!("{}/{}", ns, name),
+    };
+    Ok(Built { xml, version: version.to_string(), action })
+}
+
+/// A SOAP envelope as XML text. `op`: `{ operation: "GetQuote", namespace: "http://example.com/stock/", params: { symbol: "ACME" } (a map is child elements, a list repeats one, `@name` keys are attributes, null is xsi:nil), version: "1.1" (default) | "1.2", qualified: true (children in the namespace; false for unqualified schemas), headers: { name: value }, header_xml, security: { username, password, digest: true (PasswordDigest; false: PasswordText), timestamp: seconds (adds wsu:Timestamp) } }`.
+pub fn soap_envelope(op: serde_json::Value) -> Result<String, String> {
+    Ok(build(&op)?.xml)
+}
+
+// ---------------------------------------------------------------- reading
+
+fn elems<'a, 'i>(n: roxmltree::Node<'a, 'i>) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> {
+    n.children().filter(|c| c.is_element())
+}
+
+/// An element as a value: text when it has no children, else a map by local name (repeated
+/// names a list), attributes as `@name`, `xsi:nil` null.
+fn to_value(n: roxmltree::Node, depth: usize) -> Value {
+    if n.attributes().any(|a| a.name() == "nil" && (a.value() == "true" || a.value() == "1")) {
+        return Value::Null;
+    }
+    let kids: Vec<_> = elems(n).collect();
+    let attrs: Vec<_> = n.attributes().filter(|a| a.namespace() != Some("http://www.w3.org/2001/XMLSchema-instance")).collect();
+    if kids.is_empty() && attrs.is_empty() {
+        return json!(n.text().unwrap_or(""));
+    }
+    if depth > 64 {
+        return Value::Null;
+    }
+    let mut m = Map::new();
+    for a in attrs {
+        m.insert(format!("@{}", a.name()), json!(a.value()));
+    }
+    // Children by local name, in the order first seen; a name that repeats is a list.
+    let mut groups: Vec<(String, Vec<Value>)> = vec![];
+    for k in kids {
+        let name = k.tag_name().name().to_string();
+        let v = to_value(k, depth + 1);
+        match groups.iter_mut().find(|g| g.0 == name) {
+            Some(g) => g.1.push(v),
+            None => groups.push((name, vec![v])),
+        }
+    }
+    for (name, mut vs) in groups {
+        m.insert(name, if vs.len() == 1 { vs.pop().unwrap() } else { Value::Array(vs) });
+    }
+    if elems(n).next().is_none() {
+        if let Some(t) = n.text() {
+            if !t.trim().is_empty() {
+                m.insert("#text".into(), json!(t));
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+/// A fault code as written (`soap:Server`, `env:Sender`, `wsse:FailedAuthentication`): the SOAP
+/// envelope's own codes without a prefix (`Server`, `Sender`), others as they are.
+fn code_name(n: roxmltree::Node, envelope_ns: &str) -> Option<String> {
+    let t = n.text()?.trim();
+    match t.split_once(':') {
+        Some((p, l)) if n.lookup_namespace_uri(Some(p)) == Some(envelope_ns) => Some(l.to_string()),
+        None if n.lookup_namespace_uri(None) == Some(envelope_ns) => Some(t.to_string()),
+        _ => Some(t.to_string()),
+    }
+}
+
+fn get<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    elems(n).find(|e| e.tag_name().name() == name)
+}
+
+fn named<'a, 'i: 'a>(n: roxmltree::Node<'a, 'i>, name: &'a str) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> + 'a {
+    elems(n).filter(move |e| e.tag_name().name() == name)
+}
+
+fn parse_doc(xml: &str) -> Result<roxmltree::Document<'_>, String> {
+    let opts = roxmltree::ParsingOptions { allow_dtd: false, ..Default::default() };
+    roxmltree::Document::parse_with_options(xml.trim_start_matches('\u{feff}'), opts).map_err(|e| format!("not XML: {}", e))
+}
+
+fn parse_envelope(xml: &str) -> Result<Value, String> {
+    let doc = parse_doc(xml)?;
+    let env = doc.root_element();
+    let ns = env.tag_name().namespace().unwrap_or("");
+    let version = match ns { SOAP11 => "1.1", SOAP12 => "1.2", _ => return Err(format!("not a SOAP envelope: <{}> in {:?}", env.tag_name().name(), ns)) };
+    if env.tag_name().name() != "Envelope" {
+        return Err("a SOAP message's root is <Envelope>".into());
+    }
+    let header = elems(env).find(|e| e.tag_name().name() == "Header").map(|h| to_value(h, 0)).unwrap_or(Value::Null);
+    let body = elems(env).find(|e| e.tag_name().name() == "Body").ok_or("the envelope has no <Body>")?;
+    let first = elems(body).next();
+    let mut out = json!({ "version": version, "header": header, "operation": null, "result": null, "fault": null });
+    if let Some(f) = first {
+        if f.tag_name().name() == "Fault" && f.tag_name().namespace() == Some(ns) {
+            let fault = if version == "1.1" {
+                json!({
+                    "code": get(f, "faultcode").and_then(|e| code_name(e, ns)),
+                    "message": get(f, "faultstring").and_then(|e| e.text()),
+                    "actor": get(f, "faultactor").and_then(|e| e.text()),
+                    "detail": get(f, "detail").map(|d| to_value(d, 0)),
+                })
+            } else {
+                let code = get(f, "Code");
+                let sub: Vec<Value> = code.map(|c| c.descendants().filter(|d| d.tag_name().name() == "Value").skip(1).filter_map(|v| code_name(v, ns).map(|t| json!(t))).collect()).unwrap_or_default();
+                json!({
+                    "code": code.and_then(|c| get(c, "Value")).and_then(|v| code_name(v, ns)),
+                    "subcodes": sub,
+                    "message": get(f, "Reason").and_then(|r| get(r, "Text")).and_then(|t| t.text()),
+                    "actor": get(f, "Role").and_then(|e| e.text()),
+                    "detail": get(f, "Detail").map(|d| to_value(d, 0)),
+                })
+            };
+            out["fault"] = fault;
+        } else {
+            out["operation"] = json!(f.tag_name().name());
+            out["result"] = to_value(f, 0);
+        }
+    }
+    Ok(out)
+}
+
+/// A SOAP message read (an answer, or a request a route was sent): `{ version: "1.1" | "1.2", header, operation (the Body's first element), result (it as a map: child elements by name, a name repeated a list, `@name` attributes, all values text), fault: null or { code, subcodes (1.2), message, actor, detail } }`.
+pub fn soap_parse(xml: &str) -> Result<Value, String> {
+    parse_envelope(xml)
+}
+
+/// A fault as SOAP text, for a route answering SOAP: `code` ("Client" / "Server" in 1.1; "Sender" / "Receiver" in 1.2), `message`, `version`.
+pub fn soap_fault(code: &str, message: &str, version: &str) -> Result<String, String> {
+    let (ns, p) = match version { "1.1" | "" => (SOAP11, "soap"), "1.2" => (SOAP12, "soap12"), v => return Err(format!("`version` is \"1.1\" or \"1.2\", not {:?}", v)) };
+    let body = if p == "soap" {
+        format!("<soap:Fault><faultcode>soap:{}</faultcode><faultstring>{}</faultstring></soap:Fault>", esc(code), esc(message))
+    } else {
+        format!("<soap12:Fault><soap12:Code><soap12:Value>soap12:{}</soap12:Value></soap12:Code><soap12:Reason><soap12:Text xml:lang=\"en\">{}</soap12:Text></soap12:Reason></soap12:Fault>", esc(code), esc(message))
+    };
+    Ok(format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{p}:Envelope xmlns:{p}=\"{}\"><{p}:Body>{}</{p}:Body></{p}:Envelope>", ns, body))
+}
+
+// ---------------------------------------------------------------- calls
+
+fn agent(opts: &Value) -> ureq::Agent {
+    let ms = opts["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 300_000) as u64;
+    ureq::AgentBuilder::new().timeout(std::time::Duration::from_millis(ms)).build()
+}
+
+fn auth(mut req: ureq::Request, opts: &Value) -> ureq::Request {
+    if let (Some(u), Some(p)) = (opts["user"].as_str(), opts["password"].as_str()) {
+        use base64::Engine;
+        req = req.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+    }
+    if let Some(h) = opts["headers"].as_object() {
+        for (k, v) in h {
+            req = req.set(k, &scalar(v));
+        }
+    }
+    req
+}
+
+fn send(url: &str, b: &Built, opts: &Value) -> Result<Value, String> {
+    let ct = if b.version == "1.1" { "text/xml; charset=utf-8".to_string() } else if b.action.is_empty() { "application/soap+xml; charset=utf-8".to_string() } else { format!("application/soap+xml; charset=utf-8; action=\"{}\"", b.action) };
+    let mut req = agent(opts).post(url).set("Content-Type", &ct).set("User-Agent", "quillo-soap/1.0");
+    if b.version == "1.1" {
+        req = req.set("SOAPAction", &format!("\"{}\"", b.action));
+    }
+    let text = match auth(req, opts).send_string(&b.xml) {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        // A fault comes with HTTP 500 (1.1), 400 or 500 (1.2).
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            if t.contains("Envelope") {
+                t
+            } else {
+                return Err(format!("the SOAP server answered HTTP {}{}", code, if code == 401 { " (give user and password)" } else if code == 415 { " (try the other SOAP version)" } else { "" }));
+            }
+        }
+        Err(e) => return Err(format!("cannot reach {}: {}", url, e)),
+    };
+    parse_envelope(&text)
+}
+
+fn fault_error(f: &Value) -> String {
+    let mut s = format!("soap fault {}: {}", f["code"].as_str().unwrap_or("?"), f["message"].as_str().unwrap_or("").trim());
+    if let Some(sub) = f["subcodes"].as_array().filter(|a| !a.is_empty()) {
+        s.push_str(&format!(" ({})", sub.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    s
+}
+
+/// Calls the operation `op` (as `soap_envelope` takes it, with `action`: the SOAPAction, made from the namespace and name when left out) at `url`, and gives the answer read as `soap_parse` reads it; a fault is an error value, `soap fault soap:Client: ...`. `options`: `{ timeout_ms (10000), user, password (HTTP basic auth), headers }`.
+pub fn soap_call(url: &str, op: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let b = build(&op)?;
+    let r = send(url, &b, &options)?;
+    if !r["fault"].is_null() {
+        return Err(fault_error(&r["fault"]));
+    }
+    Ok(r)
+}
+
+// ---------------------------------------------------------------- WSDL
+
+fn load(source: &str, opts: &Value) -> Result<String, String> {
+    let s = source.trim_start();
+    if s.starts_with('<') {
+        return Ok(source.to_string());
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let r = auth(agent(opts).get(s), opts).call().map_err(|e| format!("cannot read the WSDL at {}: {}", s, e))?;
+        return r.into_string().map_err(|e| e.to_string());
+    }
+    std::fs::read_to_string(s).map_err(|e| format!("cannot read the WSDL file {}: {}", s, e))
+}
+
+fn local(qname: &str) -> &str {
+    qname.rsplit(':').next().unwrap_or(qname)
+}
+
+fn attr<'a>(n: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    n.attribute(name)
+}
+
+/// The parameters of a schema element (a sequence, inline or through a named complexType).
+fn element_params(doc: &roxmltree::Document, element: &str) -> (Option<String>, Value) {
+    let schemas: Vec<_> = doc.descendants().filter(|n| n.tag_name().name() == "schema").collect();
+    for s in &schemas {
+        for e in elems(*s).filter(|e| e.tag_name().name() == "element" && attr(*e, "name") == Some(element)) {
+            let ns = attr(*s, "targetNamespace").map(|x| x.to_string());
+            let ct = elems(e).find(|c| c.tag_name().name() == "complexType").or_else(|| {
+                let t = local(attr(e, "type")?);
+                schemas.iter().flat_map(|s| elems(*s)).find(|c| c.tag_name().name() == "complexType" && attr(*c, "name") == Some(t))
+            });
+            let params: Vec<Value> = ct
+                .map(|ct| {
+                    ct.descendants()
+                        .filter(|d| d.tag_name().name() == "element" && d.parent().map_or(false, |p| ["sequence", "all", "choice"].contains(&p.tag_name().name())))
+                        .filter(|d| d.ancestors().filter(|a| a.tag_name().name() == "complexType").count() == 1)
+                        .map(|d| json!({ "name": attr(d, "name").or(attr(d, "ref").map(local)), "type": attr(d, "type").map(local), "min": attr(d, "minOccurs").unwrap_or("1"), "max": attr(d, "maxOccurs").unwrap_or("1") }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return (ns, Value::Array(params));
+        }
+    }
+    (None, json!([]))
+}
+
+fn read_wsdl(xml: &str) -> Result<Value, String> {
+    let doc = parse_doc(xml)?;
+    let root = doc.root_element();
+    if root.tag_name().name() == "description" {
+        return Err("this is WSDL 2.0, which is not read here: only WSDL 1.1 (<definitions>)".into());
+    }
+    if root.tag_name().name() != "definitions" {
+        return Err(format!("a WSDL 1.1 file starts with <definitions>, not <{}>", root.tag_name().name()));
+    }
+    let tns = attr(root, "targetNamespace").unwrap_or("").to_string();
+    let by = |name: &'static str| named(root, name);
+    // message name -> its element (document) or parts (rpc)
+    let message = |qn: &str| -> Value {
+        let n = local(qn);
+        match by("message").find(|m| attr(*m, "name") == Some(n)) {
+            Some(m) => {
+                let parts: Vec<Value> = elems(m).filter(|p| p.tag_name().name() == "part").map(|p| json!({ "name": attr(p, "name"), "element": attr(p, "element").map(local), "type": attr(p, "type").map(local) })).collect();
+                let element = parts.iter().find_map(|p| p["element"].as_str().map(|s| s.to_string()));
+                let (ns, params) = match &element { Some(e) => element_params(&doc, e), None => (None, json!(parts.iter().map(|p| json!({ "name": p["name"], "type": p["type"] })).collect::<Vec<_>>())) };
+                json!({ "message": n, "element": element, "namespace": ns, "params": params })
+            }
+            None => json!({ "message": n }),
+        }
+    };
+    let mut services = vec![];
+    for s in by("service") {
+        let ports: Vec<Value> = elems(s)
+            .filter(|p| p.tag_name().name() == "port")
+            .map(|p| {
+                let addr = elems(p).find(|a| a.tag_name().name() == "address");
+                let version = match addr.and_then(|a| a.tag_name().namespace()) { Some(WSDL_SOAP11) => json!("1.1"), Some(WSDL_SOAP12) => json!("1.2"), _ => Value::Null };
+                json!({ "name": attr(p, "name"), "binding": attr(p, "binding").map(local), "version": version, "address": addr.and_then(|a| attr(a, "location")) })
+            })
+            .collect();
+        services.push(json!({ "name": attr(s, "name"), "ports": ports }));
+    }
+    let mut operations = vec![];
+    for b in by("binding") {
+        let bname = attr(b, "name").unwrap_or("");
+        let sb = elems(b).find(|e| e.tag_name().name() == "binding");
+        let version = match sb.and_then(|e| e.tag_name().namespace()) { Some(WSDL_SOAP11) => "1.1", Some(WSDL_SOAP12) => "1.2", _ => continue };
+        let style = sb.and_then(|e| attr(e, "style")).unwrap_or("document");
+        let pt = local(attr(b, "type").unwrap_or(""));
+        let port_type = by("portType").find(|p| attr(*p, "name") == Some(pt));
+        let address = services.iter().flat_map(|s| s["ports"].as_array().cloned().unwrap_or_default()).find(|p| p["binding"] == bname).map(|p| p["address"].clone()).unwrap_or(Value::Null);
+        for o in elems(b).filter(|e| e.tag_name().name() == "operation") {
+            let name = attr(o, "name").unwrap_or("");
+            let so = elems(o).find(|e| e.tag_name().name() == "operation");
+            let abstract_op = port_type.and_then(|p| elems(p).find(|e| e.tag_name().name() == "operation" && attr(*e, "name") == Some(name)));
+            let io = |which: &str| abstract_op.and_then(|a| elems(a).find(|e| e.tag_name().name() == which)).and_then(|e| attr(e, "message")).map(|m| message(m)).unwrap_or(Value::Null);
+            let doc_text = abstract_op.and_then(|a| elems(a).find(|e| e.tag_name().name() == "documentation")).and_then(|d| d.text()).map(|t| t.trim().to_string());
+            operations.push(json!({
+                "name": name, "binding": bname, "version": version, "style": so.and_then(|e| attr(e, "style")).unwrap_or(style),
+                "action": so.and_then(|e| attr(e, "soapAction")).unwrap_or(""), "address": address,
+                "input": io("input"), "output": io("output"), "documentation": doc_text,
+            }));
+        }
+    }
+    Ok(json!({ "target_namespace": tns, "services": services, "operations": operations }))
+}
+
+/// A WSDL 1.1 file read (`source`: a path, an http(s) URL, or the XML itself): `{ target_namespace, services: [{ name, ports: [{ name, binding, version, address }] }], operations: [{ name, binding, version, style, action, address, input: { message, element, namespace, params: [{ name, type, min, max }] }, output, documentation }] }` (an operation once per binding: SOAP 1.1 and 1.2). `options` as for `soap_call`, for a WSDL behind auth.
+pub fn soap_wsdl(source: &str, options: serde_json::Value) -> Result<Value, String> {
+    read_wsdl(&load(source, &options)?)
+}
+
+/// Calls an operation by its name alone, from the WSDL (`source` as `soap_wsdl` takes it): its endpoint, SOAPAction, namespace and SOAP version come from there. `params` is a map of its parameters. `options`: those of `soap_call`, and `version` ("1.1" unless the WSDL has only 1.2), `endpoint` (another address than the WSDL's), `security` (WS-Security as in `soap_envelope`), `headers_xml`. Gives the answer as `soap_call` does.
+pub fn soap_invoke(source: &str, operation: &str, params: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let w = read_wsdl(&load(source, &options)?)?;
+    let ops: Vec<&Value> = w["operations"].as_array().map(|a| a.iter().filter(|o| o["name"] == operation).collect()).unwrap_or_default();
+    if ops.is_empty() {
+        let names: Vec<String> = w["operations"].as_array().map(|a| a.iter().filter_map(|o| o["name"].as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+        let mut names: Vec<String> = names.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        names.truncate(30);
+        return Err(format!("the WSDL has no operation {:?}; it has {}", operation, names.join(", ")));
+    }
+    let want = options["version"].as_str().unwrap_or("1.1");
+    let o = ops.iter().find(|o| o["version"] == want).or_else(|| ops.first()).unwrap();
+    if o["style"] == "rpc" {
+        return Err(format!("{} is rpc-style; call it with soap_call and `qualified: false`", operation));
+    }
+    let element = o["input"]["element"].as_str().unwrap_or(operation);
+    let ns = o["input"]["namespace"].as_str().map(|s| s.to_string()).unwrap_or_else(|| w["target_namespace"].as_str().unwrap_or("").to_string());
+    let url = options["endpoint"].as_str().or(o["address"].as_str()).ok_or("the WSDL gives no address for this operation: pass `endpoint`")?.to_string();
+    let mut op = json!({ "operation": element, "namespace": ns, "params": params, "version": o["version"], "action": o["action"] });
+    for k in ["security", "headers_xml"] {
+        if !options[k].is_null() {
+            op[if k == "headers_xml" { "header_xml" } else { k }] = options[k].clone();
+        }
+    }
+    soap_call(&url, op, options)
+}

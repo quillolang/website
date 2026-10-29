@@ -1,0 +1,673 @@
+//! NATS messaging: publish with headers, subscribe with `*` and `>` wildcards and queue groups into buffers the program drains, request and reply with a timeout, and JetStream streams with publish acknowledgements and stored messages read back.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! async-nats = { version = "=0.51.0", default-features = false, features = ["ring", "nkeys", "nuid"] }
+//! tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+//! futures-util = { version = "0.3", default-features = false }
+//! bytes = "1"
+//! base64 = "0.22"
+
+use base64::Engine;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// The client runs on a tokio runtime kept in a static (2 threads). Each subscription has a task
+// that moves what arrives into a bounded buffer (`buffer`, 10000 messages by default; when full
+// the oldest is dropped and counted), which nats_receive drains. async-nats reconnects by itself
+// and subscribes again; every call has its own timeout (`timeout_ms`, 10 s by default).
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("nats").enable_all().build().expect("a tokio runtime")
+    })
+}
+
+/// Runs `f` on the runtime and waits for it, at most `t`.
+fn run<T: Send + 'static>(t: Duration, what: String, f: impl std::future::Future<Output = Result<T, String>> + Send + 'static) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt().spawn(async move {
+        let r = tokio::time::timeout(t, f).await;
+        let _ = tx.send(r);
+    });
+    match rx.recv() {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(format!("{} took more than {} ms: check that the NATS server is up, or give a longer timeout_ms", what, t.as_millis())),
+        Err(_) => Err(format!("{}: the NATS task stopped", what)),
+    }
+}
+
+struct Inbox {
+    msgs: VecDeque<Value>,
+    received: u64,
+    dropped: u64,
+}
+
+struct Sub {
+    subject: String,
+    queue: Option<String>,
+    inbox: Arc<(Mutex<Inbox>, Condvar)>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct Conn {
+    client: async_nats::Client,
+    subs: Mutex<HashMap<String, Sub>>,
+    timeout: Duration,
+    cap: usize,
+    js: String,
+}
+
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn get(name: &str) -> Result<Arc<Conn>, String> {
+    lock(&CONNS).as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no NATS connection named `{}`: call nats_connect(\"{}\", url, options) first", name, name))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn opt_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn opt_i64(o: &Value, k: &str) -> Result<Option<i64>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).map(Some).ok_or(format!("`{}` must be a number", k)),
+        Some(v) => Err(format!("`{}` must be a number, not {}", k, v)),
+    }
+}
+
+fn opt_bool(o: &Value, k: &str) -> Result<Option<bool>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(format!("`{}` must be true or false, not {}", k, v)),
+    }
+}
+
+fn check_keys(o: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
+    match o {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(format!("{} has no option `{}`; it takes {}", what, k, allowed.join(", ")));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("{} options must be a map", what)),
+    }
+}
+
+fn timeout_of(c: &Conn, o: &Value) -> Result<Duration, String> {
+    Ok(opt_i64(o, "timeout_ms")?.map(|t| Duration::from_millis(t.clamp(1, 600_000) as u64)).unwrap_or(c.timeout))
+}
+
+/// The payload: text as it is, `{ base64: "..." }` for bytes, anything else as JSON.
+fn payload_bytes(v: &Value) -> Result<bytes::Bytes, String> {
+    match v {
+        Value::String(s) => Ok(bytes::Bytes::from(s.clone().into_bytes())),
+        Value::Null => Ok(bytes::Bytes::new()),
+        Value::Object(m) if m.len() == 1 && m.contains_key("base64") => {
+            let b = m.get("base64").and_then(|x| x.as_str()).ok_or("`base64` must be text")?;
+            base64::engine::general_purpose::STANDARD.decode(b.trim()).map(bytes::Bytes::from).map_err(|e| format!("the payload's base64 is not valid: {}", e))
+        }
+        other => Ok(bytes::Bytes::from(other.to_string().into_bytes())),
+    }
+}
+
+fn put_payload(b: &[u8], m: &mut serde_json::Map<String, Value>) {
+    match std::str::from_utf8(b) {
+        Ok(s) => {
+            m.insert("payload".into(), json!(s));
+        }
+        Err(_) => {
+            m.insert("payload".into(), Value::Null);
+            m.insert("payload_base64".into(), json!(base64::engine::general_purpose::STANDARD.encode(b)));
+        }
+    }
+}
+
+fn headers_of(v: Option<&Value>) -> Result<Option<async_nats::HeaderMap>, String> {
+    let m = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(m)) => m,
+        Some(_) => return Err("headers must be a map, like { \"Content-Type\": \"application/json\" }".into()),
+    };
+    let mut h = async_nats::HeaderMap::new();
+    for (k, v) in m {
+        if k.is_empty() || k.chars().any(|c| c == ':' || c.is_whitespace() || c.is_control()) {
+            return Err(format!("{:?} cannot be a header name", k));
+        }
+        let vals: Vec<String> = match v {
+            Value::Array(a) => a.iter().map(|x| x.as_str().map(|s| s.to_string()).unwrap_or(x.to_string())).collect(),
+            Value::String(s) => vec![s.clone()],
+            other => vec![other.to_string()],
+        };
+        for s in vals {
+            if s.contains('\r') || s.contains('\n') {
+                return Err(format!("the header {} cannot hold a line break", k));
+            }
+            h.append(k.as_str(), s.as_str());
+        }
+    }
+    Ok(Some(h))
+}
+
+fn headers_json(h: &async_nats::HeaderMap) -> Value {
+    let mut m = serde_json::Map::new();
+    let mut names: Vec<_> = h.iter().collect();
+    names.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+    for (k, vs) in names {
+        let vals: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+        m.insert(k.to_string(), if vals.len() == 1 { json!(vals[0]) } else { json!(vals) });
+    }
+    Value::Object(m)
+}
+
+fn message_json(m: &async_nats::Message) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("subject".into(), json!(m.subject.to_string()));
+    put_payload(&m.payload, &mut o);
+    o.insert("reply".into(), m.reply.as_ref().map(|r| json!(r.to_string())).unwrap_or(Value::Null));
+    o.insert("headers".into(), m.headers.as_ref().map(headers_json).unwrap_or(json!({})));
+    if let Some(s) = &m.status {
+        o.insert("status".into(), json!(s.as_u16()));
+    }
+    o.insert("at".into(), json!(now_ms()));
+    Value::Object(o)
+}
+
+/// Percent-decoding, for a user and password written in the URL.
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 1 {
+            if let Some(x) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(x);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn valid_subject(s: &str, wildcards: bool) -> Result<(), String> {
+    if s.is_empty() || s.starts_with('.') || s.ends_with('.') || s.contains("..") {
+        return Err(format!("{:?} is not a NATS subject: tokens split by dots, like orders.created", s));
+    }
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("a NATS subject cannot hold spaces: {:?}", s));
+    }
+    let toks: Vec<&str> = s.split('.').collect();
+    for (i, t) in toks.iter().enumerate() {
+        if wildcards {
+            if t.contains('>') && (*t != ">" || i != toks.len() - 1) {
+                return Err(format!("`>` must be the last token, as in orders.>: {:?}", s));
+            }
+            if t.contains('*') && *t != "*" {
+                return Err(format!("`*` must be a whole token, as in orders.*.paid: {:?}", s));
+            }
+        } else if *t == "*" || *t == ">" {
+            return Err(format!("a subject to publish to cannot hold the wildcards `*` or `>`: {:?}", s));
+        }
+    }
+    Ok(())
+}
+
+/// Connects to NATS and keeps the connection as `name`: `url` is nats://host:4222 (user:pass@ inside, tls:// for TLS, or several, comma-separated); options: token, username, password, nkey (a seed), creds_file, tls (true: require it), ca_file, cert_file, key_file, client_name, buffer (10000 messages per subscription), js_prefix ("$JS.API"; "$JS.<domain>.API" for a domain), timeout_ms (10000).
+pub fn nats_connect(name: &str, url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["token", "username", "password", "nkey", "creds_file", "tls", "ca_file", "cert_file", "key_file", "client_name", "buffer", "js_prefix", "timeout_ms", "no_echo"], "nats_connect")?;
+    if name.is_empty() {
+        return Err("give the connection a name, like \"main\"".into());
+    }
+    let servers: Vec<String> = url.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if servers.is_empty() {
+        return Err("give the NATS server's address, like nats://127.0.0.1:4222".into());
+    }
+    let mut addrs = vec![];
+    for s in &servers {
+        let low = s.to_ascii_lowercase();
+        if low.contains("://") && !["nats://", "tls://", "ws://", "wss://"].iter().any(|p| low.starts_with(p)) {
+            return Err(format!("{} is not a NATS address: write nats://host:4222 or tls://host:4222", s));
+        }
+        addrs.push(s.parse::<async_nats::ServerAddr>().map_err(|e| format!("{}: {}", s, e))?);
+    }
+    let timeout = Duration::from_millis(opt_i64(o, "timeout_ms")?.unwrap_or(10_000).clamp(100, 600_000) as u64);
+    let cap = opt_i64(o, "buffer")?.unwrap_or(10_000).clamp(1, 1_000_000) as usize;
+    let js = opt_str(o, "js_prefix").unwrap_or("$JS.API".into());
+    let mut co = async_nats::ConnectOptions::new()
+        .connection_timeout(timeout)
+        .request_timeout(Some(timeout))
+        .subscription_capacity(cap.max(64));
+    // async-nats parses user:pass@ in the URL but never sends it: take it from the first address
+    // (a user alone is a token, as other NATS clients read it).
+    let (mut url_user, mut url_pass) = (None, None);
+    if let Some(a) = addrs.first() {
+        url_user = a.username().filter(|u| !u.is_empty()).map(pct);
+        url_pass = a.password().map(pct);
+    }
+    if let Some(t) = opt_str(o, "token").or(if url_pass.is_none() { url_user.take() } else { None }) {
+        co = co.token(t);
+    }
+    if let Some(u) = opt_str(o, "username").or(url_user) {
+        co = co.user_and_password(u, opt_str(o, "password").or(url_pass).unwrap_or_default());
+    }
+    if let Some(n) = opt_str(o, "nkey") {
+        co = co.nkey(n);
+    }
+    if opt_bool(o, "tls")?.unwrap_or(false) {
+        co = co.require_tls(true);
+    }
+    if let Some(ca) = opt_str(o, "ca_file") {
+        co = co.add_root_certificates(ca.into());
+    }
+    match (opt_str(o, "cert_file"), opt_str(o, "key_file")) {
+        (Some(c), Some(k)) => co = co.add_client_certificate(c.into(), k.into()),
+        (None, None) => {}
+        _ => return Err("give both cert_file and key_file for a client certificate".into()),
+    }
+    if let Some(n) = opt_str(o, "client_name") {
+        co = co.name(n);
+    }
+    if opt_bool(o, "no_echo")?.unwrap_or(false) {
+        co = co.no_echo();
+    }
+    let creds = opt_str(o, "creds_file");
+    let shown = servers.join(",");
+    let client = run(timeout, format!("connecting to {}", shown), async move {
+        let co = match creds {
+            Some(f) => co.credentials_file(f.clone()).await.map_err(|e| format!("cannot read creds_file {}: {}", f, e))?,
+            None => co,
+        };
+        co.connect(addrs).await.map_err(|e| {
+            let s = e.to_string();
+            if s.contains("authorization") || s.contains("Authorization") {
+                format!("the NATS server refused the credentials: {}", s)
+            } else {
+                format!("cannot connect to NATS: {}", s)
+            }
+        })
+    })?;
+    let info = client.server_info();
+    let old = lock(&CONNS).get_or_insert_with(HashMap::new).insert(name.to_string(), Arc::new(Conn { client, subs: Mutex::new(HashMap::new()), timeout, cap, js }));
+    if let Some(old) = old {
+        for (_, s) in lock(&old.subs).drain() {
+            s.task.abort();
+        }
+    }
+    Ok(json!({ "name": name, "connected": true, "server": info.server_name, "version": info.version, "headers": info.headers, "max_payload": info.max_payload }))
+}
+
+/// Publishes `payload` (text, `{ base64 }` for bytes, anything else as JSON) to `subject`; options: headers (a map), reply (a subject for answers), flush (true: wait until the server has it).
+pub fn nats_publish(name: &str, subject: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["headers", "reply", "flush", "timeout_ms"], "nats_publish")?;
+    valid_subject(subject, false)?;
+    let c = get(name)?;
+    let body = payload_bytes(&payload)?;
+    let bytes = body.len();
+    let headers = headers_of(o.get("headers"))?;
+    let reply = opt_str(o, "reply");
+    if let Some(r) = &reply {
+        valid_subject(r, false)?;
+    }
+    let flush = opt_bool(o, "flush")?.unwrap_or(true);
+    let t = timeout_of(&c, o)?;
+    let client = c.client.clone();
+    let subj = subject.to_string();
+    run(t, format!("publishing to {}", subject), async move {
+        let r = match (reply, headers) {
+            (None, None) => client.publish(subj, body).await,
+            (None, Some(h)) => client.publish_with_headers(subj, h, body).await,
+            (Some(r), None) => client.publish_with_reply(subj, r, body).await,
+            (Some(r), Some(h)) => client.publish_with_reply_and_headers(subj, r, h, body).await,
+        };
+        r.map_err(|e| format!("cannot publish: {}", e))?;
+        if flush {
+            client.flush().await.map_err(|e| format!("the NATS server did not confirm: {}", e))?;
+        }
+        Ok(())
+    })?;
+    Ok(json!({ "subject": subject, "bytes": bytes, "flushed": flush }))
+}
+
+/// Subscribes to `subject` (`*` one token, `>` the rest: orders.*.paid, orders.>); options: queue (a queue group: each message goes to one member), id (the name nats_receive takes; the subject by default). What arrives waits in a buffer for nats_receive. Gives the id.
+pub fn nats_subscribe(name: &str, subject: &str, options: serde_json::Value) -> Result<String, String> {
+    let o = &options;
+    check_keys(o, &["queue", "id", "timeout_ms"], "nats_subscribe")?;
+    valid_subject(subject, true)?;
+    let c = get(name)?;
+    let queue = opt_str(o, "queue");
+    if let Some(q) = &queue {
+        if q.is_empty() || q.chars().any(|ch| ch.is_whitespace()) {
+            return Err(format!("{:?} cannot be a queue group name", q));
+        }
+    }
+    let id = opt_str(o, "id").unwrap_or_else(|| match &queue { Some(q) => format!("{} {}", subject, q), None => subject.to_string() });
+    if lock(&c.subs).contains_key(&id) {
+        return Err(format!("there is already a subscription `{}` on this connection: nats_unsubscribe it, or give this one another id", id));
+    }
+    let t = timeout_of(&c, o)?;
+    let client = c.client.clone();
+    let (subj, q2) = (subject.to_string(), queue.clone());
+    let mut sub = run(t, format!("subscribing to {}", subject), async move {
+        let s = match q2 {
+            Some(q) => client.queue_subscribe(subj, q).await,
+            None => client.subscribe(subj).await,
+        }
+        .map_err(|e| format!("cannot subscribe: {}", e))?;
+        client.flush().await.map_err(|e| format!("the NATS server did not confirm the subscription: {}", e))?;
+        Ok(s)
+    })?;
+    let inbox = Arc::new((Mutex::new(Inbox { msgs: VecDeque::new(), received: 0, dropped: 0 }), Condvar::new()));
+    let (ib, cap) = (inbox.clone(), c.cap);
+    let task = rt().spawn(async move {
+        while let Some(m) = sub.next().await {
+            let v = message_json(&m);
+            let mut st = lock(&ib.0);
+            if st.msgs.len() >= cap {
+                st.msgs.pop_front();
+                st.dropped += 1;
+            }
+            st.msgs.push_back(v);
+            st.received += 1;
+            drop(st);
+            ib.1.notify_all();
+        }
+    });
+    lock(&c.subs).insert(id.clone(), Sub { subject: subject.to_string(), queue, inbox, task });
+    Ok(id)
+}
+
+/// Takes up to `max` messages from subscription `id`, oldest first, waiting up to `wait_ms` for the first (0: only what is there): each { subject, payload, reply, headers, at }. Answer a request by publishing to its `reply`.
+pub fn nats_receive(name: &str, id: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let c = get(name)?;
+    let inbox = lock(&c.subs).get(id).map(|s| s.inbox.clone()).ok_or(format!("no subscription `{}` on connection `{}`: nats_subscribe first", id, name))?;
+    let max = max.clamp(1, 100_000) as usize;
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut st = lock(&inbox.0);
+    while st.msgs.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        st = inbox.1.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = max.min(st.msgs.len());
+    Ok(st.msgs.drain(..n).collect())
+}
+
+/// Ends subscription `id`; what it buffered is dropped. Whether there was one.
+pub fn nats_unsubscribe(name: &str, id: &str) -> Result<bool, String> {
+    let c = get(name)?;
+    let gone = lock(&c.subs).remove(id);
+    match gone {
+        Some(s) => {
+            s.task.abort();
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Sends a request to `subject` and waits for the first answer, at most timeout_ms; options: headers, timeout_ms. Gives the answer { subject, payload, headers }; no responder, or none in time, is an error that says so.
+pub fn nats_request(name: &str, subject: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["headers", "timeout_ms"], "nats_request")?;
+    valid_subject(subject, false)?;
+    let c = get(name)?;
+    let body = payload_bytes(&payload)?;
+    let headers = headers_of(o.get("headers"))?;
+    let t = timeout_of(&c, o)?;
+    let client = c.client.clone();
+    let subj = subject.to_string();
+    let m = run(t + Duration::from_millis(500), format!("the request to {}", subject), async move {
+        let mut req = async_nats::Request::new().payload(body).timeout(Some(t));
+        if let Some(h) = headers {
+            req = req.headers(h);
+        }
+        client.send_request(subj.clone(), req).await.map_err(|e| match e.kind() {
+            async_nats::RequestErrorKind::NoResponders => format!("no one answers on {}: start a responder (a subscription that publishes to each message's reply), or check the subject", subj),
+            async_nats::RequestErrorKind::TimedOut => format!("no answer on {} within {} ms", subj, t.as_millis()),
+            _ => format!("the request to {} failed: {}", subj, e),
+        })
+    })?;
+    Ok(message_json(&m))
+}
+
+/// How the connection is: its state, the server (id, name, version, JetStream), and each subscription with what it buffered, received and dropped (its buffer was full).
+pub fn nats_status(name: &str) -> Result<serde_json::Value, String> {
+    let c = get(name)?;
+    let info = c.client.server_info();
+    let state = format!("{:?}", c.client.connection_state()).to_lowercase();
+    let mut subs: Vec<Value> = lock(&c.subs).iter().map(|(id, s)| {
+        let st = lock(&s.inbox.0);
+        json!({ "id": id, "subject": s.subject, "queue": s.queue, "buffered": st.msgs.len(), "received": st.received, "dropped": st.dropped })
+    }).collect();
+    subs.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let stats = c.client.statistics();
+    Ok(json!({
+        "state": state,
+        "server": { "id": info.server_id, "name": info.server_name, "version": info.version, "host": info.host, "port": info.port, "max_payload": info.max_payload, "headers": info.headers },
+        "subscriptions": subs,
+        "in_messages": stats.in_messages.load(std::sync::atomic::Ordering::Relaxed),
+        "out_messages": stats.out_messages.load(std::sync::atomic::Ordering::Relaxed),
+    }))
+}
+
+/// Flushes what is still to be sent, ends every subscription and closes the connection; whether there was one.
+pub fn nats_close(name: &str) -> Result<bool, String> {
+    let c = match lock(&CONNS).as_mut().and_then(|m| m.remove(name)) {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    for (_, s) in lock(&c.subs).drain() {
+        s.task.abort();
+    }
+    let client = c.client.clone();
+    let _ = run(Duration::from_secs(3), "closing".into(), async move {
+        let _ = client.drain().await;
+        Ok(())
+    });
+    Ok(true)
+}
+
+// ---- JetStream, through its JSON API on `$JS.API.>` ----
+
+fn js_call(c: &Conn, api: &str, body: Value, t: Duration) -> Result<Value, String> {
+    let subject = format!("{}.{}", c.js, api);
+    let client = c.client.clone();
+    let payload = bytes::Bytes::from(if body.is_null() { vec![] } else { body.to_string().into_bytes() });
+    let m = run(t + Duration::from_millis(500), format!("the JetStream call {}", api), async move {
+        let req = async_nats::Request::new().payload(payload).timeout(Some(t));
+        client.send_request(subject, req).await.map_err(|e| match e.kind() {
+            async_nats::RequestErrorKind::NoResponders => "JetStream is not enabled on this NATS server (no one answers on $JS.API): start nats-server with -js".to_string(),
+            async_nats::RequestErrorKind::TimedOut => format!("JetStream did not answer within {} ms", t.as_millis()),
+            _ => format!("the JetStream call failed: {}", e),
+        })
+    })?;
+    serde_json::from_slice(&m.payload).map_err(|e| format!("JetStream's answer is not JSON: {}", e))
+}
+
+fn js_error(v: &Value) -> Option<(i64, String)> {
+    let e = v.get("error")?;
+    Some((e.get("err_code").and_then(|x| x.as_i64()).unwrap_or(0), format!("{} (JetStream error {}, code {})", e.get("description").and_then(|x| x.as_str()).unwrap_or("error"), e.get("err_code").and_then(|x| x.as_i64()).unwrap_or(0), e.get("code").and_then(|x| x.as_i64()).unwrap_or(0))))
+}
+
+fn valid_stream(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.chars().any(|c| c == '.' || c == '*' || c == '>' || c == '/' || c == '\\' || c.is_whitespace() || c.is_control()) {
+        return Err(format!("{:?} cannot be a stream name: letters, digits, - and _ (no dots, spaces or wildcards)", s));
+    }
+    Ok(())
+}
+
+/// Creates JetStream stream `stream`, or updates it, from `config`: subjects (a list; `>` and `*` allowed), storage ("file" or "memory"), max_msgs, max_bytes, max_age_s, duplicate_window_s, num_replicas, retention ("limits", "interest", "workqueue"), discard ("old", "new"), description. Gives { created, config, state }.
+pub fn nats_js_stream(name: &str, stream: &str, config: serde_json::Value) -> Result<serde_json::Value, String> {
+    valid_stream(stream)?;
+    let c = get(name)?;
+    let mut cfg = match config {
+        Value::Object(m) => m,
+        Value::Null => serde_json::Map::new(),
+        _ => return Err("the stream's config must be a map, like { subjects: [\"orders.>\"] }".into()),
+    };
+    let t = timeout_of(&c, &Value::Object(cfg.clone()))?;
+    cfg.remove("timeout_ms");
+    for (from, to) in [("max_age_s", "max_age"), ("duplicate_window_s", "duplicate_window")] {
+        if let Some(v) = cfg.remove(from) {
+            let s = v.as_f64().ok_or(format!("`{}` must be a number of seconds", from))?;
+            cfg.insert(to.into(), json!((s * 1e9) as i64));
+        }
+    }
+    if let Some(Value::Array(subs)) = cfg.get("subjects") {
+        for s in subs {
+            valid_subject(s.as_str().ok_or("subjects must be texts")?, true)?;
+        }
+    } else if cfg.contains_key("subjects") {
+        return Err("subjects must be a list, like [\"orders.>\"]".into());
+    }
+    for (k, ok) in [("storage", &["file", "memory"][..]), ("retention", &["limits", "interest", "workqueue"][..]), ("discard", &["old", "new"][..])] {
+        if let Some(v) = cfg.get(k) {
+            if !v.as_str().map(|s| ok.contains(&s)).unwrap_or(false) {
+                return Err(format!("`{}` must be one of {}", k, ok.join(", ")));
+            }
+        }
+    }
+    cfg.insert("name".into(), json!(stream));
+    let info = js_call(&c, &format!("STREAM.INFO.{}", stream), Value::Null, t)?;
+    let (api, body, created) = match js_error(&info) {
+        Some((10059, _)) => {
+            if !cfg.contains_key("subjects") {
+                cfg.insert("subjects".into(), json!([stream]));
+            }
+            cfg.entry("storage").or_insert(json!("file"));
+            cfg.entry("retention").or_insert(json!("limits"));
+            cfg.entry("discard").or_insert(json!("old"));
+            cfg.entry("num_replicas").or_insert(json!(1));
+            ("CREATE", Value::Object(cfg), true)
+        }
+        Some((_, e)) => return Err(e),
+        None => {
+            let mut merged = info.get("config").and_then(|x| x.as_object()).cloned().unwrap_or_default();
+            let same = cfg.iter().all(|(k, v)| merged.get(k) == Some(v));
+            if same {
+                return Ok(json!({ "created": false, "updated": false, "config": info["config"], "state": info["state"] }));
+            }
+            for (k, v) in cfg {
+                merged.insert(k, v);
+            }
+            ("UPDATE", Value::Object(merged), false)
+        }
+    };
+    let r = js_call(&c, &format!("STREAM.{}.{}", api, stream), body, t)?;
+    if let Some((_, e)) = js_error(&r) {
+        return Err(e);
+    }
+    Ok(json!({ "created": created, "updated": !created, "config": r["config"], "state": r["state"] }))
+}
+
+/// Publishes to a subject a JetStream stream takes, and waits for the stream's acknowledgement: { stream, seq, duplicate }. Options: headers, msg_id (the stream drops a second message with the same id within its duplicate window), expected_stream, expected_last_seq, timeout_ms.
+pub fn nats_js_publish(name: &str, subject: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["headers", "msg_id", "expected_stream", "expected_last_seq", "timeout_ms"], "nats_js_publish")?;
+    valid_subject(subject, false)?;
+    let c = get(name)?;
+    let body = payload_bytes(&payload)?;
+    let mut h = headers_of(o.get("headers"))?.unwrap_or_default();
+    if let Some(id) = opt_str(o, "msg_id") {
+        h.insert("Nats-Msg-Id", id.as_str());
+    }
+    if let Some(s) = opt_str(o, "expected_stream") {
+        h.insert("Nats-Expected-Stream", s.as_str());
+    }
+    if let Some(n) = opt_i64(o, "expected_last_seq")? {
+        h.insert("Nats-Expected-Last-Sequence", n.to_string().as_str());
+    }
+    let t = timeout_of(&c, o)?;
+    let client = c.client.clone();
+    let subj = subject.to_string();
+    let m = run(t + Duration::from_millis(500), format!("publishing to {}", subject), async move {
+        let req = async_nats::Request::new().payload(body).headers(h).timeout(Some(t));
+        client.send_request(subj.clone(), req).await.map_err(|e| match e.kind() {
+            async_nats::RequestErrorKind::NoResponders => format!("no JetStream stream takes {}: make one with nats_js_stream(name, stream, {{ subjects: [...] }})", subj),
+            async_nats::RequestErrorKind::TimedOut => format!("the stream did not acknowledge {} within {} ms", subj, t.as_millis()),
+            _ => format!("cannot publish to {}: {}", subj, e),
+        })
+    })?;
+    let ack: Value = serde_json::from_slice(&m.payload).map_err(|_| format!("the answer to a JetStream publish was not an acknowledgement: {:?} (is {} a stream's subject?)", String::from_utf8_lossy(&m.payload), subject))?;
+    if let Some((_, e)) = js_error(&ack) {
+        return Err(e);
+    }
+    Ok(json!({ "stream": ack["stream"], "seq": ack["seq"], "duplicate": ack.get("duplicate").and_then(|d| d.as_bool()).unwrap_or(false) }))
+}
+
+/// Reads a message stored in `stream`: `which` is its sequence number, or a subject for the last message on it. Gives { subject, seq, payload, headers, time }.
+pub fn nats_js_get(name: &str, stream: &str, which: serde_json::Value) -> Result<serde_json::Value, String> {
+    valid_stream(stream)?;
+    let c = get(name)?;
+    let body = match &which {
+        Value::Number(n) => json!({ "seq": n.as_u64().ok_or("the sequence number must be 1 or more")? }),
+        Value::String(s) => {
+            valid_subject(s, false)?;
+            json!({ "last_by_subj": s })
+        }
+        _ => return Err("give a sequence number, or a subject for the last message on it".into()),
+    };
+    let r = js_call(&c, &format!("STREAM.MSG.GET.{}", stream), body, c.timeout)?;
+    if let Some((_, e)) = js_error(&r) {
+        return Err(e);
+    }
+    let m = r.get("message").ok_or("JetStream's answer has no message")?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let data = b64.decode(m.get("data").and_then(|x| x.as_str()).unwrap_or("")).map_err(|e| e.to_string())?;
+    let mut out = serde_json::Map::new();
+    out.insert("subject".into(), m["subject"].clone());
+    out.insert("seq".into(), m["seq"].clone());
+    put_payload(&data, &mut out);
+    let mut headers = serde_json::Map::new();
+    if let Some(h) = m.get("hdrs").and_then(|x| x.as_str()) {
+        let raw = b64.decode(h).map_err(|e| e.to_string())?;
+        // NATS/1.0, then `Name: value` lines.
+        for line in String::from_utf8_lossy(&raw).split("\r\n").skip(1) {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_string(), json!(v.trim()));
+            }
+        }
+    }
+    out.insert("headers".into(), Value::Object(headers));
+    out.insert("time".into(), m.get("time").cloned().unwrap_or(Value::Null));
+    Ok(Value::Object(out))
+}
+
+/// A JetStream stream's configuration and state (messages, bytes, first_seq, last_seq, consumer_count), as the server gives them.
+pub fn nats_js_info(name: &str, stream: &str) -> Result<serde_json::Value, String> {
+    valid_stream(stream)?;
+    let c = get(name)?;
+    let r = js_call(&c, &format!("STREAM.INFO.{}", stream), Value::Null, c.timeout)?;
+    if let Some((_, e)) = js_error(&r) {
+        return Err(e);
+    }
+    Ok(json!({ "config": r["config"], "state": r["state"], "created": r["created"] }))
+}

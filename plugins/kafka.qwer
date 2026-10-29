@@ -1,0 +1,606 @@
+//! Apache Kafka from pure Rust (rskafka): topics listed and created, records produced with keys and headers (partitioned by key as the Java client does), fetched from an offset, earliest and latest offsets, and a simple consumer that remembers its place, in memory or in a file.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rskafka = { version = "=0.6.0", default-features = false, features = ["compression-gzip", "compression-snappy", "transport-tls"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+//! tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+//! base64 = "0.22"
+
+use base64::Engine;
+use rskafka::chrono::{TimeZone, Utc};
+use rskafka::client::error::{Error as KError, ProtocolError};
+use rskafka::client::partition::{Compression, OffsetAt, PartitionClient, UnknownTopicHandling};
+use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
+use rskafka::record::Record;
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+fn rt() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("kafka").enable_all().build().map_err(|e| format!("cannot start the Kafka runtime: {}", e))
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// One named connection: how to make the client, and what it has learned.
+struct Conn {
+    brokers: Vec<String>,
+    options: Value,
+    timeout: Duration,
+    client: tokio::sync::Mutex<Option<Arc<Client>>>,
+    parts: Mutex<HashMap<(String, i32), Arc<PartitionClient>>>,
+    counts: Mutex<HashMap<String, i32>>,
+    round: AtomicUsize,
+}
+
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn conn(name: &str) -> Result<Arc<Conn>, String> {
+    let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no Kafka connection named '{}': call kafka_connect(\"{}\", brokers, {{}}) first", name, name))
+}
+
+fn opt_str(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn opt_i64(o: &Value, k: &str, d: i64) -> i64 {
+    o.get(k).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))).unwrap_or(d)
+}
+
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = opt_str(o, "ca_file") {
+        use rustls::pki_types::pem::PemObject;
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(&path).map_err(|e| format!("cannot read ca_file {}: {}", path, e))?;
+        for c in certs {
+            roots.add(c.map_err(|e| format!("ca_file {}: {}", path, e))?).map_err(|e| format!("ca_file {}: {}", path, e))?;
+        }
+    }
+    Ok(Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()))
+}
+
+fn sasl_config(o: &Value) -> Result<Option<SaslConfig>, String> {
+    let s = match o.get("sasl") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(s) => s,
+    };
+    let user = opt_str(s, "username").ok_or("sasl needs a username")?;
+    let pass = opt_str(s, "password").ok_or("sasl needs a password")?;
+    let c = Credentials::new(user, pass);
+    match opt_str(s, "mechanism").unwrap_or("PLAIN".into()).to_uppercase().as_str() {
+        "PLAIN" => Ok(Some(SaslConfig::Plain(c))),
+        "SCRAM-SHA-256" => Ok(Some(SaslConfig::ScramSha256(c))),
+        "SCRAM-SHA-512" => Ok(Some(SaslConfig::ScramSha512(c))),
+        m => Err(format!("sasl mechanism {} is not one of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512", m)),
+    }
+}
+
+/// A connection error, a broken pipe or a time-out: the next call makes a new client.
+fn is_connection(e: &KError) -> bool {
+    matches!(e, KError::Connection(_) | KError::Request(_))
+}
+
+fn kafka_error(e: &KError, what: &str) -> String {
+    match e {
+        KError::ServerError { protocol_error, error_message, .. } => {
+            let hint = match protocol_error {
+                ProtocolError::UnknownTopicOrPartition => ": create the topic first (kafka_create_topic), or check its name and partition",
+                ProtocolError::OffsetOutOfRange => ": kafka_offsets gives the range of offsets there are",
+                ProtocolError::TopicAuthorizationFailed | ProtocolError::ClusterAuthorizationFailed => ": the user has no right to do that (check the ACLs)",
+                ProtocolError::SaslAuthenticationFailed => ": check the sasl username and password",
+                _ => "",
+            };
+            match error_message {
+                Some(m) if !m.is_empty() => format!("{}: Kafka said {} ({}){}", what, protocol_error, m, hint),
+                _ => format!("{}: Kafka said {}{}", what, protocol_error, hint),
+            }
+        }
+        KError::Connection(c) => format!("{}: cannot reach the brokers: {} (check the address, and kafkas:// for TLS)", what, c),
+        other => format!("{}: {}", what, other),
+    }
+}
+
+impl Conn {
+    async fn client(&self) -> Result<Arc<Client>, String> {
+        let mut slot = self.client.lock().await;
+        if let Some(c) = slot.as_ref() {
+            return Ok(c.clone());
+        }
+        let o = &self.options;
+        let tls = self.brokers.iter().any(|b| b.starts_with("kafkas://")) || o.get("tls").and_then(|v| v.as_bool()).unwrap_or(false);
+        let hosts: Vec<String> = self.brokers.iter().map(|b| b.trim_start_matches("kafkas://").trim_start_matches("kafka://").trim_end_matches('/').to_string()).collect();
+        let mut b = ClientBuilder::new(hosts).client_id(opt_str(o, "client_id").unwrap_or("quillo".into())).backoff_config(rskafka::BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(1),
+            base: 3.0,
+            deadline: Some(self.timeout),
+        });
+        if tls {
+            b = b.tls_config(tls_config(o)?);
+        }
+        if let Some(s) = sasl_config(o)? {
+            b = b.sasl_config(s);
+        }
+        let c = match tokio::time::timeout(self.timeout, b.build()).await {
+            Ok(Ok(c)) => Arc::new(c),
+            Ok(Err(e)) => return Err(kafka_error(&e, &format!("cannot connect to {}", self.brokers.join(",")))),
+            Err(_) => return Err(format!("no answer from the brokers {} in {} ms: is Kafka running there?", self.brokers.join(","), self.timeout.as_millis())),
+        };
+        *slot = Some(c.clone());
+        Ok(c)
+    }
+
+    async fn forget(&self) {
+        *self.client.lock().await = None;
+        self.parts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Runs `f` with a time limit; a connection error or a time-out drops the client, so the next call reconnects.
+    async fn run<T, F, Fut>(&self, what: &str, f: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, KError>>,
+    {
+        match tokio::time::timeout(self.timeout, f()).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                if is_connection(&e) {
+                    self.forget().await;
+                }
+                Err(kafka_error(&e, what))
+            }
+            Err(_) => {
+                self.forget().await;
+                Err(format!("{}: no answer in {} ms (timeout_ms in kafka_connect's options sets the limit)", what, self.timeout.as_millis()))
+            }
+        }
+    }
+
+    async fn partition(&self, topic: &str, p: i32) -> Result<Arc<PartitionClient>, String> {
+        let key = (topic.to_string(), p);
+        if let Some(pc) = self.parts.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(pc.clone());
+        }
+        let c = self.client().await?;
+        let pc = Arc::new(self.run(&format!("{} partition {}", topic, p), || c.partition_client(topic.to_string(), p, UnknownTopicHandling::Error)).await?);
+        self.parts.lock().unwrap_or_else(|e| e.into_inner()).insert(key, pc.clone());
+        Ok(pc)
+    }
+
+    async fn topics(&self) -> Result<Vec<rskafka::topic::Topic>, String> {
+        let c = self.client().await?;
+        let ts = self.run("listing topics", || c.list_topics()).await?;
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.clear();
+        for t in &ts {
+            counts.insert(t.name.clone(), t.partitions.len() as i32);
+        }
+        Ok(ts)
+    }
+
+    async fn partition_count(&self, topic: &str) -> Result<i32, String> {
+        if let Some(n) = self.counts.lock().unwrap_or_else(|e| e.into_inner()).get(topic) {
+            return Ok(*n);
+        }
+        self.topics().await?;
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).get(topic).copied().ok_or(format!("there is no topic '{}': create it with kafka_create_topic", topic))
+    }
+}
+
+fn block<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    rt()?.block_on(f)
+}
+
+/// Kafka's default partitioner (murmur2 of the key, as the Java client), so keys land where other clients put them.
+fn murmur2(data: &[u8]) -> u32 {
+    let m: u32 = 0x5bd1e995;
+    let len = data.len();
+    let mut h: u32 = 0x9747b28c ^ (len as u32);
+    let mut chunks = data.chunks_exact(4);
+    for c in &mut chunks {
+        let mut k = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        k = k.wrapping_mul(m);
+        k ^= k >> 24;
+        k = k.wrapping_mul(m);
+        h = h.wrapping_mul(m);
+        h ^= k;
+    }
+    let t = chunks.remainder();
+    if t.len() == 3 { h ^= (t[2] as u32) << 16; }
+    if t.len() >= 2 { h ^= (t[1] as u32) << 8; }
+    if !t.is_empty() {
+        h ^= t[0] as u32;
+        h = h.wrapping_mul(m);
+    }
+    h ^= h >> 13;
+    h = h.wrapping_mul(m);
+    h ^= h >> 15;
+    h
+}
+
+fn bytes_in(r: &Value, text: &str, b64: &str) -> Result<Option<Vec<u8>>, String> {
+    if let Some(s) = r.get(b64).and_then(|v| v.as_str()) {
+        return B64.decode(s).map(Some).map_err(|e| format!("{} is not base64: {}", b64, e));
+    }
+    Ok(match r.get(text) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone().into_bytes()),
+        Some(other) => Some(other.to_string().into_bytes()),
+    })
+}
+
+/// Bytes as text when they are UTF-8; under `<field>_base64` too when asked, or when they are not text (the text is then null).
+fn put_bytes(m: &mut Map<String, Value>, field: &str, b: &Option<Vec<u8>>, base64: bool) {
+    let text = b.as_ref().and_then(|b| std::str::from_utf8(b).ok());
+    m.insert(field.to_string(), text.map(|t| Value::String(t.to_string())).unwrap_or(Value::Null));
+    if let Some(b) = b {
+        if base64 || text.is_none() {
+            m.insert(format!("{}_base64", field), Value::String(B64.encode(b)));
+        }
+    }
+}
+
+fn record_out(r: &rskafka::record::RecordAndOffset, partition: i32, base64: bool) -> Value {
+    let headers: Map<String, Value> = r
+        .record
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(if base64 { B64.encode(v) } else { String::from_utf8_lossy(v).into_owned() })))
+        .collect();
+    let mut m = Map::new();
+    m.insert("partition".into(), json!(partition));
+    m.insert("offset".into(), json!(r.offset));
+    put_bytes(&mut m, "key", &r.record.key, base64);
+    put_bytes(&mut m, "value", &r.record.value, base64);
+    m.insert("headers".into(), Value::Object(headers));
+    m.insert("timestamp".into(), json!(r.record.timestamp.timestamp_millis()));
+    Value::Object(m)
+}
+
+/// Opens (or reopens) the connection `name` to the brokers ("host:9092,host2:9092"; kafkas:// for TLS), with options: timeout_ms (10000), client_id, tls, ca_file, sasl {mechanism PLAIN or SCRAM-SHA-256/512, username, password}. Calling it again with the same brokers and options keeps the client.
+pub fn kafka_connect(name: &str, brokers: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list: Vec<String> = brokers.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if list.is_empty() {
+        return Err("no brokers given: pass \"host:9092\" (several with commas)".into());
+    }
+    if !options.is_null() && !options.is_object() {
+        return Err("options must be a map, e.g. { timeout_ms: 5000 }".into());
+    }
+    let ms = opt_i64(&options, "timeout_ms", 10_000).clamp(100, 600_000) as u64;
+    let c = {
+        let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        match m.get(name) {
+            Some(c) if c.brokers == list && c.options == options => c.clone(),
+            _ => {
+                let c = Arc::new(Conn {
+                    brokers: list,
+                    options,
+                    timeout: Duration::from_millis(ms),
+                    client: tokio::sync::Mutex::new(None),
+                    parts: Mutex::new(HashMap::new()),
+                    counts: Mutex::new(HashMap::new()),
+                    round: AtomicUsize::new(0),
+                });
+                m.insert(name.to_string(), c.clone());
+                c
+            }
+        }
+    };
+    block(async {
+        c.client().await?;
+        Ok(json!({ "name": name, "brokers": c.brokers, "connected": true }))
+    })
+}
+
+/// Closes the connection `name`; whether there was one.
+pub fn kafka_close(name: &str) -> bool {
+    let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_mut().map(|m| m.remove(name).is_some()).unwrap_or(false)
+}
+
+/// The topics on the cluster, each with its number of partitions (internal topics left out).
+pub fn kafka_topics(name: &str) -> Result<Vec<serde_json::Value>, String> {
+    let c = conn(name)?;
+    block(async {
+        let mut ts: Vec<Value> = c.topics().await?.into_iter().map(|t| json!({ "name": t.name, "partitions": t.partitions.len() })).collect();
+        ts.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(ts)
+    })
+}
+
+/// Creates `topic` with `partitions` partitions, each kept on `replication` brokers; `created` is false when it was already there.
+pub fn kafka_create_topic(name: &str, topic: &str, partitions: i64, replication: i64) -> Result<serde_json::Value, String> {
+    if partitions < 1 || partitions > 100_000 {
+        return Err(format!("partitions must be from 1 to 100000, not {}", partitions));
+    }
+    if replication < 1 || replication > 32 {
+        return Err(format!("replication must be from 1 to 32, not {}", replication));
+    }
+    let c = conn(name)?;
+    block(async {
+        let client = c.client().await?;
+        let ctl = client.controller_client().map_err(|e| kafka_error(&e, "no controller"))?;
+        let ms = c.timeout.as_millis() as i32;
+        let r = tokio::time::timeout(c.timeout, ctl.create_topic(topic.to_string(), partitions as i32, replication as i16, ms)).await;
+        c.counts.lock().unwrap_or_else(|e| e.into_inner()).remove(topic);
+        match r {
+            Ok(Ok(())) => Ok(json!({ "topic": topic, "partitions": partitions, "created": true })),
+            Ok(Err(KError::ServerError { protocol_error: ProtocolError::TopicAlreadyExists, .. })) => Ok(json!({ "topic": topic, "created": false })),
+            Ok(Err(e)) => {
+                if is_connection(&e) {
+                    c.forget().await;
+                }
+                Err(kafka_error(&e, &format!("cannot create topic '{}'", topic)))
+            }
+            Err(_) => {
+                c.forget().await;
+                Err(format!("creating topic '{}': no answer in {} ms", topic, c.timeout.as_millis()))
+            }
+        }
+    })
+}
+
+/// Sends `records` to `topic`: each a map with value (text, or any value sent as JSON), key, headers (a map of text), partition and timestamp (ms) if wanted, or key_base64/value_base64 for bytes. Without a partition, a key picks one as Kafka's own clients do, and keyless records go round. Options: compression ("none", "gzip", "snappy"). Gives each record's partition and offset, in order.
+pub fn kafka_produce(name: &str, topic: &str, records: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let compression = match opt_str(&options, "compression").unwrap_or("none".into()).as_str() {
+        "none" | "" => Compression::NoCompression,
+        "gzip" => Compression::Gzip,
+        "snappy" => Compression::Snappy,
+        other => return Err(format!("compression {} is not one of none, gzip, snappy", other)),
+    };
+    let c = conn(name)?;
+    block(async {
+        let n = c.partition_count(topic).await?;
+        // rskafka's chrono has no clock: the time comes from std.
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let mut by_part: BTreeMap<i32, Vec<(usize, Record)>> = BTreeMap::new();
+        for (i, r) in records.iter().enumerate() {
+            if !r.is_object() {
+                return Err(format!("record {} is not a map: give {{ key, value, headers }}", i + 1));
+            }
+            let key = bytes_in(r, "key", "key_base64")?;
+            let value = bytes_in(r, "value", "value_base64")?;
+            let mut headers = BTreeMap::new();
+            if let Some(h) = r.get("headers").and_then(|h| h.as_object()) {
+                for (k, v) in h {
+                    headers.insert(k.clone(), match v { Value::String(s) => s.clone().into_bytes(), other => other.to_string().into_bytes() });
+                }
+            }
+            let ms = opt_i64(r, "timestamp", now_ms);
+            let timestamp = Utc.timestamp_millis_opt(ms).single().ok_or(format!("record {}: timestamp {} is not a time in ms", i + 1, ms))?;
+            let p = match r.get("partition").and_then(|v| v.as_i64()) {
+                Some(p) if p >= 0 && p < n as i64 => p as i32,
+                Some(p) => return Err(format!("record {}: partition {} is not in 0..{} ('{}' has {})", i + 1, p, n - 1, topic, n)),
+                None => match &key {
+                    Some(k) => ((murmur2(k) & 0x7fffffff) % n as u32) as i32,
+                    None => (c.round.fetch_add(1, Ordering::Relaxed) % n as usize) as i32,
+                },
+            };
+            by_part.entry(p).or_default().push((i, Record { key, value, headers, timestamp }));
+        }
+        let mut out = vec![Value::Null; records.len()];
+        for (p, list) in by_part {
+            let pc = c.partition(topic, p).await?;
+            let (idx, recs): (Vec<usize>, Vec<Record>) = list.into_iter().unzip();
+            let offsets = c.run(&format!("producing to {}/{}", topic, p), || pc.produce(recs, compression)).await?;
+            for (i, o) in idx.into_iter().zip(offsets) {
+                out[i] = json!({ "partition": p, "offset": o });
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Up to `max` records of `topic`'s `partition` from `offset` on, with the high watermark (the next offset to be written) and next_offset (where to go on). Options: max_bytes (1 MiB), max_wait_ms (500: how long the broker may wait for a record when there is none yet), base64 (key_base64, value_base64 and headers in base64 too). A key or value that is not UTF-8 comes as null with its bytes in key_base64 or value_base64.
+pub fn kafka_fetch(name: &str, topic: &str, partition: i64, offset: i64, max: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conn(name)?;
+    let max_bytes = opt_i64(&options, "max_bytes", 1 << 20).clamp(1024, 100 << 20) as i32;
+    let wait = opt_i64(&options, "max_wait_ms", 500).clamp(0, (c.timeout.as_millis() as i64 - 100).max(0)) as i32;
+    let base64 = options.get("base64").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max = max.clamp(1, 100_000) as usize;
+    block(async {
+        let pc = c.partition(topic, partition as i32).await?;
+        let (recs, hw) = c.run(&format!("fetching {}/{} from offset {}", topic, partition, offset), || pc.fetch_records(offset, 1..max_bytes, wait)).await?;
+        let list: Vec<Value> = recs.iter().take(max).map(|r| record_out(r, partition as i32, base64)).collect();
+        let next = list.last().and_then(|r| r["offset"].as_i64()).map(|o| o + 1).unwrap_or(offset);
+        Ok(json!({ "records": list, "high_watermark": hw, "next_offset": next }))
+    })
+}
+
+/// The earliest offset still kept and the latest (the next to be written) of `topic`'s `partition`.
+pub fn kafka_offsets(name: &str, topic: &str, partition: i64) -> Result<serde_json::Value, String> {
+    let c = conn(name)?;
+    block(async {
+        let pc = c.partition(topic, partition as i32).await?;
+        let earliest = c.run("asking the earliest offset", || pc.get_offset(OffsetAt::Earliest)).await?;
+        let latest = c.run("asking the latest offset", || pc.get_offset(OffsetAt::Latest)).await?;
+        Ok(json!({ "topic": topic, "partition": partition, "earliest": earliest, "latest": latest }))
+    })
+}
+
+/// The first offset of `topic`'s `partition` whose record is at or after `timestamp_ms`, or -1 when none is.
+pub fn kafka_offset_at(name: &str, topic: &str, partition: i64, timestamp_ms: i64) -> Result<i64, String> {
+    let c = conn(name)?;
+    let at = Utc.timestamp_millis_opt(timestamp_ms).single().ok_or(format!("{} is not a time in ms", timestamp_ms))?;
+    block(async {
+        let pc = c.partition(topic, partition as i32).await?;
+        c.run("asking an offset by time", || pc.get_offset(OffsetAt::Timestamp(at))).await
+    })
+}
+
+// ---- A simple consumer that remembers its offsets ----
+
+struct Consumer {
+    start: String,
+    file: Option<String>,
+    positions: BTreeMap<i32, i64>,
+    committed: BTreeMap<i32, i64>,
+}
+
+static CONSUMERS: Mutex<Option<HashMap<String, Consumer>>> = Mutex::new(None);
+
+fn ckey(name: &str, consumer: &str, topic: &str) -> String {
+    format!("{}\u{0}{}\u{0}{}", name, consumer, topic)
+}
+
+fn read_file(path: &str) -> Result<Map<String, Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().is_empty() => Ok(Map::new()),
+        Ok(t) => match serde_json::from_str::<Value>(&t) {
+            Ok(Value::Object(m)) => Ok(m),
+            _ => Err(format!("{} is not a JSON map of offsets: move it away, or give another file", path)),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(e) => Err(format!("cannot read {}: {}", path, e)),
+    }
+}
+
+fn positions_json(p: &BTreeMap<i32, i64>) -> Value {
+    Value::Object(p.iter().map(|(k, v)| (k.to_string(), json!(v))).collect())
+}
+
+/// Sets up the consumer `consumer` of `topic` (optional: kafka_consume makes one that starts at the earliest offset). Options: start ("earliest" or "latest", where a partition with no remembered offset begins), file (a JSON file kafka_commit writes the offsets to, and read back here, so a restart goes on where it was). Called again, it goes back to the last commit. Gives the offsets it will read from.
+pub fn kafka_consumer(name: &str, consumer: &str, topic: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    conn(name)?;
+    let start = opt_str(&options, "start").unwrap_or("earliest".into());
+    if start != "earliest" && start != "latest" {
+        return Err(format!("start must be \"earliest\" or \"latest\", not \"{}\"", start));
+    }
+    let file = opt_str(&options, "file");
+    let mut committed = BTreeMap::new();
+    if let Some(f) = &file {
+        let all = read_file(f)?;
+        if let Some(Value::Object(m)) = all.get(&format!("{}/{}", consumer, topic)) {
+            for (k, v) in m {
+                if let (Ok(p), Some(o)) = (k.parse::<i32>(), v.as_i64()) {
+                    committed.insert(p, o);
+                }
+            }
+        }
+    }
+    let mut g = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let out = json!({ "consumer": consumer, "topic": topic, "start": start, "positions": positions_json(&committed) });
+    m.insert(ckey(name, consumer, topic), Consumer { start, file, positions: committed.clone(), committed });
+    Ok(out)
+}
+
+/// The next records for the consumer `consumer` of `topic`, at most `max`, from every partition where it left off, waiting up to `wait_ms` when there are none yet. Its offsets move past what it gives; kafka_commit keeps them (in its file, if it has one).
+pub fn kafka_consume(name: &str, consumer: &str, topic: &str, max: i64, wait_ms: i64) -> Result<serde_json::Value, String> {
+    let c = conn(name)?;
+    let key = ckey(name, consumer, topic);
+    let exists = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.contains_key(&key)).unwrap_or(false);
+    if !exists {
+        kafka_consumer(name, consumer, topic, Value::Null)?;
+    }
+    let (start, mut positions) = {
+        let g = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.as_ref().and_then(|m| m.get(&key)).ok_or("the consumer went away")?;
+        (s.start.clone(), s.positions.clone())
+    };
+    let max = max.clamp(1, 100_000) as usize;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 60_000) as u64);
+    let result = block(async {
+        let n = c.partition_count(topic).await?;
+        let mut out: Vec<Value> = vec![];
+        loop {
+            for p in 0..n {
+                if out.len() >= max {
+                    break;
+                }
+                let pc = c.partition(topic, p).await?;
+                let at = match positions.get(&p) {
+                    Some(o) => *o,
+                    None => {
+                        let o = c.run("asking where to start", || pc.get_offset(if start == "latest" { OffsetAt::Latest } else { OffsetAt::Earliest })).await?;
+                        positions.insert(p, o);
+                        o
+                    }
+                };
+                let fetched = tokio::time::timeout(c.timeout, pc.fetch_records(at, 1..(1 << 20), 0)).await;
+                let recs = match fetched {
+                    Ok(Ok((recs, _))) => recs,
+                    Ok(Err(KError::ServerError { protocol_error: ProtocolError::OffsetOutOfRange, .. })) => {
+                        // Records were deleted under it (retention): start again where the start option says.
+                        let o = c.run("asking where to start again", || pc.get_offset(if start == "latest" { OffsetAt::Latest } else { OffsetAt::Earliest })).await?;
+                        positions.insert(p, o);
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        if is_connection(&e) {
+                            c.forget().await;
+                        }
+                        return Err(kafka_error(&e, &format!("fetching {}/{}", topic, p)));
+                    }
+                    Err(_) => {
+                        c.forget().await;
+                        return Err(format!("fetching {}/{}: no answer in {} ms", topic, p, c.timeout.as_millis()));
+                    }
+                };
+                for r in recs.iter().take(max - out.len()) {
+                    out.push(record_out(r, p, false));
+                    positions.insert(p, r.offset + 1);
+                }
+            }
+            if !out.is_empty() || Instant::now() >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(out)
+    });
+    // On an error nothing moves: the records read before it were not handed over.
+    let mut g = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_mut().and_then(|m| m.get_mut(&key)).ok_or("the consumer went away")?;
+    if result.is_ok() {
+        for (p, o) in &positions {
+            s.positions.insert(*p, *o);
+        }
+    }
+    let records = result?;
+    Ok(json!({ "records": records, "positions": positions_json(&s.positions), "committed": positions_json(&s.committed) }))
+}
+
+/// Keeps the consumer's offsets as they are now, writing them to its file when it has one, and gives them.
+pub fn kafka_commit(name: &str, consumer: &str, topic: &str) -> Result<serde_json::Value, String> {
+    let mut g = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_mut().and_then(|m| m.get_mut(&ckey(name, consumer, topic))).ok_or(format!("no consumer '{}' of '{}' yet: kafka_consume makes it", consumer, topic))?;
+    if let Some(f) = &s.file {
+        let mut all = read_file(f)?;
+        all.insert(format!("{}/{}", consumer, topic), positions_json(&s.positions));
+        let tmp = format!("{}.tmp", f);
+        let text = serde_json::to_string_pretty(&Value::Object(all)).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {}", tmp, e))?;
+        std::fs::rename(&tmp, f).map_err(|e| format!("cannot replace {}: {}", f, e))?;
+    }
+    s.committed = s.positions.clone();
+    Ok(positions_json(&s.committed))
+}
+
+/// Moves the consumer to `offset` in `partition` (to read again, or skip ahead); kafka_commit keeps it.
+pub fn kafka_seek(name: &str, consumer: &str, topic: &str, partition: i64, offset: i64) -> Result<serde_json::Value, String> {
+    if offset < 0 {
+        return Err(format!("offset {} is negative: kafka_offsets gives the range", offset));
+    }
+    let key = ckey(name, consumer, topic);
+    let exists = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.contains_key(&key)).unwrap_or(false);
+    if !exists {
+        kafka_consumer(name, consumer, topic, Value::Null)?;
+    }
+    let mut g = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_mut().and_then(|m| m.get_mut(&key)).ok_or("the consumer went away")?;
+    s.positions.insert(partition as i32, offset);
+    Ok(positions_json(&s.positions))
+}

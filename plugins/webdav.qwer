@@ -1,0 +1,437 @@
+//! A WebDAV client for Nextcloud, ownCloud, SharePoint-style and Apache servers: folders listed with their properties (PROPFIND), files read and written (GET, PUT, uploads and downloads), folders made (MKCOL), moved, copied and deleted, and locks taken and given back, with basic or bearer auth and errors that say what to do.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! ureq = "2"
+//! roxmltree = "0.20"
+//! base64 = "0.22"
+//! httpdate = "1"
+
+use serde_json::{json, Map, Value};
+use std::io::Read;
+use std::time::Duration;
+
+const DAV: &str = "DAV:";
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn agent(o: &Value) -> ureq::Agent {
+    let ms = o["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 600_000) as u64;
+    ureq::AgentBuilder::new().timeout(Duration::from_millis(ms)).redirects(0).build()
+}
+
+fn request(method: &str, url: &str, o: &Value) -> Result<ureq::Request, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("{:?}: a WebDAV address starts with http:// or https://", url));
+    }
+    let mut r = agent(o).request(method, url).set("User-Agent", "quillo-webdav/1.0");
+    use base64::Engine;
+    if let (Some(u), Some(p)) = (o["user"].as_str(), o["password"].as_str()) {
+        r = r.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+    } else if let Some(t) = o["token"].as_str() {
+        r = r.set("Authorization", &format!("Bearer {}", t));
+    }
+    if let Some(t) = o["lock_token"].as_str() {
+        let t = t.trim_matches(|c| c == '<' || c == '>');
+        r = r.set("If", &format!("(<{}>)", t));
+    }
+    if let Some(h) = o["headers"].as_object() {
+        for (k, v) in h {
+            r = r.set(k, v.as_str().unwrap_or(&v.to_string()));
+        }
+    }
+    Ok(r)
+}
+
+fn explain(method: &str, url: &str, code: u16, body: &str) -> String {
+    let why = match code {
+        401 => "the server refused the credentials: check user and password (or the token; Nextcloud wants an app password)",
+        403 => "not allowed for this user here",
+        404 => "nothing is there",
+        405 => if method == "MKCOL" { "something is already there" } else { "the server does not allow this here (a folder where a file was meant?)" },
+        409 => "a parent folder is missing: make it first with webdav_mkcol",
+        412 => "a precondition failed: the destination exists and overwrite is false, or the ETag no longer matches",
+        415 => "the server does not take this kind of body",
+        423 => "it is locked: pass the lock's token as `lock_token`",
+        502 => "the destination is on another server",
+        507 => "the server has no room left",
+        _ => "",
+    };
+    // A DAV:error body names the precondition that failed (RFC 4918 16), such as lock-token-submitted.
+    let detail = roxmltree::Document::parse(body)
+        .ok()
+        .filter(|d| d.root_element().has_tag_name((DAV, "error")))
+        .map(|d| d.root_element().children().filter(|c| c.is_element()).map(|c| c.tag_name().name().to_string()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    format!("{} {} answered {}{}{}", method, url, code, if why.is_empty() { String::new() } else { format!(": {}", why) }, if detail.is_empty() { String::new() } else { format!(" ({})", detail.trim()) })
+}
+
+struct Answer {
+    status: u16,
+    headers: Map<String, Value>,
+    body: Vec<u8>,
+}
+
+fn send(method: &str, url: &str, o: &Value, extra: &[(&str, String)], body: Option<&[u8]>, content_type: Option<&str>) -> Result<Answer, String> {
+    let mut r = request(method, url, o)?;
+    for (k, v) in extra {
+        r = r.set(k, v);
+    }
+    if let Some(ct) = content_type {
+        r = r.set("Content-Type", ct);
+    }
+    let res = match body {
+        Some(b) => r.send_bytes(b),
+        None => r.call(),
+    };
+    let resp = match res {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let mut b = String::new();
+            let _ = resp.into_reader().take(64 * 1024).read_to_string(&mut b);
+            return Err(explain(method, url, code, &b));
+        }
+        Err(e) => return Err(format!("cannot reach {}: {}", url, e)),
+    };
+    let status = resp.status();
+    let mut headers = Map::new();
+    for n in resp.headers_names() {
+        if let Some(v) = resp.header(&n) {
+            headers.insert(n.to_lowercase(), json!(v));
+        }
+    }
+    let mut out = vec![];
+    resp.into_reader().take(1 << 30).read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(Answer { status, headers, body: out })
+}
+
+// ---------------------------------------------------------------- PROPFIND
+
+/// `getetag`, `DAV:getetag` or `{DAV:}getetag` for DAV's; `{http://owncloud.org/ns}fileid` for others.
+fn clark(p: &str) -> (String, String) {
+    if let Some(rest) = p.strip_prefix('{') {
+        if let Some((ns, n)) = rest.split_once('}') {
+            return (ns.to_string(), n.to_string());
+        }
+    }
+    let p = p.strip_prefix("DAV:").unwrap_or(p);
+    let p = p.strip_prefix("d:").unwrap_or(p);
+    (DAV.to_string(), p.to_string())
+}
+
+fn propfind_body(props: &[String]) -> String {
+    if props.is_empty() {
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:propfind xmlns:d=\"DAV:\"><d:allprop/></d:propfind>".into();
+    }
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:propfind xmlns:d=\"DAV:\"><d:prop>");
+    for (i, p) in props.iter().enumerate() {
+        let (ns, n) = clark(p);
+        if ns == DAV {
+            out.push_str(&format!("<d:{}/>", n));
+        } else {
+            out.push_str(&format!("<x{}:{} xmlns:x{}=\"{}\"/>", i, n, i, esc(&ns)));
+        }
+    }
+    out.push_str("</d:prop></d:propfind>");
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let hexval = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            out.push(hexval(b[i + 1]) * 16 + hexval(b[i + 2]));
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn path_of(href: &str) -> String {
+    // An href may be a full URL or an absolute path.
+    let p = if let Some(i) = href.find("://") { href[i + 3..].find('/').map(|j| &href[i + 3 + j..]).unwrap_or("/") } else { href };
+    percent_decode(p)
+}
+
+fn prop_value(e: roxmltree::Node) -> Value {
+    let kids: Vec<_> = e.children().filter(|c| c.is_element()).collect();
+    if kids.is_empty() {
+        return json!(e.text().unwrap_or("").trim());
+    }
+    // resourcetype, supportedlock, lockdiscovery...: the element names inside, or nested.
+    if kids.iter().all(|k| k.children().all(|c| !c.is_element()) && k.text().map_or(true, |t| t.trim().is_empty())) {
+        return json!(kids.iter().map(|k| k.tag_name().name()).collect::<Vec<_>>());
+    }
+    let mut m = Map::new();
+    for k in kids {
+        m.insert(k.tag_name().name().to_string(), prop_value(k));
+    }
+    Value::Object(m)
+}
+
+fn rfc3339(http_date: &str) -> Value {
+    match httpdate::parse_http_date(http_date) {
+        Ok(t) => {
+            let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            json!(fmt_time(secs))
+        }
+        Err(_) => json!(http_date),
+    }
+}
+
+/// Seconds since 1970 as `2026-10-30T12:00:00Z`.
+fn fmt_time(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", if m <= 2 { y + 1 } else { y }, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+fn multistatus(xml: &str) -> Result<Vec<Value>, String> {
+    let doc = roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: false, ..Default::default() }).map_err(|e| format!("the server's multistatus is not XML: {}", e))?;
+    let root = doc.root_element();
+    if !(root.tag_name().name() == "multistatus" && root.tag_name().namespace() == Some(DAV)) {
+        return Err(format!("expected a DAV: multistatus, got <{}>", root.tag_name().name()));
+    }
+    let mut out = vec![];
+    for r in root.children().filter(|c| c.has_tag_name((DAV, "response"))) {
+        let href = r.children().find(|c| c.has_tag_name((DAV, "href"))).and_then(|h| h.text()).unwrap_or("").trim().to_string();
+        let mut props = Map::new();
+        let mut missing = vec![];
+        for ps in r.children().filter(|c| c.has_tag_name((DAV, "propstat"))) {
+            let status = ps.children().find(|c| c.has_tag_name((DAV, "status"))).and_then(|s| s.text()).unwrap_or("");
+            let ok = status.split_whitespace().nth(1).map_or(false, |c| c.starts_with('2'));
+            for prop in ps.children().filter(|c| c.has_tag_name((DAV, "prop"))) {
+                for p in prop.children().filter(|c| c.is_element()) {
+                    let ns = p.tag_name().namespace().unwrap_or("");
+                    let key = if ns == DAV { p.tag_name().name().to_string() } else { format!("{{{}}}{}", ns, p.tag_name().name()) };
+                    if ok {
+                        props.insert(key, prop_value(p));
+                    } else {
+                        missing.push(json!(key));
+                    }
+                }
+            }
+        }
+        let status = r.children().find(|c| c.has_tag_name((DAV, "status"))).and_then(|s| s.text()).map(|s| s.trim().to_string());
+        let path = path_of(&href);
+        let is_dir = props.get("resourcetype").and_then(|v| v.as_array()).map_or(false, |a| a.iter().any(|x| x == "collection")) || (props.is_empty() && href.ends_with('/'));
+        let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+        let num = |k: &str| props.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).map(|n| json!(n)).unwrap_or(Value::Null);
+        let text = |k: &str| props.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| json!(s)).unwrap_or(Value::Null);
+        out.push(json!({
+            "href": href, "path": path, "name": name, "is_dir": is_dir,
+            "size": if is_dir { Value::Null } else { num("getcontentlength") },
+            "modified": props.get("getlastmodified").and_then(|v| v.as_str()).map(rfc3339).unwrap_or(Value::Null),
+            "created": text("creationdate"),
+            "etag": props.get("getetag").and_then(|v| v.as_str()).map(|s| json!(s.trim_matches('"'))).unwrap_or(Value::Null),
+            "content_type": text("getcontenttype"),
+            "display_name": text("displayname"),
+            "locked": props.get("lockdiscovery").map_or(false, |v| v.as_object().map_or(false, |m| !m.is_empty()) || v.as_array().map_or(false, |a| !a.is_empty())),
+            "status": status,
+            "props": Value::Object(props),
+            "missing": missing,
+        }));
+    }
+    Ok(out)
+}
+
+fn names(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => vec![],
+    }
+}
+
+fn propfind(url: &str, depth: &str, props: &[String], o: &Value) -> Result<Vec<Value>, String> {
+    let a = send("PROPFIND", url, o, &[("Depth", depth.to_string())], Some(propfind_body(props).as_bytes()), Some("application/xml; charset=utf-8"))?;
+    if a.status != 207 {
+        return Err(format!("PROPFIND {} answered {} instead of 207 Multi-Status: is it a WebDAV address?", url, a.status));
+    }
+    multistatus(&String::from_utf8_lossy(&a.body))
+}
+
+/// A folder's contents (PROPFIND): a list of `{ href, path, name, is_dir, size, modified, created, etag, content_type, display_name, locked, props, missing }`, the folder itself left out (folders first, then by name). `options`: `{ user, password } or { token }, depth: 1 (default) | "infinity", props: ["getetag", "{http://owncloud.org/ns}fileid"] (named properties instead of all: those the server lacks are in `missing`), include_self, timeout_ms (10000), headers }`.
+pub fn webdav_list(url: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let depth = match &options["depth"] { Value::Null => "1".to_string(), Value::Number(n) => n.to_string(), Value::String(s) => s.clone(), _ => "1".into() };
+    let mut all = propfind(url, &depth, &names(&options["props"]), &options)?;
+    let me = path_of(url);
+    let me = me.trim_end_matches('/');
+    if !options["include_self"].as_bool().unwrap_or(false) {
+        all.retain(|e| e["path"].as_str().map_or(true, |p| p.trim_end_matches('/') != me));
+    }
+    all.sort_by(|a, b| (!a["is_dir"].as_bool().unwrap_or(false), a["path"].as_str().unwrap_or("")).cmp(&(!b["is_dir"].as_bool().unwrap_or(false), b["path"].as_str().unwrap_or(""))));
+    Ok(all)
+}
+
+/// One file's or folder's entry (PROPFIND with depth 0), as `webdav_list` gives them, or null when nothing is there.
+pub fn webdav_stat(url: &str, options: serde_json::Value) -> Result<Option<Value>, String> {
+    match propfind(url, "0", &names(&options["props"]), &options) {
+        Ok(mut v) => Ok(if v.is_empty() { None } else { Some(v.remove(0)) }),
+        Err(e) if e.contains(" answered 404") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------- files
+
+/// A file's content as text.
+pub fn webdav_get(url: &str, options: serde_json::Value) -> Result<String, String> {
+    let a = send("GET", url, &options, &[], None, None)?;
+    String::from_utf8(a.body).map_err(|_| format!("{} is not text: use webdav_download", url))
+}
+
+/// A file saved to `path` on this machine; gives its size in bytes.
+pub fn webdav_download(url: &str, path: &str, options: serde_json::Value) -> Result<i64, String> {
+    let a = send("GET", url, &options, &[], None, None)?;
+    std::fs::write(path, &a.body).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    Ok(a.body.len() as i64)
+}
+
+fn put(url: &str, body: &[u8], o: &Value) -> Result<Value, String> {
+    let mut extra = vec![];
+    if o["overwrite"] == false {
+        extra.push(("If-None-Match", "*".to_string()));
+    }
+    if let Some(e) = o["if_match"].as_str() {
+        extra.push(("If-Match", format!("\"{}\"", e.trim_matches('"'))));
+    }
+    let ct = o["content_type"].as_str().unwrap_or("application/octet-stream");
+    let a = send("PUT", url, o, &extra, Some(body), Some(ct))?;
+    Ok(json!({ "created": a.status == 201, "status": a.status, "etag": a.headers.get("etag").and_then(|v| v.as_str()).map(|s| s.trim_matches('"').to_string()), "size": body.len() }))
+}
+
+/// Writes `text` to the file at `url` (made, or replaced): `{ created, status, etag, size }`. `options` add `content_type` ("text/plain; charset=utf-8" unless given), `overwrite: false` (fail when a file is there), `if_match` (an ETag: fail when the file changed since), `lock_token`.
+pub fn webdav_put(url: &str, text: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut o = options.clone();
+    if o["content_type"].is_null() {
+        o["content_type"] = json!("text/plain; charset=utf-8");
+    }
+    put(url, text.as_bytes(), &o)
+}
+
+/// Uploads the file at `path` on this machine to `url`, as `webdav_put` writes.
+pub fn webdav_upload(url: &str, path: &str, options: serde_json::Value) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    put(url, &b, &options)
+}
+
+/// Makes the folder at `url` (its parent must exist); with `options.parents: true`, the missing folders above it too. Gives whether it was made (false: it was there).
+pub fn webdav_mkcol(url: &str, options: serde_json::Value) -> Result<bool, String> {
+    let u = if url.ends_with('/') { url.to_string() } else { format!("{}/", url) };
+    match send("MKCOL", &u, &options, &[], None, None) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains(" answered 405") => Ok(false),
+        Err(e) if e.contains(" answered 409") && options["parents"] == true => {
+            let trimmed = u.trim_end_matches('/');
+            let parent = &trimmed[..trimmed.rfind('/').ok_or(e.clone())? + 1];
+            if parent.matches('/').count() <= 3 {
+                return Err(e);
+            }
+            webdav_mkcol(parent, options.clone())?;
+            send("MKCOL", &u, &options, &[], None, None).map(|_| true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Deletes the file or folder (with everything in it) at `url`; gives whether something was there.
+pub fn webdav_delete(url: &str, options: serde_json::Value) -> Result<bool, String> {
+    match send("DELETE", url, &options, &[], None, None) {
+        Ok(a) if a.status == 207 => Err(format!("DELETE {} failed for some of what is inside: {}", url, String::from_utf8_lossy(&a.body).chars().take(400).collect::<String>())),
+        Ok(_) => Ok(true),
+        Err(e) if e.contains(" answered 404") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn destination(from: &str, to: &str) -> String {
+    if to.starts_with("http://") || to.starts_with("https://") {
+        return to.to_string();
+    }
+    let origin_end = from.find("://").map(|i| i + 3 + from[i + 3..].find('/').unwrap_or(from.len() - i - 3)).unwrap_or(0);
+    format!("{}{}", &from[..origin_end], if to.starts_with('/') { to.to_string() } else { format!("/{}", to) })
+}
+
+fn transfer(method: &str, from: &str, to: &str, o: &Value) -> Result<Value, String> {
+    let dest = destination(from, to);
+    let overwrite = if o["overwrite"] == true { "T" } else { "F" };
+    let a = send(method, from, o, &[("Destination", dest.clone()), ("Overwrite", overwrite.to_string()), ("Depth", "infinity".to_string())], None, None)?;
+    if a.status == 207 {
+        return Err(format!("{} {} -> {} failed for part of it: {}", method, from, dest, String::from_utf8_lossy(&a.body).chars().take(400).collect::<String>()));
+    }
+    Ok(json!({ "to": dest, "created": a.status == 201, "replaced": a.status == 204 }))
+}
+
+/// Moves (or renames) a file or folder to `to` (a full URL, or a path on the same server): `{ to, created, replaced }`. Nothing at `to` is replaced unless `options.overwrite` is true.
+pub fn webdav_move(from: &str, to: &str, options: serde_json::Value) -> Result<Value, String> {
+    transfer("MOVE", from, to, &options)
+}
+
+/// Copies a file or folder (with everything in it) to `to`, as `webdav_move` does.
+pub fn webdav_copy(from: &str, to: &str, options: serde_json::Value) -> Result<Value, String> {
+    transfer("COPY", from, to, &options)
+}
+
+// ---------------------------------------------------------------- locks
+
+fn lock_answer(a: &Answer) -> Result<Value, String> {
+    let token = a.headers.get("lock-token").and_then(|v| v.as_str()).map(|s| s.trim().trim_matches(|c| c == '<' || c == '>').to_string());
+    let xml = String::from_utf8_lossy(&a.body).into_owned();
+    let doc = roxmltree::Document::parse(&xml).map_err(|e| format!("the LOCK answer is not XML: {}", e))?;
+    let active = doc.descendants().find(|n| n.has_tag_name((DAV, "activelock"))).ok_or("the LOCK answer has no activelock")?;
+    let find = |name: &str| active.descendants().find(|n| n.has_tag_name((DAV, name)));
+    let token = token.or_else(|| find("locktoken").and_then(|t| t.children().find(|c| c.has_tag_name((DAV, "href")))).and_then(|h| h.text()).map(|s| s.trim().to_string()));
+    let timeout = find("timeout").and_then(|t| t.text()).map(|t| t.trim().to_string());
+    let seconds = timeout.as_deref().and_then(|t| t.strip_prefix("Second-")).and_then(|s| s.parse::<i64>().ok());
+    Ok(json!({
+        "token": token,
+        "timeout": seconds,
+        "scope": find("lockscope").and_then(|s| s.children().find(|c| c.is_element())).map(|c| c.tag_name().name()),
+        "depth": find("depth").and_then(|d| d.text()).map(|s| s.trim()),
+        "owner": find("owner").map(|o| o.descendants().filter(|d| d.is_text()).map(|d| d.text().unwrap_or("")).collect::<String>().trim().to_string()),
+        "created": a.status == 201,
+    }))
+}
+
+/// Locks the file at `url` for writing (an exclusive write lock, LOCK): `{ token, timeout, scope, depth, owner, created }`; a URL with nothing there gets an empty file. `options`: `{ timeout: seconds (600), owner: "text", shared: true, depth: 0 | "infinity" }`, and `lock_token` with no other to refresh a lock you hold. Others' writes then fail with 423 until `webdav_unlock`.
+pub fn webdav_lock(url: &str, options: serde_json::Value) -> Result<Value, String> {
+    let secs = options["timeout"].as_i64().unwrap_or(600).clamp(1, 4_100_000_000);
+    let mut extra = vec![("Timeout", format!("Second-{}", secs))];
+    let depth = match &options["depth"] { Value::String(s) if s == "infinity" => "infinity", _ => "0" };
+    extra.push(("Depth", depth.to_string()));
+    let a = if !options["lock_token"].is_null() {
+        send("LOCK", url, &options, &extra, None, None)?
+    } else {
+        let owner = options["owner"].as_str().map(|o| format!("<d:owner>{}</d:owner>", esc(o))).unwrap_or_default();
+        let scope = if options["shared"] == true { "shared" } else { "exclusive" };
+        let body = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:lockinfo xmlns:d=\"DAV:\"><d:lockscope><d:{}/></d:lockscope><d:locktype><d:write/></d:locktype>{}</d:lockinfo>", scope, owner);
+        send("LOCK", url, &options, &extra, Some(body.as_bytes()), Some("application/xml; charset=utf-8"))?
+    };
+    lock_answer(&a)
+}
+
+/// Gives a lock back (UNLOCK) with its `token`.
+pub fn webdav_unlock(url: &str, token: &str, options: serde_json::Value) -> Result<(), String> {
+    let t = token.trim().trim_matches(|c| c == '<' || c == '>');
+    send("UNLOCK", url, &options, &[("Lock-Token", format!("<{}>", t))], None, None).map(|_| ())
+}

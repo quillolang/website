@@ -1,0 +1,330 @@
+//! Pusher Channels (and Soketi, which speaks the same HTTP API) from the server: events triggered on channels with the signed request Pusher wants, batches, channel and presence user queries, the private and presence channel signatures a browser asks for, and webhook signatures checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! md-5 = "0.10"
+//! hex = "0.4"
+
+use hmac::{Hmac, Mac};
+use md5::{Digest, Md5};
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// `app` is a map: { app_id, key, secret, host, timeout_ms }. `host` is the API's address: a URL
+// (https://api-eu.pusher.com, http://127.0.0.1:6001 for Soketi) or a bare host name, or give
+// `cluster` (eu, mt1, us2, ap1, ...) for Pusher's own api-<cluster>.pusher.com.
+
+struct App {
+    id: String,
+    key: String,
+    secret: String,
+    base: String,
+    timeout: Duration,
+}
+
+fn s(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn app_of(app: &Value) -> Result<App, String> {
+    if !app.is_object() {
+        return Err("the app must be a map: { app_id, key, secret, host or cluster }".into());
+    }
+    for k in app.as_object().into_iter().flat_map(|m| m.keys()) {
+        if !["app_id", "key", "secret", "host", "cluster", "timeout_ms"].contains(&k.as_str()) {
+            return Err(format!("the app has no setting `{}`; it takes app_id, key, secret, host, cluster, timeout_ms", k));
+        }
+    }
+    let need = |k: &str| s(app, k).ok_or(format!("the app needs `{}` (from the Pusher dashboard's App Keys)", k));
+    let host = match (s(app, "host"), s(app, "cluster")) {
+        (Some(h), _) => h,
+        (None, Some(c)) => format!("api-{}.pusher.com", c),
+        (None, None) => return Err("give the app a `host` (a URL, like https://api-eu.pusher.com) or a `cluster` (like eu)".into()),
+    };
+    let base = if host.starts_with("http://") || host.starts_with("https://") { host.trim_end_matches('/').to_string() } else { format!("https://{}", host.trim_end_matches('/')) };
+    let timeout = Duration::from_millis(app.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(10_000).clamp(100, 120_000) as u64);
+    Ok(App { id: need("app_id")?, key: need("key")?, secret: need("secret")?, base, timeout })
+}
+
+fn hmac_hex(secret: &str, text: &str) -> String {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(text.as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+fn enc(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~,".contains(&b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{:02X}", b));
+        }
+    }
+    o
+}
+
+/// The query string Pusher's signature covers: parameters sorted by key (lowercase), `key=value` joined by `&`, then auth_signature.
+fn signed_query(a: &App, method: &str, path: &str, params: &[(String, String)], body: &str, ts: u64) -> String {
+    let mut p: Vec<(String, String)> = params.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect();
+    p.push(("auth_key".into(), a.key.clone()));
+    p.push(("auth_timestamp".into(), ts.to_string()));
+    p.push(("auth_version".into(), "1.0".into()));
+    if !body.is_empty() {
+        p.push(("body_md5".into(), hex::encode(Md5::digest(body.as_bytes()))));
+    }
+    p.sort();
+    let plain = p.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    let sig = hmac_hex(&a.secret, &format!("{}\n{}\n{}", method, path, plain));
+    let encoded = p.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect::<Vec<_>>().join("&");
+    format!("{}&auth_signature={}", encoded, sig)
+}
+
+fn now_s() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn call(a: &App, method: &str, path: &str, params: &[(String, String)], body: Option<&Value>) -> Result<Value, String> {
+    let text = body.map(|b| b.to_string()).unwrap_or_default();
+    let q = signed_query(a, method, path, params, &text, now_s());
+    let url = format!("{}{}?{}", a.base, path, q);
+    let agent = ureq::AgentBuilder::new().timeout(a.timeout).build();
+    let req = agent.request(method, &url);
+    let r = if body.is_some() { req.set("Content-Type", "application/json").send_string(&text) } else { req.call() };
+    match r {
+        Ok(resp) => {
+            let t = resp.into_string().map_err(|e| e.to_string())?;
+            if t.trim().is_empty() {
+                return Ok(json!({}));
+            }
+            serde_json::from_str(&t).map_err(|_| format!("Pusher's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let t = resp.into_string().unwrap_or_default();
+            let hint = match code {
+                401 => " (check the app's key and secret, and the server's clock)",
+                403 => " (the app is disabled, or over its message quota)",
+                404 => " (check app_id and the host)",
+                413 => " (an event's data is at most 10 KB)",
+                _ => "",
+            };
+            Err(format!("Pusher answered {}: {}{}", code, t.trim(), hint))
+        }
+        Err(e) => Err(format!("cannot reach Pusher at {}: {}", a.base, e)),
+    }
+}
+
+fn valid_channel(c: &str) -> Result<(), String> {
+    if c.is_empty() || c.len() > 200 || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_=@,.;".contains(ch)) {
+        return Err(format!("{:?} is not a Pusher channel name: up to 200 of a-z, A-Z, 0-9 and - _ = @ , . ;", c));
+    }
+    Ok(())
+}
+
+fn valid_socket(id: &str) -> Result<(), String> {
+    let ok = id.split_once('.').map(|(a, b)| !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit())).unwrap_or(false);
+    if ok { Ok(()) } else { Err(format!("{:?} is not a socket id (it looks like 1234.5678, from the browser's pusher.connection.socket_id)", id)) }
+}
+
+fn data_text(d: &Value) -> String {
+    match d {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn info_param(v: &Value) -> Result<Option<String>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.is_empty() => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Array(a) => Ok(Some(a.iter().map(|x| x.as_str().map(|s| s.to_string()).ok_or("info must be texts, like [\"user_count\"]")).collect::<Result<Vec<_>, _>>()?.join(","))),
+        _ => Err("info must be a text or a list, like [\"user_count\", \"subscription_count\"]".into()),
+    }
+}
+
+/// Triggers `event` on `channels` (one name or a list of up to 100) with `data` (text, or anything else as JSON, at most 10 KB); options: socket_id (leave that browser out), info ("subscription_count", "user_count"). Gives Pusher's answer ({} or { channels }).
+pub fn pusher_trigger(app: serde_json::Value, channels: serde_json::Value, event: &str, data: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    let chans: Vec<String> = match &channels {
+        Value::String(c) => vec![c.clone()],
+        Value::Array(l) => l.iter().map(|x| x.as_str().map(|s| s.to_string()).ok_or("channels must be texts".to_string())).collect::<Result<_, _>>()?,
+        _ => return Err("channels must be a channel name or a list of them".into()),
+    };
+    if chans.is_empty() || chans.len() > 100 {
+        return Err(format!("an event goes to 1 to 100 channels, not {}", chans.len()));
+    }
+    for c in &chans {
+        valid_channel(c)?;
+    }
+    if event.is_empty() || event.len() > 200 {
+        return Err("an event name is 1 to 200 characters".into());
+    }
+    let text = data_text(&data);
+    if text.len() > 10_240 {
+        return Err(format!("the event's data is {} bytes; Pusher takes at most 10240", text.len()));
+    }
+    let mut body = json!({ "name": event, "data": text, "channels": chans });
+    if let Some(sid) = s(&options, "socket_id") {
+        valid_socket(&sid)?;
+        body["socket_id"] = json!(sid);
+    }
+    if let Some(i) = info_param(options.get("info").unwrap_or(&Value::Null))? {
+        body["info"] = json!(i);
+    }
+    call(&a, "POST", &format!("/apps/{}/events", a.id), &[], Some(&body))
+}
+
+/// Triggers up to 10 events in one request: each { channel, name, data, socket_id, info }.
+pub fn pusher_trigger_batch(app: serde_json::Value, events: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    if events.is_empty() || events.len() > 10 {
+        return Err(format!("a batch holds 1 to 10 events, not {}", events.len()));
+    }
+    let mut batch = vec![];
+    for e in &events {
+        let ch = s(e, "channel").ok_or("each event needs a `channel`")?;
+        valid_channel(&ch)?;
+        let name = s(e, "name").ok_or("each event needs a `name`")?;
+        let text = data_text(e.get("data").unwrap_or(&Value::Null));
+        if text.len() > 10_240 {
+            return Err(format!("an event's data is {} bytes; Pusher takes at most 10240", text.len()));
+        }
+        let mut b = json!({ "channel": ch, "name": name, "data": text });
+        if let Some(sid) = s(e, "socket_id") {
+            valid_socket(&sid)?;
+            b["socket_id"] = json!(sid);
+        }
+        if let Some(i) = info_param(e.get("info").unwrap_or(&Value::Null))? {
+            b["info"] = json!(i);
+        }
+        batch.push(b);
+    }
+    call(&a, "POST", &format!("/apps/{}/batch_events", a.id), &[], Some(&json!({ "batch": batch })))
+}
+
+/// The channels with someone on them; options: prefix (like "presence-"), info ("user_count", for presence channels). Gives { channels: { name: {...} } }.
+pub fn pusher_channels(app: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    let mut p = vec![];
+    if let Some(pre) = s(&options, "prefix") {
+        p.push(("filter_by_prefix".to_string(), pre));
+    }
+    if let Some(i) = info_param(options.get("info").unwrap_or(&Value::Null))? {
+        p.push(("info".to_string(), i));
+    }
+    call(&a, "GET", &format!("/apps/{}/channels", a.id), &p, None)
+}
+
+/// One channel: { occupied, user_count (presence), subscription_count } as asked in `info` ("user_count", "subscription_count", or a list).
+pub fn pusher_channel(app: serde_json::Value, channel: &str, info: serde_json::Value) -> Result<serde_json::Value, String> {
+    valid_channel(channel)?;
+    let a = app_of(&app)?;
+    let mut p = vec![];
+    if let Some(i) = info_param(&info)? {
+        p.push(("info".to_string(), i));
+    }
+    call(&a, "GET", &format!("/apps/{}/channels/{}", a.id, channel), &p, None)
+}
+
+/// The ids of the users on a presence channel.
+pub fn pusher_users(app: serde_json::Value, channel: &str) -> Result<Vec<String>, String> {
+    valid_channel(channel)?;
+    if !channel.starts_with("presence-") {
+        return Err(format!("{} is not a presence channel: only presence- channels have users", channel));
+    }
+    let a = app_of(&app)?;
+    let r = call(&a, "GET", &format!("/apps/{}/channels/{}/users", a.id, channel), &[], None)?;
+    Ok(r.get("users").and_then(|u| u.as_array()).map(|l| l.iter().filter_map(|u| u.get("id").map(|i| data_text(i))).collect()).unwrap_or_default())
+}
+
+/// Disconnects every connection of a signed-in user (`user_id`, from pusher_user_auth).
+pub fn pusher_terminate(app: serde_json::Value, user_id: &str) -> Result<serde_json::Value, String> {
+    if user_id.is_empty() || user_id.len() > 200 {
+        return Err("a user id is 1 to 200 characters".into());
+    }
+    let a = app_of(&app)?;
+    call(&a, "POST", &format!("/apps/{}/users/{}/terminate_connections", a.id, enc(user_id)), &[], Some(&json!({})))
+}
+
+/// The answer to the browser's auth request for a private or presence channel: { auth } for private-, { auth, channel_data } for presence- with `user` ({ user_id, user_info }; null for a private channel). Check first that this visitor may join it.
+pub fn pusher_auth(app: serde_json::Value, socket_id: &str, channel: &str, user: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    valid_socket(socket_id)?;
+    valid_channel(channel)?;
+    if channel.starts_with("presence-") {
+        // The user id stays as given, text or number, as the browser's members list shows it.
+        let uid = match user.get("user_id") {
+            Some(Value::String(u)) if !u.is_empty() => json!(u),
+            Some(Value::Number(n)) => json!(n),
+            _ => return Err("a presence channel needs the user: { user_id, user_info }, user_id a text or a number".into()),
+        };
+        let mut cd = json!({ "user_id": uid });
+        if let Some(info) = user.get("user_info") {
+            cd["user_info"] = info.clone();
+        }
+        let channel_data = cd.to_string();
+        let sig = hmac_hex(&a.secret, &format!("{}:{}:{}", socket_id, channel, channel_data));
+        Ok(json!({ "auth": format!("{}:{}", a.key, sig), "channel_data": channel_data }))
+    } else if channel.starts_with("private-") {
+        if channel.starts_with("private-encrypted-") {
+            return Err("encrypted channels need a shared secret per channel, which this plugin does not make".into());
+        }
+        let sig = hmac_hex(&a.secret, &format!("{}:{}", socket_id, channel));
+        Ok(json!({ "auth": format!("{}:{}", a.key, sig) }))
+    } else {
+        Err(format!("{} is a public channel: it needs no auth (private- and presence- channels do)", channel))
+    }
+}
+
+/// The answer to the browser's user sign-in (pusher.signin()): { auth, user_data } for `user` ({ id, user_info, watchlist }).
+pub fn pusher_user_auth(app: serde_json::Value, socket_id: &str, user: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    valid_socket(socket_id)?;
+    let id = user.get("id").map(data_text).filter(|u| !u.is_empty()).ok_or("the user needs an `id`")?;
+    let mut u = user.as_object().cloned().unwrap_or_default();
+    u.insert("id".into(), json!(id));
+    let user_data = Value::Object(u).to_string();
+    let sig = hmac_hex(&a.secret, &format!("{}::user::{}", socket_id, user_data));
+    Ok(json!({ "auth": format!("{}:{}", a.key, sig), "user_data": user_data }))
+}
+
+/// Checks a webhook from Pusher: `headers` are the request's (x-pusher-key and x-pusher-signature, the HMAC-SHA256 of `body` with the app's secret). Gives { time_ms, events }, or an error when it was not signed by this app.
+pub fn pusher_webhook(app: serde_json::Value, headers: std::collections::HashMap<String, serde_json::Value>, body: &str) -> Result<serde_json::Value, String> {
+    let a = app_of(&app)?;
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| data_text(v));
+    let key = h("x-pusher-key").ok_or("no X-Pusher-Key header: this did not come from Pusher")?;
+    if key != a.key {
+        return Err(format!("the webhook is for app key {}, not this app's", key));
+    }
+    let sig = h("x-pusher-signature").ok_or("no X-Pusher-Signature header")?;
+    let want = hmac_hex(&a.secret, body);
+    // Compared in constant time.
+    let same = want.len() == sig.len() && want.bytes().zip(sig.to_ascii_lowercase().bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+    if !same {
+        return Err("the webhook's signature does not match: it was not signed with this app's secret".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "time_ms": v.get("time_ms").cloned().unwrap_or(Value::Null), "events": v.get("events").cloned().unwrap_or(json!([])) }))
+}
+
+/// Signs a webhook body as Pusher does, for tests: the X-Pusher-Signature value.
+pub fn pusher_webhook_sign(app: serde_json::Value, body: &str) -> Result<String, String> {
+    let a = app_of(&app)?;
+    Ok(hmac_hex(&a.secret, body))
+}
+
+/// The signed query string for any other Pusher API call (`method`, `path` like /apps/123/channels, `params`, `body` text or ""), for a timestamp `ts` (0: now).
+pub fn pusher_sign(app: serde_json::Value, method: &str, path: &str, params: std::collections::HashMap<String, String>, body: &str, ts: i64) -> Result<String, String> {
+    let a = app_of(&app)?;
+    let mut p: Vec<(String, String)> = params.into_iter().collect();
+    p.sort();
+    Ok(signed_query(&a, &method.to_uppercase(), path, &p, body, if ts > 0 { ts as u64 } else { now_s() }))
+}

@@ -1,0 +1,483 @@
+//! Amazon SQS over its JSON protocol, signed with Signature Version 4: messages sent one at a time or in batches (FIFO group and deduplication ids, delays, attributes, MD5s checked), received with long polling and a visibility timeout, deleted, made visible later, and queues found, made and described; the endpoint can be ElasticMQ or LocalStack.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! md-5 = "0.10"
+//! hex = "0.4"
+
+use hmac::{Hmac, Mac};
+use md5::Md5;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct Cfg {
+    endpoint: String,
+    host: String,
+    region: String,
+    key: String,
+    secret: String,
+    token: Option<String>,
+    timeout: Duration,
+}
+
+/// The accounts, by the name given to `sqs_connect`.
+static ACCOUNTS: Mutex<Option<HashMap<String, Cfg>>> = Mutex::new(None);
+
+fn cfg(name: &str) -> Result<Cfg, String> {
+    ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(name).cloned().ok_or(format!(
+        "no SQS account named `{}`: call sqs_connect(\"{}\", {{ region, access_key_id, secret_access_key }}) first",
+        name, name
+    ))
+}
+
+// ---- Signature Version 4 ----
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes a key of any size");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn amz_date(secs: i64) -> String {
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let r = secs.rem_euclid(86400);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+/// The headers for one SQS call: SigV4 over host, content-type, x-amz-date, x-amz-target (and the session token), the body's SHA-256 in the canonical request.
+fn signed(c: &Cfg, target: &str, body: &str, secs: i64) -> Vec<(String, String)> {
+    let date = amz_date(secs);
+    let day = &date[..8];
+    let mut headers: Vec<(String, String)> = vec![
+        ("content-type".into(), "application/x-amz-json-1.0".into()),
+        ("host".into(), c.host.clone()),
+        ("x-amz-date".into(), date.clone()),
+        ("x-amz-target".into(), format!("AmazonSQS.{}", target)),
+    ];
+    if let Some(t) = &c.token {
+        headers.push(("x-amz-security-token".into(), t.clone()));
+    }
+    headers.sort();
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{}:{}\n", k, v.trim())).collect();
+    let signed_names = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let payload = hex::encode(Sha256::digest(body.as_bytes()));
+    let canonical = format!("POST\n/\n\n{}\n{}\n{}", canonical_headers, signed_names, payload);
+    let scope = format!("{}/{}/sqs/aws4_request", day, c.region);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", date, scope, hex::encode(Sha256::digest(canonical.as_bytes())));
+    let k = hmac(&hmac(&hmac(&hmac(format!("AWS4{}", c.secret).as_bytes(), day), &c.region), "sqs"), "aws4_request");
+    let sig = hex::encode(hmac(&k, &to_sign));
+    headers.push(("authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", c.key, scope, signed_names, sig)));
+    headers
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn call(c: &Cfg, target: &str, body: Value, wait: Duration) -> Result<Value, String> {
+    let text = body.to_string();
+    let agent = ureq::AgentBuilder::new().timeout(c.timeout + wait).build();
+    let mut req = agent.post(&format!("{}/", c.endpoint));
+    for (k, v) in signed(c, target, &text, now_secs()) {
+        if k != "host" {
+            req = req.set(&k, &v);
+        }
+    }
+    match req.send_string(&text) {
+        Ok(r) => {
+            let t = r.into_string().map_err(|e| e.to_string())?;
+            if t.trim().is_empty() {
+                return Ok(json!({}));
+            }
+            serde_json::from_str(&t).map_err(|e| format!("SQS's answer to {} is not JSON: {}", target, e))
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let query_error = r.header("x-amzn-query-error").map(str::to_string);
+            let t = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            let kind = v["__type"].as_str().map(|s| s.rsplit('#').next().unwrap_or(s).to_string()).or(query_error.map(|q| q.split(';').next().unwrap_or("").to_string())).unwrap_or_else(|| format!("HTTP {}", code));
+            let msg = v["message"].as_str().or(v["Message"].as_str()).unwrap_or(t.trim()).to_string();
+            let hint = match kind.as_str() {
+                "InvalidSignatureException" | "SignatureDoesNotMatch" | "IncompleteSignature" => " (check the secret access key and the region)",
+                "UnrecognizedClientException" | "InvalidClientTokenId" => " (check the access key id)",
+                "QueueDoesNotExist" | "AWS.SimpleQueueService.NonExistentQueue" => " (check the queue URL, or make it with sqs_create_queue)",
+                "AccessDeniedException" | "AccessDenied" => " (the key's IAM policy does not allow this action on this queue)",
+                _ => "",
+            };
+            Err(format!("SQS refused {}: {}: {}{}", target, kind, msg, hint))
+        }
+        Err(e) => Err(format!("cannot reach SQS at {}: {}", c.endpoint, e)),
+    }
+}
+
+// ---- MD5s, as SQS computes them ----
+
+fn md5_hex(b: &[u8]) -> String {
+    hex::encode(Md5::digest(b))
+}
+
+/// The MD5 of message attributes: names sorted, each as length-prefixed name, type, a transport byte and the value.
+fn attributes_md5(attrs: &Map<String, Value>) -> String {
+    let mut names: Vec<&String> = attrs.keys().collect();
+    names.sort();
+    let mut buf = vec![];
+    let put = |buf: &mut Vec<u8>, b: &[u8]| {
+        buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        buf.extend_from_slice(b);
+    };
+    for n in names {
+        let a = &attrs[n];
+        let t = a["DataType"].as_str().unwrap_or("String");
+        put(&mut buf, n.as_bytes());
+        put(&mut buf, t.as_bytes());
+        if t.starts_with("Binary") {
+            buf.push(2);
+            let raw = a["BinaryValue"].as_str().map(b64_decode).unwrap_or_default();
+            put(&mut buf, &raw);
+        } else {
+            buf.push(1);
+            put(&mut buf, a["StringValue"].as_str().unwrap_or("").as_bytes());
+        }
+    }
+    md5_hex(&buf)
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// `{ name: "text" | number | true }` as SQS message attributes; `{ type: "Number.cents", value: "12" }` for a custom type.
+fn to_attributes(v: &Value) -> Result<Map<String, Value>, String> {
+    let mut out = Map::new();
+    let Some(m) = v.as_object() else {
+        return if v.is_null() { Ok(out) } else { Err("attributes are a map: { kind: \"order\", total: 42 }".into()) };
+    };
+    for (k, x) in m {
+        let a = match x {
+            Value::String(s) => json!({ "DataType": "String", "StringValue": s }),
+            Value::Number(n) => json!({ "DataType": "Number", "StringValue": n.to_string() }),
+            Value::Bool(b) => json!({ "DataType": "String", "StringValue": b.to_string() }),
+            Value::Object(o) if o.contains_key("type") => {
+                let t = o["type"].as_str().ok_or("an attribute's type is text")?;
+                let val = match &o["value"] { Value::String(s) => s.clone(), other => other.to_string() };
+                if t.starts_with("Binary") { json!({ "DataType": t, "BinaryValue": val }) } else { json!({ "DataType": t, "StringValue": val }) }
+            }
+            _ => return Err(format!("the attribute `{}` is text, a number, or {{ type, value }}", k)),
+        };
+        out.insert(k.clone(), a);
+    }
+    if out.len() > 10 {
+        return Err("SQS takes at most 10 message attributes".into());
+    }
+    Ok(out)
+}
+
+fn from_attributes(v: &Value) -> Value {
+    let mut out = Map::new();
+    if let Some(m) = v.as_object() {
+        for (k, a) in m {
+            let t = a["DataType"].as_str().unwrap_or("String");
+            let val = if t.starts_with("Number") {
+                let s = a["StringValue"].as_str().unwrap_or("");
+                s.parse::<i64>().map(Value::from).or_else(|_| s.parse::<f64>().map(Value::from)).unwrap_or(json!(s))
+            } else if t.starts_with("Binary") {
+                a["BinaryValue"].clone()
+            } else {
+                a["StringValue"].clone()
+            };
+            out.insert(k.clone(), val);
+        }
+    }
+    Value::Object(out)
+}
+
+fn entry(queue_url: &str, body: &str, o: &Value, id: Option<String>) -> Result<(Value, Map<String, Value>), String> {
+    if body.is_empty() {
+        return Err("SQS does not take an empty message".into());
+    }
+    if body.len() > 262_144 {
+        return Err(format!("the message is {} bytes: SQS takes at most 256 KB (put the rest in S3 and send its key)", body.len()));
+    }
+    let attrs = to_attributes(&o["attributes"])?;
+    let mut e = json!({ "MessageBody": body });
+    if let Some(i) = id {
+        e["Id"] = json!(i);
+    } else {
+        e["QueueUrl"] = json!(queue_url);
+    }
+    if let Some(d) = o["delay_seconds"].as_i64() {
+        if !(0..=900).contains(&d) {
+            return Err("delay_seconds is 0 to 900".into());
+        }
+        e["DelaySeconds"] = json!(d);
+    }
+    if !attrs.is_empty() {
+        e["MessageAttributes"] = Value::Object(attrs.clone());
+    }
+    if let Some(g) = o["group_id"].as_str() {
+        e["MessageGroupId"] = json!(g);
+    }
+    if let Some(d) = o["dedup_id"].as_str() {
+        e["MessageDeduplicationId"] = json!(d);
+    }
+    if queue_url.ends_with(".fifo") && o["group_id"].is_null() {
+        return Err("a FIFO queue needs a group_id with each message".into());
+    }
+    Ok((e, attrs))
+}
+
+fn queue_ok(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("`{}` is not a queue URL: sqs_queue_url(account, \"name\") gives it", url));
+    }
+    Ok(())
+}
+
+/// Remembers an AWS account and region as `name`. Options: `region` ("us-east-1"), `access_key_id`, `secret_access_key`, `session_token` (temporary credentials), `endpoint` (https://sqs.<region>.amazonaws.com unless given: ElasticMQ's http://localhost:9324, LocalStack's http://localhost:4566), `timeout_ms` (10000, added to a long poll's wait).
+pub fn sqs_connect(name: &str, options: serde_json::Value) -> Result<Value, String> {
+    let region = options["region"].as_str().filter(|r| !r.is_empty()).unwrap_or("us-east-1").to_string();
+    let key = options["access_key_id"].as_str().filter(|k| !k.is_empty()).ok_or("an access_key_id is needed (any text for ElasticMQ)")?.to_string();
+    let secret = options["secret_access_key"].as_str().filter(|k| !k.is_empty()).ok_or("a secret_access_key is needed (any text for ElasticMQ)")?.to_string();
+    let endpoint = options["endpoint"].as_str().filter(|e| !e.is_empty()).map(|e| e.trim_end_matches('/').to_string()).unwrap_or(format!("https://sqs.{}.amazonaws.com", region));
+    let rest = endpoint.split_once("://").map(|(_, r)| r).ok_or(format!("`{}` is not an endpoint URL", endpoint))?;
+    let host = rest.split('/').next().unwrap_or("").to_string();
+    let host = if endpoint.starts_with("https://") { host.trim_end_matches(":443").to_string() } else { host.trim_end_matches(":80").to_string() };
+    let c = Cfg {
+        endpoint: endpoint.clone(),
+        host,
+        region: region.clone(),
+        key,
+        secret,
+        token: options["session_token"].as_str().filter(|t| !t.is_empty()).map(str::to_string),
+        timeout: Duration::from_millis(options["timeout_ms"].as_u64().unwrap_or(10_000).clamp(100, 120_000)),
+    };
+    ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c);
+    Ok(json!({ "name": name, "endpoint": endpoint, "region": region }))
+}
+
+/// The URL of the queue named `queue` (GetQueueUrl): what the other calls take.
+pub fn sqs_queue_url(name: &str, queue: &str) -> Result<String, String> {
+    let c = cfg(name)?;
+    let v = call(&c, "GetQueueUrl", json!({ "QueueName": queue }), Duration::ZERO)?;
+    v["QueueUrl"].as_str().map(str::to_string).ok_or("SQS gave no QueueUrl".into())
+}
+
+/// Makes the queue `queue` (a name ending in .fifo makes a FIFO queue) with `attributes` (`VisibilityTimeout`, `MessageRetentionPeriod`, `ContentBasedDeduplication`, `RedrivePolicy`...: values as text or numbers), or finds it when it is there with the same attributes; gives its URL.
+pub fn sqs_create_queue(name: &str, queue: &str, attributes: serde_json::Value) -> Result<String, String> {
+    let c = cfg(name)?;
+    let mut attrs = Map::new();
+    if let Some(m) = attributes.as_object() {
+        for (k, v) in m {
+            attrs.insert(k.clone(), json!(match v { Value::String(s) => s.clone(), other => other.to_string() }));
+        }
+    }
+    if queue.ends_with(".fifo") {
+        attrs.insert("FifoQueue".into(), json!("true"));
+    }
+    let mut body = json!({ "QueueName": queue });
+    if !attrs.is_empty() {
+        body["Attributes"] = Value::Object(attrs);
+    }
+    let v = call(&c, "CreateQueue", body, Duration::ZERO)?;
+    v["QueueUrl"].as_str().map(str::to_string).ok_or("SQS gave no QueueUrl".into())
+}
+
+/// Sends one message. Options: `attributes` (a map: text, numbers, or `{ type, value }`), `delay_seconds` (0 to 900; not per message on FIFO queues), `group_id` and `dedup_id` (FIFO queues). Gives `{ message_id, sequence_number }`, after checking the MD5s SQS sends back.
+pub fn sqs_send(name: &str, queue_url: &str, body: &str, options: serde_json::Value) -> Result<Value, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    let (e, attrs) = entry(queue_url, body, &options, None)?;
+    let v = call(&c, "SendMessage", e, Duration::ZERO)?;
+    if v["MD5OfMessageBody"].as_str().map(|m| m != md5_hex(body.as_bytes())).unwrap_or(false) {
+        return Err("the MD5 of the body SQS received does not match what was sent".into());
+    }
+    if !attrs.is_empty() && v["MD5OfMessageAttributes"].as_str().map(|m| m != attributes_md5(&attrs)).unwrap_or(false) {
+        return Err("the MD5 of the attributes SQS received does not match what was sent".into());
+    }
+    Ok(json!({ "message_id": v["MessageId"], "sequence_number": v["SequenceNumber"] }))
+}
+
+/// Sends many messages, ten to a request (SendMessageBatch): each is a body (text) or `{ body, id, attributes, delay_seconds, group_id, dedup_id }`. Gives `{ sent: [{ id, message_id }], failed: [{ id, code, message, sender_fault }] }`.
+pub fn sqs_send_batch(name: &str, queue_url: &str, messages: Vec<serde_json::Value>) -> Result<Value, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    let mut sent = vec![];
+    let mut failed = vec![];
+    let mut entries = vec![];
+    for (i, m) in messages.iter().enumerate() {
+        let (body, o) = match m {
+            Value::String(s) => (s.clone(), json!({})),
+            Value::Object(_) => (m["body"].as_str().ok_or(format!("message {} has no body", i + 1))?.to_string(), m.clone()),
+            _ => return Err("each message is text or { body, ... }".into()),
+        };
+        let id = o["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("m{}", i + 1));
+        let (e, attrs) = entry(queue_url, &body, &o, Some(id.clone()))?;
+        entries.push((e, md5_hex(body.as_bytes()), attrs));
+    }
+    for chunk in entries.chunks(10) {
+        let list: Vec<Value> = chunk.iter().map(|(e, _, _)| e.clone()).collect();
+        let v = call(&c, "SendMessageBatch", json!({ "QueueUrl": queue_url, "Entries": list }), Duration::ZERO)?;
+        for s in v["Successful"].as_array().cloned().unwrap_or_default() {
+            let want = chunk.iter().find(|(e, _, _)| e["Id"] == s["Id"]);
+            if let (Some((_, md5, _)), Some(got)) = (want, s["MD5OfMessageBody"].as_str()) {
+                if md5 != got {
+                    failed.push(json!({ "id": s["Id"], "code": "MD5Mismatch", "message": "the MD5 of the body SQS received does not match", "sender_fault": false }));
+                    continue;
+                }
+            }
+            sent.push(json!({ "id": s["Id"], "message_id": s["MessageId"], "sequence_number": s["SequenceNumber"] }));
+        }
+        for f in v["Failed"].as_array().cloned().unwrap_or_default() {
+            failed.push(json!({ "id": f["Id"], "code": f["Code"], "message": f["Message"], "sender_fault": f["SenderFault"] }));
+        }
+    }
+    Ok(json!({ "sent": sent, "failed": failed }))
+}
+
+/// Receives up to `max` messages (1 to 10), waiting up to `wait_seconds` (0 to 20: long polling) for the first. Options: `visibility_timeout` (seconds the messages stay hidden from other receivers; the queue's own unless given). Each is `{ message_id, receipt_handle, body, attributes, message_attributes, receive_count, group_id }`; delete it with its `receipt_handle` once done, or it comes again.
+pub fn sqs_receive(name: &str, queue_url: &str, max: i64, wait_seconds: i64, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    let wait = wait_seconds.clamp(0, 20);
+    let mut body = json!({
+        "QueueUrl": queue_url, "MaxNumberOfMessages": max.clamp(1, 10), "WaitTimeSeconds": wait,
+        "MessageAttributeNames": ["All"], "MessageSystemAttributeNames": ["All"], "AttributeNames": ["All"],
+    });
+    if let Some(v) = options["visibility_timeout"].as_i64() {
+        body["VisibilityTimeout"] = json!(v.clamp(0, 43_200));
+    }
+    if let Some(r) = options["attempt_id"].as_str() {
+        body["ReceiveRequestAttemptId"] = json!(r);
+    }
+    let v = call(&c, "ReceiveMessage", body, Duration::from_secs(wait as u64))?;
+    let mut out = vec![];
+    for m in v["Messages"].as_array().cloned().unwrap_or_default() {
+        let text = m["Body"].as_str().unwrap_or("").to_string();
+        if let Some(md5) = m["MD5OfBody"].as_str() {
+            if md5 != md5_hex(text.as_bytes()) {
+                return Err(format!("message {} came with a body whose MD5 does not match", m["MessageId"]));
+            }
+        }
+        let attrs = &m["Attributes"];
+        out.push(json!({
+            "message_id": m["MessageId"], "receipt_handle": m["ReceiptHandle"], "body": text,
+            "attributes": attrs, "message_attributes": from_attributes(&m["MessageAttributes"]),
+            "receive_count": attrs["ApproximateReceiveCount"].as_str().and_then(|s| s.parse::<i64>().ok()),
+            "group_id": attrs["MessageGroupId"],
+        }));
+    }
+    Ok(out)
+}
+
+fn handle_of(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Ok(s.clone()),
+        Value::Object(_) => v["receipt_handle"].as_str().map(str::to_string).ok_or("this message has no receipt_handle".into()),
+        _ => Err("give the message from sqs_receive, or its receipt_handle".into()),
+    }
+}
+
+/// Deletes a received message (the map from `sqs_receive`, or its receipt handle): it will not come again.
+pub fn sqs_delete(name: &str, queue_url: &str, message: serde_json::Value) -> Result<bool, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    call(&c, "DeleteMessage", json!({ "QueueUrl": queue_url, "ReceiptHandle": handle_of(&message)? }), Duration::ZERO)?;
+    Ok(true)
+}
+
+/// Deletes many received messages, ten to a request: `{ deleted, failed: [{ id, code, message }] }`.
+pub fn sqs_delete_batch(name: &str, queue_url: &str, messages: Vec<serde_json::Value>) -> Result<Value, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    let handles: Vec<String> = messages.iter().map(handle_of).collect::<Result<_, _>>()?;
+    let (mut deleted, mut failed) = (0, vec![]);
+    for (n, chunk) in handles.chunks(10).enumerate() {
+        let entries: Vec<Value> = chunk.iter().enumerate().map(|(i, h)| json!({ "Id": format!("d{}", n * 10 + i + 1), "ReceiptHandle": h })).collect();
+        let v = call(&c, "DeleteMessageBatch", json!({ "QueueUrl": queue_url, "Entries": entries }), Duration::ZERO)?;
+        deleted += v["Successful"].as_array().map(|a| a.len()).unwrap_or(0);
+        for f in v["Failed"].as_array().cloned().unwrap_or_default() {
+            failed.push(json!({ "id": f["Id"], "code": f["Code"], "message": f["Message"] }));
+        }
+    }
+    Ok(json!({ "deleted": deleted, "failed": failed }))
+}
+
+/// Keeps a received message hidden for `seconds` more from now (0: visible again at once, for another receiver to try).
+pub fn sqs_change_visibility(name: &str, queue_url: &str, message: serde_json::Value, seconds: i64) -> Result<bool, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    call(&c, "ChangeMessageVisibility", json!({ "QueueUrl": queue_url, "ReceiptHandle": handle_of(&message)?, "VisibilityTimeout": seconds.clamp(0, 43_200) }), Duration::ZERO)?;
+    Ok(true)
+}
+
+/// The queue's attributes (GetQueueAttributes), whole numbers as numbers: `ApproximateNumberOfMessages`, `ApproximateNumberOfMessagesNotVisible`, `ApproximateNumberOfMessagesDelayed`, `VisibilityTimeout`, `QueueArn`, `FifoQueue`...
+pub fn sqs_queue_attributes(name: &str, queue_url: &str) -> Result<Value, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    let v = call(&c, "GetQueueAttributes", json!({ "QueueUrl": queue_url, "AttributeNames": ["All"] }), Duration::ZERO)?;
+    let mut out = Map::new();
+    if let Some(m) = v["Attributes"].as_object() {
+        for (k, x) in m {
+            let s = x.as_str().unwrap_or("");
+            out.insert(k.clone(), if !s.is_empty() && s.len() < 18 && s.chars().all(|c| c.is_ascii_digit()) { json!(s.parse::<i64>().unwrap_or(0)) } else { x.clone() });
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Deletes every message in the queue (PurgeQueue; SQS allows it once a minute).
+pub fn sqs_purge(name: &str, queue_url: &str) -> Result<bool, String> {
+    queue_ok(queue_url)?;
+    let c = cfg(name)?;
+    call(&c, "PurgeQueue", json!({ "QueueUrl": queue_url }), Duration::ZERO)?;
+    Ok(true)
+}
+
+/// The signed headers for a call, without sending it: for a look at what SigV4 makes (`at` is a Unix time, 0 for now).
+pub fn sqs_sign(name: &str, action: &str, body: &str, at: i64) -> Result<Value, String> {
+    let c = cfg(name)?;
+    let secs = if at > 0 { at } else { now_secs() };
+    let mut m = Map::new();
+    for (k, v) in signed(&c, action, body, secs) {
+        m.insert(k, json!(v));
+    }
+    Ok(Value::Object(m))
+}

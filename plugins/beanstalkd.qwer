@@ -1,0 +1,484 @@
+//! beanstalkd work queues: jobs put with a priority, delay and time to run into tubes, reserved with a timeout by workers that watch tubes, then deleted, released, buried, kicked or touched, with peeks and the server's, tubes' and jobs' stats, over connections kept open by name.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+struct Conn {
+    url: String,
+    host: String,
+    port: u16,
+    timeout: Duration,
+    stream: Option<BufReader<TcpStream>>,
+    using: String,
+    watching: Vec<String>,
+}
+
+/// The connections, by the name given to `beanstalk_connect`. Each has its own lock, so a worker waiting in a reserve holds up only its own connection.
+static CONNS: Mutex<Option<HashMap<String, Arc<Mutex<Conn>>>>> = Mutex::new(None);
+
+fn conn(name: &str) -> Result<Arc<Mutex<Conn>>, String> {
+    let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new)
+        .get(name)
+        .cloned()
+        .ok_or(format!("no beanstalkd connection named `{}`: call beanstalk_connect(\"{}\", \"beanstalk://127.0.0.1:11300\", {{}}) first", name, name))
+}
+
+fn with<T>(name: &str, f: impl FnOnce(&mut Conn) -> Result<T, String>) -> Result<T, String> {
+    let c = conn(name)?;
+    let mut g = c.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut g)
+}
+
+fn parse_url(url: &str) -> Result<(String, u16), String> {
+    let rest = match url.split_once("://") {
+        Some((s, r)) if s.eq_ignore_ascii_case("beanstalk") || s.eq_ignore_ascii_case("beanstalkd") || s.eq_ignore_ascii_case("tcp") => r,
+        Some((s, _)) => return Err(format!("`{}`: the scheme is beanstalk://, not {}://", url, s)),
+        None => url,
+    };
+    let rest = rest.trim_end_matches('/');
+    let (host, port) = if let Some(r) = rest.strip_prefix('[') {
+        let (h, p) = r.split_once(']').ok_or(format!("`{}`: an IPv6 address is closed with ]", url))?;
+        (h.to_string(), p.trim_start_matches(':').to_string())
+    } else {
+        match rest.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (rest.to_string(), String::new()),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("`{}` has no host", url));
+    }
+    let port = if port.is_empty() { 11300 } else { port.parse().map_err(|_| format!("`{}`: `{}` is not a port", url, port))? };
+    Ok((host, port))
+}
+
+/// A tube's name as beanstalkd takes it: 1 to 200 bytes of letters, digits and `-+/;.$_()`, not starting with `-`.
+fn tube_name(t: &str) -> Result<&str, String> {
+    let ok = !t.is_empty() && t.len() <= 200 && !t.starts_with('-') && t.chars().all(|c| c.is_ascii_alphanumeric() || "-+/;.$_()".contains(c));
+    if ok { Ok(t) } else { Err(format!("`{}` is not a tube name: 1 to 200 letters, digits and -+/;.$_() (not starting with -)", t)) }
+}
+
+enum Reply {
+    Line(Vec<String>),
+    Data(Vec<String>, Vec<u8>),
+}
+
+impl Conn {
+    fn open(&mut self) -> Result<(), String> {
+        let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port).to_socket_addrs().map_err(|e| format!("{}: {}", self.host, e))?.collect();
+        let mut last = format!("{} has no address", self.host);
+        for a in addrs {
+            match TcpStream::connect_timeout(&a, self.timeout) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    s.set_write_timeout(Some(self.timeout)).map_err(|e| e.to_string())?;
+                    self.stream = Some(BufReader::new(s));
+                    // What this connection used and watched before it broke.
+                    if self.using != "default" {
+                        let u = self.using.clone();
+                        self.raw(&format!("use {}", u), None, Duration::ZERO)?;
+                    }
+                    let watching = self.watching.clone();
+                    for t in &watching {
+                        if t != "default" {
+                            self.raw(&format!("watch {}", t), None, Duration::ZERO)?;
+                        }
+                    }
+                    if !watching.iter().any(|t| t == "default") {
+                        self.raw("ignore default", None, Duration::ZERO)?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => last = format!("cannot reach beanstalkd at {}: {} (is it running? beanstalkd -l 127.0.0.1 -p {})", a, e, self.port),
+            }
+        }
+        Err(last)
+    }
+
+    /// Whether the open connection was closed by the server since the last command.
+    fn stale(&mut self) -> bool {
+        let Some(s) = self.stream.as_mut() else { return true };
+        if !s.buffer().is_empty() {
+            return true;
+        }
+        let sock = s.get_mut();
+        if sock.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut b = [0u8; 1];
+        let dead = match sock.peek(&mut b) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        };
+        let _ = sock.set_nonblocking(false);
+        dead
+    }
+
+    fn raw(&mut self, cmd: &str, body: Option<&[u8]>, wait: Duration) -> Result<Reply, String> {
+        let timeout = self.timeout + wait;
+        let url = self.url.clone();
+        let s = self.stream.as_mut().ok_or("not connected")?;
+        let mut out = Vec::with_capacity(cmd.len() + 2 + body.map(|b| b.len() + 2).unwrap_or(0));
+        out.extend_from_slice(cmd.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        if let Some(b) = body {
+            out.extend_from_slice(b);
+            out.extend_from_slice(b"\r\n");
+        }
+        let io = |e: std::io::Error| {
+            if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+                format!("beanstalkd at {} did not answer `{}` in time", url, cmd.split(' ').next().unwrap_or(""))
+            } else {
+                format!("beanstalkd at {}: {}", url, e)
+            }
+        };
+        s.get_mut().write_all(&out).map_err(io)?;
+        s.get_mut().set_read_timeout(Some(timeout)).map_err(io)?;
+        let mut line = String::new();
+        let n = s.read_line(&mut line).map_err(io)?;
+        if n == 0 || !line.ends_with("\r\n") {
+            return Err(format!("beanstalkd at {} closed the connection", url));
+        }
+        let words: Vec<String> = line.trim_end().split(' ').map(str::to_string).collect();
+        if matches!(words[0].as_str(), "RESERVED" | "FOUND" | "OK") {
+            let len: usize = words.last().and_then(|w| w.parse().ok()).ok_or(format!("beanstalkd sent `{}`", line.trim_end()))?;
+            let mut data = vec![0u8; len + 2];
+            s.read_exact(&mut data).map_err(io)?;
+            data.truncate(len);
+            return Ok(Reply::Data(words, data));
+        }
+        Ok(Reply::Line(words))
+    }
+
+    fn call(&mut self, cmd: &str, body: Option<&[u8]>, wait: Duration) -> Result<Reply, String> {
+        if self.stale() {
+            self.stream = None;
+            self.open()?;
+        }
+        let r = self.raw(cmd, body, wait);
+        if r.is_err() {
+            self.stream = None;
+        }
+        let r = r?;
+        if let Reply::Line(w) = &r {
+            let hint = match w[0].as_str() {
+                "OUT_OF_MEMORY" => Some("beanstalkd is out of memory (OUT_OF_MEMORY)"),
+                "INTERNAL_ERROR" => Some("beanstalkd had an internal error (INTERNAL_ERROR)"),
+                "BAD_FORMAT" => Some("beanstalkd could not read the command (BAD_FORMAT)"),
+                "UNKNOWN_COMMAND" => Some("beanstalkd does not know this command (UNKNOWN_COMMAND): an older server?"),
+                "DRAINING" => Some("beanstalkd is draining (shutting down) and takes no new jobs"),
+                "JOB_TOO_BIG" => Some("the job is larger than the server's max-job-size (beanstalkd -z; 65535 bytes unless set)"),
+                "EXPECTED_CRLF" => Some("beanstalkd expected the job to end with CRLF"),
+                _ => None,
+            };
+            if let Some(h) = hint {
+                return Err(format!("{}: `{}`", h, cmd.split(' ').next().unwrap_or("")));
+            }
+        }
+        Ok(r)
+    }
+
+    fn line(&mut self, cmd: &str) -> Result<Vec<String>, String> {
+        match self.call(cmd, None, Duration::ZERO)? {
+            Reply::Line(w) => Ok(w),
+            Reply::Data(w, _) => Ok(w),
+        }
+    }
+}
+
+fn unexpected(cmd: &str, w: &[String]) -> String {
+    format!("beanstalkd answered `{}` with `{}`", cmd, w.join(" "))
+}
+
+fn id_of(w: &[String]) -> i64 {
+    w.get(1).and_then(|x| x.parse().ok()).unwrap_or(0)
+}
+
+fn job(w: &[String], data: Vec<u8>) -> Value {
+    match String::from_utf8(data) {
+        Ok(text) => json!({ "id": id_of(w), "body": text }),
+        Err(e) => json!({ "id": id_of(w), "body": String::from_utf8_lossy(e.as_bytes()), "binary": true }),
+    }
+}
+
+/// beanstalkd's YAML answers: `key: value` lines (numbers as numbers) or `- item` lists.
+fn yaml(data: &[u8]) -> Value {
+    let text = String::from_utf8_lossy(data);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty() && l.trim() != "---").collect();
+    if lines.iter().all(|l| l.starts_with("- ")) {
+        return Value::Array(lines.iter().map(|l| json!(unquote(&l[2..]))).collect());
+    }
+    let mut m = Map::new();
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let v = v.trim();
+            let val = if let Ok(n) = v.parse::<i64>() {
+                json!(n)
+            } else if let Ok(f) = v.parse::<f64>() {
+                json!(f)
+            } else if v == "true" || v == "false" {
+                json!(v == "true")
+            } else {
+                json!(unquote(v))
+            };
+            m.insert(k.trim().to_string(), val);
+        }
+    }
+    Value::Object(m)
+}
+
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') { s[1..s.len() - 1].to_string() } else { s.to_string() }
+}
+
+fn int_opt(o: &Value, key: &str, default: i64, max: i64) -> Result<i64, String> {
+    match &o[key] {
+        Value::Null => Ok(default),
+        v => v.as_i64().filter(|n| (0..=max).contains(n)).ok_or(format!("`{}` is a whole number from 0 to {}", key, max)),
+    }
+}
+
+/// Opens (or replaces) the connection `name` to beanstalkd at `url` (`beanstalk://host:11300`). Options: `use` (the tube `put` goes to), `watch` (a list of tubes `reserve` takes from; only these, not "default", when given), `timeout_ms` (2000). Gives `{ name, url, using, watching }`.
+/// It connects again by itself when the server closed it, using and watching the same tubes (jobs it had reserved go back to the queue then, as beanstalkd does).
+pub fn beanstalk_connect(name: &str, url: &str, options: serde_json::Value) -> Result<Value, String> {
+    let (host, port) = parse_url(url)?;
+    let using = tube_name(options["use"].as_str().unwrap_or("default"))?.to_string();
+    let watching: Vec<String> = match &options["watch"] {
+        Value::Null => vec!["default".into()],
+        Value::String(s) => vec![tube_name(s)?.to_string()],
+        Value::Array(a) if !a.is_empty() => a.iter().map(|t| t.as_str().ok_or("`watch` is a list of tube names".to_string()).and_then(|t| tube_name(t).map(str::to_string))).collect::<Result<_, _>>()?,
+        _ => return Err("`watch` is a list of tube names, at least one".into()),
+    };
+    let timeout = Duration::from_millis(options["timeout_ms"].as_i64().unwrap_or(2000).clamp(50, 120_000) as u64);
+    let mut c = Conn { url: url.to_string(), host, port, timeout, stream: None, using, watching };
+    c.open()?;
+    let out = json!({ "name": name, "url": url, "using": c.using, "watching": c.watching });
+    let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new).insert(name.to_string(), Arc::new(Mutex::new(c)));
+    Ok(out)
+}
+
+/// Puts a job (`body`, text) into the tube in use. Options: `priority` (0 is most urgent; 1024), `delay` (seconds before it can be reserved; 0), `ttr` (seconds a worker has before it goes back to the queue; 60), `tube` (use this tube first). Gives `{ id, buried }`: buried when the server had no memory to queue it.
+pub fn beanstalk_put(name: &str, body: &str, options: serde_json::Value) -> Result<Value, String> {
+    let pri = int_opt(&options, "priority", 1024, u32::MAX as i64)?;
+    let delay = int_opt(&options, "delay", 0, u32::MAX as i64)?;
+    let ttr = int_opt(&options, "ttr", 60, u32::MAX as i64)?.max(1);
+    with(name, |c| {
+        if let Some(t) = options["tube"].as_str() {
+            use_tube(c, t)?;
+        }
+        let cmd = format!("put {} {} {} {}", pri, delay, ttr, body.len());
+        let w = match c.call(&cmd, Some(body.as_bytes()), Duration::ZERO)? {
+            Reply::Line(w) | Reply::Data(w, _) => w,
+        };
+        match w[0].as_str() {
+            "INSERTED" => Ok(json!({ "id": id_of(&w), "buried": false, "tube": c.using })),
+            "BURIED" => Ok(json!({ "id": id_of(&w), "buried": true, "tube": c.using })),
+            _ => Err(unexpected("put", &w)),
+        }
+    })
+}
+
+fn use_tube(c: &mut Conn, t: &str) -> Result<String, String> {
+    tube_name(t)?;
+    if c.using == t && c.stream.is_some() {
+        return Ok(t.to_string());
+    }
+    let w = c.line(&format!("use {}", t))?;
+    if w[0] != "USING" {
+        return Err(unexpected("use", &w));
+    }
+    c.using = w.get(1).cloned().unwrap_or_default();
+    Ok(c.using.clone())
+}
+
+/// Makes `tube` the one `beanstalk_put` puts jobs into, on this connection; gives its name.
+pub fn beanstalk_use(name: &str, tube: &str) -> Result<String, String> {
+    with(name, |c| use_tube(c, tube))
+}
+
+/// Adds `tube` to those this connection reserves from; gives how many it watches.
+pub fn beanstalk_watch(name: &str, tube: &str) -> Result<i64, String> {
+    tube_name(tube)?;
+    with(name, |c| {
+        let w = c.line(&format!("watch {}", tube))?;
+        if w[0] != "WATCHING" {
+            return Err(unexpected("watch", &w));
+        }
+        if !c.watching.iter().any(|t| t == tube) {
+            c.watching.push(tube.to_string());
+        }
+        Ok(id_of(&w))
+    })
+}
+
+/// Stops reserving from `tube`; gives how many tubes are still watched. A connection always watches one: ignoring the last is an error.
+pub fn beanstalk_ignore(name: &str, tube: &str) -> Result<i64, String> {
+    tube_name(tube)?;
+    with(name, |c| {
+        let w = c.line(&format!("ignore {}", tube))?;
+        match w[0].as_str() {
+            "WATCHING" => {
+                c.watching.retain(|t| t != tube);
+                Ok(id_of(&w))
+            }
+            "NOT_IGNORED" => Err(format!("`{}` is the last tube watched: watch another before ignoring it", tube)),
+            _ => Err(unexpected("ignore", &w)),
+        }
+    })
+}
+
+/// Takes the next job from the watched tubes, waiting up to `timeout_s` seconds (0: only one ready now; -1: until one comes). Gives `{ id, body }`, or null when none came in time; `{ deadline_soon: true }` when a job this connection holds is about to run out of time (touch, delete or release it).
+/// The job is this connection's until it is deleted, released or buried, or its time to run is up.
+pub fn beanstalk_reserve(name: &str, timeout_s: i64) -> Result<Option<Value>, String> {
+    let (cmd, wait) = if timeout_s < 0 { ("reserve".to_string(), Duration::from_secs(86_400 * 365)) } else { (format!("reserve-with-timeout {}", timeout_s), Duration::from_secs(timeout_s as u64)) };
+    with(name, |c| match c.call(&cmd, None, wait)? {
+        Reply::Data(w, data) if w[0] == "RESERVED" => Ok(Some(job(&w, data))),
+        Reply::Line(w) if w[0] == "TIMED_OUT" => Ok(None),
+        Reply::Line(w) if w[0] == "DEADLINE_SOON" => Ok(Some(json!({ "id": null, "deadline_soon": true }))),
+        Reply::Line(w) | Reply::Data(w, _) => Err(unexpected("reserve", &w)),
+    })
+}
+
+/// Reserves the job `id` itself, whatever tube it is in (beanstalkd 1.12 and later); null when there is no such job ready, delayed or buried.
+pub fn beanstalk_reserve_job(name: &str, id: i64) -> Result<Option<Value>, String> {
+    with(name, |c| match c.call(&format!("reserve-job {}", id), None, Duration::ZERO)? {
+        Reply::Data(w, data) if w[0] == "RESERVED" => Ok(Some(job(&w, data))),
+        Reply::Line(w) if w[0] == "NOT_FOUND" => Ok(None),
+        Reply::Line(w) | Reply::Data(w, _) => Err(unexpected("reserve-job", &w)),
+    })
+}
+
+fn simple(name: &str, cmd: String, ok: &'static str) -> Result<bool, String> {
+    with(name, |c| {
+        let w = c.line(&cmd)?;
+        match w[0].as_str() {
+            x if x == ok => Ok(true),
+            "NOT_FOUND" => Ok(false),
+            _ => Err(unexpected(cmd.split(' ').next().unwrap_or(""), &w)),
+        }
+    })
+}
+
+/// Deletes the job `id`: done with it. False when there is no such job, or another connection has it reserved.
+pub fn beanstalk_delete(name: &str, id: i64) -> Result<bool, String> {
+    simple(name, format!("delete {}", id), "DELETED")
+}
+
+/// Puts a job this connection reserved back into its tube, to be tried again. Options: `priority` (1024), `delay` (seconds; 0). Gives "released", or "buried" when the server had no memory for it.
+pub fn beanstalk_release(name: &str, id: i64, options: serde_json::Value) -> Result<String, String> {
+    let pri = int_opt(&options, "priority", 1024, u32::MAX as i64)?;
+    let delay = int_opt(&options, "delay", 0, u32::MAX as i64)?;
+    with(name, |c| {
+        let w = c.line(&format!("release {} {} {}", id, pri, delay))?;
+        match w[0].as_str() {
+            "RELEASED" => Ok("released".into()),
+            "BURIED" => Ok("buried".into()),
+            "NOT_FOUND" => Err(format!("job {} is not reserved by this connection", id)),
+            _ => Err(unexpected("release", &w)),
+        }
+    })
+}
+
+/// Buries a job this connection reserved: set aside, not tried again until kicked (for jobs that keep failing). False when it is not reserved by this connection.
+pub fn beanstalk_bury(name: &str, id: i64, priority: i64) -> Result<bool, String> {
+    simple(name, format!("bury {} {}", id, priority.clamp(0, u32::MAX as i64)), "BURIED")
+}
+
+/// Asks for more time on a reserved job: its time to run starts again. False when it is not reserved by this connection.
+pub fn beanstalk_touch(name: &str, id: i64) -> Result<bool, String> {
+    simple(name, format!("touch {}", id), "TOUCHED")
+}
+
+/// Moves up to `bound` jobs of the tube in use back to ready: the buried ones when there are any, else the delayed ones. Gives how many moved.
+pub fn beanstalk_kick(name: &str, bound: i64) -> Result<i64, String> {
+    with(name, |c| {
+        let w = c.line(&format!("kick {}", bound.max(1)))?;
+        if w[0] != "KICKED" {
+            return Err(unexpected("kick", &w));
+        }
+        Ok(id_of(&w))
+    })
+}
+
+/// Moves the buried or delayed job `id` to ready; false when it is neither.
+pub fn beanstalk_kick_job(name: &str, id: i64) -> Result<bool, String> {
+    simple(name, format!("kick-job {}", id), "KICKED")
+}
+
+/// A look at a job without reserving it: `which` is a job id (as text or number), or "ready", "delayed" or "buried" for the next of those in the tube in use. Gives `{ id, body }` or null.
+pub fn beanstalk_peek(name: &str, which: serde_json::Value) -> Result<Option<Value>, String> {
+    let cmd = match &which {
+        Value::Number(n) => format!("peek {}", n.as_i64().ok_or("a job id is a whole number")?),
+        Value::String(s) if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => format!("peek {}", s),
+        Value::String(s) if matches!(s.as_str(), "ready" | "delayed" | "buried") => format!("peek-{}", s),
+        _ => return Err(format!("peek takes a job id, or \"ready\", \"delayed\" or \"buried\", not {}", which)),
+    };
+    with(name, |c| match c.call(&cmd, None, Duration::ZERO)? {
+        Reply::Data(w, data) if w[0] == "FOUND" => Ok(Some(job(&w, data))),
+        Reply::Line(w) if w[0] == "NOT_FOUND" => Ok(None),
+        Reply::Line(w) | Reply::Data(w, _) => Err(unexpected("peek", &w)),
+    })
+}
+
+fn stats_of(name: &str, cmd: String) -> Result<Option<Value>, String> {
+    with(name, |c| match c.call(&cmd, None, Duration::ZERO)? {
+        Reply::Data(w, data) if w[0] == "OK" => Ok(Some(yaml(&data))),
+        Reply::Line(w) if w[0] == "NOT_FOUND" => Ok(None),
+        Reply::Line(w) | Reply::Data(w, _) => Err(unexpected(cmd.split(' ').next().unwrap_or(""), &w)),
+    })
+}
+
+/// The server's stats, as beanstalkd gives them: `current-jobs-ready`, `current-workers`, `total-jobs`, `uptime`, `version`...
+pub fn beanstalk_stats(name: &str) -> Result<Value, String> {
+    stats_of(name, "stats".into()).map(|v| v.unwrap_or(Value::Null))
+}
+
+/// A tube's stats (`current-jobs-ready`, `-delayed`, `-reserved`, `-buried`, `total-jobs`, `current-watching`, `pause`...), or null when there is no such tube.
+pub fn beanstalk_stats_tube(name: &str, tube: &str) -> Result<Option<Value>, String> {
+    tube_name(tube)?;
+    stats_of(name, format!("stats-tube {}", tube))
+}
+
+/// A job's stats (`tube`, `state`: ready, delayed, reserved or buried, `pri`, `age`, `time-left`, `reserves`, `timeouts`, `releases`, `buries`, `kicks`), or null when there is no such job.
+pub fn beanstalk_stats_job(name: &str, id: i64) -> Result<Option<Value>, String> {
+    stats_of(name, format!("stats-job {}", id))
+}
+
+/// The tubes the server has.
+pub fn beanstalk_tubes(name: &str) -> Result<Vec<String>, String> {
+    let v = stats_of(name, "list-tubes".into())?.unwrap_or(json!([]));
+    Ok(v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default())
+}
+
+/// Holds back reservations from `tube` for `seconds` (a deploy, a downstream outage); false when there is no such tube.
+pub fn beanstalk_pause_tube(name: &str, tube: &str, seconds: i64) -> Result<bool, String> {
+    tube_name(tube)?;
+    simple(name, format!("pause-tube {} {}", tube, seconds.clamp(0, u32::MAX as i64)), "PAUSED")
+}
+
+/// Closes the connection `name` (its reserved jobs go back to their tubes); whether there was one.
+pub fn beanstalk_close(name: &str) -> Result<bool, String> {
+    let c = CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    match c {
+        Some(c) => {
+            let mut g = c.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = g.stream.as_mut() {
+                let _ = s.get_mut().write_all(b"quit\r\n");
+                let _ = s.get_mut().shutdown(std::net::Shutdown::Both);
+            }
+            g.stream = None;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}

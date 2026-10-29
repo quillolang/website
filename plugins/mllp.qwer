@@ -1,0 +1,645 @@
+//! HL7 v2 over MLLP, the way lab systems and hospital interface engines connect: messages sent in MLLP blocks and their ACK or NACK read (MSA code, control ID, ERR text), ACKs built for received messages, a listener that receives and acknowledges, and framing for a server of your own.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+// ---- Options, TCP with timeouts, and TLS by rustls (ring) ----
+
+fn o_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn o_i64(o: &Value, k: &str, d: i64) -> i64 {
+    match o.get(k) {
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).unwrap_or(d),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
+        _ => d,
+    }
+}
+
+fn o_bool(o: &Value, k: &str, d: bool) -> bool {
+    match o.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        _ => d,
+    }
+}
+
+/// `timeout_ms` from the options (10 s when not given).
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o_i64(o, "timeout_ms", 10_000).clamp(100, 600_000) as u64)
+}
+
+/// `host`, `host:port`, `[v6]:port` or a bare IPv6 address, with the protocol's port when none is given.
+fn split_host(host: &str, default_port: u16) -> Result<(String, u16), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given: write host or host:port".into());
+    }
+    let (name, port) = if let Some(rest) = h.strip_prefix('[') {
+        let end = rest.find(']').ok_or(format!("{}: a [ without its ]", host))?;
+        let after = &rest[end + 1..];
+        (rest[..end].to_string(), after.strip_prefix(':').map(|p| p.to_string()))
+    } else if h.matches(':').count() == 1 {
+        let (a, b) = h.split_once(':').unwrap();
+        (a.to_string(), Some(b.to_string()))
+    } else {
+        (h.to_string(), None)
+    };
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("{}: the port is not a number from 1 to 65535", host))?,
+        None => default_port,
+    };
+    Ok((name, port))
+}
+
+/// Connects with a time limit to each address the name has, and keeps the limit on reads and writes.
+fn connect(name: &str, port: u16, t: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = (name, port).to_socket_addrs().map_err(|e| format!("{}: {}", name, e))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{} has no address", name));
+    }
+    let mut last = String::new();
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, t) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(t));
+                let _ = s.set_write_timeout(Some(t));
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = format!("cannot reach {}: {}", a, e),
+        }
+    }
+    Err(last)
+}
+
+/// Takes any certificate: for `insecure: true`, on a test bench only.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The certificates in PEM text.
+fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[a + 27..];
+        let Some(b) = body.find("-----END CERTIFICATE-----") else { break };
+        out.push(b64_decode(&body[..b]));
+        rest = &body[b + 25..];
+    }
+    out
+}
+
+/// A rustls client set up from the options: Mozilla's roots, plus `ca` (PEM text, or a PEM file's path); `insecure: true` takes any certificate.
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let config = if o_bool(o, "insecure", false) {
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAny(provider))).with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        if let Some(ca) = o_str(o, "ca").filter(|s| !s.trim().is_empty()) {
+            let text = if ca.contains("-----BEGIN") { ca.clone() } else { std::fs::read_to_string(&ca).map_err(|e| format!("cannot read the ca file {}: {}", ca, e))? };
+            let certs = pem_certs(&text);
+            if certs.is_empty() {
+                return Err("`ca` holds no PEM certificate (-----BEGIN CERTIFICATE-----)".into());
+            }
+            for c in certs {
+                roots.add(rustls::pki_types::CertificateDer::from(c)).map_err(|e| format!("a `ca` certificate cannot be used: {}", e))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(s) => match s.read(b) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                r => r,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// TLS over a connected socket, the handshake done now so a bad certificate is said at once. `server_name` in the options overrides the name checked.
+fn tls_wrap(mut tcp: TcpStream, name: &str, o: &Value) -> Result<Stream, String> {
+    let config = tls_config(o)?;
+    let sni = o_str(o, "server_name").unwrap_or_else(|| name.to_string());
+    let server = rustls::pki_types::ServerName::try_from(sni.clone()).map_err(|_| format!("{} is not a name TLS can check", sni))?;
+    let mut conn = rustls::ClientConnection::new(config, server).map_err(|e| e.to_string())?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).map_err(|e| format!("TLS with {} failed: {} (a private CA? pass its PEM as `ca`)", name, e))?;
+    }
+    Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+// ---- HL7 pieces ----
+
+const SB: u8 = 0x0b;
+const EB: u8 = 0x1c;
+const CR: u8 = 0x0d;
+
+/// Segments end with a carriage return, whatever line ends the text came with.
+fn segments_cr(message: &str) -> String {
+    let m = message.replace("\r\n", "\r").replace('\n', "\r");
+    let m = m.trim_matches(|c| c == '\r' || c == '\u{0b}' || c == '\u{1c}');
+    format!("{}\r", m)
+}
+
+/// Bytes as text: UTF-8 when they are, else Latin-1 (as many HL7 senders write).
+fn text_of(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_string(),
+        Err(_) => b.iter().map(|&c| c as char).collect(),
+    }
+}
+
+struct Msh {
+    sep: char,
+    comp: char,
+    fields: Vec<String>,
+}
+
+impl Msh {
+    /// MSH-n as HL7 numbers it (MSH-1 is the separator itself).
+    fn get(&self, n: usize) -> String {
+        if n == 1 {
+            return self.sep.to_string();
+        }
+        self.fields.get(n - 1).cloned().unwrap_or_default()
+    }
+    fn comp(&self, n: usize, c: usize) -> String {
+        self.get(n).split(self.comp).nth(c - 1).unwrap_or("").to_string()
+    }
+}
+
+fn msh_of(message: &str) -> Result<Msh, String> {
+    let m = segments_cr(message);
+    let first = m.split('\r').next().unwrap_or("");
+    if !first.starts_with("MSH") || first.len() < 8 {
+        return Err("not an HL7 v2 message: it does not start with an MSH segment".into());
+    }
+    let mut it = first.chars().skip(3);
+    let sep = it.next().unwrap_or('|');
+    let comp = it.next().unwrap_or('^');
+    let fields = first.split(sep).map(|s| s.to_string()).collect();
+    Ok(Msh { sep, comp, fields })
+}
+
+fn segment<'a>(message: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    message.split(['\r', '\n']).find(|s| s.starts_with(name) && s[name.len()..].starts_with('|')).map(|s| s.split('|').collect())
+}
+
+fn escape(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\E\\"),
+            '|' => out.push_str("\\F\\"),
+            '^' => out.push_str("\\S\\"),
+            '&' => out.push_str("\\T\\"),
+            '~' => out.push_str("\\R\\"),
+            '\r' | '\n' => out.push_str("\\.br\\"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape(text: &str) -> String {
+    text.replace("\\F\\", "|").replace("\\S\\", "^").replace("\\T\\", "&").replace("\\R\\", "~").replace("\\.br\\", "\n").replace("\\E\\", "\\")
+}
+
+fn stamp() -> (String, u128) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let t = now.as_secs() as i64;
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (format!("{:04}{:02}{:02}{:02}{:02}{:02}", y, m, d, secs / 3600, secs % 3600 / 60, secs % 60), now.as_millis())
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn new_control_id() -> String {
+    let (_, ms) = stamp();
+    format!("A{}{:03}", ms, COUNTER.fetch_add(1, Ordering::Relaxed) % 1000)
+}
+
+fn ack_for(message: &str, code: &str, text: &str) -> Result<String, String> {
+    let code = code.trim().to_ascii_uppercase();
+    if !["AA", "AE", "AR", "CA", "CE", "CR"].contains(&code.as_str()) {
+        return Err(format!("{} is not an acknowledgment code: AA, AE or AR (CA, CE or CR for commit acks)", code));
+    }
+    let h = msh_of(message)?;
+    let s = h.sep;
+    let enc = h.get(2);
+    let trigger = h.comp(9, 2);
+    let msg_type = if trigger.is_empty() { "ACK".to_string() } else { format!("ACK{c}{}{c}ACK", trigger, c = h.comp) };
+    let version = h.get(12);
+    let (now, _) = stamp();
+    let header = [
+        "MSH".to_string(), enc, h.get(5), h.get(6), h.get(3), h.get(4), now, String::new(), msg_type, new_control_id(),
+        if h.get(11).is_empty() { "P".to_string() } else { h.get(11) }, version.clone(),
+    ]
+    .join(&s.to_string());
+    let mut out = format!("{}\rMSA{s}{}{s}{}{s}{}\r", header, code, h.get(10), escape(text), s = s);
+    let modern = version.split('.').nth(1).and_then(|m| m.parse::<i64>().ok()).map_or(false, |m| m >= 5) && version.starts_with("2.");
+    if code != "AA" && code != "CA" && modern {
+        let (num, label) = if code.ends_with('R') { ("200", "Unsupported message type") } else { ("207", "Application internal error") };
+        out.push_str(&format!("ERR{s}{s}{s}{}{c}{}{c}HL70357{s}E{s}{s}{s}{s}{}\r", num, label, escape(text), s = s, c = h.comp));
+    }
+    Ok(out)
+}
+
+fn ack_read(ack: &str) -> Result<Value, String> {
+    let m = segments_cr(ack);
+    let h = msh_of(&m)?;
+    let msa = segment(&m, "MSA").ok_or("the answer has no MSA segment: it is not an ACK")?;
+    let code = msa.get(1).unwrap_or(&"").to_string();
+    let meaning = match code.as_str() {
+        "AA" => "accepted",
+        "AE" => "error: the receiver could not process it",
+        "AR" => "rejected: the receiver will not process it",
+        "CA" => "accepted for processing (commit)",
+        "CE" => "commit error",
+        "CR" => "commit rejected",
+        _ => "unknown code",
+    };
+    let errors: Vec<Value> = m
+        .split('\r')
+        .filter(|s| s.starts_with("ERR|"))
+        .map(|s| {
+            let f: Vec<&str> = s.split('|').collect();
+            let pick = |i: usize| f.get(i).map(|x| unescape(x)).unwrap_or_default();
+            json!({ "location": if pick(2).is_empty() { pick(1) } else { pick(2) }, "code": pick(3), "severity": pick(4), "text": if pick(8).is_empty() { pick(7) } else { pick(8) } })
+        })
+        .collect();
+    Ok(json!({
+        "code": code,
+        "accepted": code == "AA" || code == "CA",
+        "meaning": meaning,
+        "control_id": msa.get(2).unwrap_or(&""),
+        "text": unescape(msa.get(3).unwrap_or(&"")),
+        "errors": errors,
+        "type": h.get(9),
+        "ack_id": h.get(10),
+        "raw": m.trim_end_matches('\r').replace('\r', "\n"),
+    }))
+}
+
+/// Takes whole MLLP blocks off the front of `buf`.
+fn unframe_bytes(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    loop {
+        let Some(start) = buf.iter().position(|&c| c == SB) else {
+            // Bytes before a start block are noise; keep none of them.
+            buf.clear();
+            return out;
+        };
+        let Some(end) = buf[start..].windows(2).position(|w| w[0] == EB && w[1] == CR).map(|e| e + start) else {
+            buf.drain(..start);
+            return out;
+        };
+        out.push(buf[start + 1..end].to_vec());
+        buf.drain(..end + 2);
+    }
+}
+
+// ---- Sending ----
+
+struct Peer {
+    s: Stream,
+    buf: Vec<u8>,
+}
+
+static PEERS: Mutex<Option<HashMap<String, Peer>>> = Mutex::new(None);
+
+fn open(host: &str, o: &Value) -> Result<Peer, String> {
+    let (name, port) = split_host(host, 2575)?;
+    let tcp = connect(&name, port, timeout_of(o))?;
+    let s = if o_bool(o, "tls", false) { tls_wrap(tcp, &name, o)? } else { Stream::Plain(tcp) };
+    Ok(Peer { s, buf: vec![] })
+}
+
+fn exchange(p: &mut Peer, framed: &[u8], t: Duration) -> Result<Vec<u8>, String> {
+    p.s.write_all(framed).and_then(|_| p.s.flush()).map_err(|e| format!("cannot write: {}", e))?;
+    let until = Instant::now() + t;
+    let mut b = [0u8; 8192];
+    loop {
+        let mut got = unframe_bytes(&mut p.buf);
+        if !got.is_empty() {
+            return Ok(got.remove(0));
+        }
+        if Instant::now() > until {
+            return Err("no ACK came in time (timeout_ms)".into());
+        }
+        match p.s.read(&mut b) {
+            Ok(0) => return Err("the receiver closed the connection without an ACK".into()),
+            Ok(n) => p.buf.extend_from_slice(&b[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err("no ACK came in time (timeout_ms)".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Frames an HL7 v2 message for MLLP (start block 0x0B, the segments each ended by a carriage return, end block 0x1C 0x0D).
+pub fn mllp_frame(message: &str) -> String {
+    format!("\u{0b}{}\u{1c}\r", segments_cr(message))
+}
+
+/// The whole messages in what a socket read (`data`), and the `rest` to keep for the next read: `{ messages, rest }`.
+pub fn mllp_unframe(data: &str) -> Value {
+    let mut buf = data.as_bytes().to_vec();
+    let msgs: Vec<String> = unframe_bytes(&mut buf).iter().map(|m| text_of(m)).collect();
+    json!({ "messages": msgs, "rest": text_of(&buf) })
+}
+
+/// Sends `message` to `host` (`host:port`, 2575 by default) and waits for its ACK, read into `{ code, accepted, meaning, control_id, text, errors, type }`. Options: `timeout_ms` (10000), `tls`, `ca`, `insecure`, `keep` (true: the connection stays open for the next message). An ACK for another message is an error.
+pub fn mllp_send(host: &str, message: &str, opts: serde_json::Value) -> Result<Value, String> {
+    let body = segments_cr(message);
+    let h = msh_of(&body)?;
+    let control = h.get(10);
+    let framed = mllp_frame(&body).into_bytes();
+    let t = timeout_of(&opts);
+    let keep = o_bool(&opts, "keep", true);
+    let key = format!("{}|{}", host, o_bool(&opts, "tls", false));
+    let kept = if keep { PEERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(&key) } else { None };
+    let reused = kept.is_some();
+    let mut peer = match kept {
+        Some(p) => p,
+        None => open(host, &opts)?,
+    };
+    let _ = peer.s.tcp().set_read_timeout(Some(t));
+    let raw = match exchange(&mut peer, &framed, t) {
+        Ok(r) => r,
+        // A kept connection the receiver closed meanwhile: once more on a new one.
+        Err(e) if reused && !e.contains("in time") => {
+            peer = open(host, &opts)?;
+            exchange(&mut peer, &framed, t)?
+        }
+        Err(e) => return Err(format!("{}: {}", host, e)),
+    };
+    if keep {
+        PEERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, peer);
+    }
+    let mut ack = ack_read(&text_of(&raw))?;
+    let answered = ack["control_id"].as_str().unwrap_or("").to_string();
+    if !control.is_empty() && answered != control {
+        return Err(format!("the ACK is for message {} but {} was sent: the receiver mixed up its answers", answered, control));
+    }
+    ack["sent_id"] = json!(control);
+    Ok(ack)
+}
+
+/// Reads an ACK (or NACK) message: its MSA code and what it means, the control ID it answers, its text and ERR segments.
+pub fn mllp_parse_ack(ack: &str) -> Result<Value, String> {
+    ack_read(ack)
+}
+
+/// The ACK to send back for a received `message`: `code` AA (accepted), AE (error) or AR (rejected), with `text`; sender and receiver swapped, the message's control ID in MSA-2, and an ERR segment for an error from HL7 2.5 on.
+pub fn mllp_ack(message: &str, code: &str, text: &str) -> Result<String, String> {
+    ack_for(message, code, text)
+}
+
+/// Closes the kept connection to `host`; whether there was one.
+pub fn mllp_close(host: &str) -> bool {
+    let mut g = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let before = m.len();
+    m.retain(|k, _| !k.starts_with(&format!("{}|", host)));
+    before != m.len()
+}
+
+// ---- Receiving ----
+
+struct Listener {
+    queue: Mutex<VecDeque<Value>>,
+    ready: Condvar,
+    capacity: usize,
+    stop: AtomicBool,
+    received: AtomicU64,
+    refused: AtomicU64,
+    addr: String,
+}
+
+static LISTENERS: Mutex<Option<HashMap<u16, Arc<Listener>>>> = Mutex::new(None);
+
+fn serve(l: Arc<Listener>, mut s: TcpStream) {
+    let from = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut buf = vec![];
+    let mut b = [0u8; 8192];
+    let mut idle = Instant::now();
+    while !l.stop.load(Ordering::Relaxed) {
+        match s.read(&mut b) {
+            Ok(0) => return,
+            Ok(n) => {
+                idle = Instant::now();
+                buf.extend_from_slice(&b[..n]);
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                // A sender that keeps its connection open but quiet for 10 minutes is let go.
+                if idle.elapsed() > Duration::from_secs(600) {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => return,
+        }
+        for raw in unframe_bytes(&mut buf) {
+            let text = text_of(&raw);
+            let ack = match msh_of(&text) {
+                Err(e) => format!("MSH|^~\\&|||||{}||ACK|{}|P|2.5\rMSA|AR||{}\r", stamp().0, new_control_id(), escape(&e)),
+                Ok(h) => {
+                    let mut q = l.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    if q.len() >= l.capacity {
+                        l.refused.fetch_add(1, Ordering::Relaxed);
+                        drop(q);
+                        ack_for(&text, "AE", "receiver busy: its buffer is full, send again later").unwrap_or_default()
+                    } else {
+                        q.push_back(json!({
+                            "message": segments_cr(&text).trim_end_matches('\r').replace('\r', "\n"),
+                            "control_id": h.get(10),
+                            "type": h.get(9),
+                            "version": h.get(12),
+                            "sender": format!("{}{}{}", h.get(3), if h.get(4).is_empty() { "" } else { "@" }, h.get(4)),
+                            "from": from,
+                            "at": stamp().1 as i64,
+                        }));
+                        l.received.fetch_add(1, Ordering::Relaxed);
+                        drop(q);
+                        l.ready.notify_all();
+                        ack_for(&text, "AA", "").unwrap_or_default()
+                    }
+                }
+            };
+            if s.write_all(mllp_frame(&ack).as_bytes()).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Listens for HL7 senders on `port`: each message is kept for `mllp_receive` and answered AA at once (AE when the buffer is full, so the sender tries again; AR for what is not HL7). Options: `host` ("0.0.0.0"), `buffer` (1000 messages). Calling it again for the same port gives the listener already there.
+pub fn mllp_listen(port: i64, opts: serde_json::Value) -> Result<Value, String> {
+    let p = u16::try_from(port).map_err(|_| format!("{} is not a port", port))?;
+    let mut g = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if let Some(l) = map.get(&p) {
+        return Ok(json!({ "port": p, "address": l.addr, "buffer": l.capacity, "new": false }));
+    }
+    let host = o_str(&opts, "host").unwrap_or_else(|| "0.0.0.0".into());
+    let sock = TcpListener::bind((host.as_str(), p)).map_err(|e| format!("cannot listen on {}:{}: {}", host, p, e))?;
+    let capacity = o_i64(&opts, "buffer", 1000).clamp(1, 1_000_000) as usize;
+    let l = Arc::new(Listener { queue: Mutex::new(VecDeque::new()), ready: Condvar::new(), capacity, stop: AtomicBool::new(false), received: AtomicU64::new(0), refused: AtomicU64::new(0), addr: format!("{}:{}", host, p) });
+    let lc = l.clone();
+    sock.set_nonblocking(true).map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        while !lc.stop.load(Ordering::Relaxed) {
+            match sock.accept() {
+                Ok((s, _)) => {
+                    let _ = s.set_nonblocking(false);
+                    let l2 = lc.clone();
+                    std::thread::spawn(move || serve(l2, s));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    });
+    map.insert(p, l);
+    Ok(json!({ "port": p, "address": format!("{}:{}", host, p), "buffer": capacity, "new": true }))
+}
+
+/// Up to `max` messages received on `port` since the last call, waiting up to `wait_ms` for the first: each `{ message, control_id, type, version, sender, from, at }` (segments on lines of their own).
+pub fn mllp_receive(port: i64, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let l = {
+        let g = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|m| m.get(&(port as u16)).cloned()).ok_or(format!("nothing listens on port {}: call mllp_listen({}, {{}}) first", port, port))?
+    };
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut q = l.queue.lock().unwrap_or_else(|e| e.into_inner());
+    while q.is_empty() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        q = l.ready.wait_timeout(q, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = (max.max(1) as usize).min(q.len());
+    Ok(q.drain(..n).collect())
+}
+
+/// How the listener on `port` is doing: `{ port, waiting, received, refused }` (refused: answered AE because the buffer was full).
+pub fn mllp_listener(port: i64) -> Result<Value, String> {
+    let g = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let l = g.as_ref().and_then(|m| m.get(&(port as u16)).cloned()).ok_or(format!("nothing listens on port {}", port))?;
+    let waiting = l.queue.lock().unwrap_or_else(|e| e.into_inner()).len();
+    Ok(json!({ "port": port, "waiting": waiting, "received": l.received.load(Ordering::Relaxed), "refused": l.refused.load(Ordering::Relaxed) }))
+}
+
+/// Stops listening on `port` (messages not yet received are dropped); whether it listened.
+pub fn mllp_stop(port: i64) -> bool {
+    let mut g = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.get_or_insert_with(HashMap::new).remove(&(port as u16)) {
+        Some(l) => {
+            l.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}

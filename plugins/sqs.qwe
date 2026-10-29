@@ -1,0 +1,86 @@
+// Orders through Amazon SQS: sent with attributes, taken by a worker once a second (long polling
+// off, so the tick is short) and deleted in a batch; invoices on a FIFO queue, in order and sent
+// once though sent twice; a message given back to the queue at once with its visibility timeout;
+// and the queue's counts.
+//
+//   AWS_REGION=eu-west-3 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... quillo run sqs.qwe      then open http://localhost:8080/order?id=A-1
+//
+// Needs SQS, or ElasticMQ (java -jar elasticmq-server.jar, then SQS_ENDPOINT=http://localhost:9324)
+// or LocalStack (SQS_ENDPOINT=http://localhost:4566).
+
+use "sqs.qwer"
+
+let account = sqs_connect("aws", {
+    region: env("AWS_REGION", "us-east-1"),
+    access_key_id: env("AWS_ACCESS_KEY_ID", ""),
+    secret_access_key: env("AWS_SECRET_ACCESS_KEY", ""),
+    session_token: env("AWS_SESSION_TOKEN", ""),
+    endpoint: env("SQS_ENDPOINT", ""),
+})
+let ORDERS = sqs_create_queue("aws", "orders", { VisibilityTimeout: 30 })
+let INVOICES = sqs_create_queue("aws", "invoices.fifo", { ContentBasedDeduplication: "true" })
+
+let processed = []
+
+// The worker: what is waiting now (up to 10), handled, then deleted in one request.
+fn work() {
+    let got = sqs_receive("aws", ORDERS?, 10, 0, {})?
+    if len(got) == 0 { return 0 }
+    for m in got {
+        processed = processed + [{ order: json.parse(m.body)?.id, kind: m.message_attributes.kind, total: m.message_attributes.total }]
+    }
+    sqs_delete_batch("aws", ORDERS?, got)?.deleted
+}
+
+every(1000, work)
+
+route GET /order ? { id: str = "A-1" } {
+    let sent = sqs_send("aws", ORDERS?, json.stringify({ id, lines: 3 }), { attributes: { kind: "order", total: 42.5 } })?
+    { queued: sent.message_id != null }
+}
+
+route GET /processed {
+    sleep(1200)
+    { processed }
+}
+
+// FIFO: in order within a group, and the repeated message (same body) taken once.
+route GET /invoices {
+    let batch = sqs_send_batch("aws", INVOICES?, [
+        { body: "invoice 1 for customer 7", group_id: "customer-7" },
+        { body: "invoice 2 for customer 7", group_id: "customer-7" },
+        { body: "invoice 1 for customer 7", group_id: "customer-7" },
+        { body: "invoice 3 for customer 7", group_id: "customer-7" },
+    ])?
+    let seen = []
+    let round = 0
+    while round < 5 {
+        let got = sqs_receive("aws", INVOICES?, 10, 1, {})?
+        for m in got {
+            seen = seen + [m.body]
+            sqs_delete("aws", INVOICES?, m)?
+        }
+        round = len(got) == 0 && len(seen) > 0 ? 5 : round + 1
+    }
+    { sent: len(batch.sent), failed: len(batch.failed), received_in_order: seen }
+}
+
+// Received, given back at once (visibility 0), received again: its receive count is 2.
+route GET /retry {
+    let q = sqs_create_queue("aws", "flaky", {})?
+    sqs_send("aws", q, "charge card 4242", { delay_seconds: 0 })?
+    let first = sqs_receive("aws", q, 1, 5, { visibility_timeout: 60 })?[0] ?? reply 504 "nothing came"
+    let hidden = len(sqs_receive("aws", q, 1, 0, {})?)
+    sqs_change_visibility("aws", q, first, 0)?
+    let again = sqs_receive("aws", q, 1, 5, {})?[0] ?? reply 504 "it did not come again"
+    sqs_delete("aws", q, again)?
+    let counts = sqs_queue_attributes("aws", q)?
+    // A key with the wrong secret: SQS checks the signature.
+    sqs_connect("forged", { region: env("AWS_REGION", "us-east-1"), access_key_id: env("AWS_ACCESS_KEY_ID", ""), secret_access_key: "not-the-secret", endpoint: env("SQS_ENDPOINT", "") })?
+    let forged = sqs_queue_url("forged", "flaky")
+    {
+        body: again.body, hidden_while_received: hidden == 0, receive_count: again.receive_count,
+        left: counts.ApproximateNumberOfMessages,
+        forged: is_err(forged) ? forged.error : "taken: this server does not check signatures (ElasticMQ does not)",
+    }
+}

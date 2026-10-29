@@ -1,0 +1,564 @@
+//! FTP and FTPS for partners and machines that still use them: folders listed (MLSD, or LIST read in Unix and DOS forms), files uploaded and downloaded (from disk or as text), renamed, deleted, folders made and removed; passive mode, explicit (AUTH TLS) and implicit TLS, time limits on every connection, one session kept per server.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! suppaftp = { version = "=12.2.1", default-features = false, features = ["rustls-ring", "deprecated"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// ---- Options, TCP with timeouts, and TLS by rustls (ring) ----
+
+fn o_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn o_i64(o: &Value, k: &str, d: i64) -> i64 {
+    match o.get(k) {
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).unwrap_or(d),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
+        _ => d,
+    }
+}
+
+fn o_bool(o: &Value, k: &str, d: bool) -> bool {
+    match o.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        _ => d,
+    }
+}
+
+/// `timeout_ms` from the options (10 s when not given).
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o_i64(o, "timeout_ms", 10_000).clamp(100, 600_000) as u64)
+}
+
+/// `host`, `host:port`, `[v6]:port` or a bare IPv6 address, with the protocol's port when none is given.
+fn split_host(host: &str, default_port: u16) -> Result<(String, u16), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given: write host or host:port".into());
+    }
+    let (name, port) = if let Some(rest) = h.strip_prefix('[') {
+        let end = rest.find(']').ok_or(format!("{}: a [ without its ]", host))?;
+        let after = &rest[end + 1..];
+        (rest[..end].to_string(), after.strip_prefix(':').map(|p| p.to_string()))
+    } else if h.matches(':').count() == 1 {
+        let (a, b) = h.split_once(':').unwrap();
+        (a.to_string(), Some(b.to_string()))
+    } else {
+        (h.to_string(), None)
+    };
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("{}: the port is not a number from 1 to 65535", host))?,
+        None => default_port,
+    };
+    Ok((name, port))
+}
+
+/// Connects with a time limit to each address the name has, and keeps the limit on reads and writes.
+fn connect(name: &str, port: u16, t: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = (name, port).to_socket_addrs().map_err(|e| format!("{}: {}", name, e))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{} has no address", name));
+    }
+    let mut last = String::new();
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, t) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(t));
+                let _ = s.set_write_timeout(Some(t));
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = format!("cannot reach {}: {}", a, e),
+        }
+    }
+    Err(last)
+}
+
+/// Takes any certificate: for `insecure: true`, on a test bench only.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The certificates in PEM text.
+fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[a + 27..];
+        let Some(b) = body.find("-----END CERTIFICATE-----") else { break };
+        out.push(b64_decode(&body[..b]));
+        rest = &body[b + 25..];
+    }
+    out
+}
+
+/// A rustls client set up from the options: Mozilla's roots, plus `ca` (PEM text, or a PEM file's path); `insecure: true` takes any certificate.
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let config = if o_bool(o, "insecure", false) {
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAny(provider))).with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        if let Some(ca) = o_str(o, "ca").filter(|s| !s.trim().is_empty()) {
+            let text = if ca.contains("-----BEGIN") { ca.clone() } else { std::fs::read_to_string(&ca).map_err(|e| format!("cannot read the ca file {}: {}", ca, e))? };
+            let certs = pem_certs(&text);
+            if certs.is_empty() {
+                return Err("`ca` holds no PEM certificate (-----BEGIN CERTIFICATE-----)".into());
+            }
+            for c in certs {
+                roots.add(rustls::pki_types::CertificateDer::from(c)).map_err(|e| format!("a `ca` certificate cannot be used: {}", e))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(s) => match s.read(b) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                r => r,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// TLS over a connected socket, the handshake done now so a bad certificate is said at once. `server_name` in the options overrides the name checked.
+fn tls_wrap(mut tcp: TcpStream, name: &str, o: &Value) -> Result<Stream, String> {
+    let config = tls_config(o)?;
+    let sni = o_str(o, "server_name").unwrap_or_else(|| name.to_string());
+    let server = rustls::pki_types::ServerName::try_from(sni.clone()).map_err(|_| format!("{} is not a name TLS can check", sni))?;
+    let mut conn = rustls::ClientConnection::new(config, server).map_err(|e| e.to_string())?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).map_err(|e| format!("TLS with {} failed: {} (a private CA? pass its PEM as `ca`)", name, e))?;
+    }
+    Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+
+// ---- Accounts and messages ----
+
+struct Account {
+    tls: bool,
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    path: String,
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hexv = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hexv(b[i + 1]), hexv(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// `scheme://user:password@host:port/path`; `user` and `password` in the options win over the URL's (no percent-encoding needed there).
+fn account(url: &str, opts: &Value, plain: &str, secure: &str, plain_port: u16, secure_port: u16) -> Result<Account, String> {
+    let (scheme, rest) = url.split_once("://").ok_or(format!("{} is not a URL: write {}://user:password@host", url, plain))?;
+    let tls = match scheme.to_ascii_lowercase().as_str() {
+        s if s == plain => false,
+        s if s == secure => true,
+        s => return Err(format!("{}:// is not {}:// or {}://", s, plain, secure)),
+    };
+    let (auth_host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+        None => (rest, String::new()),
+    };
+    let (auth, hostport) = match auth_host.rfind('@') {
+        Some(i) => (&auth_host[..i], &auth_host[i + 1..]),
+        None => ("", auth_host),
+    };
+    let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
+    let (host, port) = split_host(hostport, if tls { secure_port } else { plain_port })?;
+    let user = o_str(opts, "user").unwrap_or_else(|| pct_decode(u));
+    let password = o_str(opts, "password").unwrap_or_else(|| pct_decode(p));
+    if user.is_empty() {
+        return Err(format!("no user name: write {}://user:password@{} or give `user` and `password`", plain, hostport));
+    }
+    Ok(Account { tls, host, port, user, password, path: pct_decode(&path) })
+}
+
+
+// ---- FTP sessions ----
+
+type Ftp = suppaftp::RustlsFtpStream;
+
+struct Site {
+    ftp: Ftp,
+    base: String,
+    tls: &'static str,
+    mlsd: bool,
+}
+
+static SITES: Mutex<Option<HashMap<String, Site>>> = Mutex::new(None);
+static TURNS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+fn turn(key: &str) -> Arc<Mutex<()>> {
+    TURNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(key.to_string()).or_default().clone()
+}
+
+fn says(e: suppaftp::FtpError) -> String {
+    match e {
+        suppaftp::FtpError::UnexpectedResponse(r) => format!("the server said: {}", String::from_utf8_lossy(&r.body).trim()),
+        suppaftp::FtpError::ConnectionError(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => "the server did not answer in time (timeout_ms)".into(),
+        suppaftp::FtpError::BadResponse => "the server's reply could not be read, or a TLS data connection was cut short without its close_notify".into(),
+        e => e.to_string(),
+    }
+}
+
+fn open(url: &str, opts: &Value) -> Result<Site, String> {
+    let lower = url.to_ascii_lowercase();
+    let explicit = lower.starts_with("ftpes://") || o_str(opts, "tls").as_deref() == Some("explicit");
+    let norm = if lower.starts_with("ftpes://") { format!("ftp://{}", &url[8..]) } else { url.to_string() };
+    let anon = !norm.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").contains('@') && o_str(opts, "user").is_none();
+    let mut o = opts.clone();
+    if anon {
+        o["user"] = json!("anonymous");
+        o["password"] = json!("anonymous@");
+    }
+    let a = account(&norm, &o, "ftp", "ftps", 21, 990)?;
+    let t = timeout_of(opts);
+    let addr = (a.host.as_str(), a.port).to_socket_addrs().map_err(|e| format!("{}: {}", a.host, e))?.next().ok_or(format!("{} has no address", a.host))?;
+    let local = a.host == "127.0.0.1" || a.host == "localhost" || a.host == "::1";
+    let tls_mode = if a.tls { "implicit" } else if explicit { "explicit" } else { "none" };
+    if tls_mode == "none" && !anon && !o_bool(opts, "allow_plain_password", local) {
+        return Err(format!("{} would get the password in clear: use ftpes:// (AUTH TLS) or ftps://, or allow_plain_password: true for a server that has no TLS", a.host));
+    }
+    let connector = || -> Result<suppaftp::RustlsConnector, String> { Ok(suppaftp::RustlsConnector::from(tls_config(opts)?)) };
+    let name = o_str(opts, "server_name").unwrap_or_else(|| a.host.clone());
+    let mut ftp = if tls_mode == "implicit" {
+        // suppaftp's implicit TLS connect takes no time limit, for the connection or the greeting:
+        // it runs on a thread of its own, waited for up to the limit.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (c, n) = (connector()?, name.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Ftp::connect_secure_implicit(addr, c, &n).map_err(says));
+        });
+        rx.recv_timeout(t).map_err(|_| format!("{} did not greet in time (timeout_ms)", a.host))?.map_err(|e| format!("{}: {}", a.host, e))?
+    } else {
+        // The socket comes with its time limits, so a server that never greets cannot hold the call.
+        let sock = TcpStream::connect_timeout(&addr, t).map_err(|e| format!("cannot reach {}: {}", addr, e))?;
+        let _ = sock.set_read_timeout(Some(t));
+        let _ = sock.set_write_timeout(Some(t));
+        Ftp::connect_with_stream(sock).map_err(|e| format!("{}: {}", a.host, says(e)))?
+    };
+    let _ = ftp.get_ref().set_read_timeout(Some(t));
+    let _ = ftp.get_ref().set_write_timeout(Some(t));
+    if tls_mode == "explicit" {
+        ftp = ftp.into_secure(connector()?, &name).map_err(|e| format!("AUTH TLS with {} failed: {}", a.host, says(e)))?;
+    }
+    let mut ftp = ftp.passive_stream_builder(move |addr| {
+        let s = TcpStream::connect_timeout(&addr, t).map_err(suppaftp::FtpError::ConnectionError)?;
+        let _ = s.set_read_timeout(Some(t));
+        let _ = s.set_write_timeout(Some(t));
+        Ok(s)
+    });
+    ftp.set_passive_nat_workaround(o_bool(opts, "nat_workaround", true));
+    if o_bool(opts, "epsv", false) {
+        ftp.set_mode(suppaftp::Mode::ExtendedPassive);
+    }
+    ftp.login(a.user.as_str(), a.password.as_str()).map_err(|e| format!("sign-in failed: {}", says(e)))?;
+    ftp.transfer_type(suppaftp::types::FileType::Binary).map_err(says)?;
+    let mlsd = ftp.feat().map(|f| f.keys().any(|k| k.eq_ignore_ascii_case("MLST"))).unwrap_or(false);
+    let base = a.path.trim_end_matches('/').to_string();
+    Ok(Site { ftp, base, tls: tls_mode, mlsd })
+}
+
+fn with<T>(url: &str, opts: &Value, f: impl Fn(&mut Site) -> Result<T, String>) -> Result<T, String> {
+    let t = turn(url);
+    let _turn = t.lock().unwrap_or_else(|e| e.into_inner());
+    let kept = SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(url);
+    let mut s = match kept {
+        // A kept session the server dropped (FTP servers time out idle ones) is opened again.
+        Some(mut s) => if s.ftp.noop().is_ok() { s } else { open(url, opts)? },
+        None => open(url, opts)?,
+    };
+    let r = f(&mut s);
+    let broken = matches!(&r, Err(e) if !e.starts_with("the server said") && !e.starts_with("cannot read") && !e.starts_with("cannot write"));
+    if !broken {
+        SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(url.to_string(), s);
+    }
+    r
+}
+
+fn remote(s: &Site, path: &str) -> String {
+    if path.starts_with('/') || s.base.is_empty() {
+        path.to_string()
+    } else {
+        format!("/{}/{}", s.base.trim_start_matches('/'), path)
+    }
+}
+
+fn iso(t: std::time::SystemTime) -> Option<String> {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let (days, s) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, s / 3600, s % 3600 / 60, s % 60))
+}
+
+fn entry(f: &suppaftp::list::File, raw: &str) -> Value {
+    let kind = if f.is_directory() { "dir" } else if f.is_symlink() { "link" } else { "file" };
+    json!({
+        "name": f.name(),
+        "type": kind,
+        "size": f.size(),
+        "modified": iso(f.modified()),
+        "target": f.symlink().map(|p| p.to_string_lossy().to_string()),
+        "line": raw,
+    })
+}
+
+/// The files in `path` on the server at `url` (ftp://user:password@host/folder, ftpes:// for AUTH TLS, ftps:// for implicit TLS; no user means anonymous): `[{ name, type ("file", "dir", "link"), size, modified, target, line }]`, from MLSD when the server has it, else LIST read in Unix or DOS form. Options: `user`, `password`, `tls` ("explicit" on ftp://), `ca`, `insecure`, `timeout_ms`, `epsv`, `nat_workaround` (true: data connections go to the control host when the server names a private address), `allow_plain_password`. The session stays open for the next call.
+pub fn ftp_list(url: &str, path: &str, opts: serde_json::Value) -> Result<Vec<Value>, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, path);
+        let target = if p.is_empty() { None } else { Some(p.as_str()) };
+        let mut out = vec![];
+        if s.mlsd {
+            for line in s.ftp.mlsd(target).map_err(says)? {
+                if let Ok(f) = suppaftp::list::File::from_mlsx_line(&line) {
+                    if f.name() != "." && f.name() != ".." {
+                        out.push(entry(&f, &line));
+                    }
+                }
+            }
+        } else {
+            for line in s.ftp.list(target).map_err(says)? {
+                match suppaftp::list::File::from_posix_line(&line).or_else(|_| suppaftp::list::File::from_dos_line(&line)) {
+                    Ok(f) if f.name() != "." && f.name() != ".." => out.push(entry(&f, &line)),
+                    Ok(_) => {}
+                    Err(_) if line.to_ascii_lowercase().starts_with("total ") => {}
+                    Err(_) => out.push(json!({ "name": null, "type": "unknown", "line": line })),
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Uploads the local file `local_path` to `remote_path`: `{ bytes, remote }`.
+pub fn ftp_upload(url: &str, remote_path: &str, local_path: &str, opts: serde_json::Value) -> Result<Value, String> {
+    with(url, &opts, |s| {
+        let mut f = std::fs::File::open(local_path).map_err(|e| format!("cannot read {}: {}", local_path, e))?;
+        let p = remote(s, remote_path);
+        let n = s.ftp.put_file(&p, &mut f).map_err(says)?;
+        Ok(json!({ "bytes": n, "remote": p }))
+    })
+}
+
+/// Writes `text` (as UTF-8) to `remote_path`: `{ bytes, remote }`.
+pub fn ftp_put_text(url: &str, remote_path: &str, text: &str, opts: serde_json::Value) -> Result<Value, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, remote_path);
+        let n = s.ftp.put_file(&p, &mut std::io::Cursor::new(text.as_bytes())).map_err(says)?;
+        Ok(json!({ "bytes": n, "remote": p }))
+    })
+}
+
+/// Downloads `remote_path` to the local file `local_path` (written whole, or not at all): `{ bytes, path }`.
+pub fn ftp_download(url: &str, remote_path: &str, local_path: &str, opts: serde_json::Value) -> Result<Value, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, remote_path);
+        let part = format!("{}.part", local_path);
+        let n = s
+            .ftp
+            .retr(&p, |r| {
+                let mut f = std::fs::File::create(&part).map_err(|e| suppaftp::FtpError::ConnectionError(e))?;
+                std::io::copy(r, &mut f).map_err(suppaftp::FtpError::ConnectionError)
+            })
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                says(e)
+            })?;
+        std::fs::rename(&part, local_path).map_err(|e| format!("cannot write {}: {}", local_path, e))?;
+        Ok(json!({ "bytes": n, "path": local_path }))
+    })
+}
+
+/// The text of `remote_path` (up to 50 MB; UTF-8, or Latin-1 when it is not).
+pub fn ftp_get_text(url: &str, remote_path: &str, opts: serde_json::Value) -> Result<String, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, remote_path);
+        let b = s
+            .ftp
+            .retr(&p, |r| {
+                let mut out = vec![];
+                r.take(50 << 20).read_to_end(&mut out).map_err(suppaftp::FtpError::ConnectionError)?;
+                Ok(out)
+            })
+            .map_err(says)?;
+        Ok(match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(e) => e.into_bytes().iter().map(|&c| c as char).collect(),
+        })
+    })
+}
+
+/// Renames (or moves) `from` to `to` on the server.
+pub fn ftp_rename(url: &str, from: &str, to: &str, opts: serde_json::Value) -> Result<bool, String> {
+    with(url, &opts, |s| {
+        let (a, b) = (remote(s, from), remote(s, to));
+        s.ftp.rename(&a, &b).map_err(says)?;
+        Ok(true)
+    })
+}
+
+/// Deletes the file `path` on the server.
+pub fn ftp_delete(url: &str, path: &str, opts: serde_json::Value) -> Result<bool, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, path);
+        s.ftp.rm(&p).map_err(says)?;
+        Ok(true)
+    })
+}
+
+/// Makes the folder `path` on the server, with the folders above it when `parents: true`; a folder already there is fine then.
+pub fn ftp_mkdir(url: &str, path: &str, opts: serde_json::Value) -> Result<bool, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, path);
+        if o_bool(&opts, "parents", false) {
+            let mut at = String::new();
+            for piece in p.split('/').filter(|x| !x.is_empty()) {
+                at = if at.is_empty() && !p.starts_with('/') { piece.to_string() } else { format!("{}/{}", at, piece) };
+                let _ = s.ftp.mkdir(&at);
+            }
+            return s.ftp.cwd(&p).and_then(|_| s.ftp.cwd("/")).map(|_| true).map_err(says);
+        }
+        s.ftp.mkdir(&p).map_err(says)?;
+        Ok(true)
+    })
+}
+
+/// Removes the empty folder `path` on the server.
+pub fn ftp_rmdir(url: &str, path: &str, opts: serde_json::Value) -> Result<bool, String> {
+    with(url, &opts, |s| {
+        let p = remote(s, path);
+        s.ftp.rmdir(&p).map_err(says)?;
+        Ok(true)
+    })
+}
+
+/// How the session to `url` is: `{ tls ("none", "explicit", "implicit"), mlsd, welcome, folder }`.
+pub fn ftp_info(url: &str, opts: serde_json::Value) -> Result<Value, String> {
+    with(url, &opts, |s| Ok(json!({ "tls": s.tls, "mlsd": s.mlsd, "welcome": s.ftp.get_welcome_msg().map(|w| w.trim().to_string()), "folder": s.ftp.pwd().ok() })))
+}
+
+/// Says goodbye (QUIT) and closes the session kept for `url`; whether there was one.
+pub fn ftp_close(url: &str) -> bool {
+    let t = turn(url);
+    let _turn = t.lock().unwrap_or_else(|e| e.into_inner());
+    match SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(url) {
+        Some(mut s) => {
+            let _ = s.ftp.quit();
+            true
+        }
+        None => false,
+    }
+}

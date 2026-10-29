@@ -1,0 +1,1601 @@
+//! Siemens S7 PLCs (S7-300, S7-400, S7-1200, S7-1500, ET 200SP, LOGO! 8) over ISO-on-TCP (RFC 1006, COTP, S7comm), in pure Rust: connect by rack and slot, read and write data blocks, inputs, outputs, merkers, timers and counters as typed values (BOOL, INT, DINT, REAL, STRING, DATE_AND_TIME and more, arrays too), many addresses per call split to the PLC's PDU size, and the CPU's state, order code and identity.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------------------------
+// Addresses and types
+
+const AREA_P: u8 = 0x80; // peripheral I/O
+const AREA_I: u8 = 0x81;
+const AREA_Q: u8 = 0x82;
+const AREA_M: u8 = 0x83;
+const AREA_DB: u8 = 0x84;
+const AREA_C: u8 = 0x1C;
+const AREA_T: u8 = 0x1D;
+
+#[derive(Clone, Debug, PartialEq)]
+enum Ty {
+    Bool,
+    Byte,
+    Word,
+    DWord,
+    LWord,
+    Char,
+    SInt,
+    USInt,
+    Int,
+    UInt,
+    DInt,
+    UDInt,
+    LInt,
+    ULInt,
+    Real,
+    LReal,
+    Str(usize),
+    WStr(usize),
+    Time,
+    S5Time,
+    Date,
+    Tod,
+    Dt,
+    Dtl,
+    Timer,
+    Counter,
+}
+
+impl Ty {
+    fn size(&self) -> usize {
+        match self {
+            Ty::Bool => 1,
+            Ty::Byte | Ty::Char | Ty::SInt | Ty::USInt => 1,
+            Ty::Word | Ty::Int | Ty::UInt | Ty::S5Time | Ty::Date | Ty::Timer | Ty::Counter => 2,
+            Ty::DWord | Ty::DInt | Ty::UDInt | Ty::Real | Ty::Time | Ty::Tod => 4,
+            Ty::LWord | Ty::LInt | Ty::ULInt | Ty::LReal | Ty::Dt => 8,
+            Ty::Dtl => 12,
+            Ty::Str(n) => n + 2,
+            Ty::WStr(n) => 2 * n + 4,
+        }
+    }
+    fn name(&self) -> String {
+        match self {
+            Ty::Bool => "BOOL".into(),
+            Ty::Byte => "BYTE".into(),
+            Ty::Word => "WORD".into(),
+            Ty::DWord => "DWORD".into(),
+            Ty::LWord => "LWORD".into(),
+            Ty::Char => "CHAR".into(),
+            Ty::SInt => "SINT".into(),
+            Ty::USInt => "USINT".into(),
+            Ty::Int => "INT".into(),
+            Ty::UInt => "UINT".into(),
+            Ty::DInt => "DINT".into(),
+            Ty::UDInt => "UDINT".into(),
+            Ty::LInt => "LINT".into(),
+            Ty::ULInt => "ULINT".into(),
+            Ty::Real => "REAL".into(),
+            Ty::LReal => "LREAL".into(),
+            Ty::Str(n) => format!("STRING[{}]", n),
+            Ty::WStr(n) => format!("WSTRING[{}]", n),
+            Ty::Time => "TIME".into(),
+            Ty::S5Time => "S5TIME".into(),
+            Ty::Date => "DATE".into(),
+            Ty::Tod => "TIME_OF_DAY".into(),
+            Ty::Dt => "DATE_AND_TIME".into(),
+            Ty::Dtl => "DTL".into(),
+            Ty::Timer => "TIMER".into(),
+            Ty::Counter => "COUNTER".into(),
+        }
+    }
+}
+
+fn parse_type(t: &str) -> Result<(Ty, Option<usize>), String> {
+    let t = t.trim().to_uppercase();
+    // `STRING[20]` is a length; `INT[10]` is ten of them.
+    let (base, bracket) = match t.find('[') {
+        Some(i) => {
+            if !t.ends_with(']') {
+                return Err(format!("`{}`: a `[` needs its `]`", t));
+            }
+            let n: usize = t[i + 1..t.len() - 1].trim().parse().map_err(|_| format!("`{}`: the number in [] must be a whole number", t))?;
+            (t[..i].trim().to_string(), Some(n))
+        }
+        None => (t.clone(), None),
+    };
+    let ty = match base.as_str() {
+        "BOOL" | "X" => Ty::Bool,
+        "BYTE" | "B" => Ty::Byte,
+        "WORD" | "W" => Ty::Word,
+        "DWORD" | "D" => Ty::DWord,
+        "LWORD" => Ty::LWord,
+        "CHAR" => Ty::Char,
+        "SINT" => Ty::SInt,
+        "USINT" => Ty::USInt,
+        "INT" => Ty::Int,
+        "UINT" => Ty::UInt,
+        "DINT" => Ty::DInt,
+        "UDINT" => Ty::UDInt,
+        "LINT" => Ty::LInt,
+        "ULINT" => Ty::ULInt,
+        "REAL" => Ty::Real,
+        "LREAL" => Ty::LReal,
+        "TIME" => Ty::Time,
+        "S5TIME" => Ty::S5Time,
+        "DATE" => Ty::Date,
+        "TOD" | "TIME_OF_DAY" => Ty::Tod,
+        "DT" | "DATE_AND_TIME" => Ty::Dt,
+        "DTL" => Ty::Dtl,
+        "STRING" => {
+            let n = bracket.unwrap_or(254);
+            if n == 0 || n > 254 {
+                return Err(format!("`{}`: a STRING holds 1 to 254 characters", t));
+            }
+            return Ok((Ty::Str(n), None));
+        }
+        "WSTRING" => {
+            let n = bracket.unwrap_or(254);
+            if n == 0 || n > 16382 {
+                return Err(format!("`{}`: a WSTRING holds 1 to 16382 characters", t));
+            }
+            return Ok((Ty::WStr(n), None));
+        }
+        _ => return Err(format!("unknown S7 type `{}`: use BOOL, BYTE, WORD, DWORD, LWORD, CHAR, SINT, USINT, INT, UINT, DINT, UDINT, LINT, ULINT, REAL, LREAL, STRING[n], WSTRING[n], TIME, S5TIME, DATE, TOD, DT or DTL", base)),
+    };
+    if let Some(n) = bracket {
+        if n == 0 || n > 65535 {
+            return Err(format!("`{}`: an array has 1 to 65535 elements", t));
+        }
+    }
+    Ok((ty, bracket))
+}
+
+#[derive(Clone, Debug)]
+struct Addr {
+    text: String,
+    area: u8,
+    db: u16,
+    byte: u32,
+    bit: u8,
+    ty: Ty,
+    count: Option<usize>,
+}
+
+impl Addr {
+    /// Bytes the address covers (for BOOL, the bytes holding its bits).
+    fn byte_len(&self) -> usize {
+        let n = self.count.unwrap_or(1);
+        match self.ty {
+            Ty::Bool => (self.bit as usize + n + 7) / 8,
+            Ty::Timer | Ty::Counter => 2 * n,
+            _ => self.ty.size() * n,
+        }
+    }
+}
+
+fn area_name(a: u8) -> &'static str {
+    match a {
+        AREA_DB => "DB",
+        AREA_I => "I",
+        AREA_Q => "Q",
+        AREA_M => "M",
+        AREA_P => "P",
+        AREA_T => "T",
+        AREA_C => "C",
+        _ => "?",
+    }
+}
+
+fn num<T: std::str::FromStr>(s: &str, what: &str, full: &str) -> Result<T, String> {
+    s.trim().parse::<T>().map_err(|_| format!("`{}`: `{}` is not a valid {}", full, s, what))
+}
+
+/// Parses a STEP 7 address (`DB1.DBX0.0`, `DB1.DBW2:INT`, `MD10:REAL`, `I0.3`, `QB4`, `T5`, `C2`;
+/// German `E`/`A` for I/Q and `Z` for counters; a leading `%` as TIA writes it).
+fn parse_addr(text: &str) -> Result<Addr, String> {
+    let full = text.trim();
+    if full.is_empty() {
+        return Err("an empty S7 address: write one like DB1.DBW2:INT, M0.1 or IW64".into());
+    }
+    let (place, ty_text) = match full.split_once(':') {
+        Some((p, t)) => (p.trim(), Some(t.trim())),
+        None => (full, None),
+    };
+    let p = place.trim_start_matches('%').to_uppercase().replace(' ', "");
+    let explicit = match ty_text {
+        Some(t) => Some(parse_type(t)?),
+        None => None,
+    };
+    // width: 'X' a bit, 'B' a byte (any type may start there), 'W' two bytes, 'D' four.
+    let (area, db, rest): (u8, u16, String) = if let Some(r) = p.strip_prefix("DB") {
+        let (dbn, rest) = r.split_once('.').ok_or_else(|| format!("`{}`: a data block address is like DB1.DBX0.0, DB1.DBB2, DB1.DBW4 or DB1.DBD8", full))?;
+        let n: u16 = num(dbn, "data block number", full)?;
+        if n == 0 {
+            return Err(format!("`{}`: data blocks are numbered from 1", full));
+        }
+        let rest = rest.strip_prefix("DB").ok_or_else(|| format!("`{}`: after DB{}. comes DBX, DBB, DBW or DBD", full, n))?;
+        (AREA_DB, n, rest.to_string())
+    } else if let Some(r) = p.strip_prefix("PI").or_else(|| p.strip_prefix("PE")).or_else(|| p.strip_prefix("PQ")).or_else(|| p.strip_prefix("PA")) {
+        (AREA_P, 0, r.to_string())
+    } else if let Some(r) = p.strip_prefix('I').or_else(|| p.strip_prefix('E')) {
+        (AREA_I, 0, r.to_string())
+    } else if let Some(r) = p.strip_prefix('Q').or_else(|| p.strip_prefix('A')) {
+        (AREA_Q, 0, r.to_string())
+    } else if let Some(r) = p.strip_prefix('M') {
+        (AREA_M, 0, r.to_string())
+    } else if let Some(r) = p.strip_prefix('T') {
+        let n: u32 = num(r, "timer number", full)?;
+        let (ty, count) = explicit.unwrap_or((Ty::Timer, None));
+        if ty != Ty::Timer && ty != Ty::S5Time {
+            return Err(format!("`{}`: a timer is read as TIMER (its time in milliseconds)", full));
+        }
+        return Ok(Addr { text: full.to_string(), area: AREA_T, db: 0, byte: n, bit: 0, ty: Ty::Timer, count });
+    } else if let Some(r) = p.strip_prefix('C').or_else(|| p.strip_prefix('Z')) {
+        let n: u32 = num(r, "counter number", full)?;
+        let (ty, count) = explicit.unwrap_or((Ty::Counter, None));
+        if ty != Ty::Counter {
+            return Err(format!("`{}`: a counter is read as COUNTER (0 to 999)", full));
+        }
+        return Ok(Addr { text: full.to_string(), area: AREA_C, db: 0, byte: n, bit: 0, ty: Ty::Counter, count });
+    } else {
+        return Err(format!("`{}` is not an S7 address: write DB1.DBW2:INT, I0.0 (E0.0), Q0.1 (A0.1), MB10, MW12:INT, MD14:REAL, T1 or C1", full));
+    };
+    let (width, digits) = match rest.chars().next() {
+        Some(c @ ('X' | 'B' | 'W' | 'D')) => (c, rest[1..].to_string()),
+        Some(c) if c.is_ascii_digit() => ('X', rest.clone()),
+        _ => return Err(format!("`{}`: after the area comes X (a bit, as in M0.1), B, W or D and the byte number", full)),
+    };
+    if width == 'X' {
+        let (b, bit) = digits.split_once('.').ok_or_else(|| format!("`{}`: a bit address is byte.bit, as in {}0.1", full, if area == AREA_DB { "DB1.DBX" } else { area_name(area) }))?;
+        let byte: u32 = num(b, "byte number", full)?;
+        let bit: u8 = num(bit, "bit number", full)?;
+        if bit > 7 {
+            return Err(format!("`{}`: bits are numbered 0 to 7", full));
+        }
+        let (ty, count) = explicit.unwrap_or((Ty::Bool, None));
+        if ty != Ty::Bool {
+            return Err(format!("`{}`: a bit address holds a BOOL; for {} start at a byte, as in {}", full, ty.name(), if area == AREA_DB { format!("DB{}.DBB{}:{}", db, byte, ty.name()) } else { format!("{}B{}:{}", area_name(area), byte, ty.name()) }));
+        }
+        if byte > 0xFFFF {
+            return Err(format!("`{}`: the byte number is too large", full));
+        }
+        return Ok(Addr { text: full.to_string(), area, db, byte, bit, ty, count });
+    }
+    if digits.contains('.') {
+        return Err(format!("`{}`: only bit addresses (X) have a .bit", full));
+    }
+    let byte: u32 = num(&digits, "byte number", full)?;
+    if byte > 0xFFFF {
+        return Err(format!("`{}`: the byte number is too large", full));
+    }
+    let default = match width {
+        'B' => Ty::Byte,
+        'W' => Ty::Word,
+        _ => Ty::DWord,
+    };
+    let (ty, count) = explicit.unwrap_or((default, None));
+    let need = match width {
+        'W' => Some(2),
+        'D' => Some(4),
+        _ => None,
+    };
+    if ty == Ty::Bool {
+        return Err(format!("`{}`: a BOOL has a bit address, as in {}", full, if area == AREA_DB { format!("DB{}.DBX{}.0", db, byte) } else { format!("{}{}.0", area_name(area), byte) }));
+    }
+    if ty == Ty::Timer || ty == Ty::Counter {
+        return Err(format!("`{}`: TIMER and COUNTER are for T and C addresses (T1, C1)", full));
+    }
+    if let Some(n) = need {
+        if ty.size() != n {
+            let w = match ty.size() { 2 => 'W', 4 => 'D', _ => 'B' };
+            let b = if area == AREA_DB { format!("DB{}.DB{}{}", db, w, byte) } else { format!("{}{}{}", area_name(area), w, byte) };
+            return Err(format!("`{}`: {} is {} bytes, not {}: write {}:{}", full, ty.name(), ty.size(), n, b, ty.name()));
+        }
+    }
+    Ok(Addr { text: full.to_string(), area, db, byte, bit: 0, ty, count })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Values: bytes to JSON and back
+
+fn bcd(b: u8) -> Result<u32, String> {
+    let (h, l) = (b >> 4, b & 0x0F);
+    if h > 9 || l > 9 {
+        return Err(format!("0x{:02X} is not a BCD byte", b));
+    }
+    Ok((h * 10 + l) as u32)
+}
+
+fn to_bcd(n: u32) -> u8 {
+    (((n / 10) % 10) << 4 | (n % 10)) as u8
+}
+
+fn days_to_date(days: i64) -> (i64, u32, u32) {
+    // days since 1970-01-01 to a civil date (Howard Hinnant's algorithm)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn date_to_days(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+const DAYS_1990: i64 = 7305; // 1990-01-01 in days since 1970
+
+fn parse_date(s: &str) -> Result<(i64, u32, u32), String> {
+    let p: Vec<&str> = s.trim().split('-').collect();
+    if p.len() != 3 {
+        return Err(format!("`{}` is not a date like 2026-10-30", s));
+    }
+    let y: i64 = p[0].parse().map_err(|_| format!("`{}` is not a date like 2026-10-30", s))?;
+    let m: u32 = p[1].parse().map_err(|_| format!("`{}` is not a date like 2026-10-30", s))?;
+    let d: u32 = p[2].parse().map_err(|_| format!("`{}` is not a date like 2026-10-30", s))?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(format!("`{}` is not a date", s));
+    }
+    Ok((y, m, d))
+}
+
+/// `HH:MM[:SS[.fff]]` to nanoseconds since midnight.
+fn parse_tod(s: &str) -> Result<u64, String> {
+    let bad = || format!("`{}` is not a time of day like 08:30:00.250", s);
+    let p: Vec<&str> = s.trim().split(':').collect();
+    if p.len() < 2 || p.len() > 3 {
+        return Err(bad());
+    }
+    let h: u64 = p[0].parse().map_err(|_| bad())?;
+    let m: u64 = p[1].parse().map_err(|_| bad())?;
+    let (sec, frac) = match p.get(2) {
+        Some(x) => match x.split_once('.') {
+            Some((a, b)) => {
+                let mut f = b.to_string();
+                if f.len() > 9 || !f.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(bad());
+                }
+                while f.len() < 9 {
+                    f.push('0');
+                }
+                (a.parse::<u64>().map_err(|_| bad())?, f.parse::<u64>().map_err(|_| bad())?)
+            }
+            None => (x.parse::<u64>().map_err(|_| bad())?, 0),
+        },
+        None => (0, 0),
+    };
+    if h > 23 || m > 59 || sec > 59 {
+        return Err(bad());
+    }
+    Ok(((h * 60 + m) * 60 + sec) * 1_000_000_000 + frac)
+}
+
+fn split_datetime(s: &str) -> Result<((i64, u32, u32), u64), String> {
+    let t = s.trim().trim_end_matches('Z');
+    let (d, tm) = t.split_once(|c| c == 'T' || c == ' ').ok_or_else(|| format!("`{}` is not a date and time like 2026-10-30T08:15:00", s))?;
+    Ok((parse_date(d)?, parse_tod(tm)?))
+}
+
+fn fmt_tod(ns: u64) -> String {
+    let ms_total = ns / 1_000_000;
+    let (h, m, sec, ms) = (ms_total / 3_600_000, (ms_total / 60_000) % 60, (ms_total / 1000) % 60, ms_total % 1000);
+    let sub = ns % 1_000_000;
+    if sub != 0 {
+        format!("{:02}:{:02}:{:02}.{:09}", h, m, sec, ns % 1_000_000_000)
+    } else {
+        format!("{:02}:{:02}:{:02}.{:03}", h, m, sec, ms)
+    }
+}
+
+fn latin1(b: &[u8]) -> String {
+    b.iter().map(|&c| c as char).collect()
+}
+
+fn s5time_ms(w: u16) -> Result<i64, String> {
+    let base = [10i64, 100, 1000, 10000][((w >> 12) & 0x3) as usize];
+    let (h, t, u) = (((w >> 8) & 0xF) as i64, ((w >> 4) & 0xF) as i64, (w & 0xF) as i64);
+    if h > 9 || t > 9 || u > 9 {
+        return Err(format!("0x{:04X} is not an S5TIME", w));
+    }
+    Ok((h * 100 + t * 10 + u) * base)
+}
+
+/// Milliseconds as an S5TIME: the finest time base that holds them (what is finer is dropped, as the PLC does).
+fn ms_s5time(ms: i64) -> Result<u16, String> {
+    for (i, base) in [10i64, 100, 1000, 10000].iter().enumerate() {
+        let v = ms / base;
+        if (0..=999).contains(&v) && ms >= 0 {
+            let v = v as u16;
+            return Ok(((i as u16) << 12) | (v / 100) << 8 | ((v / 10) % 10) << 4 | (v % 10));
+        }
+    }
+    Err(format!("{} ms does not fit an S5TIME (0 to 9990 s)", ms))
+}
+
+fn decode_one(ty: &Ty, b: &[u8]) -> Result<Value, String> {
+    let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    let be32 = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let be64 = |i: usize| u64::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5], b[i + 6], b[i + 7]]);
+    if b.len() < ty.size() && !matches!(ty, Ty::Bool) {
+        return Err(format!("{} needs {} bytes, got {}", ty.name(), ty.size(), b.len()));
+    }
+    Ok(match ty {
+        Ty::Bool => json!(b.first().map(|x| *x != 0).unwrap_or(false)),
+        Ty::Byte | Ty::USInt => json!(b[0]),
+        Ty::Char => json!(latin1(&b[..1])),
+        Ty::SInt => json!(b[0] as i8),
+        Ty::Word | Ty::UInt => json!(be16(0)),
+        Ty::Int => json!(be16(0) as i16),
+        Ty::DWord | Ty::UDInt => json!(be32(0)),
+        Ty::DInt => json!(be32(0) as i32),
+        Ty::LWord | Ty::ULInt => {
+            let v = be64(0);
+            if v > i64::MAX as u64 {
+                json!(v.to_string())
+            } else {
+                json!(v as i64)
+            }
+        }
+        Ty::LInt => json!(be64(0) as i64),
+        Ty::Real => {
+            let f = f32::from_bits(be32(0));
+            // f32 to the shortest decimal that reads back as it: 72.5, not 72.5000000001
+            let s = format!("{}", f);
+            json!(s.parse::<f64>().unwrap_or(f as f64))
+        }
+        Ty::LReal => json!(f64::from_bits(be64(0))),
+        Ty::Str(n) => {
+            let len = (b[1] as usize).min(*n).min(b.len() - 2);
+            json!(latin1(&b[2..2 + len]))
+        }
+        Ty::WStr(n) => {
+            let len = (be16(2) as usize).min(*n).min((b.len() - 4) / 2);
+            let units: Vec<u16> = (0..len).map(|i| be16(4 + 2 * i)).collect();
+            json!(String::from_utf16_lossy(&units))
+        }
+        Ty::Time => json!(be32(0) as i32),
+        Ty::S5Time | Ty::Timer => json!(s5time_ms(be16(0))?),
+        Ty::Counter => {
+            let w = be16(0);
+            let h = ((w >> 8) & 0x0F) as u32;
+            if h > 9 {
+                return Err(format!("0x{:04X} is not a counter value", w));
+            }
+            json!(h * 100 + bcd((w & 0xFF) as u8)?)
+        }
+        Ty::Date => {
+            let (y, m, d) = days_to_date(DAYS_1990 + be16(0) as i64);
+            json!(format!("{:04}-{:02}-{:02}", y, m, d))
+        }
+        Ty::Tod => json!(fmt_tod(be32(0) as u64 * 1_000_000)),
+        Ty::Dt => {
+            let yy = bcd(b[0])?;
+            let y = if yy >= 90 { 1900 + yy } else { 2000 + yy };
+            let ms = bcd(b[6])? * 10 + (b[7] >> 4) as u32;
+            json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}", y, bcd(b[1])?, bcd(b[2])?, bcd(b[3])?, bcd(b[4])?, bcd(b[5])?, ms))
+        }
+        Ty::Dtl => {
+            let ns = be32(8) as u64;
+            json!(format!("{:04}-{:02}-{:02}T{}", be16(0), b[2], b[3], fmt_tod(((b[5] as u64 * 60 + b[6] as u64) * 60 + b[7] as u64) * 1_000_000_000 + ns)))
+        }
+    })
+}
+
+fn int_of(v: &Value, lo: i128, hi: i128, ty: &Ty) -> Result<i128, String> {
+    let n: i128 = if let Some(i) = v.as_i64() {
+        i as i128
+    } else if let Some(u) = v.as_u64() {
+        u as i128
+    } else if let Some(f) = v.as_f64() {
+        if f.fract() != 0.0 {
+            return Err(format!("{} takes a whole number, not {}", ty.name(), f));
+        }
+        f as i128
+    } else if let Some(b) = v.as_bool() {
+        b as i128
+    } else if let Some(s) = v.as_str() {
+        s.trim().parse::<i128>().map_err(|_| format!("{} takes a number, not {:?}", ty.name(), s))?
+    } else {
+        return Err(format!("{} takes a number, not {}", ty.name(), v));
+    };
+    if n < lo || n > hi {
+        return Err(format!("{} does not fit {} ({} to {})", n, ty.name(), lo, hi));
+    }
+    Ok(n)
+}
+
+fn encode_one(ty: &Ty, v: &Value) -> Result<Vec<u8>, String> {
+    let txt = |v: &Value| -> Result<String, String> { v.as_str().map(|s| s.to_string()).ok_or_else(|| format!("{} takes text, not {}", ty.name(), v)) };
+    Ok(match ty {
+        Ty::Bool => {
+            let b = match v {
+                Value::Bool(b) => *b,
+                Value::Number(n) if n.as_i64() == Some(0) || n.as_i64() == Some(1) => n.as_i64() == Some(1),
+                _ => return Err(format!("BOOL takes true or false, not {}", v)),
+            };
+            vec![b as u8]
+        }
+        Ty::Byte | Ty::USInt => vec![int_of(v, 0, 255, ty)? as u8],
+        Ty::SInt => vec![int_of(v, -128, 127, ty)? as i8 as u8],
+        Ty::Char => {
+            let s = txt(v)?;
+            let c: Vec<char> = s.chars().collect();
+            if c.len() != 1 || c[0] as u32 > 255 {
+                return Err(format!("CHAR takes one Latin-1 character, not {:?}", s));
+            }
+            vec![c[0] as u32 as u8]
+        }
+        Ty::Word | Ty::UInt => (int_of(v, 0, 65535, ty)? as u16).to_be_bytes().to_vec(),
+        Ty::Int => (int_of(v, -32768, 32767, ty)? as i16).to_be_bytes().to_vec(),
+        Ty::DWord | Ty::UDInt => (int_of(v, 0, u32::MAX as i128, ty)? as u32).to_be_bytes().to_vec(),
+        Ty::DInt | Ty::Time => (int_of(v, i32::MIN as i128, i32::MAX as i128, ty)? as i32).to_be_bytes().to_vec(),
+        Ty::LWord | Ty::ULInt => (int_of(v, 0, u64::MAX as i128, ty)? as u64).to_be_bytes().to_vec(),
+        Ty::LInt => (int_of(v, i64::MIN as i128, i64::MAX as i128, ty)? as i64).to_be_bytes().to_vec(),
+        Ty::Real => {
+            let f = v.as_f64().ok_or_else(|| format!("REAL takes a number, not {}", v))?;
+            if f.is_finite() && f.abs() > f32::MAX as f64 {
+                return Err(format!("{} does not fit a REAL", f));
+            }
+            (f as f32).to_bits().to_be_bytes().to_vec()
+        }
+        Ty::LReal => v.as_f64().ok_or_else(|| format!("LREAL takes a number, not {}", v))?.to_bits().to_be_bytes().to_vec(),
+        Ty::Str(n) => {
+            let s = txt(v)?;
+            let mut out = vec![*n as u8, 0];
+            for c in s.chars() {
+                if c as u32 > 255 {
+                    return Err(format!("a STRING holds Latin-1 characters only ({:?} is not one): use WSTRING", c));
+                }
+                out.push(c as u32 as u8);
+            }
+            if out.len() - 2 > *n {
+                return Err(format!("{:?} is {} characters, more than the STRING[{}] holds", s, out.len() - 2, n));
+            }
+            out[1] = (out.len() - 2) as u8;
+            out
+        }
+        Ty::WStr(n) => {
+            let s = txt(v)?;
+            let units: Vec<u16> = s.encode_utf16().collect();
+            if units.len() > *n {
+                return Err(format!("{:?} is {} characters, more than the WSTRING[{}] holds", s, units.len(), n));
+            }
+            let mut out = vec![];
+            out.extend_from_slice(&(*n as u16).to_be_bytes());
+            out.extend_from_slice(&(units.len() as u16).to_be_bytes());
+            for u in units {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+            out
+        }
+        Ty::S5Time | Ty::Timer => {
+            let ms = int_of(v, 0, 9_990_000, ty)? as i64;
+            ms_s5time(ms)?.to_be_bytes().to_vec()
+        }
+        Ty::Counter => {
+            let c = int_of(v, 0, 999, ty)? as u32;
+            vec![(c / 100) as u8, to_bcd(c % 100)]
+        }
+        Ty::Date => {
+            let (y, m, d) = parse_date(&txt(v)?)?;
+            let days = date_to_days(y, m, d) - DAYS_1990;
+            if !(0..=65378).contains(&days) {
+                return Err("a DATE is from 1990-01-01 to 2168-12-31".into());
+            }
+            (days as u16).to_be_bytes().to_vec()
+        }
+        Ty::Tod => ((parse_tod(&txt(v)?)? / 1_000_000) as u32).to_be_bytes().to_vec(),
+        Ty::Dt => {
+            let ((y, m, d), ns) = split_datetime(&txt(v)?)?;
+            if !(1990..=2089).contains(&y) {
+                return Err("a DATE_AND_TIME is from 1990 to 2089".into());
+            }
+            let ms = (ns / 1_000_000) as u32;
+            let weekday = ((date_to_days(y, m, d) + 4).rem_euclid(7) + 1) as u8; // 1 = Sunday
+            let secs = ms / 1000;
+            vec![to_bcd((y % 100) as u32), to_bcd(m), to_bcd(d), to_bcd(secs / 3600), to_bcd((secs / 60) % 60), to_bcd(secs % 60), to_bcd((ms % 1000) / 10), (((ms % 10) as u8) << 4) | weekday]
+        }
+        Ty::Dtl => {
+            let ((y, m, d), ns) = split_datetime(&txt(v)?)?;
+            if !(1970..=2262).contains(&y) {
+                return Err("a DTL is from 1970 to 2262".into());
+            }
+            let weekday = ((date_to_days(y, m, d) + 4).rem_euclid(7) + 1) as u8;
+            let secs = ns / 1_000_000_000;
+            let mut out = (y as u16).to_be_bytes().to_vec();
+            out.extend_from_slice(&[m as u8, d as u8, weekday, (secs / 3600) as u8, ((secs / 60) % 60) as u8, (secs % 60) as u8]);
+            out.extend_from_slice(&((ns % 1_000_000_000) as u32).to_be_bytes());
+            out
+        }
+    })
+}
+
+/// The value at an address, from the bytes it covers.
+fn decode_addr(a: &Addr, b: &[u8]) -> Result<Value, String> {
+    match (&a.ty, a.count) {
+        (Ty::Bool, None) => Ok(json!(b.first().map(|x| x >> a.bit & 1 == 1).unwrap_or(false))),
+        (Ty::Bool, Some(n)) => Ok(Value::Array((0..n).map(|i| {
+            let at = a.bit as usize + i;
+            json!(b.get(at / 8).map(|x| x >> (at % 8) & 1 == 1).unwrap_or(false))
+        }).collect())),
+        (ty, None) => decode_one(ty, b),
+        (ty, Some(n)) => {
+            let s = if matches!(ty, Ty::Timer | Ty::Counter) { 2 } else { ty.size() };
+            let mut out = vec![];
+            for i in 0..n {
+                out.push(decode_one(ty, &b[i * s..(i + 1) * s])?);
+            }
+            Ok(Value::Array(out))
+        }
+    }
+}
+
+fn encode_addr(a: &Addr, v: &Value) -> Result<Vec<u8>, String> {
+    match a.count {
+        None => encode_one(&a.ty, v),
+        Some(n) => {
+            let items = v.as_array().ok_or_else(|| format!("`{}` is an array of {}: give a list of {} values", a.text, n, n))?;
+            if items.len() != n {
+                return Err(format!("`{}` holds {} values; {} given", a.text, n, items.len()));
+            }
+            let mut out = vec![];
+            for x in items {
+                out.extend(encode_one(&a.ty, x).map_err(|e| format!("`{}`: {}", a.text, e))?);
+            }
+            Ok(out)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The connection
+
+struct Conn {
+    host: String,
+    rack: i64,
+    slot: i64,
+    local_tsap: u16,
+    remote_tsap: u16,
+    want_pdu: u16,
+    timeout: Duration,
+    stream: Option<TcpStream>,
+    pdu: usize,
+    pdu_ref: u16,
+    max_items: usize,
+}
+
+fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<Conn>>>> {
+    static R: OnceLock<Mutex<HashMap<String, Arc<Mutex<Conn>>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_conn(name: &str) -> Result<Arc<Mutex<Conn>>, String> {
+    registry().lock().map_err(|_| "the S7 registry is poisoned".to_string())?.get(name).cloned().ok_or_else(|| format!("no S7 connection named {:?}: call s7_connect({:?}, host, rack, slot, {{}}) first", name, name))
+}
+
+fn sock_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))
+}
+
+fn tsap(v: &Value, what: &str) -> Result<Option<u16>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => n.as_u64().filter(|x| *x <= 0xFFFF).map(|x| Some(x as u16)).ok_or_else(|| format!("{} is 0 to 65535", what)),
+        Value::String(s) => {
+            let h: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            if h.len() != 4 {
+                return Err(format!("{} is four hex digits, like \"02.00\" or \"0300\"", what));
+            }
+            u16::from_str_radix(&h, 16).map(Some).map_err(|e| e.to_string())
+        }
+        _ => Err(format!("{} is a number or hex text like \"02.00\"", what)),
+    }
+}
+
+impl Conn {
+    fn stream(&mut self) -> Result<&mut TcpStream, String> {
+        self.stream.as_mut().ok_or_else(|| "not connected".to_string())
+    }
+
+    fn send_tpkt(&mut self, payload: &[u8]) -> Result<(), String> {
+        let mut p = vec![3, 0];
+        p.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+        p.extend_from_slice(payload);
+        self.stream()?.write_all(&p).map_err(|e| format!("sending to the PLC at {}: {}", self.host, e))
+    }
+
+    fn read_tpkt(&mut self) -> Result<Vec<u8>, String> {
+        let host = self.host.clone();
+        let s = self.stream()?;
+        let mut h = [0u8; 4];
+        s.read_exact(&mut h).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!("the PLC at {} did not answer in time", host),
+            std::io::ErrorKind::UnexpectedEof => format!("the PLC at {} closed the connection", host),
+            _ => format!("reading from the PLC at {}: {}", host, e),
+        })?;
+        if h[0] != 3 {
+            return Err(format!("the PLC at {} sent something that is not ISO-on-TCP (TPKT version {})", host, h[0]));
+        }
+        let len = u16::from_be_bytes([h[2], h[3]]) as usize;
+        if len < 7 {
+            return Err(format!("the PLC at {} sent a TPKT of {} bytes", host, len));
+        }
+        let mut body = vec![0u8; len - 4];
+        s.read_exact(&mut body).map_err(|e| format!("reading from the PLC at {}: {}", host, e))?;
+        Ok(body)
+    }
+
+    /// One S7 PDU from COTP data units (a PDU may come in several, the last marked EOT).
+    fn read_pdu(&mut self) -> Result<Vec<u8>, String> {
+        let mut out = vec![];
+        loop {
+            let t = self.read_tpkt()?;
+            let li = t[0] as usize;
+            if t.len() < li + 1 || t.len() < 3 {
+                return Err("a COTP header longer than its packet".into());
+            }
+            match t[1] {
+                0xF0 => {
+                    out.extend_from_slice(&t[li + 1..]);
+                    if t[2] & 0x80 != 0 {
+                        return Ok(out);
+                    }
+                }
+                0x80 => {
+                    self.stream = None;
+                    return Err(format!("the PLC at {} closed the connection (COTP disconnect request)", self.host));
+                }
+                k => return Err(format!("the PLC sent COTP type 0x{:02X} where data was expected", k)),
+            }
+        }
+    }
+
+    fn connect(&mut self) -> Result<(), String> {
+        self.stream = None;
+        let a = sock_addr(&self.host, 102)?;
+        let s = TcpStream::connect_timeout(&a, self.timeout).map_err(|e| format!("cannot reach the PLC at {}: {} (ISO-on-TCP is port 102; is the CPU on the network and the address right?)", a, e))?;
+        s.set_read_timeout(Some(self.timeout)).map_err(|e| e.to_string())?;
+        s.set_write_timeout(Some(self.timeout)).map_err(|e| e.to_string())?;
+        let _ = s.set_nodelay(true);
+        self.stream = Some(s);
+        // COTP connection request: TPDU size 1024, the calling and called TSAPs.
+        let l = self.local_tsap.to_be_bytes();
+        let r = self.remote_tsap.to_be_bytes();
+        let cr = [17u8, 0xE0, 0, 0, 0, 1, 0, 0xC0, 1, 0x0A, 0xC1, 2, l[0], l[1], 0xC2, 2, r[0], r[1]];
+        self.send_tpkt(&cr)?;
+        let cc = self.read_tpkt().map_err(|e| format!("{} (no answer to the connection request: check rack {} and slot {})", e, self.rack, self.slot))?;
+        if cc.len() < 2 || cc[1] != 0xD0 {
+            self.stream = None;
+            return Err(format!(
+                "the PLC at {} refused the connection for rack {}, slot {} (TSAP {:02X}.{:02X}): S7-300 is usually rack 0 slot 2, S7-1200/1500 rack 0 slot 1 (or 0); S7-400 depends on the rack; a LOGO! needs local_tsap and remote_tsap",
+                self.host, self.rack, self.slot, r[0], r[1]
+            ));
+        }
+        // S7 setup communication: one job at a time each way, the PDU size we would like.
+        let p = self.want_pdu.to_be_bytes();
+        let ans = self.job(&[0xF0, 0, 0, 1, 0, 1, p[0], p[1]], &[])?;
+        let (params, _) = ans;
+        if params.len() < 8 || params[0] != 0xF0 {
+            return Err("the PLC's answer to setup communication is not one".into());
+        }
+        self.pdu = (u16::from_be_bytes([params[6], params[7]]) as usize).max(64);
+        Ok(())
+    }
+
+    fn header(&mut self, rosctr: u8, plen: usize, dlen: usize) -> Vec<u8> {
+        self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
+        let r = self.pdu_ref.to_be_bytes();
+        let mut h = vec![0x02, 0xF0, 0x80, 0x32, rosctr, 0, 0, r[0], r[1]];
+        h.extend_from_slice(&(plen as u16).to_be_bytes());
+        h.extend_from_slice(&(dlen as u16).to_be_bytes());
+        h
+    }
+
+    /// A job (ROSCTR 1) sent, its ack-data read: (parameters, data).
+    fn job(&mut self, params: &[u8], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mut p = self.header(1, params.len(), data.len());
+        let want = self.pdu_ref;
+        p.extend_from_slice(params);
+        p.extend_from_slice(data);
+        self.send_tpkt(&p)?;
+        loop {
+            let pdu = self.read_pdu()?;
+            if pdu.len() < 10 || pdu[0] != 0x32 {
+                return Err("the PLC's answer is not an S7 PDU".into());
+            }
+            let rosctr = pdu[1];
+            let r = u16::from_be_bytes([pdu[4], pdu[5]]);
+            if r != want {
+                continue; // a late answer to an earlier request that timed out
+            }
+            if rosctr != 2 && rosctr != 3 {
+                return Err(format!("the PLC answered with S7 message type {} to a job", rosctr));
+            }
+            if pdu.len() < 12 {
+                return Err("a short S7 ack".into());
+            }
+            let plen = u16::from_be_bytes([pdu[6], pdu[7]]) as usize;
+            let dlen = u16::from_be_bytes([pdu[8], pdu[9]]) as usize;
+            let (ec, code) = (pdu[10], pdu[11]);
+            if ec != 0 || code != 0 {
+                return Err(header_error(ec, code));
+            }
+            if pdu.len() < 12 + plen + dlen {
+                return Err("the PLC's answer is shorter than it says".into());
+            }
+            return Ok((pdu[12..12 + plen].to_vec(), pdu[12 + plen..12 + plen + dlen].to_vec()));
+        }
+    }
+
+    /// A user-data request (ROSCTR 7): (parameters, data) of the answer.
+    fn userdata(&mut self, params: &[u8], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mut p = self.header(7, params.len(), data.len());
+        let want = self.pdu_ref;
+        p.extend_from_slice(params);
+        p.extend_from_slice(data);
+        self.send_tpkt(&p)?;
+        loop {
+            let pdu = self.read_pdu()?;
+            if pdu.len() < 10 || pdu[0] != 0x32 {
+                return Err("the PLC's answer is not an S7 PDU".into());
+            }
+            if u16::from_be_bytes([pdu[4], pdu[5]]) != want {
+                continue;
+            }
+            let (hlen, plen, dlen) = if pdu[1] == 7 {
+                (10, u16::from_be_bytes([pdu[6], pdu[7]]) as usize, u16::from_be_bytes([pdu[8], pdu[9]]) as usize)
+            } else if pdu[1] == 2 || pdu[1] == 3 {
+                if pdu.len() >= 12 && (pdu[10] != 0 || pdu[11] != 0) {
+                    return Err(header_error(pdu[10], pdu[11]));
+                }
+                (12, u16::from_be_bytes([pdu[6], pdu[7]]) as usize, u16::from_be_bytes([pdu[8], pdu[9]]) as usize)
+            } else {
+                return Err(format!("the PLC answered with S7 message type {}", pdu[1]));
+            };
+            if pdu.len() < hlen + plen + dlen {
+                return Err("the PLC's answer is shorter than it says".into());
+            }
+            return Ok((pdu[hlen..hlen + plen].to_vec(), pdu[hlen + plen..hlen + plen + dlen].to_vec()));
+        }
+    }
+
+    fn ensure(&mut self) -> Result<(), String> {
+        if self.stream.is_none() {
+            self.connect()?;
+        }
+        Ok(())
+    }
+}
+
+fn header_error(class: u8, code: u8) -> String {
+    let what = match (class, code) {
+        (0x81, 0x04) => "the PLC does not support this request in this context (on S7-1200/1500: allow PUT/GET communication in the CPU's protection settings)",
+        (0x85, 0x00) => "the request is longer than the PDU the PLC accepts",
+        (0x87, 0x04) => "the PLC refused the request",
+        (0x84, _) => "the PLC says the request breaks the protocol",
+        (0x83, _) => "no resources free in the PLC for this request",
+        (0x82, _) => "the PLC's object definition does not allow this",
+        (0xD6, _) | (0xD2, _) | (0xD0, _) => "the PLC refused the request",
+        _ => "the PLC refused the request",
+    };
+    format!("{} (S7 error class 0x{:02X}, code 0x{:02X})", what, class, code)
+}
+
+fn item_error(rc: u8, a: &str) -> String {
+    let what = match rc {
+        0x01 => "a hardware fault in the PLC",
+        0x03 => "access to it is not allowed (on S7-1200/1500: allow PUT/GET, and turn off optimized block access for the data block)",
+        0x05 => "the address is out of range (past the end of the area or data block; or the block uses optimized access)",
+        0x06 => "the data type is not supported there",
+        0x07 => "the data type does not match",
+        0x0A => "it does not exist (no such data block, or that area is not in this CPU)",
+        _ => "the PLC refused it",
+    };
+    format!("`{}`: {} (S7 return code 0x{:02X})", a, what, rc)
+}
+
+/// A piece of a request: a run of bytes in one area, or one bit.
+#[derive(Clone, Debug)]
+struct Piece {
+    area: u8,
+    db: u16,
+    start: u32,
+    bit: Option<u8>,
+    len: usize,
+}
+
+impl Piece {
+    fn spec(&self) -> [u8; 12] {
+        let (ts, len, addr) = match (self.area, self.bit) {
+            (AREA_T, _) => (0x1D, self.len / 2, self.start),
+            (AREA_C, _) => (0x1C, self.len / 2, self.start),
+            (_, Some(b)) => (0x01, 1, self.start * 8 + b as u32),
+            (_, None) => (0x02, self.len, self.start * 8),
+        };
+        let l = (len as u16).to_be_bytes();
+        let d = self.db.to_be_bytes();
+        [0x12, 0x0A, 0x10, ts, l[0], l[1], d[0], d[1], self.area, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8]
+    }
+    fn unit(&self) -> usize {
+        if self.area == AREA_T || self.area == AREA_C { 2 } else { 1 }
+    }
+}
+
+/// Splits a run of bytes into pieces no longer than `max` (whole timers and counters).
+fn split(area: u8, db: u16, start: u32, len: usize, max: usize) -> Vec<Piece> {
+    let unit = if area == AREA_T || area == AREA_C { 2 } else { 1 };
+    let max = (max / 2 * 2).max(2);
+    let mut out = vec![];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(max);
+        let off = if unit == 2 { (done / 2) as u32 } else { done as u32 };
+        out.push(Piece { area, db, start: start + off, bit: None, len: n });
+        done += n;
+    }
+    out
+}
+
+/// Reads pieces in as few requests as the PDU allows; the bytes of each, in order.
+fn read_pieces(c: &mut Conn, pieces: &[Piece]) -> Result<Vec<Result<Vec<u8>, u8>>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < pieces.len() {
+        // fit as many as the request (12 bytes each) and the answer (4 + data + 1) allow
+        let mut req = 10 + 2;
+        let mut ans = 12 + 2;
+        let mut j = i;
+        while j < pieces.len() && j - i < c.max_items {
+            let r = 12;
+            let a = 4 + pieces[j].len + pieces[j].len % 2;
+            if req + r > c.pdu || ans + a > c.pdu {
+                break;
+            }
+            req += r;
+            ans += a;
+            j += 1;
+        }
+        if j == i {
+            return Err(format!("a piece of {} bytes does not fit the PDU of {}", pieces[i].len, c.pdu));
+        }
+        let group = &pieces[i..j];
+        let mut params = vec![0x04, group.len() as u8];
+        for p in group {
+            params.extend_from_slice(&p.spec());
+        }
+        let (rp, data) = c.job(&params, &[])?;
+        if rp.len() < 2 || rp[0] != 0x04 {
+            return Err("the PLC's answer to a read is not one".into());
+        }
+        if rp[1] as usize != group.len() {
+            return Err(format!("asked for {} items, the PLC answered {}", group.len(), rp[1]));
+        }
+        let mut at = 0;
+        for (k, p) in group.iter().enumerate() {
+            if data.len() < at + 4 {
+                return Err("the PLC's answer to a read is cut short".into());
+            }
+            let rc = data[at];
+            let ts = data[at + 1];
+            let l = u16::from_be_bytes([data[at + 2], data[at + 3]]) as usize;
+            let bytes = if matches!(ts, 0x03 | 0x04 | 0x05) { (l + 7) / 8 } else { l };
+            at += 4;
+            if rc != 0xFF {
+                out.push(Err(rc));
+                // an error item has no data (and no fill byte, being 4 bytes long)
+                continue;
+            }
+            if data.len() < at + bytes {
+                return Err("the PLC's answer to a read is cut short".into());
+            }
+            let mut b = data[at..at + bytes].to_vec();
+            at += bytes;
+            if bytes % 2 == 1 && k + 1 < group.len() {
+                at += 1;
+            }
+            if p.bit.is_some() {
+                // a bit comes back as one byte, 0 or 1: put it where the bit is
+                let v = b.first().copied().unwrap_or(0) & 1;
+                b = vec![v << p.bit.unwrap()];
+            } else if b.len() != p.len {
+                return Err(format!("asked for {} bytes, the PLC sent {}", p.len, b.len()));
+            }
+            out.push(Ok(b));
+        }
+        i = j;
+    }
+    Ok(out)
+}
+
+fn write_pieces(c: &mut Conn, pieces: &[(Piece, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < pieces.len() {
+        let mut req = 10 + 2;
+        let mut j = i;
+        while j < pieces.len() && j - i < c.max_items {
+            let r = 12 + 4 + pieces[j].1.len() + pieces[j].1.len() % 2;
+            if req + r > c.pdu {
+                break;
+            }
+            req += r;
+            j += 1;
+        }
+        if j == i {
+            return Err(format!("a piece of {} bytes does not fit the PDU of {}", pieces[i].1.len(), c.pdu));
+        }
+        let group = &pieces[i..j];
+        let mut params = vec![0x05, group.len() as u8];
+        let mut data = vec![];
+        for (k, (p, b)) in group.iter().enumerate() {
+            params.extend_from_slice(&p.spec());
+            let (ts, len) = match (p.area, p.bit) {
+                (AREA_T, _) | (AREA_C, _) => (0x09, b.len()),
+                (_, Some(_)) => (0x03, 1),
+                _ => (0x04, b.len() * 8),
+            };
+            data.push(0);
+            data.push(ts);
+            data.extend_from_slice(&(len as u16).to_be_bytes());
+            data.extend_from_slice(b);
+            if b.len() % 2 == 1 && k + 1 < group.len() {
+                data.push(0);
+            }
+        }
+        let (rp, rd) = c.job(&params, &data)?;
+        if rp.len() < 2 || rp[0] != 0x05 {
+            return Err("the PLC's answer to a write is not one".into());
+        }
+        if rd.len() < group.len() {
+            return Err(format!("wrote {} items, the PLC answered for {}", group.len(), rd.len()));
+        }
+        out.extend_from_slice(&rd[..group.len()]);
+        i = j;
+    }
+    Ok(out)
+}
+
+/// Runs `f` on the named connection, connecting first, and once more on a fresh connection
+/// when the old one broke (a PLC restarted, a cable pulled and put back).
+fn with_conn<T>(name: &str, f: &dyn Fn(&mut Conn) -> Result<T, String>) -> Result<T, String> {
+    let c = get_conn(name)?;
+    let mut c = c.lock().map_err(|_| "the S7 connection is poisoned".to_string())?;
+    let fresh = c.stream.is_none();
+    c.ensure()?;
+    match f(&mut c) {
+        Ok(v) => Ok(v),
+        Err(e) if c.stream.is_some() && !broken(&e) => Err(e),
+        Err(e) => {
+            if fresh {
+                c.stream = None;
+                return Err(e);
+            }
+            c.stream = None;
+            c.connect().map_err(|e2| format!("{}; connecting again: {}", e, e2))?;
+            f(&mut c).map_err(|e| {
+                if broken(&e) {
+                    c.stream = None;
+                }
+                e
+            })
+        }
+    }
+}
+
+fn broken(e: &str) -> bool {
+    e.contains("reading from the PLC") || e.contains("sending to the PLC") || e.contains("did not answer in time") || e.contains("closed the connection") || e.contains("not an S7 PDU") || e.contains("not ISO-on-TCP")
+}
+
+fn pieces_for(a: &Addr, max: usize) -> Vec<Piece> {
+    if a.ty == Ty::Bool && a.count.is_none() {
+        return vec![Piece { area: a.area, db: a.db, start: a.byte, bit: Some(a.bit), len: 1 }];
+    }
+    split(a.area, a.db, a.byte, a.byte_len(), max)
+}
+
+fn read_addrs(c: &mut Conn, addrs: &[Addr]) -> Result<Vec<Result<Value, String>>, String> {
+    let max = c.pdu.saturating_sub(18).max(2);
+    let mut pieces = vec![];
+    let mut owner = vec![];
+    for (i, a) in addrs.iter().enumerate() {
+        for p in pieces_for(a, max) {
+            pieces.push(p);
+            owner.push(i);
+        }
+    }
+    let got = read_pieces(c, &pieces)?;
+    let mut bytes: Vec<Result<Vec<u8>, u8>> = addrs.iter().map(|_| Ok(vec![])).collect();
+    for (k, g) in got.into_iter().enumerate() {
+        let i = owner[k];
+        match (&mut bytes[i], g) {
+            (Ok(b), Ok(x)) => b.extend(x),
+            (slot @ Ok(_), Err(rc)) => *slot = Err(rc),
+            _ => {}
+        }
+    }
+    Ok(addrs.iter().zip(bytes).map(|(a, b)| match b {
+        Ok(b) => decode_addr(a, &b).map_err(|e| format!("`{}`: {}", a.text, e)),
+        Err(rc) => Err(item_error(rc, &a.text)),
+    }).collect())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The functions
+
+/// Opens a connection named `name` to the PLC at `host` (port 102, or `host:port`) by rack and
+/// slot, or keeps the one open under that name with the same settings (call it before each use); options: `timeout_ms` (5000), `connection` ("pg", "op" or "basic"),
+/// `pdu_size` (960 asked), `local_tsap` and `remote_tsap` (for LOGO! and S7-200, e.g. "02.00").
+pub fn s7_connect(name: &str, host: &str, rack: i64, slot: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !(0..=7).contains(&rack) || !(0..=31).contains(&slot) {
+        return Err("rack is 0 to 7 and slot 0 to 31".into());
+    }
+    let o = if options.is_object() { options } else { json!({}) };
+    let timeout = o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(5000).clamp(100, 120_000) as u64;
+    let kind = match o.get("connection").and_then(|v| v.as_str()).unwrap_or("pg").to_lowercase().as_str() {
+        "pg" => 1u16,
+        "op" => 2,
+        "basic" | "s7_basic" => 3,
+        k => return Err(format!("connection {:?}: use \"pg\", \"op\" or \"basic\"", k)),
+    };
+    let local = tsap(o.get("local_tsap").unwrap_or(&Value::Null), "local_tsap")?.unwrap_or(0x0100);
+    let remote = tsap(o.get("remote_tsap").unwrap_or(&Value::Null), "remote_tsap")?.unwrap_or((kind << 8) | (rack as u16 * 32 + slot as u16));
+    let want = o.get("pdu_size").and_then(|v| v.as_i64()).unwrap_or(960).clamp(240, 960) as u16;
+    let max_items = o.get("max_items").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 20) as usize;
+    let host = host.trim().to_string();
+    // The same settings under the same name: keep the connection (connecting again if it broke).
+    let existing = registry().lock().map_err(|_| "the S7 registry is poisoned".to_string())?.get(name).cloned();
+    if let Some(e) = existing {
+        let mut c = e.lock().map_err(|_| "the S7 connection is poisoned".to_string())?;
+        if c.host == host && c.local_tsap == local && c.remote_tsap == remote && c.want_pdu == want {
+            c.timeout = Duration::from_millis(timeout);
+            c.max_items = max_items;
+            c.ensure()?;
+            return Ok(json!({ "name": name, "host": c.host, "rack": rack, "slot": slot, "pdu_size": c.pdu, "remote_tsap": format!("{:02X}.{:02X}", remote >> 8, remote & 0xFF) }));
+        }
+    }
+    let mut c = Conn {
+        host,
+        rack,
+        slot,
+        local_tsap: local,
+        remote_tsap: remote,
+        want_pdu: want,
+        timeout: Duration::from_millis(timeout),
+        stream: None,
+        pdu: 240,
+        pdu_ref: 0,
+        max_items,
+    };
+    c.connect()?;
+    let info = json!({ "name": name, "host": c.host, "rack": rack, "slot": slot, "pdu_size": c.pdu, "remote_tsap": format!("{:02X}.{:02X}", remote >> 8, remote & 0xFF) });
+    let old = registry().lock().map_err(|_| "the S7 registry is poisoned".to_string())?.insert(name.to_string(), Arc::new(Mutex::new(c)));
+    if let Some(old) = old {
+        if let Ok(mut o) = old.lock() {
+            o.stream = None;
+        }
+    }
+    Ok(info)
+}
+
+/// Reads several addresses at once (`DB1.DBX0.0`, `DB1.DBW2:INT`, `DB1.DBD4:REAL`,
+/// `DB1.DBB12:STRING[20]`, `DB2.DBD0:REAL[10]`, `IW64`, `Q0.1`, `MD20:DINT`, `T1`, `C1`), in
+/// as few requests as the PDU allows: a map from each address to its value. One that fails
+/// fails the call; `s7_read_each` gives an error per address instead.
+pub fn s7_read(name: &str, addresses: Vec<String>) -> Result<serde_json::Value, String> {
+    let addrs: Vec<Addr> = addresses.iter().map(|a| parse_addr(a)).collect::<Result<_, _>>()?;
+    let vals = with_conn(name, &|c| read_addrs(c, &addrs))?;
+    let mut m = Map::new();
+    for (a, v) in addrs.iter().zip(vals) {
+        m.insert(a.text.clone(), v?);
+    }
+    Ok(Value::Object(m))
+}
+
+/// Reads several addresses, each giving `{ address, value }` or `{ address, error }`, so one
+/// missing data block does not hide the rest.
+pub fn s7_read_each(name: &str, addresses: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
+    let mut parsed = vec![];
+    let mut out: Vec<Option<Value>> = vec![];
+    for a in &addresses {
+        match parse_addr(a) {
+            Ok(x) => {
+                parsed.push(x);
+                out.push(None);
+            }
+            Err(e) => out.push(Some(json!({ "address": a, "error": e }))),
+        }
+    }
+    let vals = with_conn(name, &|c| read_addrs(c, &parsed))?;
+    let mut it = parsed.iter().zip(vals);
+    Ok(out.into_iter().map(|o| match o {
+        Some(v) => v,
+        None => {
+            let (a, v) = it.next().unwrap();
+            match v {
+                Ok(v) => json!({ "address": a.text, "value": v }),
+                Err(e) => json!({ "address": a.text, "error": e }),
+            }
+        }
+    }).collect())
+}
+
+/// Reads one address: its value.
+pub fn s7_get(name: &str, address: &str) -> Result<serde_json::Value, String> {
+    let a = parse_addr(address)?;
+    let mut v = with_conn(name, &|c| read_addrs(c, std::slice::from_ref(&a)))?;
+    v.remove(0)
+}
+
+/// Writes values to addresses (`{ "DB1.DBW34:INT": 1500, "M0.1": true, "DB1.DBB12:STRING[20]": "Line 3" }`):
+/// every value is checked against its type before anything is sent; then `{ written }`, the
+/// addresses written. Bits are written one by one, never by rewriting their byte.
+pub fn s7_write(name: &str, values: std::collections::HashMap<String, serde_json::Value>) -> Result<serde_json::Value, String> {
+    let mut keys: Vec<&String> = values.keys().collect();
+    keys.sort();
+    let mut pieces: Vec<(Piece, Vec<u8>)> = vec![];
+    let mut owner = vec![];
+    let mut addrs = vec![];
+    for k in keys {
+        let a = parse_addr(k)?;
+        let v = &values[k];
+        if a.ty == Ty::Bool {
+            let bits: Vec<Value> = match a.count {
+                None => vec![v.clone()],
+                Some(n) => {
+                    let l = v.as_array().ok_or_else(|| format!("`{}` is {} bits: give a list of {} true/false", a.text, n, n))?;
+                    if l.len() != n {
+                        return Err(format!("`{}` holds {} bits; {} given", a.text, n, l.len()));
+                    }
+                    l.clone()
+                }
+            };
+            for (i, b) in bits.iter().enumerate() {
+                let on = encode_one(&Ty::Bool, b).map_err(|e| format!("`{}`: {}", a.text, e))?[0];
+                let at = a.bit as usize + i;
+                pieces.push((Piece { area: a.area, db: a.db, start: a.byte + (at / 8) as u32, bit: Some((at % 8) as u8), len: 1 }, vec![on]));
+                owner.push(addrs.len());
+            }
+        } else {
+            let bytes = encode_addr(&a, v).map_err(|e| if e.starts_with('`') { e } else { format!("`{}`: {}", a.text, e) })?;
+            // the caller's PDU is not known yet: split at 200 bytes, which fits every PLC's 240
+            let parts = split(a.area, a.db, a.byte, bytes.len(), 200);
+            let mut at = 0;
+            for p in parts {
+                let chunk = bytes[at..at + p.len].to_vec();
+                at += p.len;
+                pieces.push((p, chunk));
+                owner.push(addrs.len());
+            }
+        }
+        addrs.push(a);
+    }
+    let codes = with_conn(name, &|c| {
+        // pieces sized for this PLC's PDU
+        let max = c.pdu.saturating_sub(28).max(2);
+        let mut sized = vec![];
+        let mut own = vec![];
+        for (k, (p, b)) in pieces.iter().enumerate() {
+            if p.bit.is_some() || b.len() <= max {
+                sized.push((p.clone(), b.clone()));
+                own.push(owner[k]);
+            } else {
+                let mut at = 0;
+                for q in split(p.area, p.db, p.start, b.len(), max) {
+                    sized.push((q.clone(), b[at..at + q.len].to_vec()));
+                    own.push(owner[k]);
+                    at += q.len;
+                }
+            }
+        }
+        let rc = write_pieces(c, &sized)?;
+        Ok((rc, own))
+    })?;
+    let (rc, own) = codes;
+    let mut failed: Vec<String> = vec![];
+    let mut seen = vec![false; addrs.len()];
+    for (k, code) in rc.iter().enumerate() {
+        let i = own[k];
+        if *code != 0xFF && !seen[i] {
+            seen[i] = true;
+            failed.push(item_error(*code, &addrs[i].text));
+        }
+    }
+    if !failed.is_empty() {
+        let ok: Vec<&str> = addrs.iter().enumerate().filter(|(i, _)| !seen[*i]).map(|(_, a)| a.text.as_str()).collect();
+        return Err(format!("{}{}", failed.join("; "), if ok.is_empty() { String::new() } else { format!(" (written: {})", ok.join(", ")) }));
+    }
+    Ok(json!({ "written": addrs.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }))
+}
+
+fn area_code(area: &str) -> Result<(u8, u16), String> {
+    let a = area.trim().to_uppercase();
+    Ok(match a.as_str() {
+        "I" | "E" | "INPUTS" => (AREA_I, 0),
+        "Q" | "A" | "OUTPUTS" => (AREA_Q, 0),
+        "M" | "MERKERS" | "FLAGS" => (AREA_M, 0),
+        "P" | "PERIPHERY" => (AREA_P, 0),
+        "T" | "TIMERS" => (AREA_T, 0),
+        "C" | "Z" | "COUNTERS" => (AREA_C, 0),
+        _ => match a.strip_prefix("DB").and_then(|n| n.parse::<u16>().ok()).filter(|n| *n > 0) {
+            Some(n) => (AREA_DB, n),
+            None => return Err(format!("area {:?}: use \"DB1\" (any data block), \"I\", \"Q\", \"M\", \"P\", \"T\" or \"C\"", area)),
+        },
+    })
+}
+
+/// Reads `count` raw bytes of an area (`"DB5"`, `"I"`, `"Q"`, `"M"`, `"P"`; for `"T"` and `"C"`,
+/// `count` timers or counters, two bytes each) from byte `start`: a list of byte values.
+pub fn s7_read_area(name: &str, area: &str, start: i64, count: i64) -> Result<Vec<u8>, String> {
+    let (a, db) = area_code(area)?;
+    if start < 0 || start > 0xFFFF || count < 1 || count > 65536 {
+        return Err("start is 0 to 65535 and count 1 to 65536".into());
+    }
+    let len = if a == AREA_T || a == AREA_C { count as usize * 2 } else { count as usize };
+    with_conn(name, &|c| {
+        let pieces = split(a, db, start as u32, len, c.pdu.saturating_sub(18).max(2));
+        let got = read_pieces(c, &pieces)?;
+        let mut out = vec![];
+        for g in got {
+            match g {
+                Ok(b) => out.extend(b),
+                Err(rc) => return Err(item_error(rc, &format!("{} from byte {}", area, start))),
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Writes raw bytes to an area from byte `start` (big data blocks split to the PDU): how many written.
+pub fn s7_write_area(name: &str, area: &str, start: i64, bytes: Vec<i64>) -> Result<i64, String> {
+    let (a, db) = area_code(area)?;
+    if start < 0 || start > 0xFFFF || bytes.is_empty() {
+        return Err("start is 0 to 65535, and give at least one byte".into());
+    }
+    let b: Vec<u8> = bytes.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect::<Result<_, _>>()?;
+    if (a == AREA_T || a == AREA_C) && b.len() % 2 == 1 {
+        return Err("timers and counters are two bytes each".into());
+    }
+    with_conn(name, &|c| {
+        let max = c.pdu.saturating_sub(28).max(2);
+        let mut at = 0;
+        let mut ps = vec![];
+        for p in split(a, db, start as u32, b.len(), max) {
+            ps.push((p.clone(), b[at..at + p.len].to_vec()));
+            at += p.len;
+        }
+        let rc = write_pieces(c, &ps)?;
+        if let Some(bad) = rc.iter().find(|x| **x != 0xFF) {
+            return Err(item_error(*bad, &format!("{} from byte {}", area, start)));
+        }
+        Ok(b.len() as i64)
+    })
+}
+
+/// Reads a system status list (SZL) with every fragment: `{ id, index, record_length, records }`,
+/// each record as hex.
+fn szl(c: &mut Conn, id: u16, index: u16) -> Result<(usize, Vec<Vec<u8>>), String> {
+    let i = id.to_be_bytes();
+    let x = index.to_be_bytes();
+    let (p, d) = c.userdata(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00], &[0xFF, 0x09, 0x00, 0x04, i[0], i[1], x[0], x[1]])?;
+    let parse = |p: &[u8], d: &[u8], body: &mut Vec<u8>| -> Result<(bool, u8, u8), String> {
+        if p.len() < 12 {
+            return Err("the PLC's SZL answer has no parameters".into());
+        }
+        let err = u16::from_be_bytes([p[10], p[11]]);
+        if err != 0 {
+            return Err(match err {
+                0xD401 => format!("the CPU has no SZL 0x{:04X} index 0x{:04X}", id, index),
+                0xD402 | 0xD404 => format!("SZL 0x{:04X}: the CPU does not offer that list", id),
+                _ => format!("SZL 0x{:04X}: the CPU refused it (error 0x{:04X})", id, err),
+            });
+        }
+        if d.len() < 4 || d[0] != 0xFF {
+            return Err(format!("SZL 0x{:04X}: the CPU refused it (return code 0x{:02X})", id, d.first().copied().unwrap_or(0)));
+        }
+        let len = u16::from_be_bytes([d[2], d[3]]) as usize;
+        let data = &d[4..(4 + len).min(d.len())];
+        body.extend_from_slice(data);
+        Ok((p[9] != 0, p[7], p[8]))
+    };
+    let mut body = vec![];
+    let (mut more, mut seq, mut dur) = parse(&p, &d, &mut body)?;
+    let mut rounds = 0;
+    while more && rounds < 200 {
+        rounds += 1;
+        let (p2, d2) = c.userdata(&[0x00, 0x01, 0x12, 0x08, 0x12, 0x44, 0x01, seq, dur, 0x00, 0x00, 0x00], &[0x0A, 0x00, 0x00, 0x00])?;
+        let r = parse(&p2, &d2, &mut body)?;
+        more = r.0;
+        seq = r.1;
+        dur = r.2;
+    }
+    if body.len() < 8 {
+        return Err(format!("SZL 0x{:04X}: a short answer", id));
+    }
+    let rec_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+    let n = u16::from_be_bytes([body[6], body[7]]) as usize;
+    let mut recs = vec![];
+    let mut at = 8;
+    for _ in 0..n {
+        if rec_len == 0 || at + rec_len > body.len() {
+            break;
+        }
+        recs.push(body[at..at + rec_len].to_vec());
+        at += rec_len;
+    }
+    Ok((rec_len, recs))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// Reads a system status list by its ID and index (e.g. 0x0011 = 17 for module identification,
+/// 0x001C = 28 for component identification, 0x0424 = 1060 for the mode): its records as hex.
+pub fn s7_szl(name: &str, id: i64, index: i64) -> Result<serde_json::Value, String> {
+    if !(0..=0xFFFF).contains(&id) || !(0..=0xFFFF).contains(&index) {
+        return Err("id and index are 0 to 65535".into());
+    }
+    let (rl, recs) = with_conn(name, &|c| szl(c, id as u16, index as u16))?;
+    Ok(json!({ "id": id, "index": index, "record_length": rl, "records": recs.iter().map(|r| hex(r)).collect::<Vec<_>>() }))
+}
+
+fn mode_name(m: u8) -> &'static str {
+    match m {
+        1..=4 => "stop",
+        5..=7 => "startup",
+        8 | 9 => "run",
+        0x0A => "hold",
+        0x0D => "defect",
+        _ => "unknown",
+    }
+}
+
+/// The CPU's operating mode: `{ state: "run" | "stop" | "startup" | "hold" | "defect" | "unknown",
+/// running, code, previous }` (from SZL 0x0424; `previous` is null when the CPU does not say).
+pub fn s7_cpu_state(name: &str) -> Result<serde_json::Value, String> {
+    let (_, recs) = with_conn(name, &|c| szl(c, 0x0424, 0))?;
+    let r = recs.first().ok_or("the CPU sent no mode record")?;
+    if r.len() < 4 {
+        return Err("a short mode record".into());
+    }
+    let now = r[3] & 0x0F;
+    let before = r[3] >> 4;
+    Ok(json!({ "state": mode_name(now), "running": mode_name(now) == "run", "code": now, "previous": if before == 0 { Value::Null } else { json!(mode_name(before)) } }))
+}
+
+fn text_of(b: &[u8]) -> String {
+    latin1(b).trim_end_matches(|c: char| c == '\0' || c == ' ').trim().to_string()
+}
+
+/// The CPU's identity: order code and firmware (SZL 0x0011), and its names, serial number and
+/// module type (SZL 0x001C); what a CPU does not offer is left out.
+pub fn s7_cpu_info(name: &str) -> Result<serde_json::Value, String> {
+    let (a, b) = with_conn(name, &|c| Ok((szl(c, 0x0011, 0), szl(c, 0x001C, 0))))?;
+    let mut m = Map::new();
+    if let Ok((_, recs)) = a {
+        for r in recs {
+            if r.len() < 28 {
+                continue;
+            }
+            let idx = u16::from_be_bytes([r[0], r[1]]);
+            if idx == 1 {
+                m.insert("order_code".into(), json!(text_of(&r[2..22])));
+            }
+            if idx == 7 && r[24] == b'V' {
+                m.insert("firmware".into(), json!(format!("V{}.{}.{}", r[25], r[26], r[27])));
+            }
+            if idx == 6 && m.get("hardware").is_none() {
+                m.insert("hardware".into(), json!(u16::from_be_bytes([r[26], r[27]])));
+            }
+        }
+    }
+    if let Ok((_, recs)) = b {
+        for r in recs {
+            if r.len() < 4 {
+                continue;
+            }
+            let idx = u16::from_be_bytes([r[0], r[1]]);
+            let key = match idx {
+                1 => "as_name",
+                2 => "module_name",
+                3 => "plant_id",
+                4 => "copyright",
+                5 => "serial_number",
+                7 => "module_type",
+                8 => "memory_card_serial",
+                11 => "location",
+                _ => continue,
+            };
+            let t = text_of(&r[2..]);
+            if !t.is_empty() {
+                m.insert(key.into(), json!(t));
+            }
+        }
+    }
+    if m.is_empty() {
+        return Err("the CPU answered neither SZL 0x0011 nor 0x001C".into());
+    }
+    Ok(Value::Object(m))
+}
+
+/// Closes the named connection: true when there was one.
+pub fn s7_close(name: &str) -> bool {
+    let c = registry().lock().ok().and_then(|mut r| r.remove(name));
+    match c {
+        Some(c) => {
+            if let Ok(mut c) = c.lock() {
+                if let Some(s) = c.stream.take() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// What an address means, without a PLC: `{ area, db, byte, bit, type, count, bytes }`, or why it is wrong.
+pub fn s7_address(address: &str) -> Result<serde_json::Value, String> {
+    let a = parse_addr(address)?;
+    Ok(json!({
+        "address": a.text, "area": area_name(a.area), "db": if a.area == AREA_DB { json!(a.db) } else { Value::Null },
+        "byte": a.byte, "bit": if a.ty == Ty::Bool { json!(a.bit) } else { Value::Null },
+        "type": a.ty.name(), "count": a.count, "bytes": a.byte_len(),
+    }))
+}
+
+/// A typed value from its bytes as the PLC keeps them (big-endian): `s7_decode("REAL", [66, 145, 0, 0])` is 72.5.
+pub fn s7_decode(kind: &str, bytes: Vec<i64>) -> Result<serde_json::Value, String> {
+    let (ty, count) = parse_type(kind)?;
+    let b: Vec<u8> = bytes.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect::<Result<_, _>>()?;
+    let a = Addr { text: kind.to_string(), area: AREA_DB, db: 1, byte: 0, bit: 0, ty, count };
+    let need = if a.ty == Ty::Bool { a.count.map(|n| (n + 7) / 8).unwrap_or(1) } else { a.byte_len() };
+    if b.len() < need {
+        return Err(format!("{} needs {} bytes, {} given", kind, need, b.len()));
+    }
+    decode_addr(&a, &b)
+}
+
+/// A typed value as the bytes the PLC keeps (big-endian): `s7_encode("INT", -2)` is [255, 254].
+pub fn s7_encode(kind: &str, value: serde_json::Value) -> Result<Vec<u8>, String> {
+    let (ty, count) = parse_type(kind)?;
+    if ty == Ty::Bool && count.is_some() {
+        let l = value.as_array().ok_or("a BOOL array takes a list of true/false")?;
+        let mut out = vec![0u8; (l.len() + 7) / 8];
+        for (i, v) in l.iter().enumerate() {
+            if encode_one(&Ty::Bool, v)?[0] == 1 {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        return Ok(out);
+    }
+    let a = Addr { text: kind.to_string(), area: AREA_DB, db: 1, byte: 0, bit: 0, ty, count };
+    encode_addr(&a, &value)
+}

@@ -1,0 +1,317 @@
+//! XML-RPC both ways: calls and answers built and read with every value type (int, i8, boolean, string, double, dateTime, base64, struct, array, nil) and faults, a client over HTTP with system.multicall, and the server side for routes (a call read, an answer or a fault written).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! roxmltree = "0.20"
+//! base64 = "0.22"
+//! ureq = "2"
+
+use serde_json::{json, Value};
+
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '\r' => o.push_str("&#13;"),
+            c if (c as u32) < 0x20 && c != '\n' && c != '\t' => {}
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// `2026-10-30T12:00:00` (or `...Z`, or the XML-RPC form) as XML-RPC writes it: `20261030T12:00:00`.
+fn to_iso8601_basic(s: &str) -> Result<String, String> {
+    let t = s.trim().trim_end_matches('Z');
+    let t = if t.len() > 19 && t.as_bytes()[10] == b'T' { &t[..19] } else { t };
+    let compact = t.replacen('-', "", 2);
+    let ok = compact.len() == 17 && compact.as_bytes()[8] == b'T' && compact[..8].bytes().all(|b| b.is_ascii_digit());
+    if !ok {
+        return Err(format!("{:?} is not a date and time (2026-10-30T12:00:00)", s));
+    }
+    Ok(compact)
+}
+
+fn value_xml(v: &Value, out: &mut String, depth: usize) -> Result<(), String> {
+    if depth > 64 {
+        return Err("values nested more than 64 deep".into());
+    }
+    out.push_str("<value>");
+    match v {
+        Value::Null => out.push_str("<nil/>"),
+        Value::Bool(b) => out.push_str(&format!("<boolean>{}</boolean>", if *b { 1 } else { 0 })),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    out.push_str(&format!("<int>{}</int>", i));
+                } else {
+                    out.push_str(&format!("<i8>{}</i8>", i));
+                }
+            } else {
+                let f = n.as_f64().unwrap_or(0.0);
+                let mut s = format!("{}", f);
+                if !s.contains('.') && !s.contains('e') {
+                    s.push_str(".0");
+                }
+                out.push_str(&format!("<double>{}</double>", s));
+            }
+        }
+        Value::String(s) => out.push_str(&format!("<string>{}</string>", esc(s))),
+        Value::Array(a) => {
+            out.push_str("<array><data>");
+            for x in a {
+                value_xml(x, out, depth + 1)?;
+            }
+            out.push_str("</data></array>");
+        }
+        Value::Object(m) => {
+            if m.len() == 1 {
+                if let Some(Value::String(b)) = m.get("$base64") {
+                    out.push_str(&format!("<base64>{}</base64>", esc(b.trim())));
+                    out.push_str("</value>");
+                    return Ok(());
+                }
+                if let Some(Value::String(d)) = m.get("$datetime") {
+                    out.push_str(&format!("<dateTime.iso8601>{}</dateTime.iso8601>", to_iso8601_basic(d)?));
+                    out.push_str("</value>");
+                    return Ok(());
+                }
+            }
+            out.push_str("<struct>");
+            for (k, x) in m {
+                out.push_str(&format!("<member><name>{}</name>", esc(k)));
+                value_xml(x, out, depth + 1)?;
+                out.push_str("</member>");
+            }
+            out.push_str("</struct>");
+        }
+    }
+    out.push_str("</value>");
+    Ok(())
+}
+
+fn params_xml(params: &[Value], out: &mut String) -> Result<(), String> {
+    out.push_str("<params>");
+    for p in params {
+        out.push_str("<param>");
+        value_xml(p, out, 0)?;
+        out.push_str("</param>");
+    }
+    out.push_str("</params>");
+    Ok(())
+}
+
+fn call_xml(method: &str, params: &[Value]) -> Result<String, String> {
+    if method.is_empty() || !method.chars().all(|c| c.is_ascii_alphanumeric() || "_.:/".contains(c)) {
+        return Err(format!("{:?} is not a method name (letters, digits, _ . : /)", method));
+    }
+    let mut out = format!("<?xml version=\"1.0\"?>\n<methodCall><methodName>{}</methodName>", method);
+    params_xml(params, &mut out)?;
+    out.push_str("</methodCall>\n");
+    Ok(out)
+}
+
+/// A call as XML-RPC text, to send yourself: `params` is a list of values. Ints past 32 bits go as `<i8>` (the Apache extension most servers know), null as `<nil/>`; `{ "$base64": "..." }` is a base64 value and `{ "$datetime": "2026-10-30T12:00:00" }` a dateTime.iso8601 (`xmlrpc_base64` and `xmlrpc_datetime` make them).
+pub fn xmlrpc_request(method: &str, params: Vec<serde_json::Value>) -> Result<String, String> {
+    call_xml(method, &params)
+}
+
+/// An answer to a call, as XML-RPC text: for a route serving XML-RPC (`respond(200, xmlrpc_response(v)?, { "content-type": "text/xml" })`).
+pub fn xmlrpc_response(value: serde_json::Value) -> Result<String, String> {
+    let mut out = String::from("<?xml version=\"1.0\"?>\n<methodResponse>");
+    params_xml(&[value], &mut out)?;
+    out.push_str("</methodResponse>\n");
+    Ok(out)
+}
+
+/// A fault answer, as XML-RPC text: `code` and `message` (faultCode and faultString).
+pub fn xmlrpc_fault(code: i64, message: &str) -> String {
+    let mut out = String::from("<?xml version=\"1.0\"?>\n<methodResponse><fault>");
+    let _ = value_xml(&json!({ "faultCode": code, "faultString": message }), &mut out, 0);
+    out.push_str("</fault></methodResponse>\n");
+    out
+}
+
+/// A base64 value for a call (`b64` is base64 text): a file's bytes, an image.
+pub fn xmlrpc_base64(b64: &str) -> Value {
+    json!({ "$base64": b64 })
+}
+
+/// A dateTime.iso8601 value for a call, from `2026-10-30T12:00:00`.
+pub fn xmlrpc_datetime(iso: &str) -> Result<Value, String> {
+    to_iso8601_basic(iso)?;
+    Ok(json!({ "$datetime": iso }))
+}
+
+// ---------------------------------------------------------------- reading
+
+fn elems<'a, 'i>(n: roxmltree::Node<'a, 'i>) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> {
+    n.children().filter(|c| c.is_element())
+}
+
+fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    elems(n).find(|c| c.tag_name().name() == name)
+}
+
+fn text_of(n: roxmltree::Node) -> String {
+    n.descendants().filter(|d| d.is_text()).map(|d| d.text().unwrap_or("")).collect()
+}
+
+fn read_value(v: roxmltree::Node, depth: usize) -> Result<Value, String> {
+    if depth > 64 {
+        return Err("values nested more than 64 deep".into());
+    }
+    let typed = elems(v).next();
+    let t = match typed {
+        None => return Ok(json!(text_of(v))), // no type: a string
+        Some(t) => t,
+    };
+    let name = t.tag_name().name();
+    let text = text_of(t);
+    let s = text.trim();
+    Ok(match name {
+        "i4" | "int" | "i1" | "i2" | "i8" | "biginteger" => json!(s.parse::<i64>().map_err(|_| format!("<{}>{}</{}> is not an integer", name, s, name))?),
+        "boolean" => match s { "1" | "true" => json!(true), "0" | "false" => json!(false), _ => return Err(format!("<boolean>{}</boolean> is neither 0 nor 1", s)) },
+        "string" => json!(text),
+        "double" | "float" | "bigdecimal" => {
+            let f: f64 = s.parse().map_err(|_| format!("<double>{}</double> is not a number", s))?;
+            serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
+        }
+        "dateTime.iso8601" => {
+            // 19980717T14:08:55 (sometimes with dashes or a zone): given back as 1998-07-17T14:08:55.
+            let c = s.replace('-', "");
+            if c.len() >= 17 && c.as_bytes()[8] == b'T' {
+                json!(format!("{}-{}-{}{}", &c[..4], &c[4..6], &c[6..8], &c[8..]))
+            } else {
+                json!(s)
+            }
+        }
+        "base64" => json!(s.split_whitespace().collect::<String>()),
+        "nil" => Value::Null,
+        "array" => {
+            let data = child(t, "data").ok_or("an <array> has a <data>")?;
+            let mut out = vec![];
+            for x in elems(data).filter(|e| e.tag_name().name() == "value") {
+                out.push(read_value(x, depth + 1)?);
+            }
+            Value::Array(out)
+        }
+        "struct" => {
+            let mut m = serde_json::Map::new();
+            for mem in elems(t).filter(|e| e.tag_name().name() == "member") {
+                let k = child(mem, "name").map(text_of).ok_or("a <member> has a <name>")?;
+                let val = child(mem, "value").ok_or("a <member> has a <value>")?;
+                m.insert(k, read_value(val, depth + 1)?);
+            }
+            Value::Object(m)
+        }
+        other => return Err(format!("unknown XML-RPC type <{}>", other)),
+    })
+}
+
+fn read_params(n: Option<roxmltree::Node>) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    if let Some(ps) = n {
+        for p in elems(ps).filter(|e| e.tag_name().name() == "param") {
+            let v = child(p, "value").ok_or("a <param> has a <value>")?;
+            out.push(read_value(v, 0)?);
+        }
+    }
+    Ok(out)
+}
+
+fn parse(xml: &str) -> Result<Value, String> {
+    let opts = roxmltree::ParsingOptions { allow_dtd: false, ..Default::default() };
+    let doc = roxmltree::Document::parse_with_options(xml.trim_start_matches('\u{feff}'), opts).map_err(|e| format!("not XML: {}", e))?;
+    let root = doc.root_element();
+    match root.tag_name().name() {
+        "methodCall" => {
+            let method = child(root, "methodName").map(|n| text_of(n).trim().to_string()).ok_or("a <methodCall> has a <methodName>")?;
+            Ok(json!({ "kind": "call", "method": method, "params": read_params(child(root, "params"))? }))
+        }
+        "methodResponse" => {
+            if let Some(f) = child(root, "fault") {
+                let v = child(f, "value").ok_or("a <fault> has a <value>")?;
+                let s = read_value(v, 0)?;
+                return Ok(json!({ "kind": "fault", "code": s["faultCode"], "message": s["faultString"] }));
+            }
+            let ps = read_params(child(root, "params"))?;
+            Ok(json!({ "kind": "response", "value": ps.into_iter().next().unwrap_or(Value::Null) }))
+        }
+        other => Err(format!("an XML-RPC message is a <methodCall> or a <methodResponse>, not <{}>", other)),
+    }
+}
+
+/// XML-RPC text read: a call is `{ kind: "call", method, params }` (what a route serving XML-RPC gets in `request.body`), an answer `{ kind: "response", value }`, a fault `{ kind: "fault", code, message }`. A dateTime comes back as `1998-07-17T14:08:55`, base64 as its text, a value with no type as a string.
+pub fn xmlrpc_parse(xml: &str) -> Result<Value, String> {
+    parse(xml)
+}
+
+// ---------------------------------------------------------------- client
+
+fn post(url: &str, body: &str, opts: &Value) -> Result<String, String> {
+    let ms = opts["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 300_000) as u64;
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_millis(ms)).build();
+    let mut req = agent.post(url).set("Content-Type", "text/xml").set("User-Agent", "quillo-xml-rpc/1.0");
+    if let (Some(u), Some(p)) = (opts["user"].as_str(), opts["password"].as_str()) {
+        use base64::Engine;
+        req = req.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+    }
+    if let Some(h) = opts["headers"].as_object() {
+        for (k, v) in h {
+            if let Some(v) = v.as_str() {
+                req = req.set(k, v);
+            }
+        }
+    }
+    match req.send_string(body) {
+        Ok(r) => r.into_string().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            // Some servers send a fault with a 500.
+            if t.contains("<methodResponse") {
+                return Ok(t);
+            }
+            Err(format!("the XML-RPC server answered HTTP {}{}", code, if code == 401 { " (give user and password)" } else { "" }))
+        }
+        Err(e) => Err(format!("cannot reach {}: {}", url, e)),
+    }
+}
+
+/// Calls `method` with `params` at `url` (http:// or https://) and gives the answer's value; a fault is an error value, `fault 4: Too many parameters`. `options`: `{ timeout_ms (10000), user, password (basic auth), headers }`.
+pub fn xmlrpc_call(url: &str, method: &str, params: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    let r = parse(&post(url, &call_xml(method, &params)?, &options)?)?;
+    match r["kind"].as_str() {
+        Some("response") => Ok(r["value"].clone()),
+        Some("fault") => Err(format!("fault {}: {}", r["code"], r["message"].as_str().unwrap_or(""))),
+        _ => Err("the server answered with a call, not a response".into()),
+    }
+}
+
+/// Several calls in one request with `system.multicall`: `calls` is `[{ method, params }]`; gives one item per call, `{ value }` or `{ fault: { code, message } }`, in order.
+pub fn xmlrpc_multicall(url: &str, calls: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    let list: Vec<Value> = calls
+        .iter()
+        .map(|c| json!({ "methodName": c["method"], "params": if c["params"].is_array() { c["params"].clone() } else { json!([]) } }))
+        .collect();
+    let r = parse(&post(url, &call_xml("system.multicall", &[Value::Array(list)])?, &options)?)?;
+    if r["kind"] == "fault" {
+        return Err(format!("fault {}: {}", r["code"], r["message"].as_str().unwrap_or("")));
+    }
+    let items = r["value"].as_array().ok_or("system.multicall answered with something other than a list")?;
+    Ok(Value::Array(
+        items
+            .iter()
+            .map(|i| match i {
+                // A result is a list of one; a fault a struct.
+                Value::Array(a) => json!({ "value": a.first().cloned().unwrap_or(Value::Null) }),
+                Value::Object(f) => json!({ "fault": { "code": f.get("faultCode"), "message": f.get("faultString") } }),
+                other => json!({ "value": other }),
+            })
+            .collect(),
+    ))
+}

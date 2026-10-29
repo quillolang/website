@@ -1,0 +1,676 @@
+//! A gRPC client with no generated code: a `.proto` file read when the program runs (or the server's own reflection), unary, server-streaming, client-streaming and bidirectional calls with JSON in and out, metadata, deadlines, status codes and messages, TLS, gzip, and connections kept open over HTTP/2.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! protox = "0.7"
+//! prost-reflect = { version = "0.14", features = ["serde"] }
+//! prost = "0.13"
+//! prost-types = "0.13"
+//! h2 = "0.4"
+//! http = "1"
+//! bytes = "1"
+//! tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+//! tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "1"
+//! flate2 = "1"
+//! base64 = "0.22"
+
+use bytes::{Buf, Bytes, BytesMut};
+use prost::Message as _;
+use prost_reflect::{DescriptorPool, DeserializeOptions, DynamicMessage, MessageDescriptor, MethodDescriptor, SerializeOptions};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+const CODES: [&str; 17] = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"];
+
+fn code_name(c: i64) -> &'static str {
+    CODES.get(c as usize).copied().unwrap_or("UNKNOWN")
+}
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("grpc").enable_all().build().expect("a tokio runtime"))
+}
+
+// ---------------------------------------------------------------- descriptors
+
+struct Pools {
+    by_file: HashMap<String, (Vec<SystemTime>, DescriptorPool)>,
+    by_server: HashMap<String, DescriptorPool>,
+}
+
+static POOLS: Mutex<Option<Pools>> = Mutex::new(None);
+
+fn files_of(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+        _ => vec![],
+    }
+}
+
+/// The .proto files compiled (with their imports and Google's well-known types), kept until one changes.
+fn pool_from_files(files: &[String], includes: &[String]) -> Result<DescriptorPool, String> {
+    let key = format!("{:?}|{:?}", files, includes);
+    let stamps: Vec<SystemTime> = files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)).collect();
+    {
+        let g = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((s, p)) = g.as_ref().and_then(|p| p.by_file.get(&key)) {
+            if *s == stamps {
+                return Ok(p.clone());
+            }
+        }
+    }
+    let mut inc: Vec<std::path::PathBuf> = includes.iter().map(std::path::PathBuf::from).collect();
+    let mut rel = vec![];
+    for f in files {
+        let p = std::path::Path::new(f);
+        if !p.exists() {
+            return Err(format!("no .proto file at {}", f));
+        }
+        // A file outside the include folders is opened from its own folder.
+        match inc.iter().find(|i| p.starts_with(i)) {
+            Some(i) => rel.push(p.strip_prefix(i).unwrap().to_path_buf()),
+            None => {
+                let dir = p.parent().map(|d| if d.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { d.to_path_buf() }).unwrap_or_else(|| ".".into());
+                inc.push(dir);
+                rel.push(std::path::PathBuf::from(p.file_name().unwrap()));
+            }
+        }
+    }
+    let mut c = protox::Compiler::new(&inc).map_err(|e| e.to_string())?;
+    c.include_imports(true);
+    for r in &rel {
+        c.open_file(r).map_err(|e| e.to_string())?;
+    }
+    let pool = c.descriptor_pool();
+    let mut g = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| Pools { by_file: HashMap::new(), by_server: HashMap::new() }).by_file.insert(key, (stamps, pool.clone()));
+    Ok(pool)
+}
+
+fn pool_for(url: &str, o: &Value) -> Result<DescriptorPool, String> {
+    let files = files_of(&o["proto"]);
+    if !files.is_empty() {
+        return pool_from_files(&files, &files_of(&o["include"]));
+    }
+    {
+        let g = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = g.as_ref().and_then(|p| p.by_server.get(url)) {
+            return Ok(p.clone());
+        }
+    }
+    let pool = reflect_pool(url, o).map_err(|e| format!("no `proto` file given, and the server's reflection did not answer: {}", e))?;
+    let mut g = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| Pools { by_file: HashMap::new(), by_server: HashMap::new() }).by_server.insert(url.to_string(), pool.clone());
+    Ok(pool)
+}
+
+/// `pkg.Service/Method`, `/pkg.Service/Method` or `pkg.Service.Method`.
+fn find_method(pool: &DescriptorPool, name: &str) -> Result<MethodDescriptor, String> {
+    let n = name.trim_start_matches('/');
+    let (svc, m) = match n.split_once('/') {
+        Some(x) => x,
+        None => n.rsplit_once('.').ok_or(format!("{:?}: name a method as package.Service/Method", name))?,
+    };
+    let service = pool.get_service_by_name(svc).ok_or_else(|| {
+        let all: Vec<String> = pool.services().map(|s| s.full_name().to_string()).collect();
+        format!("no service {:?}; there are: {}", svc, all.join(", "))
+    })?;
+    let found = service.methods().find(|x| x.name() == m);
+    found.ok_or_else(|| format!("{} has no method {:?}; it has: {}", svc, m, service.methods().map(|x| x.name().to_string()).collect::<Vec<_>>().join(", ")))
+}
+
+fn to_message(desc: &MessageDescriptor, v: &Value) -> Result<DynamicMessage, String> {
+    let v = if v.is_null() { json!({}) } else { v.clone() };
+    DynamicMessage::deserialize_with_options(desc.clone(), v, &DeserializeOptions::new().deny_unknown_fields(true)).map_err(|e| format!("the request does not fit {}: {}", desc.full_name(), e))
+}
+
+fn to_json(m: &DynamicMessage, o: &Value) -> Result<Value, String> {
+    let opts = SerializeOptions::new()
+        .stringify_64_bit_integers(false)
+        .use_proto_field_name(!o["json_names"].as_bool().unwrap_or(false))
+        .skip_default_fields(o["skip_defaults"].as_bool().unwrap_or(false))
+        .use_enum_numbers(o["enum_numbers"].as_bool().unwrap_or(false));
+    m.serialize_with_options(serde_json::value::Serializer, &opts).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------- transport
+
+type Conn = h2::client::SendRequest<Bytes>;
+
+static CONNS: Mutex<Option<HashMap<String, Conn>>> = Mutex::new(None);
+
+struct Target {
+    tls: bool,
+    host: String,
+    port: u16,
+    authority: String,
+    key: String,
+}
+
+fn target(url: &str, o: &Value) -> Result<Target, String> {
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") { (true, r) } else if let Some(r) = url.strip_prefix("http://") { (false, r) } else if let Some(r) = url.strip_prefix("grpcs://") { (true, r) } else if let Some(r) = url.strip_prefix("grpc://") { (false, r) } else {
+        return Err(format!("{:?}: a gRPC address is http://host:port (plain HTTP/2) or https://host:port (TLS)", url));
+    };
+    let hp = rest.split('/').next().unwrap_or("");
+    let (host, port) = if let Some(h) = hp.strip_prefix('[') {
+        let (h, p) = h.split_once(']').ok_or("an IPv6 address is written [::1]:50051")?;
+        (h.to_string(), p.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(if tls { 443 } else { 80 }))
+    } else {
+        match hp.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("{:?} is not a port", p))?),
+            None => (hp.to_string(), if tls { 443 } else { 80 }),
+        }
+    };
+    Ok(Target { tls, authority: hp.to_string(), key: format!("{}|{}|{}", url.trim_end_matches('/'), o["ca_file"].as_str().unwrap_or(""), o["server_name"].as_str().unwrap_or("")), host, port })
+}
+
+fn tls_config(ca_file: Option<&str>) -> Result<Arc<tokio_rustls::rustls::ClientConfig>, String> {
+    use tokio_rustls::rustls;
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_file {
+        Some(f) => {
+            let data = std::fs::read(f).map_err(|e| format!("cannot read the CA file {}: {}", f, e))?;
+            for c in rustls_pemfile::certs(&mut &data[..]) {
+                roots.add(c.map_err(|e| format!("{}: {}", f, e))?).map_err(|e| format!("{}: {}", f, e))?;
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+async fn handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(io: T) -> Result<Conn, String> {
+    let (send, conn) = h2::client::Builder::new().initial_window_size(1 << 20).initial_connection_window_size(4 << 20).max_frame_size(1 << 20).handshake(io).await.map_err(|e| format!("the HTTP/2 handshake failed: {}", e))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(send)
+}
+
+async fn connect(t: &Target, o: &Value, timeout: Duration) -> Result<Conn, String> {
+    let addr = format!("{}:{}", t.host, t.port);
+    let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await.map_err(|_| format!("connecting to {} took more than {} ms", addr, timeout.as_millis()))?.map_err(|e| format!("cannot connect to {}: {}", addr, e))?;
+    let _ = tcp.set_nodelay(true);
+    if !t.tls {
+        return handshake(tcp).await;
+    }
+    let name_text = o["server_name"].as_str().unwrap_or(&t.host).to_string();
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(name_text.clone()).map_err(|e| format!("{:?}: {}", name_text, e))?;
+    let tls = tokio::time::timeout(timeout, tokio_rustls::TlsConnector::from(tls_config(o["ca_file"].as_str())?).connect(name, tcp)).await.map_err(|_| "the TLS handshake took too long".to_string())?.map_err(|e| format!("TLS with {} failed: {}", addr, e))?;
+    if tls.get_ref().1.alpn_protocol() != Some(b"h2") {
+        return Err(format!("{} did not agree to HTTP/2 over TLS (ALPN h2): is it a gRPC server?", addr));
+    }
+    handshake(tls).await
+}
+
+async fn ready(t: &Target, o: &Value, timeout: Duration) -> Result<Conn, String> {
+    let kept = CONNS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&t.key)).cloned();
+    if let Some(c) = kept {
+        // A kept connection the server closed is not ready: open another.
+        if let Ok(Ok(c)) = tokio::time::timeout(timeout, c.ready()).await {
+            return Ok(c);
+        }
+    }
+    let c = connect(t, o, timeout).await?;
+    let c = c.ready().await.map_err(|e| e.to_string())?;
+    CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(t.key.clone(), c.clone());
+    Ok(c)
+}
+
+fn frame(msg: &[u8]) -> Bytes {
+    let mut b = BytesMut::with_capacity(5 + msg.len());
+    b.extend_from_slice(&[0]);
+    b.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    b.extend_from_slice(msg);
+    b.freeze()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let h = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            out.push(h(b[i + 1]) * 16 + h(b[i + 2]));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn header_map(h: &http::HeaderMap) -> Value {
+    let mut m = Map::new();
+    for (k, v) in h {
+        let key = k.as_str();
+        if key == "content-type" || key == "grpc-status" || key == "grpc-message" {
+            continue;
+        }
+        let val = if key.ends_with("-bin") { json!(v.to_str().unwrap_or("")) } else { json!(String::from_utf8_lossy(v.as_bytes())) };
+        m.insert(key.to_string(), val);
+    }
+    Value::Object(m)
+}
+
+struct Outcome {
+    code: i64,
+    message: String,
+    messages: Vec<Bytes>,
+    headers: Value,
+    trailers: Value,
+    truncated: bool,
+}
+
+/// One call on the wire: the request messages sent (then the stream half-closed), every answer
+/// message read (up to `limit`), and the status from the trailers.
+async fn exchange(url: &str, path: &str, msgs: Vec<Vec<u8>>, o: &Value, limit: usize) -> Result<Outcome, String> {
+    let t = target(url, o)?;
+    let timeout = Duration::from_millis(o["timeout_ms"].as_i64().unwrap_or(10_000).clamp(1, 3_600_000) as u64);
+    let until = Instant::now() + timeout;
+    let work = async {
+        let mut conn = ready(&t, o, timeout).await?;
+        let mut req = http::Request::builder()
+            .method("POST")
+            .uri(format!("{}://{}{}", if t.tls { "https" } else { "http" }, t.authority, path))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("user-agent", "quillo-grpc/1.0")
+            .header("grpc-accept-encoding", "gzip")
+            .header("grpc-timeout", format!("{}m", timeout.as_millis().min(99_999_999)));
+        if let Some(md) = o["metadata"].as_object() {
+            for (k, v) in md {
+                let k = k.to_lowercase();
+                if k.starts_with(':') || k == "content-type" || k == "te" || k.starts_with("grpc-") {
+                    return Err(format!("metadata {:?} is reserved", k));
+                }
+                let v = match v { Value::String(s) => s.clone(), other => other.to_string() };
+                let hv = http::HeaderValue::from_str(&v).map_err(|_| format!("metadata {:?}: the value is not valid (use a key ending in -bin with base64 for bytes)", k))?;
+                req = req.header(k.as_str(), hv);
+            }
+        }
+        let req = req.body(()).map_err(|e| e.to_string())?;
+        let (resp, mut send) = conn.send_request(req, false).map_err(|e| format!("cannot start the call: {}", e))?;
+        let n = msgs.len();
+        for (i, m) in msgs.into_iter().enumerate() {
+            send.send_data(frame(&m), i + 1 == n).map_err(|e| format!("sending the request: {}", e))?;
+        }
+        if n == 0 {
+            send.send_data(Bytes::new(), true).map_err(|e| e.to_string())?;
+        }
+        let resp = resp.await.map_err(|e| format!("the server did not answer: {}", e))?;
+        let (parts, mut body) = resp.into_parts();
+        let headers = header_map(&parts.headers);
+        // Trailers-only answers carry the status in the headers.
+        let status_in = |h: &http::HeaderMap| h.get("grpc-status").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<i64>().ok());
+        let message_in = |h: &http::HeaderMap| h.get("grpc-message").and_then(|v| v.to_str().ok()).map(percent_decode).unwrap_or_default();
+        if parts.status != http::StatusCode::OK {
+            let code = match parts.status.as_u16() { 400 => 13, 401 => 16, 403 => 7, 404 => 12, 429 | 502 | 503 | 504 => 14, _ => 2 };
+            return Ok(Outcome { code, message: format!("HTTP {} from the server (is it a gRPC endpoint?)", parts.status.as_u16()), messages: vec![], headers, trailers: json!({}), truncated: false });
+        }
+        if let Some(code) = status_in(&parts.headers) {
+            if body.is_end_stream() {
+                return Ok(Outcome { code, message: message_in(&parts.headers), messages: vec![], headers: json!({}), trailers: headers, truncated: false });
+            }
+        }
+        let gzip = parts.headers.get("grpc-encoding").and_then(|v| v.to_str().ok()) == Some("gzip");
+        let mut buf = BytesMut::new();
+        let mut out = vec![];
+        let mut truncated = false;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|e| format!("reading the answer: {}", e))?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+            while buf.len() >= 5 {
+                let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if len > 64 << 20 {
+                    return Err(format!("an answer message of {} bytes is more than 64 MiB", len));
+                }
+                if buf.len() < 5 + len {
+                    break;
+                }
+                let compressed = buf[0] == 1;
+                buf.advance(5);
+                let m = buf.split_to(len).freeze();
+                let m = if compressed {
+                    if !gzip {
+                        return Err("the server sent a compressed message without saying how (grpc-encoding)".into());
+                    }
+                    use std::io::Read;
+                    let mut d = vec![];
+                    flate2::read::GzDecoder::new(&m[..]).take(64 << 20).read_to_end(&mut d).map_err(|e| format!("gunzip: {}", e))?;
+                    Bytes::from(d)
+                } else {
+                    m
+                };
+                out.push(m);
+                if out.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+        if truncated {
+            // Enough: cancel the rest of the stream (RST_STREAM CANCEL when `body` goes).
+            drop(body);
+            return Ok(Outcome { code: 0, message: String::new(), messages: out, headers, trailers: json!({}), truncated: true });
+        }
+        let trailers = body.trailers().await.map_err(|e| format!("reading the trailers: {}", e))?.unwrap_or_default();
+        let code = status_in(&trailers).ok_or("the answer ended without a grpc-status")?;
+        Ok(Outcome { code, message: message_in(&trailers), messages: out, headers, trailers: header_map(&trailers), truncated: false })
+    };
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(until), work).await {
+        Ok(r) => r,
+        Err(_) => Ok(Outcome { code: 4, message: format!("the deadline of {} ms passed", timeout.as_millis()), messages: vec![], headers: json!({}), trailers: json!({}), truncated: false }),
+    }
+}
+
+fn path_of(m: &MethodDescriptor) -> String {
+    format!("/{}/{}", m.parent_service().full_name(), m.name())
+}
+
+fn run_call(url: &str, method: &str, request: &Value, o: &Value, limit: usize) -> Result<(MethodDescriptor, Outcome), String> {
+    let pool = pool_for(url, o)?;
+    let m = find_method(&pool, method)?;
+    let input = m.input();
+    let reqs: Vec<Value> = if m.is_client_streaming() {
+        match request {
+            Value::Array(a) => a.clone(),
+            other => vec![other.clone()],
+        }
+    } else {
+        vec![request.clone()]
+    };
+    let mut bytes = vec![];
+    for r in &reqs {
+        bytes.push(to_message(&input, r)?.encode_to_vec());
+    }
+    let out = runtime().block_on(exchange(url, &path_of(&m), bytes, o, limit))?;
+    Ok((m, out))
+}
+
+fn decode_all(m: &MethodDescriptor, out: &Outcome, o: &Value) -> Result<Vec<Value>, String> {
+    out.messages.iter().map(|b| DynamicMessage::decode(m.output(), b.clone()).map_err(|e| format!("the answer is not a {}: {}", m.output().full_name(), e)).and_then(|d| to_json(&d, o))).collect()
+}
+
+/// Calls a unary method and gives its answer as a map; a status other than OK is an error value, `NOT_FOUND (5): no item A-9`. `url` is `http://host:port` (HTTP/2 without TLS) or `https://host:port`; `method` is `package.Service/Method`. `options`: `{ proto: "file.proto" (or a list; without it the server's reflection is asked), include: [folders for imports], metadata: { authorization: "Bearer ..." }, timeout_ms (the deadline, 10000), ca_file, server_name, json_names (camelCase fields), skip_defaults, enum_numbers }`. 64-bit integers are numbers, bytes base64, enums their names.
+pub fn grpc_call(url: &str, method: &str, request: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (m, out) = run_call(url, method, &request, &options, 2)?;
+    if out.code != 0 {
+        return Err(format!("{} ({}): {}", code_name(out.code), out.code, out.message));
+    }
+    let mut v = decode_all(&m, &out, &options)?;
+    if v.len() != 1 {
+        return Err(format!("a unary call answers one message, this one {}", v.len()));
+    }
+    Ok(v.remove(0))
+}
+
+/// Any call, with everything about its answer and no error value for a status: `{ ok, code, status: "NOT_FOUND", message, response (the one answer, or null), responses (all of them, for streams), truncated, headers, trailers, ms }`. A client-streaming or bidirectional method takes a list of requests. `options` as for `grpc_call`, and `limit` (the most answers kept from a stream, 1000; then the stream is cancelled and `truncated` is true).
+pub fn grpc_invoke(url: &str, method: &str, request: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let started = Instant::now();
+    let limit = options["limit"].as_i64().unwrap_or(1000).clamp(1, 1_000_000) as usize;
+    let (m, out) = run_call(url, method, &request, &options, limit)?;
+    let responses = decode_all(&m, &out, &options)?;
+    Ok(json!({
+        "ok": out.code == 0, "code": out.code, "status": code_name(out.code), "message": out.message,
+        "response": if m.is_server_streaming() { Value::Null } else { responses.first().cloned().unwrap_or(Value::Null) },
+        "responses": responses, "truncated": out.truncated, "headers": out.headers, "trailers": out.trailers,
+        "ms": started.elapsed().as_millis() as i64,
+    }))
+}
+
+/// A server-streaming (or bidirectional) call's answers, collected: a list of maps, at most `limit`; a status other than OK is an error value.
+pub fn grpc_stream(url: &str, method: &str, request: serde_json::Value, limit: i64, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (m, out) = run_call(url, method, &request, &options, limit.clamp(1, 1_000_000) as usize)?;
+    if out.code != 0 {
+        return Err(format!("{} ({}): {}", code_name(out.code), out.code, out.message));
+    }
+    decode_all(&m, &out, &options)
+}
+
+fn describe(pool: &DescriptorPool, only: Option<&[String]>) -> Vec<Value> {
+    pool.services()
+        .filter(|s| only.map_or(true, |o| o.iter().any(|n| n == s.full_name())))
+        .map(|s| {
+            json!({
+                "name": s.full_name(),
+                "methods": s.methods().map(|m| json!({
+                    "name": m.name(), "path": path_of(&m), "input": m.input().full_name(), "output": m.output().full_name(),
+                    "client_streaming": m.is_client_streaming(), "server_streaming": m.is_server_streaming(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// The services and methods of `.proto` files (a path or a list; `include` folders for imports): `[{ name, methods: [{ name, path, input, output, client_streaming, server_streaming }] }]`.
+pub fn grpc_methods(proto: serde_json::Value, include: Vec<String>) -> Result<Vec<Value>, String> {
+    let files = files_of(&proto);
+    if files.is_empty() {
+        return Err("give a .proto file, or a list of them".into());
+    }
+    Ok(describe(&pool_from_files(&files, &include)?, None))
+}
+
+/// A message's fields, from `.proto` files: `[{ name, number, type, repeated, map, json_name }]` for `message_type` (`package.Message`).
+pub fn grpc_fields(proto: serde_json::Value, message_type: &str) -> Result<Vec<Value>, String> {
+    let pool = pool_from_files(&files_of(&proto), &[])?;
+    let d = pool.get_message_by_name(message_type).ok_or(format!("no message {:?}", message_type))?;
+    Ok(d.fields()
+        .map(|f| {
+            let ty = match f.kind() {
+                prost_reflect::Kind::Message(m) => m.full_name().to_string(),
+                prost_reflect::Kind::Enum(e) => e.full_name().to_string(),
+                k => format!("{:?}", k).to_lowercase(),
+            };
+            json!({ "name": f.name(), "number": f.number(), "type": ty, "repeated": f.is_list(), "map": f.is_map(), "json_name": f.json_name() })
+        })
+        .collect())
+}
+
+/// A message (a map) as protobuf bytes in base64, by the type `message_type` of the `.proto` files.
+pub fn grpc_encode(proto: serde_json::Value, message_type: &str, value: serde_json::Value) -> Result<String, String> {
+    use base64::Engine;
+    let pool = pool_from_files(&files_of(&proto), &[])?;
+    let d = pool.get_message_by_name(message_type).ok_or(format!("no message {:?}", message_type))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(to_message(&d, &value)?.encode_to_vec()))
+}
+
+/// Protobuf bytes (base64) read as a map by the type `message_type` of the `.proto` files.
+pub fn grpc_decode(proto: serde_json::Value, message_type: &str, base64: &str) -> Result<Value, String> {
+    use base64::Engine;
+    let pool = pool_from_files(&files_of(&proto), &[])?;
+    let d = pool.get_message_by_name(message_type).ok_or(format!("no message {:?}", message_type))?;
+    let b = base64::engine::general_purpose::STANDARD.decode(base64.trim()).map_err(|e| format!("not base64: {}", e))?;
+    to_json(&DynamicMessage::decode(d, &b[..]).map_err(|e| e.to_string())?, &json!({}))
+}
+
+/// Closes the kept HTTP/2 connections to `url` (all for `""`), and forgets what reflection said; how many were open.
+pub fn grpc_close(url: &str) -> i64 {
+    let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let keys: Vec<String> = m.keys().filter(|k| url.is_empty() || k.starts_with(&format!("{}|", url.trim_end_matches('/')))).cloned().collect();
+    for k in &keys {
+        m.remove(k);
+    }
+    if let Some(p) = POOLS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        p.by_server.retain(|k, _| !url.is_empty() && k != url);
+    }
+    keys.len() as i64
+}
+
+// ---------------------------------------------------------------- server reflection
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ReflectionRequest {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(oneof = "Ask", tags = "3, 4, 7")]
+    ask: Option<Ask>,
+}
+
+#[derive(Clone, PartialEq, prost::Oneof)]
+enum Ask {
+    #[prost(string, tag = "3")]
+    FileByFilename(String),
+    #[prost(string, tag = "4")]
+    FileContainingSymbol(String),
+    #[prost(string, tag = "7")]
+    ListServices(String),
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ReflectionResponse {
+    #[prost(string, tag = "1")]
+    valid_host: String,
+    #[prost(message, optional, tag = "2")]
+    original_request: Option<ReflectionRequest>,
+    #[prost(oneof = "Answer", tags = "4, 6, 7")]
+    answer: Option<Answer>,
+}
+
+#[derive(Clone, PartialEq, prost::Oneof)]
+enum Answer {
+    #[prost(message, tag = "4")]
+    Files(FileDescriptorResponse),
+    #[prost(message, tag = "6")]
+    Services(ListServiceResponse),
+    #[prost(message, tag = "7")]
+    Error(ErrorResponse),
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct FileDescriptorResponse {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    file_descriptor_proto: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListServiceResponse {
+    #[prost(message, repeated, tag = "1")]
+    service: Vec<ServiceResponse>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ServiceResponse {
+    #[prost(string, tag = "1")]
+    name: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ErrorResponse {
+    #[prost(int32, tag = "1")]
+    error_code: i32,
+    #[prost(string, tag = "2")]
+    error_message: String,
+}
+
+/// One round of reflection requests on one stream (v1, then v1alpha when v1 is not there).
+fn reflect(url: &str, asks: Vec<Ask>, o: &Value) -> Result<Vec<ReflectionResponse>, String> {
+    let msgs: Vec<Vec<u8>> = asks.into_iter().map(|a| ReflectionRequest { host: String::new(), ask: Some(a) }.encode_to_vec()).collect();
+    let mut last = String::new();
+    for path in ["/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"] {
+        let out = runtime().block_on(exchange(url, path, msgs.clone(), o, 10_000))?;
+        if out.code == 12 {
+            last = format!("{} ({}): {}", code_name(out.code), out.code, out.message);
+            continue;
+        }
+        if out.code != 0 {
+            return Err(format!("{} ({}): {}", code_name(out.code), out.code, out.message));
+        }
+        return out.messages.iter().map(|b| ReflectionResponse::decode(b.clone()).map_err(|e| format!("a reflection answer did not read: {}", e))).collect();
+    }
+    Err(format!("the server has no reflection service ({}): give the `proto` file", last))
+}
+
+fn list_service_names(url: &str, o: &Value) -> Result<Vec<String>, String> {
+    let r = reflect(url, vec![Ask::ListServices(String::new())], o)?;
+    for x in r {
+        match x.answer {
+            Some(Answer::Services(s)) => return Ok(s.service.into_iter().map(|s| s.name).collect()),
+            Some(Answer::Error(e)) => return Err(format!("reflection: {} ({})", e.error_message, e.error_code)),
+            _ => {}
+        }
+    }
+    Err("reflection gave no list of services".into())
+}
+
+/// The services' descriptors, asked symbol by symbol, then the files they import by name.
+fn reflect_pool(url: &str, o: &Value) -> Result<DescriptorPool, String> {
+    let names: Vec<String> = list_service_names(url, o)?.into_iter().filter(|n| !n.starts_with("grpc.reflection.")).collect();
+    let mut files: HashMap<String, prost_types::FileDescriptorProto> = HashMap::new();
+    let mut errors = vec![];
+    let take = |r: Vec<ReflectionResponse>, errors: &mut Vec<String>, files: &mut HashMap<String, prost_types::FileDescriptorProto>| {
+        for x in r {
+            match x.answer {
+                Some(Answer::Files(f)) => {
+                    for b in f.file_descriptor_proto {
+                        if let Ok(fd) = prost_types::FileDescriptorProto::decode(&b[..]) {
+                            files.insert(fd.name().to_string(), fd);
+                        }
+                    }
+                }
+                Some(Answer::Error(e)) => errors.push(format!("{} ({})", e.error_message, e.error_code)),
+                _ => {}
+            }
+        }
+    };
+    take(reflect(url, names.iter().map(|n| Ask::FileContainingSymbol(n.clone())).collect(), o)?, &mut errors, &mut files);
+    for _ in 0..8 {
+        let missing: Vec<String> = files.values().flat_map(|f| f.dependency.clone()).filter(|d| !files.contains_key(d)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        if missing.is_empty() {
+            break;
+        }
+        take(reflect(url, missing.into_iter().map(Ask::FileByFilename).collect(), o)?, &mut errors, &mut files);
+    }
+    if files.is_empty() {
+        return Err(format!("reflection listed {} but gave no descriptors{}", names.join(", "), if errors.is_empty() { String::new() } else { format!(": {}", errors.join("; ")) }));
+    }
+    // Files in an order where each comes after what it imports.
+    let mut ordered: Vec<prost_types::FileDescriptorProto> = vec![];
+    let mut left: Vec<prost_types::FileDescriptorProto> = files.into_values().collect();
+    while !left.is_empty() {
+        let before = left.len();
+        let (ready, rest): (Vec<_>, Vec<_>) = left.into_iter().partition(|f| f.dependency.iter().all(|d| ordered.iter().any(|o| o.name() == d)));
+        ordered.extend(ready);
+        left = rest;
+        if left.len() == before {
+            ordered.extend(left);
+            break;
+        }
+    }
+    let mut pool = DescriptorPool::new();
+    pool.add_file_descriptor_set(prost_types::FileDescriptorSet { file: ordered }).map_err(|e| format!("the server's descriptors do not fit together: {}", e))?;
+    Ok(pool)
+}
+
+/// The services a server offers, asked by its reflection service (grpc.reflection v1 or v1alpha): `[{ name, methods }]` as `grpc_methods` gives them; a service whose descriptor the server would not give has `methods: null`.
+pub fn grpc_services(url: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let names: Vec<String> = list_service_names(url, &options)?;
+    match reflect_pool(url, &options) {
+        Ok(pool) => {
+            POOLS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| Pools { by_file: HashMap::new(), by_server: HashMap::new() }).by_server.insert(url.to_string(), pool.clone());
+            let described = describe(&pool, Some(&names));
+            Ok(names.iter().map(|n| described.iter().find(|d| d["name"] == n.as_str()).cloned().unwrap_or_else(|| json!({ "name": n, "methods": null }))).collect())
+        }
+        Err(_) => Ok(names.into_iter().map(|n| json!({ "name": n, "methods": null })).collect()),
+    }
+}

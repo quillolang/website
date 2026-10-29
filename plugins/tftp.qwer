@@ -1,0 +1,750 @@
+//! TFTP (RFC 1350, with the blksize, tsize and timeout options of RFC 2347-2349): files fetched from and sent to a server, as phones, switches, PLCs and boot loaders use it for configurations and firmware, with retransmission, block-number rollover and netascii; and a small server of your own on a folder (read-only unless allowed), its transfers logged for the program to read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const RRQ: u16 = 1;
+const WRQ: u16 = 2;
+const DATA: u16 = 3;
+const ACK: u16 = 4;
+const ERROR: u16 = 5;
+const OACK: u16 = 6;
+
+fn error_meaning(code: u16) -> &'static str {
+    match code {
+        1 => "file not found",
+        2 => "access violation",
+        3 => "disk full or allocation exceeded",
+        4 => "illegal TFTP operation",
+        5 => "unknown transfer ID",
+        6 => "file already exists",
+        7 => "no such user",
+        8 => "option refused",
+        _ => "not defined",
+    }
+}
+
+fn err_packet(code: u16, msg: &str) -> Vec<u8> {
+    let mut p = vec![0, ERROR as u8];
+    p.extend_from_slice(&code.to_be_bytes());
+    p.extend_from_slice(msg.as_bytes());
+    p.push(0);
+    p
+}
+
+fn op(p: &[u8]) -> u16 {
+    if p.len() < 2 { 0 } else { u16::from_be_bytes([p[0], p[1]]) }
+}
+
+fn block(p: &[u8]) -> u16 {
+    if p.len() < 4 { 0 } else { u16::from_be_bytes([p[2], p[3]]) }
+}
+
+fn zstrings(b: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = b.split(|c| *c == 0).map(|s| String::from_utf8_lossy(s).to_string()).collect();
+    if b.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn read_error(p: &[u8]) -> String {
+    let code = block(p);
+    let msg = if p.len() > 4 { zstrings(&p[4..]).first().cloned().unwrap_or_default() } else { String::new() };
+    format!("the server says {} (TFTP error {}: {})", if msg.is_empty() { error_meaning(code).to_string() } else { format!("{:?}", msg) }, code, error_meaning(code))
+}
+
+fn sock_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    let mut all: Vec<SocketAddr> = with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.collect();
+    all.sort_by_key(|a| !a.is_ipv4());
+    all.into_iter().next().ok_or(format!("{} has no address", host))
+}
+
+struct Opt {
+    port: u16,
+    blksize: usize,
+    timeout: Duration,
+    retries: u32,
+    mode: String,
+    tsize: bool,
+    max_bytes: u64,
+}
+
+fn opt(o: &Value) -> Result<Opt, String> {
+    let mode = o.get("mode").and_then(|v| v.as_str()).unwrap_or("octet").to_lowercase();
+    if mode != "octet" && mode != "netascii" {
+        return Err(format!("mode {:?}: use \"octet\" (bytes as they are) or \"netascii\" (text)", mode));
+    }
+    Ok(Opt {
+        port: o.get("port").and_then(|v| v.as_u64()).unwrap_or(69).clamp(1, 65535) as u16,
+        // 1428 fills an Ethernet frame with IP and UDP headers; 512 is the RFC 1350 size
+        blksize: o.get("blksize").and_then(|v| v.as_u64()).unwrap_or(1428).clamp(8, 65464) as usize,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(2000).clamp(100, 255_000)),
+        retries: o.get("retries").and_then(|v| v.as_u64()).unwrap_or(5).min(50) as u32,
+        mode,
+        tsize: o.get("tsize").and_then(|v| v.as_bool()).unwrap_or(true),
+        max_bytes: o.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(512 * 1024 * 1024),
+    })
+}
+
+fn request(opcode: u16, file: &str, o: &Opt, tsize: Option<u64>) -> Vec<u8> {
+    let mut p = vec![0, opcode as u8];
+    p.extend_from_slice(file.as_bytes());
+    p.push(0);
+    p.extend_from_slice(o.mode.as_bytes());
+    p.push(0);
+    let mut add = |k: &str, v: String| {
+        p.extend_from_slice(k.as_bytes());
+        p.push(0);
+        p.extend_from_slice(v.as_bytes());
+        p.push(0);
+    };
+    if o.blksize != 512 {
+        add("blksize", o.blksize.to_string());
+    }
+    if o.tsize {
+        add("tsize", tsize.unwrap_or(0).to_string());
+    }
+    add("timeout", (o.timeout.as_secs()).clamp(1, 255).to_string());
+    p
+}
+
+fn oack(p: &[u8]) -> HashMap<String, String> {
+    let s = zstrings(&p[2..]);
+    s.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].to_lowercase(), c[1].clone())).collect()
+}
+
+fn to_netascii(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len() + b.len() / 20);
+    for (i, c) in b.iter().enumerate() {
+        match c {
+            b'\n' if i == 0 || b[i - 1] != b'\r' => out.extend_from_slice(b"\r\n"),
+            b'\r' if b.get(i + 1) != Some(&b'\n') => out.extend_from_slice(b"\r\0"),
+            _ => out.push(*c),
+        }
+    }
+    out
+}
+
+fn from_netascii(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') {
+            out.push(b'\n');
+            i += 2;
+        } else if b[i] == b'\r' && b.get(i + 1) == Some(&0) {
+            out.push(b'\r');
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Waits for a packet from the server's transfer ID (any port of it before it is known);
+/// packets from elsewhere get an "unknown transfer ID" error, as RFC 1350 says.
+fn recv(s: &UdpSocket, server: &SocketAddr, tid: &mut Option<SocketAddr>, until: Instant, buf: &mut [u8]) -> Result<Option<Vec<u8>>, String> {
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        match s.recv_from(buf) {
+            Ok((n, from)) => {
+                if from.ip() != server.ip() {
+                    continue;
+                }
+                match tid {
+                    Some(t) if *t != from => {
+                        let _ = s.send_to(&err_packet(5, "unknown transfer ID"), from);
+                        continue;
+                    }
+                    None => *tid = Some(from),
+                    _ => {}
+                }
+                return Ok(Some(buf[..n].to_vec()));
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err(format!("{} refused: no TFTP server on UDP port {}", server, server.port())),
+            Err(e) => return Err(format!("reading from {}: {}", server, e)),
+        }
+    }
+}
+
+fn no_answer(server: &SocketAddr, o: &Opt, what: &str) -> String {
+    format!("no answer from {} {} in {} ms ({} tries): is a TFTP server running there, and UDP port {} open (with the server's reply ports)?", server, what, o.timeout.as_millis(), o.retries + 1, server.port())
+}
+
+fn get_bytes(host: &str, remote: &str, o: &Opt) -> Result<(Vec<u8>, Value), String> {
+    let started = Instant::now();
+    let server = sock_addr(host, o.port)?;
+    let s = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 65536];
+    let mut tid: Option<SocketAddr> = None;
+    let mut last = request(RRQ, remote, o, None);
+    let mut blksize = 512usize;
+    let mut accepted = json!({});
+    let mut expected: u16 = 1;
+    let mut out: Vec<u8> = vec![];
+    let mut blocks: u64 = 0;
+    let mut resent = 0u32;
+    let mut first = true;
+    let mut announced: Option<u64> = None;
+    let mut send = true;
+    loop {
+        let mut tries = 0;
+        let pkt = loop {
+            if send {
+                s.send_to(&last, tid.unwrap_or(server)).map_err(|e| format!("sending to {}: {}", server, e))?;
+            }
+            send = true;
+            match recv(&s, &server, &mut tid, Instant::now() + o.timeout, &mut buf)? {
+                Some(p) => break p,
+                None => {
+                    tries += 1;
+                    resent += 1;
+                    if tries > o.retries {
+                        return Err(no_answer(&server, o, if first { "to the read request" } else { "for the next block" }));
+                    }
+                }
+            }
+        };
+        match op(&pkt) {
+            ERROR => {
+                // a server that does not take options may refuse them: ask again without
+                if first && block(&pkt) == 8 {
+                    let plain = Opt { port: o.port, blksize: 512, timeout: o.timeout, retries: o.retries, mode: o.mode.clone(), tsize: false, max_bytes: o.max_bytes };
+                    return get_bytes(host, remote, &plain);
+                }
+                return Err(format!("{} ({})", read_error(&pkt), remote));
+            }
+            OACK if first => {
+                let m = oack(&pkt);
+                if let Some(b) = m.get("blksize") {
+                    blksize = b.parse::<usize>().map_err(|_| "the server's blksize is not a number".to_string())?;
+                    if blksize < 8 || blksize > o.blksize.max(512) {
+                        let _ = s.send_to(&err_packet(8, "blksize not asked for"), tid.unwrap_or(server));
+                        return Err(format!("the server offered blksize {}, larger than asked", blksize));
+                    }
+                }
+                if let Some(t) = m.get("tsize").and_then(|t| t.parse::<u64>().ok()) {
+                    if t > o.max_bytes {
+                        let _ = s.send_to(&err_packet(3, "file too large"), tid.unwrap_or(server));
+                        return Err(format!("{} is {} bytes, more than max_bytes ({})", remote, t, o.max_bytes));
+                    }
+                    announced = Some(t);
+                }
+                accepted = json!(m);
+                first = false;
+                last = vec![0, ACK as u8, 0, 0];
+            }
+            DATA => {
+                let n = block(&pkt);
+                if first {
+                    first = false; // the server took no options: 512-byte blocks
+                }
+                if n == expected {
+                    let data = &pkt[4..];
+                    if data.len() > blksize {
+                        return Err(format!("a block of {} bytes, more than the {} agreed", data.len(), blksize));
+                    }
+                    out.extend_from_slice(data);
+                    if out.len() as u64 > o.max_bytes {
+                        let _ = s.send_to(&err_packet(3, "file too large"), tid.unwrap_or(server));
+                        return Err(format!("{} is more than max_bytes ({})", remote, o.max_bytes));
+                    }
+                    blocks += 1;
+                    last = [vec![0, ACK as u8], n.to_be_bytes().to_vec()].concat();
+                    expected = expected.wrapping_add(1);
+                    if data.len() < blksize {
+                        s.send_to(&last, tid.unwrap_or(server)).map_err(|e| e.to_string())?;
+                        break;
+                    }
+                } else if n == expected.wrapping_sub(1) {
+                    // a duplicate: our ACK was lost; the loop sends it again
+                } else {
+                    send = false;
+                    continue;
+                }
+            }
+            OACK => {}
+            k => {
+                let _ = s.send_to(&err_packet(4, "unexpected packet"), tid.unwrap_or(server));
+                return Err(format!("the server sent TFTP opcode {} during a read", k));
+            }
+        }
+    }
+    if let Some(t) = announced {
+        if o.mode == "octet" && t != out.len() as u64 {
+            return Err(format!("the server announced {} bytes and sent {}", t, out.len()));
+        }
+    }
+    let data = if o.mode == "netascii" { from_netascii(&out) } else { out };
+    let info = json!({ "file": remote, "bytes": data.len(), "blocks": blocks, "blksize": blksize, "options": accepted, "retransmissions": resent, "ms": started.elapsed().as_millis() as u64 });
+    Ok((data, info))
+}
+
+fn put_bytes(host: &str, remote: &str, data: &[u8], o: &Opt) -> Result<Value, String> {
+    let started = Instant::now();
+    let data = if o.mode == "netascii" { to_netascii(data) } else { data.to_vec() };
+    let server = sock_addr(host, o.port)?;
+    let s = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 65536];
+    let mut tid: Option<SocketAddr> = None;
+    let mut last = request(WRQ, remote, o, Some(data.len() as u64));
+    let mut blksize = 512usize;
+    let mut accepted = json!({});
+    let mut waiting_for: u16 = 0; // the ACK expected
+    let mut sent_blocks: u64 = 0;
+    let mut offset = 0usize;
+    let mut done = false;
+    let mut resent = 0u32;
+    let mut first = true;
+    let mut send = true;
+    loop {
+        let mut tries = 0;
+        let pkt = loop {
+            if send {
+                s.send_to(&last, tid.unwrap_or(server)).map_err(|e| format!("sending to {}: {}", server, e))?;
+            }
+            send = true;
+            match recv(&s, &server, &mut tid, Instant::now() + o.timeout, &mut buf)? {
+                Some(p) => break p,
+                None => {
+                    tries += 1;
+                    resent += 1;
+                    if tries > o.retries {
+                        return Err(no_answer(&server, o, if first { "to the write request" } else { "acknowledging a block" }));
+                    }
+                }
+            }
+        };
+        match op(&pkt) {
+            ERROR => {
+                if first && block(&pkt) == 8 {
+                    let plain = Opt { port: o.port, blksize: 512, timeout: o.timeout, retries: o.retries, mode: "octet".into(), tsize: false, max_bytes: o.max_bytes };
+                    return put_bytes(host, remote, &data, &plain);
+                }
+                return Err(format!("{} ({})", read_error(&pkt), remote));
+            }
+            OACK if first => {
+                let m = oack(&pkt);
+                if let Some(b) = m.get("blksize") {
+                    blksize = b.parse::<usize>().map_err(|_| "the server's blksize is not a number".to_string())?;
+                    if blksize < 8 || blksize > o.blksize.max(512) {
+                        return Err(format!("the server offered blksize {}, larger than asked", blksize));
+                    }
+                }
+                accepted = json!(m);
+            }
+            ACK if block(&pkt) == waiting_for => {}
+            ACK => {
+                // a duplicate ACK: wait on, never resend on one (the Sorcerer's Apprentice bug)
+                send = false;
+                continue;
+            }
+            k => return Err(format!("the server sent TFTP opcode {} during a write", k)),
+        }
+        first = false;
+        if done {
+            break;
+        }
+        let end = (offset + blksize).min(data.len());
+        let n = waiting_for.wrapping_add(1);
+        last = [vec![0, DATA as u8], n.to_be_bytes().to_vec(), data[offset..end].to_vec()].concat();
+        if end - offset < blksize {
+            done = true;
+        }
+        offset = end;
+        waiting_for = n;
+        sent_blocks += 1;
+    }
+    Ok(json!({ "file": remote, "bytes": data.len(), "blocks": sent_blocks, "blksize": blksize, "options": accepted, "retransmissions": resent, "ms": started.elapsed().as_millis() as u64 }))
+}
+
+/// Fetches `remote` from a TFTP server (port 69, or `host:port`) into `local_path`:
+/// `{ file, bytes, blocks, blksize, options, retransmissions, ms }`. Options: `blksize` (1428;
+/// 512 when the server takes no options), `timeout_ms` (2000) and `retries` (5) per packet,
+/// `mode` ("octet" or "netascii"), `tsize` (true), `max_bytes` (512 MB), `port`.
+pub fn tftp_get(host: &str, remote: &str, local_path: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = opt(&options)?;
+    let (data, mut info) = get_bytes(host, remote, &o)?;
+    if let Some(dir) = Path::new(local_path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        }
+    }
+    let tmp = format!("{}.part", local_path);
+    std::fs::write(&tmp, &data).map_err(|e| format!("{}: {}", tmp, e))?;
+    std::fs::rename(&tmp, local_path).map_err(|e| format!("{}: {}", local_path, e))?;
+    info["path"] = json!(local_path);
+    Ok(info)
+}
+
+/// Sends the file at `local_path` to a TFTP server as `remote`; options as `tftp_get`.
+pub fn tftp_put(host: &str, local_path: &str, remote: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = opt(&options)?;
+    let data = std::fs::read(local_path).map_err(|e| format!("{}: {}", local_path, e))?;
+    put_bytes(host, remote, &data, &o)
+}
+
+/// Fetches a text file (a phone's or switch's configuration) and gives its text.
+pub fn tftp_get_text(host: &str, remote: &str, options: serde_json::Value) -> Result<String, String> {
+    let o = opt(&options)?;
+    let (data, _) = get_bytes(host, remote, &o)?;
+    String::from_utf8(data).map_err(|_| format!("{} is not UTF-8 text: fetch it with tftp_get to a file", remote))
+}
+
+/// Sends text as a file named `remote` (a configuration backed up, a phone's settings).
+pub fn tftp_put_text(host: &str, remote: &str, text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = opt(&options)?;
+    put_bytes(host, remote, text.as_bytes(), &o)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server
+
+struct Server {
+    stop: Arc<AtomicBool>,
+    log: Arc<Mutex<VecDeque<Value>>>,
+    port: u16,
+}
+
+fn servers() -> &'static Mutex<HashMap<String, Server>> {
+    static S: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const LOG_MAX: usize = 1000;
+
+fn log(l: &Mutex<VecDeque<Value>>, v: Value) {
+    if let Ok(mut q) = l.lock() {
+        if q.len() >= LOG_MAX {
+            q.pop_front(); // the oldest goes when nobody reads them
+        }
+        q.push_back(v);
+    }
+}
+
+/// `name` inside `root`, refusing absolute paths, `..` and anything that leaves it.
+fn safe_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let n = name.trim_start_matches('/').replace('\\', "/");
+    let rel = Path::new(&n);
+    if n.is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+struct SrvOpt {
+    allow_write: bool,
+    overwrite: bool,
+    max_blksize: usize,
+    max_bytes: u64,
+    retries: u32,
+}
+
+fn serve_one(root: PathBuf, req: Vec<u8>, client: SocketAddr, cfg: Arc<SrvOpt>, logq: Arc<Mutex<VecDeque<Value>>>) {
+    let started = Instant::now();
+    let s = match UdpSocket::bind(if client.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let opcode = op(&req);
+    let parts = zstrings(&req[2..]);
+    let file = parts.first().cloned().unwrap_or_default();
+    let mode = parts.get(1).map(|m| m.to_lowercase()).unwrap_or_default();
+    let asked: HashMap<String, String> = parts[2.min(parts.len())..].chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].to_lowercase(), c[1].clone())).collect();
+    let kind = if opcode == RRQ { "get" } else { "put" };
+    let fail = |s: &UdpSocket, code: u16, msg: &str| {
+        let _ = s.send_to(&err_packet(code, msg), client);
+        log(&logq, json!({ "op": kind, "file": file, "client": client.to_string(), "ok": false, "error": msg, "bytes": 0, "ms": started.elapsed().as_millis() as u64 }));
+    };
+    if mode != "octet" && mode != "netascii" {
+        return fail(&s, 4, "mode must be octet or netascii");
+    }
+    let path = match safe_path(&root, &file) {
+        Some(p) => p,
+        None => return fail(&s, 2, "that path is outside the server's folder"),
+    };
+    // options (RFC 2347): blksize, tsize, timeout; anything else is left out of the OACK
+    let mut reply: Vec<(String, String)> = vec![];
+    let mut blksize = 512usize;
+    let mut timeout = Duration::from_secs(2);
+    if let Some(b) = asked.get("blksize").and_then(|b| b.parse::<usize>().ok()) {
+        if (8..=65464).contains(&b) {
+            blksize = b.min(cfg.max_blksize);
+            reply.push(("blksize".into(), blksize.to_string()));
+        }
+    }
+    if let Some(t) = asked.get("timeout").and_then(|t| t.parse::<u64>().ok()) {
+        if (1..=255).contains(&t) {
+            timeout = Duration::from_secs(t);
+            reply.push(("timeout".into(), t.to_string()));
+        }
+    }
+    let mut buf = vec![0u8; 65536];
+    // waits for a packet from the client; the transfer's own port refuses other senders
+    let wait = |s: &UdpSocket, buf: &mut [u8]| -> Option<Vec<u8>> {
+        let until = Instant::now() + timeout;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let _ = s.set_read_timeout(Some(left));
+            match s.recv_from(buf) {
+                Ok((n, from)) if from == client => return Some(buf[..n].to_vec()),
+                Ok((_, from)) => {
+                    let _ = s.send_to(&err_packet(5, "unknown transfer ID"), from);
+                }
+                Err(_) => return None,
+            }
+        }
+    };
+    let oack_packet = |reply: &[(String, String)]| -> Vec<u8> {
+        let mut p = vec![0, OACK as u8];
+        for (k, v) in reply {
+            p.extend_from_slice(k.as_bytes());
+            p.push(0);
+            p.extend_from_slice(v.as_bytes());
+            p.push(0);
+        }
+        p
+    };
+    if opcode == RRQ {
+        let data = match std::fs::read(&path) {
+            Ok(d) if path.is_file() => d,
+            Ok(_) => return fail(&s, 1, "not a file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fail(&s, 1, "file not found"),
+            Err(_) => return fail(&s, 2, "cannot read that file"),
+        };
+        let data = if mode == "netascii" { to_netascii(&data) } else { data };
+        if asked.contains_key("tsize") {
+            reply.push(("tsize".into(), data.len().to_string()));
+        }
+        let mut last: Vec<u8>;
+        let mut want: u16;
+        if !reply.is_empty() {
+            last = oack_packet(&reply);
+            want = 0;
+        } else {
+            let end = blksize.min(data.len());
+            last = [vec![0, DATA as u8, 0, 1], data[..end].to_vec()].concat();
+            want = 1;
+        }
+        let mut offset = if reply.is_empty() { blksize.min(data.len()) } else { 0 };
+        let mut finished = reply.is_empty() && data.len() < blksize;
+        let mut tries = 0;
+        let mut send = true;
+        loop {
+            if send {
+                let _ = s.send_to(&last, client);
+            }
+            send = true;
+            match wait(&s, &mut buf) {
+                None => {
+                    tries += 1;
+                    if tries > cfg.retries {
+                        return fail(&s, 0, "the client stopped answering");
+                    }
+                }
+                Some(p) if op(&p) == ERROR => {
+                    log(&logq, json!({ "op": kind, "file": file, "client": client.to_string(), "ok": false, "error": read_error(&p), "bytes": offset, "ms": started.elapsed().as_millis() as u64 }));
+                    return;
+                }
+                Some(p) if op(&p) == ACK && block(&p) == want => {
+                    tries = 0;
+                    if finished {
+                        break;
+                    }
+                    let end = (offset + blksize).min(data.len());
+                    want = want.wrapping_add(1);
+                    last = [vec![0, DATA as u8], want.to_be_bytes().to_vec(), data[offset..end].to_vec()].concat();
+                    if end - offset < blksize {
+                        finished = true;
+                    }
+                    offset = end;
+                }
+                Some(_) => send = false, // a duplicate or stray ACK: wait, never resend on it
+            }
+        }
+        log(&logq, json!({ "op": "get", "file": file, "client": client.to_string(), "ok": true, "bytes": data.len(), "blksize": blksize, "ms": started.elapsed().as_millis() as u64 }));
+        return;
+    }
+    // WRQ
+    if !cfg.allow_write {
+        return fail(&s, 2, "this server is read-only");
+    }
+    if path.exists() && !cfg.overwrite {
+        return fail(&s, 6, "file already exists");
+    }
+    if let Some(t) = asked.get("tsize").and_then(|t| t.parse::<u64>().ok()) {
+        if t > cfg.max_bytes {
+            return fail(&s, 3, "file too large for this server");
+        }
+        reply.push(("tsize".into(), t.to_string()));
+    }
+    let mut last = if reply.is_empty() { vec![0, ACK as u8, 0, 0] } else { oack_packet(&reply) };
+    let mut want: u16 = 1;
+    let mut got: Vec<u8> = vec![];
+    let mut tries = 0;
+    loop {
+        let _ = s.send_to(&last, client);
+        match wait(&s, &mut buf) {
+            None => {
+                tries += 1;
+                if tries > cfg.retries {
+                    return fail(&s, 0, "the client stopped sending");
+                }
+            }
+            Some(p) if op(&p) == ERROR => {
+                log(&logq, json!({ "op": kind, "file": file, "client": client.to_string(), "ok": false, "error": read_error(&p), "bytes": got.len(), "ms": started.elapsed().as_millis() as u64 }));
+                return;
+            }
+            Some(p) if op(&p) == DATA && block(&p) == want => {
+                tries = 0;
+                let d = &p[4..];
+                if d.len() > blksize {
+                    return fail(&s, 4, "a block larger than agreed");
+                }
+                got.extend_from_slice(d);
+                if got.len() as u64 > cfg.max_bytes {
+                    return fail(&s, 3, "file too large for this server");
+                }
+                last = [vec![0, ACK as u8], want.to_be_bytes().to_vec()].concat();
+                want = want.wrapping_add(1);
+                if d.len() < blksize {
+                    break;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let data = if mode == "netascii" { from_netascii(&got) } else { got };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tftp-part");
+    let ok = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &path));
+    // stored (and logged) before the last ACK says so
+    match ok {
+        Ok(_) => {
+            log(&logq, json!({ "op": "put", "file": file, "client": client.to_string(), "ok": true, "bytes": data.len(), "blksize": blksize, "ms": started.elapsed().as_millis() as u64 }));
+            let _ = s.send_to(&last, client);
+            // the last ACK may be lost: answer a repeated last block for a moment (RFC 1350's dally)
+            let until = Instant::now() + timeout.min(Duration::from_secs(2));
+            while let Some(p) = wait(&s, &mut buf) {
+                if op(&p) == DATA {
+                    let _ = s.send_to(&last, client);
+                }
+                if Instant::now() > until {
+                    break;
+                }
+            }
+        }
+        Err(e) => fail(&s, 3, &format!("cannot store it: {}", e)),
+    }
+}
+
+/// Starts a TFTP server named `name` on the folder `root`, in the background: options `port`
+/// (69, which needs root; 6969 is usual otherwise), `host` ("0.0.0.0"), `allow_write` (false),
+/// `overwrite` (false), `max_blksize` (1468), `max_bytes` (64 MB), `retries` (5). Paths
+/// outside the folder are refused. Starting a name already running gives it as it is.
+pub fn tftp_serve(name: &str, root: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(s) = servers().lock().map_err(|_| "poisoned".to_string())?.get(name) {
+        return Ok(json!({ "name": name, "port": s.port, "root": root, "running": true }));
+    }
+    let o = if options.is_object() { options } else { json!({}) };
+    let rootp = PathBuf::from(root);
+    if !rootp.is_dir() {
+        return Err(format!("{} is not a folder", root));
+    }
+    let rootp = rootp.canonicalize().map_err(|e| e.to_string())?;
+    let port = o.get("port").and_then(|v| v.as_u64()).unwrap_or(69).clamp(1, 65535) as u16;
+    let host = o.get("host").and_then(|v| v.as_str()).unwrap_or("0.0.0.0").to_string();
+    let sock = UdpSocket::bind((host.as_str(), port)).map_err(|e| format!("cannot listen on {}:{}: {}{}", host, port, e, if port < 1024 { " (ports below 1024 need root: use 6969)" } else { "" }))?;
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+    let cfg = Arc::new(SrvOpt {
+        allow_write: o.get("allow_write").and_then(|v| v.as_bool()).unwrap_or(false),
+        overwrite: o.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false),
+        max_blksize: o.get("max_blksize").and_then(|v| v.as_u64()).unwrap_or(1468).clamp(512, 65464) as usize,
+        max_bytes: o.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(64 * 1024 * 1024),
+        retries: o.get("retries").and_then(|v| v.as_u64()).unwrap_or(5).min(50) as u32,
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let logq = Arc::new(Mutex::new(VecDeque::new()));
+    let (st, lq) = (stop.clone(), logq.clone());
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        while !st.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let req = buf[..n].to_vec();
+                match op(&req) {
+                    RRQ | WRQ => {
+                        let (r, c, l) = (rootp.clone(), cfg.clone(), lq.clone());
+                        std::thread::spawn(move || serve_one(r, req, from, c, l));
+                    }
+                    ERROR => {}
+                    _ => {
+                        let _ = sock.send_to(&err_packet(4, "send a read or write request to this port"), from);
+                    }
+                }
+            }
+        }
+    });
+    servers().lock().map_err(|_| "poisoned".to_string())?.insert(name.to_string(), Server { stop, log: logq, port });
+    Ok(json!({ "name": name, "port": port, "root": root, "running": true }))
+}
+
+/// The transfers the server `name` finished (or failed) since the last call, oldest first, up
+/// to `max`, waiting up to `wait_ms` for one: each `{ op, file, client, ok, bytes, ms, error }`.
+/// The last 1000 are kept; when nobody reads them the oldest go first.
+pub fn tftp_transfers(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let q = servers().lock().map_err(|_| "poisoned".to_string())?.get(name).map(|s| s.log.clone()).ok_or_else(|| format!("no TFTP server named {:?}: start it with tftp_serve", name))?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 60_000) as u64);
+    loop {
+        {
+            let mut g = q.lock().map_err(|_| "poisoned".to_string())?;
+            if !g.is_empty() || Instant::now() >= until {
+                let n = (max.max(1) as usize).min(g.len());
+                return Ok(g.drain(..n).collect());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Stops the server `name`: true when one was running.
+pub fn tftp_stop(name: &str) -> bool {
+    match servers().lock().ok().and_then(|mut m| m.remove(name)) {
+        Some(s) => {
+            s.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
