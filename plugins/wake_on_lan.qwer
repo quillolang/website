@@ -1,0 +1,173 @@
+//! Wake-on-LAN: magic packets (with SecureOn passwords) sent to a subnet's broadcast address or a host, several times for lossy networks; MAC addresses read in their many spellings (colons, dashes, Cisco dots, bare hex, one-digit groups) and written in each; a subnet's broadcast address worked out; and magic packets read back, for a relay on `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::Duration;
+
+fn parse_mac(text: &str) -> Result<[u8; 6], String> {
+    let t = text.trim();
+    let bad = || format!("`{}` is not a MAC address: write it like 00:1a:2b:3c:4d:5e, 00-1A-2B-3C-4D-5E, 001a.2b3c.4d5e or 001A2B3C4D5E", text);
+    let t2 = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    let groups: Vec<&str> = t2.split(|c| c == ':' || c == '-' || c == '.' || c == ' ').filter(|g| !g.is_empty()).collect();
+    if groups.iter().any(|g| !g.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(bad());
+    }
+    let hex: String = match groups.len() {
+        1 if groups[0].len() == 12 => groups[0].to_string(),
+        // Cisco: three groups of four
+        3 if groups.iter().all(|g| g.len() == 4) => groups.concat(),
+        // two groups of six (001a2b-3c4d5e)
+        2 if groups.iter().all(|g| g.len() == 6) => groups.concat(),
+        // six groups of one or two digits (0:1a:2b:3c:4d:5e, as some tools print them)
+        6 if groups.iter().all(|g| g.len() <= 2) => groups.iter().map(|g| format!("{:0>2}", g)).collect(),
+        _ => return Err(bad()),
+    };
+    let mut m = [0u8; 6];
+    for i in 0..6 {
+        m[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(m)
+}
+
+fn mac_text(m: &[u8], sep: &str, upper: bool) -> String {
+    let s = m.iter().map(|b| if upper { format!("{:02X}", b) } else { format!("{:02x}", b) }).collect::<Vec<_>>().join(sep);
+    s
+}
+
+fn parse_password(p: &str) -> Result<Vec<u8>, String> {
+    let p = p.trim();
+    if p.is_empty() {
+        return Ok(vec![]);
+    }
+    if let Ok(ip) = p.parse::<Ipv4Addr>() {
+        return Ok(ip.octets().to_vec());
+    }
+    if let Ok(m) = parse_mac(p) {
+        return Ok(m.to_vec());
+    }
+    let h: String = p.chars().filter(|c| !matches!(c, ':' | '-' | ' ')).collect();
+    if h.len() == 8 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok((0..4).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect());
+    }
+    Err(format!("`{}` is not a SecureOn password: it is 6 bytes written like a MAC address (01:02:03:04:05:06) or 4 like an IPv4 address", p))
+}
+
+fn packet(mac: &[u8; 6], pw: &[u8]) -> Vec<u8> {
+    let mut p = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        p.extend_from_slice(mac);
+    }
+    p.extend_from_slice(pw);
+    p
+}
+
+/// A MAC address in any common spelling read: `{ mac, dash, cisco, bare, oui, unicast, universal }`
+/// (`mac` is `00:1A:2B:3C:4D:5E`); one that cannot be a MAC address is an error saying the spellings.
+pub fn wol_mac(text: &str) -> Result<serde_json::Value, String> {
+    let m = parse_mac(text)?;
+    let bare = mac_text(&m, "", false);
+    Ok(json!({
+        "mac": mac_text(&m, ":", true),
+        "dash": mac_text(&m, "-", true),
+        "cisco": format!("{}.{}.{}", &bare[0..4], &bare[4..8], &bare[8..12]),
+        "bare": bare,
+        "oui": mac_text(&m[..3], ":", true),
+        "unicast": m[0] & 1 == 0,
+        "universal": m[0] & 2 == 0,
+    }))
+}
+
+/// The magic packet for a MAC address as hex: 6 bytes of FF, the address 16 times, and the
+/// SecureOn password if one is given (`""` for none; 6 bytes like a MAC, or 4 like an IPv4 address).
+pub fn wol_packet(mac: &str, password: &str) -> Result<String, String> {
+    let m = parse_mac(mac)?;
+    let pw = parse_password(password)?;
+    Ok(packet(&m, &pw).iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+fn sock_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.matches(':').count() == 1 && !h.starts_with('[') { h.to_string() } else { format!("{}:{}", h, port) };
+    with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.find(|a| a.is_ipv4()).ok_or(format!("{} has no IPv4 address (Wake-on-LAN is IPv4 broadcast)", host))
+}
+
+/// Wakes a machine: its magic packet sent `count` times (3), `interval_ms` apart (100), to
+/// `to` (`"255.255.255.255"` unless given: a subnet's broadcast address such as
+/// `"192.168.1.255"`, or a host) on UDP `port` (9; 7 is the other usual one), from `from`
+/// (a local address, to pick the network card); `password` for SecureOn.
+pub fn wol_send(mac: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let m = parse_mac(mac)?;
+    let o = if options.is_object() { options } else { json!({}) };
+    let s = |k: &str| o.get(k).and_then(|v| v.as_str()).map(|x| x.to_string());
+    let pw = parse_password(&s("password").unwrap_or_default())?;
+    let port = o.get("port").and_then(|v| v.as_u64()).unwrap_or(9).clamp(1, 65535) as u16;
+    let to = s("to").unwrap_or_else(|| "255.255.255.255".into());
+    let count = o.get("count").and_then(|v| v.as_u64()).unwrap_or(3).clamp(1, 20);
+    let interval = o.get("interval_ms").and_then(|v| v.as_u64()).unwrap_or(100).min(5000);
+    let a = sock_addr(&to, port)?;
+    let from = match s("from") {
+        Some(f) => format!("{}:0", f.parse::<Ipv4Addr>().map_err(|_| format!("from {:?} is not an IPv4 address of this machine", f))?),
+        None => "0.0.0.0:0".to_string(),
+    };
+    let sock = UdpSocket::bind(&from).map_err(|e| format!("cannot use {}: {}", from, e))?;
+    sock.set_broadcast(true).map_err(|e| e.to_string())?;
+    let p = packet(&m, &pw);
+    for i in 0..count {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(interval));
+        }
+        sock.send_to(&p, a).map_err(|e| {
+            let hint = if e.raw_os_error() == Some(13) || e.kind() == std::io::ErrorKind::PermissionDenied { " (broadcasts may be refused on this network: send to the subnet's broadcast address, from: a local address, or a host)" } else { "" };
+            format!("sending to {}: {}{}", a, e, hint)
+        })?;
+    }
+    Ok(json!({ "mac": mac_text(&m, ":", true), "to": a.to_string(), "packets": count, "bytes": p.len(), "secure_on": !pw.is_empty() }))
+}
+
+/// A subnet's broadcast address, for `wol_send`'s `to`: `"192.168.1.20/24"` or
+/// `"10.0.0.7/255.255.252.0"` (or with a space) gives `"192.168.1.255"` and `"10.0.3.255"`.
+pub fn wol_broadcast(network: &str) -> Result<String, String> {
+    let n = network.trim();
+    let (ip, mask) = n.split_once(|c| c == '/' || c == ' ').ok_or_else(|| format!("`{}`: write an address and its prefix, as 192.168.1.20/24", network))?;
+    let ip: Ipv4Addr = ip.trim().parse().map_err(|_| format!("`{}` is not an IPv4 address", ip))?;
+    let m = mask.trim();
+    let bits: u32 = if let Ok(p) = m.parse::<u32>() {
+        if p > 32 {
+            return Err(format!("/{} is not a prefix (0 to 32)", p));
+        }
+        if p == 0 { 0 } else { u32::MAX << (32 - p) }
+    } else {
+        let mm: Ipv4Addr = m.parse().map_err(|_| format!("`{}` is neither a prefix nor a netmask", m))?;
+        let b = u32::from(mm);
+        if b.leading_ones() + b.trailing_zeros() != 32 {
+            return Err(format!("{} is not a netmask (its ones must come first)", mm));
+        }
+        b
+    };
+    Ok(Ipv4Addr::from(u32::from(ip) | !bits).to_string())
+}
+
+/// Reads a magic packet (as a `udp.listen` handler gets `p.bytes`, or a frame holding one):
+/// `{ mac, password }`, the password as hex or null. Anything else is an error.
+pub fn wol_read(bytes: Vec<i64>) -> Result<serde_json::Value, String> {
+    let b: Vec<u8> = bytes.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte", x))).collect::<Result<_, _>>()?;
+    let mut i = 0;
+    while i + 102 <= b.len() {
+        if b[i..i + 6].iter().all(|x| *x == 0xFF) {
+            let mac = &b[i + 6..i + 12];
+            if mac != [0xFF; 6] && (0..16).all(|k| &b[i + 6 + 6 * k..i + 12 + 6 * k] == mac) {
+                let rest = &b[i + 102..];
+                let pw = match rest.len() {
+                    4 | 6 => Some(rest.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":")),
+                    _ => None,
+                };
+                return Ok(json!({ "mac": mac_text(mac, ":", true), "password": pw }));
+            }
+        }
+        i += 1;
+    }
+    Err("not a magic packet: no 6 bytes of FF followed by one MAC address 16 times".into())
+}

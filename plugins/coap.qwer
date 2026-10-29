@@ -1,0 +1,997 @@
+//! A CoAP client (RFC 7252) for IoT devices over UDP: GET, POST, PUT and DELETE with options, confirmable messages retransmitted with backoff, separate responses, block-wise transfers both ways (RFC 7959), observing a resource with its notifications buffered for the program to read (RFC 7641), and resource discovery in CoRE link format (RFC 6690, /.well-known/core); and messages read and answered for a CoAP server on `udp.listen`. Plain coap:// (no DTLS).
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! getrandom = "0.2"
+
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const CON: u8 = 0;
+const NON: u8 = 1;
+const ACK: u8 = 2;
+const RST: u8 = 3;
+
+const O_IF_MATCH: u16 = 1;
+const O_URI_HOST: u16 = 3;
+const O_ETAG: u16 = 4;
+const O_IF_NONE_MATCH: u16 = 5;
+const O_OBSERVE: u16 = 6;
+const O_URI_PORT: u16 = 7;
+const O_LOCATION_PATH: u16 = 8;
+const O_URI_PATH: u16 = 11;
+const O_CONTENT_FORMAT: u16 = 12;
+const O_MAX_AGE: u16 = 14;
+const O_URI_QUERY: u16 = 15;
+const O_ACCEPT: u16 = 17;
+const O_LOCATION_QUERY: u16 = 20;
+const O_BLOCK2: u16 = 23;
+const O_BLOCK1: u16 = 27;
+const O_SIZE1: u16 = 60;
+
+#[derive(Clone, Debug)]
+struct Msg {
+    ty: u8,
+    code: u8,
+    mid: u16,
+    token: Vec<u8>,
+    opts: Vec<(u16, Vec<u8>)>,
+    payload: Vec<u8>,
+}
+
+impl Msg {
+    fn opt(&self, n: u16) -> Option<&Vec<u8>> {
+        self.opts.iter().find(|o| o.0 == n).map(|o| &o.1)
+    }
+    fn opts_of(&self, n: u16) -> Vec<&Vec<u8>> {
+        self.opts.iter().filter(|o| o.0 == n).map(|o| &o.1).collect()
+    }
+    fn uint(&self, n: u16) -> Option<u64> {
+        self.opt(n).map(|b| b.iter().fold(0u64, |a, x| (a << 8) | *x as u64))
+    }
+}
+
+fn uint_bytes(v: u64) -> Vec<u8> {
+    let b = v.to_be_bytes();
+    b.iter().skip_while(|x| **x == 0).cloned().collect()
+}
+
+fn encode(m: &Msg) -> Vec<u8> {
+    let mut out = vec![0x40 | (m.ty << 4) | m.token.len() as u8, m.code];
+    out.extend_from_slice(&m.mid.to_be_bytes());
+    out.extend_from_slice(&m.token);
+    let mut opts = m.opts.clone();
+    opts.sort_by_key(|o| o.0); // stable: repeated options keep their order
+    let mut last = 0u16;
+    for (n, v) in opts {
+        let delta = (n - last) as usize;
+        last = n;
+        let nib = |x: usize| if x < 13 { x as u8 } else if x < 269 { 13 } else { 14 };
+        out.push((nib(delta) << 4) | nib(v.len()));
+        for x in [delta, v.len()] {
+            if (13..269).contains(&x) {
+                out.push((x - 13) as u8);
+            } else if x >= 269 {
+                out.extend_from_slice(&((x - 269) as u16).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&v);
+    }
+    if !m.payload.is_empty() {
+        out.push(0xFF);
+        out.extend_from_slice(&m.payload);
+    }
+    out
+}
+
+fn decode(b: &[u8]) -> Result<Msg, String> {
+    if b.len() < 4 {
+        return Err("a CoAP message is at least 4 bytes".into());
+    }
+    if b[0] >> 6 != 1 {
+        return Err(format!("CoAP version {}, not 1", b[0] >> 6));
+    }
+    let ty = (b[0] >> 4) & 3;
+    let tkl = (b[0] & 0x0F) as usize;
+    if tkl > 8 || b.len() < 4 + tkl {
+        return Err("a CoAP token longer than 8 bytes, or cut short".into());
+    }
+    let mut m = Msg { ty, code: b[1], mid: u16::from_be_bytes([b[2], b[3]]), token: b[4..4 + tkl].to_vec(), opts: vec![], payload: vec![] };
+    let mut i = 4 + tkl;
+    let mut num: u32 = 0;
+    while i < b.len() {
+        if b[i] == 0xFF {
+            if i + 1 == b.len() {
+                return Err("a payload marker with no payload".into());
+            }
+            m.payload = b[i + 1..].to_vec();
+            break;
+        }
+        let mut delta = (b[i] >> 4) as usize;
+        let mut len = (b[i] & 0x0F) as usize;
+        i += 1;
+        let mut ext = |x: &mut usize| -> Result<(), String> {
+            match *x {
+                13 => {
+                    *x = 13 + *b.get(i).ok_or("an option cut short")? as usize;
+                    i += 1;
+                }
+                14 => {
+                    if i + 2 > b.len() {
+                        return Err("an option cut short".into());
+                    }
+                    *x = 269 + u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+                    i += 2;
+                }
+                15 => return Err("option nibble 15 is reserved".into()),
+                _ => {}
+            }
+            Ok(())
+        };
+        ext(&mut delta)?;
+        ext(&mut len)?;
+        num += delta as u32;
+        if i + len > b.len() || num > 65535 {
+            return Err("an option cut short".into());
+        }
+        m.opts.push((num as u16, b[i..i + len].to_vec()));
+        i += len;
+    }
+    Ok(m)
+}
+
+fn code_text(c: u8) -> String {
+    format!("{}.{:02}", c >> 5, c & 0x1F)
+}
+
+fn code_name(c: u8) -> &'static str {
+    match c {
+        0x00 => "Empty",
+        0x01 => "GET",
+        0x02 => "POST",
+        0x03 => "PUT",
+        0x04 => "DELETE",
+        0x05 => "FETCH",
+        0x06 => "PATCH",
+        0x07 => "iPATCH",
+        0x41 => "Created",
+        0x42 => "Deleted",
+        0x43 => "Valid",
+        0x44 => "Changed",
+        0x45 => "Content",
+        0x5F => "Continue",
+        0x80 => "Bad Request",
+        0x81 => "Unauthorized",
+        0x82 => "Bad Option",
+        0x83 => "Forbidden",
+        0x84 => "Not Found",
+        0x85 => "Method Not Allowed",
+        0x86 => "Not Acceptable",
+        0x88 => "Request Entity Incomplete",
+        0x89 => "Conflict",
+        0x8C => "Precondition Failed",
+        0x8D => "Request Entity Too Large",
+        0x8F => "Unsupported Content-Format",
+        0xA0 => "Internal Server Error",
+        0xA1 => "Not Implemented",
+        0xA2 => "Bad Gateway",
+        0xA3 => "Service Unavailable",
+        0xA4 => "Gateway Timeout",
+        0xA5 => "Proxying Not Supported",
+        _ => "",
+    }
+}
+
+fn parse_code(s: &str) -> Result<u8, String> {
+    let t = s.trim();
+    if let Some((a, b)) = t.split_once('.') {
+        if let (Ok(c), Ok(d)) = (a.parse::<u8>(), b.parse::<u8>()) {
+            if c <= 7 && d <= 31 {
+                return Ok((c << 5) | d);
+            }
+        }
+    }
+    for c in 0u8..=0xBF {
+        if !code_name(c).is_empty() && code_name(c).eq_ignore_ascii_case(t) {
+            return Ok(c);
+        }
+    }
+    Err(format!("`{}` is not a CoAP code: write 2.05 or Content, 2.04 or Changed, 4.04 or Not Found...", s))
+}
+
+const FORMATS: &[(u16, &str, &str)] = &[
+    (0, "text", "text/plain;charset=utf-8"), (40, "link", "application/link-format"), (41, "xml", "application/xml"),
+    (42, "octet", "application/octet-stream"), (47, "exi", "application/exi"), (50, "json", "application/json"),
+    (51, "json-patch", "application/json-patch+json"), (52, "merge-patch", "application/merge-patch+json"), (60, "cbor", "application/cbor"),
+    (110, "senml-json", "application/senml+json"), (112, "senml-cbor", "application/senml+cbor"), (11542, "lwm2m-tlv", "application/vnd.oma.lwm2m+tlv"),
+    (11543, "lwm2m-json", "application/vnd.oma.lwm2m+json"),
+];
+
+fn format_of(v: &Value) -> Result<Option<u16>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => n.as_u64().filter(|x| *x <= 65535).map(|x| Some(x as u16)).ok_or_else(|| "a content format is 0 to 65535".to_string()),
+        Value::String(s) => FORMATS.iter().find(|f| f.1.eq_ignore_ascii_case(s) || f.2.eq_ignore_ascii_case(s)).map(|f| Some(f.0)).ok_or_else(|| format!("content format {:?}: use text, json, cbor, link, xml, octet, senml-json... or its number", s)),
+        _ => Err("a content format is a name or a number".into()),
+    }
+}
+
+fn format_name(n: u64) -> Value {
+    FORMATS.iter().find(|f| f.0 as u64 == n).map(|f| json!(f.2)).unwrap_or(json!(n))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    let h: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    if h.len() % 2 == 1 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("`{}` is not hex", s));
+    }
+    Ok((0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect())
+}
+
+fn random(n: usize) -> Vec<u8> {
+    let mut b = vec![0u8; n];
+    if getrandom::getrandom(&mut b).is_err() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1);
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = (t >> ((i % 16) * 8)) as u8 ^ (i as u8).wrapping_mul(151);
+        }
+    }
+    b
+}
+
+fn next_mid() -> u16 {
+    static M: OnceLock<Mutex<u16>> = OnceLock::new();
+    let m = M.get_or_init(|| {
+        let r = random(2);
+        Mutex::new(u16::from_be_bytes([r[0], r[1]]))
+    });
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    *g = g.wrapping_add(1);
+    *g
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+struct Target {
+    addr: SocketAddr,
+    host_opt: Option<String>,
+    port: u16,
+    path: Vec<String>,
+    query: Vec<String>,
+    url: String,
+}
+
+/// `coap://host[:port]/path?query` (RFC 7252 6.4) to the options that carry it.
+fn target(url: &str) -> Result<Target, String> {
+    let u = url.trim();
+    let rest = if let Some(r) = u.strip_prefix("coap://") {
+        r
+    } else if u.starts_with("coaps://") || u.starts_with("coap+tcp://") || u.starts_with("coaps+tcp://") {
+        return Err(format!("{}: only coap:// (UDP without DTLS) is supported", url));
+    } else {
+        return Err(format!("`{}` is not a coap:// URL", url));
+    };
+    let (auth, pq) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => match rest.find('?') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        },
+    };
+    let (host, port) = if let Some(h) = auth.strip_prefix('[') {
+        let (h, r) = h.split_once(']').ok_or_else(|| format!("{}: an IPv6 address needs its ]", url))?;
+        (h.to_string(), r.strip_prefix(':').map(|p| p.parse::<u16>().map_err(|_| format!("{}: bad port", url))).transpose()?.unwrap_or(5683))
+    } else {
+        match auth.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("{}: bad port", url))?),
+            None => (auth.to_string(), 5683),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("{}: no host", url));
+    }
+    let (p, q) = match pq.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (pq, ""),
+    };
+    let path: Vec<String> = p.split('/').filter(|s| !s.is_empty()).map(pct_decode).collect();
+    let query: Vec<String> = q.split('&').filter(|s| !s.is_empty()).map(pct_decode).collect();
+    let mut addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    let addr = addrs.into_iter().next().ok_or_else(|| format!("{} has no address", host))?;
+    let host_opt = if host.parse::<IpAddr>().is_ok() { None } else { Some(host.clone()) };
+    Ok(Target { addr, host_opt, port, path, query, url: u.to_string() })
+}
+
+struct Cfg {
+    confirmable: bool,
+    ack_timeout: Duration,
+    retries: u32,
+    timeout: Duration,
+    block: usize,
+    format: Option<u16>,
+    accept: Option<u16>,
+    extra: Vec<(u16, Vec<u8>)>,
+    max_bytes: usize,
+}
+
+fn cfg(o: &Value) -> Result<Cfg, String> {
+    let block = o.get("block_size").and_then(|v| v.as_u64()).unwrap_or(1024) as usize;
+    if ![16, 32, 64, 128, 256, 512, 1024].contains(&block) {
+        return Err("block_size is 16, 32, 64, 128, 256, 512 or 1024".into());
+    }
+    let mut extra = vec![];
+    if let Some(list) = o.get("options").and_then(|v| v.as_array()) {
+        for x in list {
+            let n = x.get("number").and_then(|v| v.as_u64()).filter(|n| *n > 0 && *n <= 65535).ok_or("each extra option is { number, value } (value: text, a number, or { hex })")?;
+            let v = match x.get("value") {
+                Some(Value::String(s)) => s.as_bytes().to_vec(),
+                Some(Value::Number(n)) => uint_bytes(n.as_u64().unwrap_or(0)),
+                Some(Value::Object(h)) => unhex(h.get("hex").and_then(|v| v.as_str()).unwrap_or(""))?,
+                None | Some(Value::Null) => vec![],
+                _ => return Err("an option's value is text, a number or { hex }".into()),
+            };
+            extra.push((n as u16, v));
+        }
+    }
+    if let Some(etag) = o.get("if_match").and_then(|v| v.as_str()) {
+        extra.push((O_IF_MATCH, unhex(etag)?));
+    }
+    if o.get("if_none_match").and_then(|v| v.as_bool()) == Some(true) {
+        extra.push((O_IF_NONE_MATCH, vec![]));
+    }
+    Ok(Cfg {
+        confirmable: o.get("confirmable").and_then(|v| v.as_bool()).unwrap_or(true),
+        ack_timeout: Duration::from_millis(o.get("ack_timeout_ms").and_then(|v| v.as_u64()).unwrap_or(2000).clamp(50, 60_000)),
+        retries: o.get("retries").and_then(|v| v.as_u64()).unwrap_or(4).min(10) as u32,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000).clamp(100, 300_000)),
+        block,
+        format: format_of(o.get("content_format").unwrap_or(&Value::Null))?,
+        accept: format_of(o.get("accept").unwrap_or(&Value::Null))?,
+        extra,
+        max_bytes: o.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(16 * 1024 * 1024) as usize,
+    })
+}
+
+fn szx(size: usize) -> u64 {
+    (size.trailing_zeros() as u64).saturating_sub(4)
+}
+
+fn block_opt(num: u64, more: bool, size: usize) -> Vec<u8> {
+    uint_bytes((num << 4) | if more { 8 } else { 0 } | szx(size))
+}
+
+fn read_block(v: &[u8]) -> (u64, bool, usize) {
+    let x = v.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
+    (x >> 4, x & 8 != 0, 1usize << ((x & 7).min(6) + 4))
+}
+
+fn base_opts(t: &Target, c: &Cfg) -> Vec<(u16, Vec<u8>)> {
+    let mut o = vec![];
+    if let Some(h) = &t.host_opt {
+        o.push((O_URI_HOST, h.as_bytes().to_vec()));
+    }
+    if t.port != 5683 && t.host_opt.is_some() {
+        o.push((O_URI_PORT, uint_bytes(t.port as u64)));
+    }
+    for p in &t.path {
+        o.push((O_URI_PATH, p.as_bytes().to_vec()));
+    }
+    for q in &t.query {
+        o.push((O_URI_QUERY, q.as_bytes().to_vec()));
+    }
+    if let Some(a) = c.accept {
+        o.push((O_ACCEPT, uint_bytes(a as u64)));
+    }
+    o.extend(c.extra.iter().cloned());
+    o
+}
+
+/// One request and its response: confirmable ones retransmitted with exponential backoff
+/// (RFC 7252 4.2), a separate response waited for after an empty ACK and acknowledged.
+fn transact(s: &UdpSocket, t: &Target, req: &Msg, c: &Cfg, resent: &mut u32) -> Result<Msg, String> {
+    let bytes = encode(req);
+    let deadline = Instant::now() + c.timeout;
+    let mut buf = vec![0u8; 65536];
+    let jitter = 1.0 + (random(1)[0] as f64 / 255.0) * 0.5; // ACK_RANDOM_FACTOR 1.5
+    let mut wait = Duration::from_secs_f64(c.ack_timeout.as_secs_f64() * jitter);
+    let mut acked = req.ty != CON;
+    let mut tries = 0;
+    s.send_to(&bytes, t.addr).map_err(|e| format!("sending to {}: {}", t.addr, e))?;
+    let mut next_send = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!("no response from {} for {} in {} ms{}", t.addr, t.url, c.timeout.as_millis(), if acked && req.ty == CON { " (the request was acknowledged; the response never came)" } else { "" }));
+        }
+        if !acked && now >= next_send {
+            if tries >= c.retries {
+                return Err(format!("no answer from {} for {} after {} tries ({} ms): is the device on, and CoAP on UDP port {}?", t.addr, t.url, tries + 1, c.ack_timeout.as_millis(), t.addr.port()));
+            }
+            tries += 1;
+            *resent += 1;
+            wait *= 2;
+            s.send_to(&bytes, t.addr).map_err(|e| format!("sending to {}: {}", t.addr, e))?;
+            next_send = Instant::now() + wait;
+        }
+        let until = if acked { deadline } else { next_send.min(deadline) };
+        s.set_read_timeout(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).map_err(|e| e.to_string())?;
+        let (n, from) = match s.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err(format!("{} refused: nothing listens on UDP port {}", t.addr, t.addr.port())),
+            Err(e) => return Err(format!("reading from {}: {}", t.addr, e)),
+        };
+        if from.ip() != t.addr.ip() {
+            continue;
+        }
+        let m = match decode(&buf[..n]) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if m.ty == RST && m.mid == req.mid {
+            return Err(format!("{} answered with a reset: it could not take the request for {}", t.addr, t.url));
+        }
+        if m.ty == ACK && m.mid == req.mid {
+            if m.code == 0 {
+                acked = true; // a separate response will follow
+                continue;
+            }
+            if m.token != req.token {
+                continue;
+            }
+            return Ok(m);
+        }
+        if (m.ty == CON || m.ty == NON) && m.token == req.token && m.code >= 0x40 {
+            if m.ty == CON {
+                let ack = Msg { ty: ACK, code: 0, mid: m.mid, token: vec![], opts: vec![], payload: vec![] };
+                let _ = s.send_to(&encode(&ack), from);
+            }
+            return Ok(m);
+        }
+        if m.ty == CON {
+            // not ours: a reset, so the sender stops
+            let rst = Msg { ty: RST, code: 0, mid: m.mid, token: vec![], opts: vec![], payload: vec![] };
+            let _ = s.send_to(&encode(&rst), from);
+        }
+    }
+}
+
+fn socket_for(a: &SocketAddr) -> Result<UdpSocket, String> {
+    UdpSocket::bind(if a.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())
+}
+
+fn response_json(m: &Msg, payload: &[u8], blocks: u64, resent: u32, ms: u64) -> Value {
+    let mut o = Map::new();
+    o.insert("code".into(), json!(code_text(m.code)));
+    o.insert("status".into(), json!(code_name(m.code)));
+    o.insert("ok".into(), json!(m.code >> 5 == 2));
+    match std::str::from_utf8(payload) {
+        Ok(s) => {
+            o.insert("payload".into(), json!(s));
+        }
+        Err(_) => {
+            o.insert("payload".into(), Value::Null);
+            o.insert("payload_hex".into(), json!(hex(payload)));
+        }
+    }
+    o.insert("bytes".into(), json!(payload.len()));
+    o.insert("content_format".into(), m.uint(O_CONTENT_FORMAT).map(format_name).unwrap_or(Value::Null));
+    o.insert("etag".into(), m.opt(O_ETAG).map(|e| json!(hex(e))).unwrap_or(Value::Null));
+    o.insert("max_age".into(), json!(m.uint(O_MAX_AGE).unwrap_or(60)));
+    let loc: Vec<String> = m.opts_of(O_LOCATION_PATH).iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let locq: Vec<String> = m.opts_of(O_LOCATION_QUERY).iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    o.insert("location".into(), if loc.is_empty() && locq.is_empty() { Value::Null } else { json!(format!("/{}{}", loc.join("/"), if locq.is_empty() { String::new() } else { format!("?{}", locq.join("&")) })) });
+    if let Some(obs) = m.uint(O_OBSERVE) {
+        o.insert("observe".into(), json!(obs));
+    }
+    o.insert("blocks".into(), json!(blocks));
+    o.insert("retransmissions".into(), json!(resent));
+    o.insert("ms".into(), json!(ms));
+    Value::Object(o)
+}
+
+fn payload_of(payload: &str, o: &Value) -> Result<Vec<u8>, String> {
+    match o.get("payload_hex").and_then(|v| v.as_str()) {
+        Some(h) => unhex(h),
+        None => Ok(payload.as_bytes().to_vec()),
+    }
+}
+
+fn do_request(code: u8, url: &str, payload: Vec<u8>, o: &Value) -> Result<Value, String> {
+    let started = Instant::now();
+    let t = target(url)?;
+    let c = cfg(o)?;
+    let s = socket_for(&t.addr)?;
+    let ty = if c.confirmable { CON } else { NON };
+    let mut resent = 0u32;
+    let mut base = base_opts(&t, &c);
+    if let Some(f) = c.format {
+        base.push((O_CONTENT_FORMAT, uint_bytes(f as u64)));
+    }
+    // Block1: the payload sent in blocks when it does not fit one (RFC 7959 2.5)
+    let mut resp: Msg;
+    let mut size = c.block;
+    if payload.len() > size {
+        let mut sent = 0usize;
+        loop {
+            let num = (sent / size) as u64;
+            let end = (sent + size).min(payload.len());
+            let more = end < payload.len();
+            let mut opts = base.clone();
+            opts.push((O_BLOCK1, block_opt(num, more, size)));
+            if num == 0 {
+                opts.push((O_SIZE1, uint_bytes(payload.len() as u64)));
+            }
+            let req = Msg { ty, code, mid: next_mid(), token: random(4), opts, payload: payload[sent..end].to_vec() };
+            resp = transact(&s, &t, &req, &c, &mut resent)?;
+            if resp.code == 0x8D {
+                // too large: the server may say the size it takes
+                if let Some(b) = resp.opt(O_BLOCK1) {
+                    let (_, _, ssz) = read_block(b);
+                    if ssz < size {
+                        size = ssz;
+                        sent = 0;
+                        continue;
+                    }
+                }
+                return Ok(response_json(&resp, &resp.payload, 0, resent, started.elapsed().as_millis() as u64));
+            }
+            if !more || resp.code >> 5 != 2 {
+                break;
+            }
+            if resp.code != 0x5F && resp.opt(O_BLOCK1).is_none() {
+                break; // the server answered for all of it at once
+            }
+            if let Some(b) = resp.opt(O_BLOCK1) {
+                let (_, _, ssz) = read_block(b);
+                if ssz < size {
+                    // the server asks for smaller blocks: go on from where its size puts us
+                    sent = end;
+                    size = ssz;
+                    sent = sent / size * size;
+                    continue;
+                }
+            }
+            sent = end;
+        }
+    } else {
+        let mut opts = base.clone();
+        if c.block < 1024 && code == 0x01 {
+            opts.push((O_BLOCK2, block_opt(0, false, c.block))); // early negotiation of the size
+        }
+        let req = Msg { ty, code, mid: next_mid(), token: random(4), opts, payload: payload.clone() };
+        resp = transact(&s, &t, &req, &c, &mut resent)?;
+    }
+    // Block2: the rest of a response in blocks (RFC 7959 2.4)
+    let mut body = resp.payload.clone();
+    let mut blocks = 1u64;
+    if let Some(b2) = resp.opt(O_BLOCK2).cloned() {
+        let (mut num, mut more, mut bsize) = read_block(&b2);
+        let etag = resp.opt(O_ETAG).cloned();
+        if num != 0 {
+            return Err("the first block of the response is not block 0".into());
+        }
+        while more {
+            if body.len() > c.max_bytes {
+                return Err(format!("the response is larger than max_bytes ({})", c.max_bytes));
+            }
+            let mut opts = base.clone();
+            opts.push((O_BLOCK2, block_opt(num + 1, false, bsize)));
+            let req = Msg { ty, code, mid: next_mid(), token: random(4), opts, payload: vec![] };
+            let r = transact(&s, &t, &req, &c, &mut resent)?;
+            if r.code >> 5 != 2 {
+                return Ok(response_json(&r, &r.payload, blocks, resent, started.elapsed().as_millis() as u64));
+            }
+            if etag.is_some() && r.opt(O_ETAG) != etag.as_ref() {
+                return Err("the resource changed while its blocks were read (another ETag): read it again".into());
+            }
+            let b = r.opt(O_BLOCK2).cloned().ok_or("a block came without its Block2 option")?;
+            let (n2, m2, s2) = read_block(&b);
+            if n2 * s2 as u64 != (num + 1) * bsize as u64 {
+                return Err(format!("asked for block {} and got block {}", num + 1, n2));
+            }
+            body.extend_from_slice(&r.payload);
+            num = n2;
+            more = m2;
+            bsize = s2;
+            blocks += 1;
+            resp.code = r.code;
+        }
+    }
+    Ok(response_json(&resp, &body, blocks, resent, started.elapsed().as_millis() as u64))
+}
+
+fn method_code(m: &str) -> Result<u8, String> {
+    Ok(match m.to_uppercase().as_str() {
+        "GET" => 0x01,
+        "POST" => 0x02,
+        "PUT" => 0x03,
+        "DELETE" => 0x04,
+        "FETCH" => 0x05,
+        "PATCH" => 0x06,
+        "IPATCH" => 0x07,
+        x => return Err(format!("method {:?}: use GET, POST, PUT, DELETE, FETCH, PATCH or iPATCH", x)),
+    })
+}
+
+/// A CoAP request (`method` GET, POST, PUT, DELETE, FETCH, PATCH, iPATCH) to a
+/// `coap://host[:port]/path?query` URL: `{ code: "2.05", status: "Content", ok, payload,
+/// content_format, etag, max_age, location, blocks, retransmissions, ms }`. Options:
+/// `content_format` and `accept` ("json", "text", "cbor", "link", or a number),
+/// `confirmable` (true), `ack_timeout_ms` (2000) and `retries` (4) for retransmission,
+/// `timeout_ms` (30000) overall, `block_size` (1024; smaller asks the device for smaller
+/// blocks), `payload_hex` for bytes, `if_match`, `if_none_match`, `options` ([{ number, value }]).
+pub fn coap_request(method: &str, url: &str, payload: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let code = method_code(method)?;
+    let o = if options.is_object() { options } else { json!({}) };
+    do_request(code, url, payload_of(payload, &o)?, &o)
+}
+
+/// GETs a resource: as `coap_request("GET", url, "", options)`.
+pub fn coap_get(url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    coap_request("GET", url, "", options)
+}
+
+/// POSTs a payload (an action, a new resource: see `location`).
+pub fn coap_post(url: &str, payload: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    coap_request("POST", url, payload, options)
+}
+
+/// PUTs a payload (a resource's new value; sent in blocks when larger than `block_size`).
+pub fn coap_put(url: &str, payload: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    coap_request("PUT", url, payload, options)
+}
+
+/// DELETEs a resource.
+pub fn coap_delete(url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    coap_request("DELETE", url, "", options)
+}
+
+/// Splits link-format text at commas and semicolons outside quotes and angle brackets.
+fn split_outside(s: &str, sep: char) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let (mut q, mut a) = (false, false);
+    for c in s.chars() {
+        match c {
+            '"' if !a => q = !q,
+            '<' if !q => a = true,
+            '>' if !q => a = false,
+            _ => {}
+        }
+        if c == sep && !q && !a {
+            out.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// CoRE link format (RFC 6690) read: each link `{ href, rt, if, ct, title, obs, sz, ... }`
+/// (`rt` and `if` as lists, as they hold several values; `obs` true when present).
+pub fn coap_links(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    for link in split_outside(text, ',') {
+        if link.is_empty() {
+            continue;
+        }
+        let parts = split_outside(&link, ';');
+        let href = parts[0].trim();
+        if !(href.starts_with('<') && href.ends_with('>')) {
+            return Err(format!("`{}` is not a link: it starts with <uri>", link));
+        }
+        let mut m = Map::new();
+        m.insert("href".into(), json!(&href[1..href.len() - 1]));
+        for p in &parts[1..] {
+            let (k, v) = match p.split_once('=') {
+                Some((k, v)) => (k.trim().to_string(), Some(v.trim().trim_matches('"').to_string())),
+                None => (p.trim().to_string(), None),
+            };
+            let val = match (k.as_str(), v) {
+                ("rt" | "if" | "rel", Some(v)) => json!(v.split_whitespace().collect::<Vec<_>>()),
+                ("ct", Some(v)) => {
+                    let list: Vec<Value> = v.split_whitespace().map(|x| x.parse::<u64>().map(format_name).unwrap_or(json!(x))).collect();
+                    if list.len() == 1 { list[0].clone() } else { json!(list) }
+                }
+                ("sz", Some(v)) => v.parse::<u64>().map(|n| json!(n)).unwrap_or(json!(v)),
+                (_, Some(v)) => json!(v),
+                (_, None) => json!(true),
+            };
+            m.insert(k, val);
+        }
+        out.push(Value::Object(m));
+    }
+    Ok(out)
+}
+
+/// Discovers a device's resources: GET /.well-known/core on `url`'s host (its path is not used;
+/// its query filters, as in `?rt=temperature`), read into links as `coap_links` gives them.
+pub fn coap_discover(url: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let t = target(url)?;
+    let q = url.split_once('?').map(|(_, q)| format!("?{}", q)).unwrap_or_default();
+    let host = if t.addr.is_ipv6() { format!("[{}]", t.addr.ip()) } else { t.host_opt.clone().unwrap_or_else(|| t.addr.ip().to_string()) };
+    let u = format!("coap://{}:{}/.well-known/core{}", host, t.port, q);
+    let mut o = if options.is_object() { options } else { json!({}) };
+    o["accept"] = json!(40);
+    let r = coap_get(&u, o)?;
+    if !r["ok"].as_bool().unwrap_or(false) {
+        return Err(format!("{} answered {} {} for /.well-known/core", t.addr, r["code"].as_str().unwrap_or(""), r["status"].as_str().unwrap_or("")));
+    }
+    coap_links(r["payload"].as_str().unwrap_or(""))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Observing
+
+struct Observer {
+    stop: Arc<AtomicBool>,
+    queue: Arc<Mutex<(VecDeque<Value>, u64)>>,
+    url: String,
+}
+
+fn observers() -> &'static Mutex<HashMap<String, Observer>> {
+    static O: OnceLock<Mutex<HashMap<String, Observer>>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn notification(m: &Msg) -> Value {
+    let mut v = response_json(m, &m.payload, 1, 0, 0);
+    if let Some(o) = v.as_object_mut() {
+        for k in ["blocks", "retransmissions", "ms", "location"] {
+            o.remove(k);
+        }
+        o.insert("at".into(), json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)));
+    }
+    v
+}
+
+/// RFC 7641 3.4: is notification `v2` newer than `v1` (24-bit sequence numbers, or 128 s later)?
+fn fresher(v1: u64, v2: u64, since: Duration) -> bool {
+    (v1 < v2 && v2 - v1 < (1 << 23)) || (v1 > v2 && v1 - v2 > (1 << 23)) || since > Duration::from_secs(128)
+}
+
+/// Starts observing a resource under `name` (RFC 7641): the device sends each change, a
+/// background thread acknowledges them and keeps them (the last `buffer`, 1000 unless given;
+/// when full the oldest go), and `coap_receive(name, ...)` hands them over. The first
+/// notification is the current value. Registered again when the device falls silent past
+/// Max-Age. Options as `coap_get`. `{ name, url, observing, first }`.
+pub fn coap_observe(name: &str, url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(old) = observers().lock().map_err(|_| "poisoned".to_string())?.get(name) {
+        if old.url == url && !old.stop.load(Ordering::Relaxed) {
+            return Ok(json!({ "name": name, "url": url, "observing": true }));
+        }
+    }
+    coap_close(name);
+    let o = if options.is_object() { options } else { json!({}) };
+    let t = target(url)?;
+    let c = cfg(&o)?;
+    let cap = o.get("buffer").and_then(|v| v.as_u64()).unwrap_or(1000).clamp(1, 100_000) as usize;
+    let s = socket_for(&t.addr)?;
+    let token = random(8);
+    let register = |s: &UdpSocket, resent: &mut u32| -> Result<Msg, String> {
+        let mut opts = base_opts(&t, &c);
+        opts.push((O_OBSERVE, vec![]));
+        let req = Msg { ty: CON, code: 0x01, mid: next_mid(), token: token.clone(), opts, payload: vec![] };
+        transact(s, &t, &req, &c, resent)
+    };
+    let mut resent = 0;
+    let first = register(&s, &mut resent)?;
+    if first.code >> 5 != 2 {
+        return Err(format!("{} answered {} {} to the observe request", t.url, code_text(first.code), code_name(first.code)));
+    }
+    let observing = first.opt(O_OBSERVE).is_some();
+    let queue = Arc::new(Mutex::new((VecDeque::new(), 0u64)));
+    queue.lock().map_err(|_| "poisoned".to_string())?.0.push_back(notification(&first));
+    let stop = Arc::new(AtomicBool::new(!observing));
+    if observing {
+        let (st, q, tk) = (stop.clone(), queue.clone(), token.clone());
+        let base = base_opts(&t, &c);
+        let addr = t.addr;
+        let max_age = Duration::from_secs(first.uint(O_MAX_AGE).unwrap_or(60));
+        let mut last_seq = first.uint(O_OBSERVE).unwrap_or(0);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut last_at = Instant::now();
+            let mut age = max_age;
+            while !st.load(Ordering::Relaxed) {
+                if last_at.elapsed() > age + Duration::from_secs(15) {
+                    // silent past Max-Age: register again with the same token
+                    let mut opts = base.clone();
+                    opts.push((O_OBSERVE, vec![]));
+                    let req = Msg { ty: CON, code: 0x01, mid: next_mid(), token: tk.clone(), opts, payload: vec![] };
+                    let _ = s.send_to(&encode(&req), addr);
+                    last_at = Instant::now();
+                }
+                let (n, from) = match s.recv_from(&mut buf) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                let m = match decode(&buf[..n]) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if m.token != tk || m.code < 0x40 {
+                    if m.ty == CON {
+                        let _ = s.send_to(&encode(&Msg { ty: RST, code: 0, mid: m.mid, token: vec![], opts: vec![], payload: vec![] }), from);
+                    }
+                    continue;
+                }
+                if m.ty == CON {
+                    let _ = s.send_to(&encode(&Msg { ty: ACK, code: 0, mid: m.mid, token: vec![], opts: vec![], payload: vec![] }), from);
+                }
+                let seq = m.uint(O_OBSERVE);
+                let ended = seq.is_none() || m.code >> 5 != 2;
+                if let Some(sq) = seq {
+                    if !fresher(last_seq, sq, last_at.elapsed()) {
+                        continue; // an older notification come late
+                    }
+                    last_seq = sq;
+                }
+                last_at = Instant::now();
+                age = Duration::from_secs(m.uint(O_MAX_AGE).unwrap_or(60));
+                if let Ok(mut g) = q.lock() {
+                    if g.0.len() >= cap {
+                        g.0.pop_front();
+                        g.1 += 1;
+                    }
+                    let mut v = notification(&m);
+                    if ended {
+                        v["ended"] = json!(true);
+                    }
+                    g.0.push_back(v);
+                }
+                if ended {
+                    st.store(true, Ordering::Relaxed);
+                }
+            }
+            // deregister (RFC 7641 3.6): a GET with Observe 1 and the same token
+            let mut opts = base.clone();
+            opts.push((O_OBSERVE, vec![1]));
+            let req = Msg { ty: NON, code: 0x01, mid: next_mid(), token: tk.clone(), opts, payload: vec![] };
+            let _ = s.send_to(&encode(&req), addr);
+        });
+    }
+    observers().lock().map_err(|_| "poisoned".to_string())?.insert(name.to_string(), Observer { stop, queue, url: url.to_string() });
+    Ok(json!({ "name": name, "url": url, "observing": observing, "first": notification(&first), "note": if observing { Value::Null } else { json!("the resource is not observable: only its current value was read") } }))
+}
+
+/// The notifications that came for `name` since the last call, oldest first, up to `max`,
+/// waiting up to `wait_ms` for one: each `{ code, status, payload, content_format, observe, at }`
+/// (`ended: true` on the last one when the device stopped). The first has `missed` when the
+/// buffer overflowed meanwhile.
+pub fn coap_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let q = observers().lock().map_err(|_| "poisoned".to_string())?.get(name).map(|o| o.queue.clone()).ok_or_else(|| format!("nothing is observed as {:?}: call coap_observe first", name))?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 60_000) as u64);
+    loop {
+        {
+            let mut g = q.lock().map_err(|_| "poisoned".to_string())?;
+            if !g.0.is_empty() || Instant::now() >= until {
+                let n = (max.max(1) as usize).min(g.0.len());
+                let mut out: Vec<Value> = g.0.drain(..n).collect();
+                if g.1 > 0 {
+                    if let Some(f) = out.first_mut() {
+                        f["missed"] = json!(g.1);
+                    }
+                    g.1 = 0;
+                }
+                return Ok(out);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Stops observing `name` (the device is told, with a deregistering GET): true when it was observed.
+pub fn coap_close(name: &str) -> bool {
+    match observers().lock().ok().and_then(|mut m| m.remove(name)) {
+        Some(o) => {
+            o.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A server's side
+
+fn bytes_of(b: &[i64]) -> Result<Vec<u8>, String> {
+    b.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect()
+}
+
+/// Reads a CoAP message as a `udp.listen` handler gets it (`p.bytes`): `{ type, code, method,
+/// mid, token, path, query, content_format, accept, observe, block1, block2, payload }`.
+pub fn coap_parse(bytes: Vec<i64>) -> Result<serde_json::Value, String> {
+    let m = decode(&bytes_of(&bytes)?)?;
+    let path: Vec<String> = m.opts_of(O_URI_PATH).iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let query: Vec<String> = m.opts_of(O_URI_QUERY).iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let blk = |n: u16| m.opt(n).map(|b| {
+        let (num, more, size) = read_block(b);
+        json!({ "num": num, "more": more, "size": size })
+    });
+    let types = ["CON", "NON", "ACK", "RST"];
+    Ok(json!({
+        "type": types[m.ty as usize],
+        "code": code_text(m.code),
+        "method": if m.code > 0 && m.code < 0x20 { json!(code_name(m.code)) } else { Value::Null },
+        "mid": m.mid, "token": hex(&m.token),
+        "path": format!("/{}", path.join("/")), "query": query,
+        "content_format": m.uint(O_CONTENT_FORMAT).map(format_name),
+        "accept": m.uint(O_ACCEPT).map(format_name),
+        "observe": m.uint(O_OBSERVE),
+        "block1": blk(O_BLOCK1), "block2": blk(O_BLOCK2),
+        "payload": String::from_utf8_lossy(&m.payload),
+    }))
+}
+
+/// The response to a request as bytes for `udp.reply`: piggybacked on the ACK of a
+/// confirmable request, a NON answer to a NON one, the token copied; `code` "2.05" or
+/// "Content"...; options `content_format`, `max_age`, `etag` (hex), `location` ("/a/b?x=1").
+/// A ping (an empty CON) is answered with a reset, as RFC 7252 says.
+pub fn coap_response(request: Vec<i64>, code: &str, payload: &str, options: serde_json::Value) -> Result<Vec<u8>, String> {
+    let req = decode(&bytes_of(&request)?)?;
+    if req.ty == CON && req.code == 0 {
+        return Ok(encode(&Msg { ty: RST, code: 0, mid: req.mid, token: vec![], opts: vec![], payload: vec![] }));
+    }
+    if req.ty == ACK || req.ty == RST {
+        return Err("an ACK or a reset is not answered".into());
+    }
+    let c = parse_code(code)?;
+    let o = if options.is_object() { options } else { json!({}) };
+    let mut opts = vec![];
+    if let Some(f) = format_of(o.get("content_format").unwrap_or(&Value::Null))? {
+        opts.push((O_CONTENT_FORMAT, uint_bytes(f as u64)));
+    }
+    if let Some(a) = o.get("max_age").and_then(|v| v.as_u64()) {
+        opts.push((O_MAX_AGE, uint_bytes(a)));
+    }
+    if let Some(e) = o.get("etag").and_then(|v| v.as_str()) {
+        opts.push((O_ETAG, unhex(e)?));
+    }
+    if let Some(l) = o.get("location").and_then(|v| v.as_str()) {
+        let (p, q) = l.split_once('?').unwrap_or((l, ""));
+        for seg in p.split('/').filter(|x| !x.is_empty()) {
+            opts.push((O_LOCATION_PATH, seg.as_bytes().to_vec()));
+        }
+        for x in q.split('&').filter(|x| !x.is_empty()) {
+            opts.push((O_LOCATION_QUERY, x.as_bytes().to_vec()));
+        }
+    }
+    let payload = match o.get("payload_hex").and_then(|v| v.as_str()) {
+        Some(h) => unhex(h)?,
+        None => payload.as_bytes().to_vec(),
+    };
+    let (ty, mid) = if req.ty == CON { (ACK, req.mid) } else { (NON, next_mid()) };
+    Ok(encode(&Msg { ty, code: c, mid, token: req.token, opts, payload }))
+}

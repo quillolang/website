@@ -8,12 +8,16 @@
 // Each example is started with `quillo run <slug>.qwe` (which builds its .qwer file the
 // first time), each `try` request is made, and its answer must be a 2xx holding `expect`.
 // A plugin that `needs` a server gets a small stand-in: an SMTP sink, a Redis, an HTTP sink
-// or a label printer on a raw socket.
+// or a label printer on a raw socket. Any other `needs` names a module in standins/
+// (`needs: "mqtt"` is standins/mqtt.mjs): its `start({ port, ports })` is awaited before the
+// example runs and gives `{ env, close(), check() }`: the variables to set, how to stop it,
+// and a problem to report when the example never reached it (or null). It may take the ports
+// from `port` to `port + 4`.
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -115,6 +119,15 @@ for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug)
     if (p.needs === "redis") { helpers.push(redisStandIn(BASE + 991)); env.REDIS_URL = `redis://127.0.0.1:${BASE + 991}/`; }
     if (p.needs === "http") { received.length = 0; helpers.push(httpSink(BASE + 992)); env.SINK_URL = `http://127.0.0.1:${BASE + 992}`; }
     if (p.needs === "printer") { printed.length = 0; helpers.push(printerStandIn(BASE + 993)); env.PRINTER_HOST = `127.0.0.1:${BASE + 993}`; }
+    let standin = null;
+    if (p.needs && !["smtp", "redis", "http", "printer"].includes(p.needs)) {
+        const file = join(here, "standins", `${p.needs}.mjs`);
+        if (!existsSync(file)) { failed++; console.log(`FAIL ${p.slug}\n  no stand-in standins/${p.needs}.mjs`); continue; }
+        const mod = await import(pathToFileURL(file).href);
+        standin = await mod.start({ port: BASE + 995, ports: [BASE + 995, BASE + 996, BASE + 997, BASE + 998, BASE + 999] });
+        Object.assign(env, standin.env ?? {});
+        helpers.push(standin);
+    }
     const child = spawn(quillo, ["run", `${p.slug}.qwe`, "--port", String(port), "--log", "off"], { cwd: here, env });
     let out = "";
     child.stdout.on("data", (d) => (out += d)); child.stderr.on("data", (d) => (out += d));
@@ -136,6 +149,7 @@ for (const p of catalog.filter((p) => only.length === 0 || only.includes(p.slug)
     // A job sent by the last request may still be on its way: give it a moment.
     for (let i = 0; i < 20 && p.needs === "printer" && printed.length === 0; i++) await sleep(100);
     if (p.needs === "printer" && up && printed.length === 0) problems.push("the printer got no job");
+    if (standin && up) { const problem = await standin.check?.(); if (problem) problems.push(problem); }
     // Every plugin says its version, on the second line of its header.
     const head = readFileSync(join(here, `${p.slug}.qwer`), "utf8").split("\n").slice(0, 3).join("\n");
     if (!/^\/\/! version: \d+\.\d+\.\d+$/m.test(head)) problems.push("no `//! version: X.Y.Z` line at the top of the file");

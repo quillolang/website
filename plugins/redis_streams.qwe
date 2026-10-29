@@ -1,0 +1,98 @@
+// An order pipeline on Redis Streams: orders appended with XADD, shared out to workers by a
+// consumer group, acknowledged when done, and the one a crashed worker left behind taken over with
+// XAUTOCLAIM; plus pub/sub alerts on a channel and a pattern, drained by a tick.
+//
+//   REDIS_URL=redis://:password@127.0.0.1:6379/0 quillo run redis_streams.qwe
+//   then open http://localhost:8080/add, /work, /reclaim, /history and /alerts
+//
+// It needs Redis 6.2 or later (Valkey and KeyDB too): REDIS_URL says where, rediss:// for TLS.
+
+use "redis_streams.qwer"
+
+let url = env("REDIS_URL", "redis://127.0.0.1:6379/0")
+let alerts = []
+
+fn redis() {
+    if (redis_sub_status("shop") ?? null) == null {
+        redis_connect("shop", url, { timeout_ms: 3000 })?
+        redis_group_create("shop", "orders", "packers", "0", true)?
+        redis_subscribe("shop", ["alerts"], false)?
+        redis_subscribe("shop", ["stock.*"], true)?
+    }
+    "shop"
+}
+
+// Pub/sub messages are kept in the plugin's buffer until a tick moves them here.
+fn drain(wait_ms: int) {
+    let name = redis() ?? null
+    if name == null { return 0 }
+    let got = redis_receive(name, 100, wait_ms) ?? []
+    let all = alerts + got
+    alerts = slice(all, -50, len(all))
+    len(got)
+}
+every(500, () => drain(0), { name: "redis-alerts" })
+
+route GET /add {
+    let r = redis()?
+    let ids = [
+        redis_xadd(r, "orders", { order: "1001", sku: "A-7", qty: 2 }, { maxlen: 10000 })?,
+        redis_xadd(r, "orders", { order: "1002", sku: "B-3", qty: 1 }, { maxlen: 10000 })?,
+        redis_xadd(r, "orders", { order: "1003", sku: "A-7", qty: 5 }, { maxlen: 10000 })?,
+    ]
+    { added: len(ids), length: redis_xlen(r, "orders")? }
+}
+
+// Worker w1 takes two orders and finishes one: the other stays pending, as if w1 had crashed.
+route GET /work {
+    let r = redis()?
+    let got = redis_xreadgroup(r, "packers", "w1", { orders: ">" }, 2, 0, {})?
+    let taken = got.orders ?? []
+    redis_xack(r, "orders", "packers", [taken[0].id])?
+    {
+        taken: taken | map((e) => e.fields.order),
+        acked: taken[0].fields.order,
+        pending: redis_xpending(r, "orders", "packers", 0, {})?,
+    }
+}
+
+// Worker w2 takes over what has waited (here: at once, min_idle 0) and the order w1 never took.
+route GET /reclaim {
+    let r = redis()?
+    let stuck = redis_xpending(r, "orders", "packers", 10, {})?
+    let claimed = redis_xautoclaim(r, "orders", "packers", "w2", 0, "0-0", 10)?
+    let fresh = redis_xreadgroup(r, "packers", "w2", { orders: ">" }, 10, 100, {})?
+    let done = claimed.entries + (fresh.orders ?? [])
+    redis_xack(r, "orders", "packers", done | map((e) => e.id))?
+    {
+        stuck: stuck | map((p) => { consumer: p.consumer, deliveries: p.deliveries }),
+        claimed: claimed.entries | map((e) => e.fields.order),
+        fresh: (fresh.orders ?? []) | map((e) => e.fields.order),
+        left: redis_xpending(r, "orders", "packers", 0, {})?.count,
+    }
+}
+
+// The stream keeps every order: XRANGE reads it all, XREAD reads after an ID.
+route GET /history {
+    let r = redis()?
+    let all = redis_xrange(r, "orders", "-", "+", 0)?
+    let after_first = redis_xread(r, { orders: all[0].id }, 10, 0)?
+    {
+        orders: all | map((e) => `${e.fields.order} ${e.fields.sku} x${e.fields.qty}`),
+        after_first: after_first.orders | map((e) => e.fields.order),
+        newest: redis_xrevrange(r, "orders", "+", "-", 1)?[0].fields.order,
+    }
+}
+
+route GET /alerts {
+    let r = redis()?
+    let heard = [
+        redis_publish(r, "alerts", "packer 3 is offline")?,
+        redis_publish(r, "stock.A-7", { sku: "A-7", left: 3 })?,
+        redis_publish(r, "news", "nobody listens here")?,
+    ]
+    drain(1000)
+    sleep(100)
+    drain(0)
+    { heard: heard, alerts: alerts | map((m) => { channel: m.channel, pattern: m.pattern ?? null, payload: m.payload }) }
+}

@@ -1,0 +1,690 @@
+//! Redis Streams and pub/sub, beyond caching: XADD with trimming, XRANGE, XREAD that waits, consumer groups (XGROUP CREATE, XREADGROUP, XACK, XPENDING, XAUTOCLAIM to take over stuck work), PUBLISH, and SUBSCRIBE into a buffer the program drains.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! redis = { version = "=0.32.7", default-features = false, features = ["streams", "tls-rustls", "tls-rustls-webpki-roots"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Each named connection keeps a few idle Redis connections (at most 8), so a call that waits
+// (XREAD BLOCK) holds up no other; one that fails is dropped and the next call opens another.
+// A subscription has a connection and a thread of its own, which reconnects and subscribes again
+// after an error, and keeps messages in a bounded buffer (`buffer`, 10000; when full the oldest is
+// dropped and counted). Every call has a timeout (`timeout_ms`, 10 s by default), past any BLOCK.
+
+struct Sub {
+    channels: Vec<String>,
+    patterns: Vec<String>,
+    msgs: VecDeque<Value>,
+    received: u64,
+    dropped: u64,
+    connected: bool,
+    last_error: Option<String>,
+    stop: bool,
+    changed: bool,
+    // Each change of the subscriptions gets a number; `applied` is the last one the loop has made
+    // on the server, so a subscribe waits for its own and not an earlier one.
+    asked: u64,
+    applied: u64,
+}
+
+struct Conn {
+    client: redis::Client,
+    idle: Mutex<Vec<redis::Connection>>,
+    timeout: Duration,
+    cap: usize,
+    sub: Arc<(Mutex<Sub>, Condvar)>,
+    sub_thread: Mutex<bool>,
+}
+
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn get(name: &str) -> Result<Arc<Conn>, String> {
+    lock(&CONNS).as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no Redis connection named `{}`: call redis_connect(\"{}\", url, options) first", name, name))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn rerr(e: redis::RedisError) -> String {
+    let s = e.to_string();
+    if s.contains("NOAUTH") || s.contains("WRONGPASS") || s.contains("invalid password") || s.contains("AuthenticationFailed") {
+        format!("Redis refused the password: {} (put it in the URL, redis://:password@host:6379)", s)
+    } else if s.contains("NOGROUP") {
+        format!("{} (create the group first with redis_group_create)", s)
+    } else if s.contains("Connection refused") {
+        format!("no Redis answers there: {}", s)
+    } else {
+        s
+    }
+}
+
+impl Conn {
+    fn open(&self) -> Result<redis::Connection, String> {
+        let c = self.client.get_connection_with_timeout(self.timeout).map_err(rerr)?;
+        Ok(c)
+    }
+
+    /// Runs `f` on an idle connection (or a new one), with a read timeout of `extra` past the usual one.
+    fn with<T>(&self, extra: Duration, f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>) -> Result<T, String> {
+        let mut c = match lock(&self.idle).pop() {
+            Some(c) => c,
+            None => self.open()?,
+        };
+        let _ = c.set_read_timeout(Some(self.timeout + extra));
+        let _ = c.set_write_timeout(Some(self.timeout));
+        match f(&mut c) {
+            Ok(v) => {
+                let mut idle = lock(&self.idle);
+                if idle.len() < 8 {
+                    idle.push(c);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                // A Redis error answer leaves the connection usable; a broken or timed-out one is dropped.
+                if e.kind() == redis::ErrorKind::ResponseError || e.code().is_some() {
+                    let mut idle = lock(&self.idle);
+                    if idle.len() < 8 {
+                        idle.push(c);
+                    }
+                } else if e.is_timeout() {
+                    return Err(format!("Redis did not answer within {} ms: a longer timeout_ms, or check the server", (self.timeout + extra).as_millis()));
+                }
+                Err(rerr(e))
+            }
+        }
+    }
+}
+
+fn opt_i64(o: &Value, k: &str) -> Result<Option<i64>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(format!("`{}` must be a whole number", k)),
+        Some(v) => Err(format!("`{}` must be a whole number, not {}", k, v)),
+    }
+}
+
+fn opt_bool(o: &Value, k: &str) -> Result<Option<bool>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(format!("`{}` must be true or false, not {}", k, v)),
+    }
+}
+
+fn check_keys(o: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
+    match o {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(format!("{} has no option `{}`; it takes {}", what, k, allowed.join(", ")));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("{} options must be a map", what)),
+    }
+}
+
+fn text(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        redis::Value::VerbatimString { text, .. } => Some(text.clone()),
+        redis::Value::Int(i) => Some(i.to_string()),
+        redis::Value::Okay => Some("OK".into()),
+        _ => None,
+    }
+}
+
+fn items(v: &redis::Value) -> &[redis::Value] {
+    match v {
+        redis::Value::Array(a) | redis::Value::Set(a) | redis::Value::Push { data: a, .. } => a,
+        _ => &[],
+    }
+}
+
+fn to_json(v: &redis::Value) -> Value {
+    match v {
+        redis::Value::Nil => Value::Null,
+        redis::Value::Int(i) => json!(i),
+        redis::Value::Double(d) => json!(d),
+        redis::Value::Boolean(b) => json!(b),
+        redis::Value::Array(_) | redis::Value::Set(_) => Value::Array(items(v).iter().map(to_json).collect()),
+        redis::Value::Map(m) => Value::Object(m.iter().map(|(k, v)| (text(k).unwrap_or_default(), to_json(v))).collect()),
+        other => text(other).map(Value::String).unwrap_or(Value::Null),
+    }
+}
+
+/// One stream entry, [id, [field, value, ...]], as { id, fields }; a deleted one has null fields.
+fn entry(v: &redis::Value) -> Value {
+    let it = items(v);
+    let id = it.first().and_then(text).unwrap_or_default();
+    let fields = match it.get(1) {
+        Some(redis::Value::Nil) | None => Value::Null,
+        Some(f) => {
+            let kv = items(f);
+            let mut m = serde_json::Map::new();
+            for p in kv.chunks(2) {
+                if let (Some(k), Some(v)) = (p.first().and_then(text), p.get(1)) {
+                    m.insert(k, text(v).map(Value::String).unwrap_or(Value::Null));
+                }
+            }
+            Value::Object(m)
+        }
+    };
+    json!({ "id": id, "fields": fields })
+}
+
+fn entries(v: &redis::Value) -> Vec<Value> {
+    items(v).iter().map(entry).collect()
+}
+
+/// XREAD's answer, [[stream, entries], ...] (or a RESP3 map), as { stream: entries }.
+fn by_stream(v: &redis::Value) -> Value {
+    let mut out = serde_json::Map::new();
+    match v {
+        redis::Value::Map(m) => {
+            for (k, e) in m {
+                out.insert(text(k).unwrap_or_default(), Value::Array(entries(e)));
+            }
+        }
+        _ => {
+            for s in items(v) {
+                let p = items(s);
+                if let (Some(k), Some(e)) = (p.first().and_then(text), p.get(1)) {
+                    out.insert(k, Value::Array(entries(e)));
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+fn field_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn valid_id(id: &str, extra: &[&str]) -> Result<(), String> {
+    if extra.contains(&id) {
+        return Ok(());
+    }
+    let core = id.strip_prefix('(').unwrap_or(id);
+    let ok = match core.split_once('-') {
+        Some((a, b)) => a.parse::<u64>().is_ok() && (b.parse::<u64>().is_ok() || b == "*"),
+        None => core.parse::<u64>().is_ok(),
+    };
+    if ok { Ok(()) } else { Err(format!("{:?} is not a stream ID: write <ms>-<seq> like 1700000000000-0{}", id, if extra.is_empty() { String::new() } else { format!(", or one of {}", extra.join(" ")) })) }
+}
+
+fn streams_arg(streams: &Value, extra: &[&str]) -> Result<(Vec<String>, Vec<String>), String> {
+    let m = streams.as_object().ok_or("streams must be a map of stream name to the last ID seen, like { orders: \"$\" }")?;
+    if m.is_empty() {
+        return Err("give at least one stream".into());
+    }
+    let mut keys = vec![];
+    let mut ids = vec![];
+    for (k, v) in m {
+        let id = field_text(v);
+        valid_id(&id, extra)?;
+        keys.push(k.clone());
+        ids.push(id);
+    }
+    Ok((keys, ids))
+}
+
+/// Connects to Redis and keeps the connection as `name`: `url` is redis://[:password@]host:6379/db, or rediss:// for TLS; options: timeout_ms (10000), buffer (10000 pub/sub messages kept). Gives the server's PING answer.
+pub fn redis_connect(name: &str, url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["timeout_ms", "buffer"], "redis_connect")?;
+    if name.is_empty() {
+        return Err("give the connection a name, like \"main\"".into());
+    }
+    let low = url.trim().to_ascii_lowercase();
+    if !low.starts_with("redis://") && !low.starts_with("rediss://") && !low.starts_with("redis+unix://") && !low.starts_with("unix://") {
+        return Err(format!("{:?} is not a Redis URL: write redis://host:6379, redis://:password@host:6379/0, or rediss:// for TLS", url));
+    }
+    if low.starts_with("rediss://") {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let timeout = Duration::from_millis(opt_i64(o, "timeout_ms")?.unwrap_or(10_000).clamp(100, 600_000) as u64);
+    let cap = opt_i64(o, "buffer")?.unwrap_or(10_000).clamp(1, 1_000_000) as usize;
+    let client = redis::Client::open(url.trim()).map_err(rerr)?;
+    let conn = Arc::new(Conn {
+        client,
+        idle: Mutex::new(vec![]),
+        timeout,
+        cap,
+        sub: Arc::new((Mutex::new(Sub { channels: vec![], patterns: vec![], msgs: VecDeque::new(), received: 0, dropped: 0, connected: false, last_error: None, stop: false, changed: false, asked: 0, applied: 0 }), Condvar::new())),
+        sub_thread: Mutex::new(false),
+    });
+    let pong: String = conn.with(Duration::ZERO, |c| redis::cmd("PING").query(c))?;
+    let _ = redis_close(name);
+    lock(&CONNS).get_or_insert_with(HashMap::new).insert(name.to_string(), conn);
+    Ok(json!({ "name": name, "connected": true, "ping": pong }))
+}
+
+/// Appends an entry (`fields`, a map) to `stream` and gives its ID; options: id ("*", the default: Redis picks), maxlen (trim to about that many entries; exact: true for exactly), minid (trim older IDs), nomkstream (true: fail when the stream does not exist).
+pub fn redis_xadd(name: &str, stream: &str, fields: serde_json::Value, options: serde_json::Value) -> Result<Option<String>, String> {
+    let o = &options;
+    check_keys(o, &["id", "maxlen", "minid", "exact", "nomkstream"], "redis_xadd")?;
+    let f = fields.as_object().ok_or("the fields must be a map, like { sku: \"A-1\", qty: 2 }")?;
+    if f.is_empty() {
+        return Err("an entry needs at least one field".into());
+    }
+    let id = o.get("id").map(field_text).unwrap_or("*".into());
+    valid_id(&id, &["*"])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XADD");
+    cmd.arg(stream);
+    if opt_bool(o, "nomkstream")?.unwrap_or(false) {
+        cmd.arg("NOMKSTREAM");
+    }
+    let approx = if opt_bool(o, "exact")?.unwrap_or(false) { "=" } else { "~" };
+    if let Some(n) = opt_i64(o, "maxlen")? {
+        cmd.arg("MAXLEN").arg(approx).arg(n.max(0));
+    } else if let Some(m) = o.get("minid") {
+        let m = field_text(m);
+        valid_id(&m, &[])?;
+        cmd.arg("MINID").arg(approx).arg(m);
+    }
+    cmd.arg(&id);
+    for (k, v) in f {
+        cmd.arg(k).arg(field_text(v));
+    }
+    c.with(Duration::ZERO, |con| cmd.query::<Option<String>>(con))
+}
+
+/// The entries of `stream` from `start` to `end` ("-" and "+" for the ends, "(" before an ID to leave it out), at most `count` (0: all), oldest first (redis_xrevrange for newest first).
+pub fn redis_xrange(name: &str, stream: &str, start: &str, end: &str, count: i64) -> Result<Vec<serde_json::Value>, String> {
+    valid_id(start, &["-", "+"])?;
+    valid_id(end, &["-", "+"])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XRANGE");
+    cmd.arg(stream).arg(start).arg(end);
+    if count > 0 {
+        cmd.arg("COUNT").arg(count);
+    }
+    let v: redis::Value = c.with(Duration::ZERO, |con| cmd.query(con))?;
+    Ok(entries(&v))
+}
+
+/// The entries of `stream` from `end` back to `start` ("+" and "-" for the ends), newest first, at most `count` (0: all).
+pub fn redis_xrevrange(name: &str, stream: &str, end: &str, start: &str, count: i64) -> Result<Vec<serde_json::Value>, String> {
+    valid_id(start, &["-", "+"])?;
+    valid_id(end, &["-", "+"])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XREVRANGE");
+    cmd.arg(stream).arg(end).arg(start);
+    if count > 0 {
+        cmd.arg("COUNT").arg(count);
+    }
+    let v: redis::Value = c.with(Duration::ZERO, |con| cmd.query(con))?;
+    Ok(entries(&v))
+}
+
+/// How many entries `stream` holds (0 when there is no such stream).
+pub fn redis_xlen(name: &str, stream: &str) -> Result<i64, String> {
+    let c = get(name)?;
+    c.with(Duration::ZERO, |con| redis::cmd("XLEN").arg(stream).query(con))
+}
+
+/// Reads entries after the IDs given: `streams` maps each stream to the last ID seen ("$": only new ones, "0": from the start); at most `count` each (0: no limit); `block_ms` > 0 waits that long for one to come. Gives { stream: [{ id, fields }] }, {} when nothing came.
+pub fn redis_xread(name: &str, streams: serde_json::Value, count: i64, block_ms: i64) -> Result<serde_json::Value, String> {
+    let (keys, ids) = streams_arg(&streams, &["$", "+"])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XREAD");
+    if count > 0 {
+        cmd.arg("COUNT").arg(count);
+    }
+    let block = block_ms.clamp(0, 600_000);
+    if block > 0 {
+        cmd.arg("BLOCK").arg(block);
+    }
+    cmd.arg("STREAMS").arg(&keys).arg(&ids);
+    let v: redis::Value = c.with(Duration::from_millis(block as u64), |con| cmd.query(con))?;
+    Ok(by_stream(&v))
+}
+
+/// Creates consumer group `group` on `stream`, reading from `start` ("$": what comes next, "0": everything); mkstream: true makes the stream if there is none. Gives false when the group already exists.
+pub fn redis_group_create(name: &str, stream: &str, group: &str, start: &str, mkstream: bool) -> Result<bool, String> {
+    valid_id(start, &["$"])?;
+    let c = get(name)?;
+    let r = c.with(Duration::ZERO, |con| {
+        let mut cmd = redis::cmd("XGROUP");
+        cmd.arg("CREATE").arg(stream).arg(group).arg(start);
+        if mkstream {
+            cmd.arg("MKSTREAM");
+        }
+        cmd.query::<String>(con)
+    });
+    match r {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("BUSYGROUP") => Ok(false),
+        Err(e) if e.contains("requires the key to exist") => Err(format!("there is no stream {:?}: pass mkstream: true to make it", stream)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads as `consumer` of `group`: `streams` maps each stream to ">" (entries no one in the group has had) or an ID (this consumer's own pending ones after it, "0" for all); at most `count` each, waiting `block_ms` for new ones; options: noack (true: no acknowledgement needed). Gives { stream: [{ id, fields }] }.
+pub fn redis_xreadgroup(name: &str, group: &str, consumer: &str, streams: serde_json::Value, count: i64, block_ms: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_keys(&options, &["noack"], "redis_xreadgroup")?;
+    let (keys, ids) = streams_arg(&streams, &[">"])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XREADGROUP");
+    cmd.arg("GROUP").arg(group).arg(consumer);
+    if count > 0 {
+        cmd.arg("COUNT").arg(count);
+    }
+    let block = block_ms.clamp(0, 600_000);
+    if block > 0 {
+        cmd.arg("BLOCK").arg(block);
+    }
+    if opt_bool(&options, "noack")?.unwrap_or(false) {
+        cmd.arg("NOACK");
+    }
+    cmd.arg("STREAMS").arg(&keys).arg(&ids);
+    let v: redis::Value = c.with(Duration::from_millis(block as u64), |con| cmd.query(con))?;
+    Ok(by_stream(&v))
+}
+
+/// Acknowledges entries `ids` for `group`: they leave its pending list. Gives how many were pending.
+pub fn redis_xack(name: &str, stream: &str, group: &str, ids: Vec<String>) -> Result<i64, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    for id in &ids {
+        valid_id(id, &[])?;
+    }
+    let c = get(name)?;
+    c.with(Duration::ZERO, |con| redis::cmd("XACK").arg(stream).arg(group).arg(&ids).query(con))
+}
+
+/// What `group` has read but not acknowledged: with `count` 0 a summary { count, smallest, largest, consumers: { name: n } }; else the first `count` entries [{ id, consumer, idle_ms, deliveries }]; options: consumer (only theirs), idle_ms (only those idle that long).
+pub fn redis_xpending(name: &str, stream: &str, group: &str, count: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["consumer", "idle_ms", "start", "end"], "redis_xpending")?;
+    let c = get(name)?;
+    if count <= 0 {
+        let v: redis::Value = c.with(Duration::ZERO, |con| redis::cmd("XPENDING").arg(stream).arg(group).query(con))?;
+        let it = items(&v);
+        let mut consumers = serde_json::Map::new();
+        if let Some(list) = it.get(3) {
+            for p in items(list) {
+                let q = items(p);
+                if let (Some(n), Some(k)) = (q.first().and_then(text), q.get(1).and_then(text)) {
+                    consumers.insert(n, json!(k.parse::<i64>().unwrap_or(0)));
+                }
+            }
+        }
+        return Ok(json!({
+            "count": it.first().and_then(text).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+            "smallest": it.get(1).and_then(text),
+            "largest": it.get(2).and_then(text),
+            "consumers": consumers,
+        }));
+    }
+    let start = o.get("start").map(field_text).unwrap_or("-".into());
+    let end = o.get("end").map(field_text).unwrap_or("+".into());
+    valid_id(&start, &["-", "+"])?;
+    valid_id(&end, &["-", "+"])?;
+    let mut cmd = redis::cmd("XPENDING");
+    cmd.arg(stream).arg(group);
+    if let Some(i) = opt_i64(o, "idle_ms")? {
+        cmd.arg("IDLE").arg(i.max(0));
+    }
+    cmd.arg(&start).arg(&end).arg(count);
+    if let Some(who) = o.get("consumer") {
+        cmd.arg(field_text(who));
+    }
+    let v: redis::Value = c.with(Duration::ZERO, |con| cmd.query(con))?;
+    Ok(Value::Array(items(&v).iter().map(|e| {
+        let q = items(e);
+        json!({
+            "id": q.first().and_then(text),
+            "consumer": q.get(1).and_then(text),
+            "idle_ms": q.get(2).and_then(text).and_then(|s| s.parse::<i64>().ok()),
+            "deliveries": q.get(3).and_then(text).and_then(|s| s.parse::<i64>().ok()),
+        })
+    }).collect()))
+}
+
+/// Takes over `group`'s entries that have been pending at least `min_idle_ms` (a consumer that died), for `consumer`, from ID `start` ("0-0" from the beginning), at most `count`. Gives { next (the start for the next call; "0-0" when done), entries, deleted (IDs no longer in the stream) }.
+pub fn redis_xautoclaim(name: &str, stream: &str, group: &str, consumer: &str, min_idle_ms: i64, start: &str, count: i64) -> Result<serde_json::Value, String> {
+    valid_id(start, &[])?;
+    let c = get(name)?;
+    let mut cmd = redis::cmd("XAUTOCLAIM");
+    cmd.arg(stream).arg(group).arg(consumer).arg(min_idle_ms.max(0)).arg(start);
+    if count > 0 {
+        cmd.arg("COUNT").arg(count);
+    }
+    let v: redis::Value = c.with(Duration::ZERO, |con| cmd.query(con))?;
+    let it = items(&v);
+    Ok(json!({
+        "next": it.first().and_then(text),
+        "entries": it.get(1).map(entries).unwrap_or_default(),
+        "deleted": it.get(2).map(|d| items(d).iter().filter_map(text).collect::<Vec<_>>()).unwrap_or_default(),
+    }))
+}
+
+/// Trims `stream` to about `maxlen` entries (exact: true for exactly); gives how many went.
+pub fn redis_xtrim(name: &str, stream: &str, maxlen: i64, exact: bool) -> Result<i64, String> {
+    let c = get(name)?;
+    c.with(Duration::ZERO, |con| redis::cmd("XTRIM").arg(stream).arg("MAXLEN").arg(if exact { "=" } else { "~" }).arg(maxlen.max(0)).query(con))
+}
+
+/// Publishes `message` (text, or anything else as JSON) on pub/sub `channel`; gives how many subscribers got it.
+pub fn redis_publish(name: &str, channel: &str, message: serde_json::Value) -> Result<i64, String> {
+    let c = get(name)?;
+    let m = field_text(&message);
+    c.with(Duration::ZERO, |con| redis::cmd("PUBLISH").arg(channel).arg(&m).query(con))
+}
+
+/// The thread that holds a connection's subscriptions.
+fn sub_loop(c: Arc<Conn>) {
+    let sh = c.sub.clone();
+    let mut backoff = 500u64;
+    loop {
+        if lock(&sh.0).stop {
+            return;
+        }
+        let mut con = match c.client.get_connection_with_timeout(c.timeout) {
+            Ok(con) => con,
+            Err(e) => {
+                lock(&sh.0).last_error = Some(rerr(e));
+                std::thread::sleep(Duration::from_millis(backoff));
+                backoff = (backoff * 2).min(10_000);
+                continue;
+            }
+        };
+        let mut ps = con.as_pubsub();
+        let _ = ps.set_read_timeout(Some(Duration::from_millis(100)));
+        let (mut have_c, mut have_p): (Vec<String>, Vec<String>) = (vec![], vec![]);
+        let mut broken = false;
+        while !broken {
+            // Brings the subscriptions in line with what was asked.
+            let (want_c, want_p, stop, asked) = {
+                let mut st = lock(&sh.0);
+                st.changed = false;
+                (st.channels.clone(), st.patterns.clone(), st.stop, st.asked)
+            };
+            if stop {
+                return;
+            }
+            for ch in want_c.iter().filter(|x| !have_c.contains(x)) {
+                if ps.subscribe(ch).is_err() { broken = true; }
+            }
+            for ch in have_c.iter().filter(|x| !want_c.contains(x)) {
+                if ps.unsubscribe(ch).is_err() { broken = true; }
+            }
+            for p in want_p.iter().filter(|x| !have_p.contains(x)) {
+                if ps.psubscribe(p).is_err() { broken = true; }
+            }
+            for p in have_p.iter().filter(|x| !want_p.contains(x)) {
+                if ps.punsubscribe(p).is_err() { broken = true; }
+            }
+            if broken {
+                break;
+            }
+            have_c = want_c;
+            have_p = want_p;
+            {
+                let mut st = lock(&sh.0);
+                st.connected = true;
+                st.applied = asked;
+                st.last_error = None;
+            }
+            sh.1.notify_all();
+            backoff = 500;
+            loop {
+                if lock(&sh.0).changed || lock(&sh.0).stop {
+                    break;
+                }
+                match ps.get_message() {
+                    Ok(m) => {
+                        let payload: Vec<u8> = m.get_payload().unwrap_or_default();
+                        let mut o = serde_json::Map::new();
+                        o.insert("channel".into(), json!(m.get_channel_name()));
+                        if m.from_pattern() {
+                            o.insert("pattern".into(), json!(m.get_pattern::<String>().unwrap_or_default()));
+                        }
+                        o.insert("payload".into(), json!(String::from_utf8_lossy(&payload)));
+                        o.insert("at".into(), json!(now_ms()));
+                        let mut st = lock(&sh.0);
+                        if st.msgs.len() >= c.cap {
+                            st.msgs.pop_front();
+                            st.dropped += 1;
+                        }
+                        st.msgs.push_back(Value::Object(o));
+                        st.received += 1;
+                        drop(st);
+                        sh.1.notify_all();
+                    }
+                    Err(e) if e.is_timeout() => {}
+                    Err(e) => {
+                        lock(&sh.0).last_error = Some(rerr(e));
+                        broken = true;
+                        break;
+                    }
+                }
+            }
+        }
+        lock(&sh.0).connected = false;
+        std::thread::sleep(Duration::from_millis(backoff));
+        backoff = (backoff * 2).min(10_000);
+    }
+}
+
+/// Subscribes to pub/sub `channels` (or, with patterns: true, to glob patterns like news.*) on a connection of their own; messages wait in the buffer for redis_receive. Waits until Redis has the subscription.
+pub fn redis_subscribe(name: &str, channels: Vec<String>, patterns: bool) -> Result<serde_json::Value, String> {
+    if channels.is_empty() {
+        return Err("give at least one channel".into());
+    }
+    let c = get(name)?;
+    {
+        let mut st = lock(&c.sub.0);
+        for ch in &channels {
+            let list = if patterns { &mut st.patterns } else { &mut st.channels };
+            if !list.contains(ch) {
+                list.push(ch.clone());
+            }
+        }
+        st.changed = true;
+        st.connected = false;
+        st.asked += 1;
+    }
+    let mine = lock(&c.sub.0).asked;
+    {
+        let mut started = lock(&c.sub_thread);
+        if !*started {
+            let c2 = c.clone();
+            std::thread::Builder::new().name(format!("redis-sub-{}", name)).spawn(move || sub_loop(c2)).map_err(|e| e.to_string())?;
+            *started = true;
+        }
+    }
+    let deadline = Instant::now() + c.timeout;
+    let mut st = lock(&c.sub.0);
+    while !st.connected || st.applied < mine {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("could not subscribe in time: {}", st.last_error.clone().unwrap_or("no answer".into())));
+        }
+        st = c.sub.1.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    Ok(json!({ "channels": st.channels, "patterns": st.patterns }))
+}
+
+/// Ends the subscriptions to `channels` (channels or patterns); what they brought stays in the buffer.
+pub fn redis_unsubscribe(name: &str, channels: Vec<String>) -> Result<serde_json::Value, String> {
+    let c = get(name)?;
+    let mut st = lock(&c.sub.0);
+    st.channels.retain(|x| !channels.contains(x));
+    st.patterns.retain(|x| !channels.contains(x));
+    st.changed = true;
+    Ok(json!({ "channels": st.channels, "patterns": st.patterns }))
+}
+
+/// Takes up to `max` pub/sub messages from the buffer, oldest first, waiting up to `wait_ms` for the first: each { channel, pattern (when a pattern took it), payload, at }.
+pub fn redis_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let c = get(name)?;
+    let max = max.clamp(1, 100_000) as usize;
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut st = lock(&c.sub.0);
+    while st.msgs.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        st = c.sub.1.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = max.min(st.msgs.len());
+    Ok(st.msgs.drain(..n).collect())
+}
+
+/// The subscriptions and their buffer: channels, patterns, connected, buffered, received, dropped (the buffer was full), last_error.
+pub fn redis_sub_status(name: &str) -> Result<serde_json::Value, String> {
+    let c = get(name)?;
+    let st = lock(&c.sub.0);
+    Ok(json!({ "channels": st.channels, "patterns": st.patterns, "connected": st.connected, "buffered": st.msgs.len(), "received": st.received, "dropped": st.dropped, "last_error": st.last_error }))
+}
+
+/// Any other Redis command, as a list of words (["XINFO", "STREAM", "orders"]); gives Redis's answer as it is.
+pub fn redis_command(name: &str, words: Vec<String>) -> Result<serde_json::Value, String> {
+    let first = words.first().ok_or("give the command, like [\"XINFO\", \"GROUPS\", \"orders\"]")?.to_ascii_uppercase();
+    if ["SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR"].contains(&first.as_str()) {
+        return Err(format!("{} takes the connection over: use redis_subscribe", first));
+    }
+    let c = get(name)?;
+    let mut cmd = redis::cmd(&first);
+    cmd.arg(&words[1..]);
+    let v: redis::Value = c.with(Duration::ZERO, |con| cmd.query(con))?;
+    Ok(to_json(&v))
+}
+
+/// Closes the connection and its subscriptions; whether there was one.
+pub fn redis_close(name: &str) -> Result<bool, String> {
+    match lock(&CONNS).as_mut().and_then(|m| m.remove(name)) {
+        Some(c) => {
+            lock(&c.sub.0).stop = true;
+            c.sub.1.notify_all();
+            lock(&c.idle).clear();
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}

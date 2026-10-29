@@ -1,0 +1,334 @@
+//! Google Cloud Pub/Sub over its REST API: messages published with attributes and ordering keys, pulled from subscriptions, acknowledged or given more (or no) time with modifyAckDeadline, topics and subscriptions made; signed in with a service account (its RS256 JWT traded for a token, kept until it expires) or a token you have, or nothing for the Pub/Sub emulator.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! jsonwebtoken = "9"
+//! ureq = "2"
+//! base64 = "0.22"
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const SCOPE: &str = "https://www.googleapis.com/auth/pubsub";
+
+#[derive(Clone)]
+struct Cfg {
+    endpoint: String,
+    project: String,
+    account: Option<Value>,
+    token: Option<String>,
+    token_url: String,
+    timeout: Duration,
+}
+
+/// The projects, by the name given to `pubsub_connect`.
+static PROJECTS: Mutex<Option<HashMap<String, Cfg>>> = Mutex::new(None);
+/// Access tokens traded for a service account's JWT, by account and token URL, with when they expire.
+static TOKENS: Mutex<Option<HashMap<String, (String, i64)>>> = Mutex::new(None);
+
+fn cfg(name: &str) -> Result<Cfg, String> {
+    PROJECTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(name).cloned().ok_or(format!(
+        "no Pub/Sub project named `{}`: call pubsub_connect(\"{}\", {{ project, credentials }}) first",
+        name, name
+    ))
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn b64() -> base64::engine::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+fn account(credentials: &str) -> Result<Value, String> {
+    let text = if credentials.trim_start().starts_with('{') {
+        credentials.to_string()
+    } else {
+        std::fs::read_to_string(credentials).map_err(|e| format!("the service account file {}: {}", credentials, e))?
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {} (is it the JSON key file from the Cloud console?)", k));
+        }
+    }
+    Ok(v)
+}
+
+fn assertion(sa: &Value, aud: &str) -> Result<String, String> {
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    jsonwebtoken::encode(&head, &json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": aud, "iat": t, "exp": t + 3600 }), &key).map_err(|e| e.to_string())
+}
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(timeout).build()
+}
+
+/// The bearer token for a call: the one given, one traded for the service account's JWT (kept until five minutes before it expires), or none (the emulator).
+fn bearer(c: &Cfg) -> Result<Option<String>, String> {
+    if let Some(t) = &c.token {
+        return Ok(Some(t.clone()));
+    }
+    let Some(sa) = &c.account else { return Ok(None) };
+    let who = format!("{} {}", sa["client_email"].as_str().unwrap_or(""), c.token_url);
+    if let Some((tok, until)) = TOKENS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&who) {
+        if *until > now() + 300 {
+            return Ok(Some(tok.clone()));
+        }
+    }
+    let jwt = assertion(sa, &c.token_url)?;
+    let r = agent(c.timeout).post(&c.token_url).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let body: Value = match r {
+        Ok(r) => serde_json::from_str(&r.into_string().map_err(|e| e.to_string())?).map_err(|e| format!("the token server's answer is not JSON: {}", e))?,
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            return Err(format!("the token server refused the service account: {} {} {}", code, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(t.trim())));
+        }
+        Err(e) => return Err(format!("cannot reach the token server {}: {}", c.token_url, e)),
+    };
+    let tok = body["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    let until = now() + body["expires_in"].as_i64().unwrap_or(3600);
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(who, (tok.clone(), until));
+    Ok(Some(tok))
+}
+
+fn call(c: &Cfg, method: &str, path: &str, body: Option<Value>, what: &str) -> Result<Value, String> {
+    let url = format!("{}/v1/{}", c.endpoint, path);
+    let mut req = agent(c.timeout).request(method, &url);
+    if let Some(t) = bearer(c)? {
+        req = req.set("Authorization", &format!("Bearer {}", t));
+    }
+    let r = match body {
+        Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+        None => req.call(),
+    };
+    match r {
+        Ok(r) => {
+            let t = r.into_string().map_err(|e| e.to_string())?;
+            if t.trim().is_empty() {
+                return Ok(json!({}));
+            }
+            serde_json::from_str(&t).map_err(|e| format!("Pub/Sub's answer to {} is not JSON: {}", what, e))
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            let status = v["error"]["status"].as_str().unwrap_or("").to_string();
+            let msg = v["error"]["message"].as_str().unwrap_or(t.trim()).to_string();
+            let hint = match (code, status.as_str()) {
+                (401, _) | (_, "UNAUTHENTICATED") => " (the token is missing or expired: check the credentials)",
+                (403, _) | (_, "PERMISSION_DENIED") => " (the service account needs a Pub/Sub role on this project, topic or subscription)",
+                (404, _) | (_, "NOT_FOUND") => " (make it first: pubsub_create_topic or pubsub_create_subscription)",
+                _ => "",
+            };
+            Err(format!("Pub/Sub refused {}: {} {}: {}{}", what, code, status, msg, hint))
+        }
+        Err(e) => Err(format!("cannot reach Pub/Sub at {}: {}", c.endpoint, e)),
+    }
+}
+
+fn path_of(project: &str, kind: &str, name: &str) -> Result<String, String> {
+    if name.starts_with("projects/") {
+        return Ok(name.to_string());
+    }
+    let ok = name.len() >= 3 && name.len() <= 255 && name.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) && !name.starts_with("goog") && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.~+%".contains(c));
+    if !ok {
+        return Err(format!("`{}` is not a {} name: 3 to 255 letters, digits and -_.~+%, starting with a letter, not with goog", name, kind));
+    }
+    Ok(format!("projects/{}/{}s/{}", project, kind, name))
+}
+
+/// Remembers a Google Cloud project as `name`. Options: `project` (the service account's project unless given), `credentials` (a service account's JSON key, its text or its file's path), `access_token` (a token you already have, instead), `endpoint` (https://pubsub.googleapis.com; the emulator's http://localhost:8085, as PUBSUB_EMULATOR_HOST says), `token_url` (the account's token_uri unless given), `timeout_ms` (15000). With neither credentials nor a token, calls go unsigned, as the emulator takes them.
+pub fn pubsub_connect(name: &str, options: serde_json::Value) -> Result<Value, String> {
+    let sa = match options["credentials"].as_str().filter(|s| !s.is_empty()) {
+        Some(c) => Some(account(c)?),
+        None => None,
+    };
+    let project = options["project"].as_str().filter(|p| !p.is_empty()).map(str::to_string).or(sa.as_ref().and_then(|s| s["project_id"].as_str().map(str::to_string))).ok_or("a project is needed: { project } or a service account with project_id")?;
+    let mut endpoint = options["endpoint"].as_str().filter(|e| !e.is_empty()).unwrap_or("https://pubsub.googleapis.com").trim_end_matches('/').to_string();
+    if !endpoint.contains("://") {
+        endpoint = format!("http://{}", endpoint);
+    }
+    let token_url = options["token_url"].as_str().filter(|t| !t.is_empty()).map(str::to_string).or(sa.as_ref().and_then(|s| s["token_uri"].as_str().map(str::to_string))).unwrap_or("https://oauth2.googleapis.com/token".into());
+    let c = Cfg {
+        endpoint: endpoint.clone(),
+        project: project.clone(),
+        account: sa.clone(),
+        token: options["access_token"].as_str().filter(|t| !t.is_empty()).map(str::to_string),
+        token_url,
+        timeout: Duration::from_millis(options["timeout_ms"].as_u64().unwrap_or(15_000).clamp(100, 120_000)),
+    };
+    PROJECTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c);
+    let auth = if options["access_token"].as_str().map(|t| !t.is_empty()).unwrap_or(false) { "token" } else if sa.is_some() { "service account" } else { "none" };
+    Ok(json!({ "name": name, "project": project, "endpoint": endpoint, "auth": auth, "account": sa.as_ref().map(|s| s["client_email"].clone()) }))
+}
+
+/// Makes the topic `topic` (a short name, or projects/p/topics/t). Gives true, or false when it was there already.
+pub fn pubsub_create_topic(name: &str, topic: &str) -> Result<bool, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "topic", topic)?;
+    match call(&c, "PUT", &p, Some(json!({})), "the new topic") {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("ALREADY_EXISTS") || e.contains(" 409 ") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Makes the subscription `subscription` to `topic`. Options: `ack_deadline_seconds` (10 to 600; 10), `ordering` (true: messages with one ordering key come in order), `filter`, `retain_acked`, `dead_letter_topic` and `max_delivery_attempts`. True, or false when it was there already.
+pub fn pubsub_create_subscription(name: &str, subscription: &str, topic: &str, options: serde_json::Value) -> Result<bool, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "subscription", subscription)?;
+    let mut body = json!({ "topic": path_of(&c.project, "topic", topic)?, "ackDeadlineSeconds": options["ack_deadline_seconds"].as_i64().unwrap_or(10).clamp(10, 600) });
+    if options["ordering"].as_bool() == Some(true) {
+        body["enableMessageOrdering"] = json!(true);
+    }
+    if let Some(f) = options["filter"].as_str() {
+        body["filter"] = json!(f);
+    }
+    if options["retain_acked"].as_bool() == Some(true) {
+        body["retainAckedMessages"] = json!(true);
+    }
+    if let Some(d) = options["dead_letter_topic"].as_str() {
+        body["deadLetterPolicy"] = json!({ "deadLetterTopic": path_of(&c.project, "topic", d)?, "maxDeliveryAttempts": options["max_delivery_attempts"].as_i64().unwrap_or(5).clamp(5, 100) });
+    }
+    match call(&c, "PUT", &p, Some(body), "the new subscription") {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("ALREADY_EXISTS") || e.contains(" 409 ") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn message(m: &Value) -> Result<Value, String> {
+    let (data, attrs, key) = match m {
+        Value::String(s) => (s.clone(), Value::Null, None),
+        Value::Object(_) => (
+            match &m["data"] { Value::String(s) => s.clone(), Value::Null => String::new(), other => other.to_string() },
+            m["attributes"].clone(),
+            m["ordering_key"].as_str().map(str::to_string),
+        ),
+        _ => return Err("a message is text, or { data, attributes, ordering_key }".into()),
+    };
+    let mut out = json!({ "data": b64().encode(data.as_bytes()) });
+    if let Some(a) = attrs.as_object() {
+        let mut am = Map::new();
+        for (k, v) in a {
+            am.insert(k.clone(), json!(match v { Value::String(s) => s.clone(), other => other.to_string() }));
+        }
+        if am.len() > 100 {
+            return Err("a message takes at most 100 attributes".into());
+        }
+        out["attributes"] = Value::Object(am);
+    }
+    if data.is_empty() && out.get("attributes").map(|a| a.as_object().map(|o| o.is_empty()).unwrap_or(true)).unwrap_or(true) {
+        return Err("a message needs data or attributes".into());
+    }
+    if let Some(k) = key {
+        out["orderingKey"] = json!(k);
+    }
+    Ok(out)
+}
+
+/// Publishes one message to `topic`. Options: `attributes` (a map of text), `ordering_key` (messages with one key reach a subscription with ordering on in the order published). Gives the message id.
+pub fn pubsub_publish(name: &str, topic: &str, data: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut m = options.clone();
+    if !m.is_object() {
+        m = json!({});
+    }
+    m["data"] = json!(data);
+    let ids = publish(name, topic, vec![message(&m)?])?;
+    ids.into_iter().next().ok_or("Pub/Sub gave no message id".into())
+}
+
+fn publish(name: &str, topic: &str, msgs: Vec<Value>) -> Result<Vec<String>, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "topic", topic)?;
+    let mut ids = vec![];
+    for chunk in msgs.chunks(1000) {
+        let v = call(&c, "POST", &format!("{}:publish", p), Some(json!({ "messages": chunk })), "the publish")?;
+        ids.extend(v["messageIds"].as_array().cloned().unwrap_or_default().into_iter().filter_map(|x| x.as_str().map(str::to_string)));
+    }
+    Ok(ids)
+}
+
+/// Publishes many messages (text, or `{ data, attributes, ordering_key }` each), 1000 to a request. Gives their ids, in order.
+pub fn pubsub_publish_many(name: &str, topic: &str, messages: Vec<serde_json::Value>) -> Result<Vec<String>, String> {
+    let msgs = messages.iter().map(message).collect::<Result<Vec<_>, _>>()?;
+    publish(name, topic, msgs)
+}
+
+/// Pulls up to `max` messages from `subscription`, asking again every 200 ms for up to `wait_ms` until some come. Each is `{ ack_id, message_id, data, attributes, ordering_key, publish_time, delivery_attempt }` (`data` as text); acknowledge it before its ack deadline, or it comes again.
+pub fn pubsub_pull(name: &str, subscription: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "subscription", subscription)?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 300_000) as u64);
+    loop {
+        let v = call(&c, "POST", &format!("{}:pull", p), Some(json!({ "maxMessages": max.clamp(1, 1000), "returnImmediately": true })), "the pull")?;
+        let got = v["receivedMessages"].as_array().cloned().unwrap_or_default();
+        if !got.is_empty() || Instant::now() >= until {
+            return Ok(got
+                .iter()
+                .map(|r| {
+                    let m = &r["message"];
+                    let raw = b64().decode(m["data"].as_str().unwrap_or("")).unwrap_or_default();
+                    json!({
+                        "ack_id": r["ackId"], "message_id": m["messageId"], "data": String::from_utf8_lossy(&raw),
+                        "attributes": if m["attributes"].is_object() { m["attributes"].clone() } else { json!({}) },
+                        "ordering_key": m["orderingKey"], "publish_time": m["publishTime"], "delivery_attempt": r["deliveryAttempt"],
+                    })
+                })
+                .collect());
+        }
+        std::thread::sleep(Duration::from_millis(200).min(until.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn ack_ids(v: &Value) -> Result<Vec<String>, String> {
+    let one = |x: &Value| -> Result<String, String> {
+        match x {
+            Value::String(s) if !s.is_empty() => Ok(s.clone()),
+            Value::Object(_) => x["ack_id"].as_str().map(str::to_string).ok_or("this message has no ack_id".into()),
+            _ => Err("give messages from pubsub_pull, or their ack_id".into()),
+        }
+    };
+    match v {
+        Value::Array(a) => a.iter().map(one).collect(),
+        other => Ok(vec![one(other)?]),
+    }
+}
+
+/// Acknowledges messages (one from `pubsub_pull`, a list of them, or their ack ids): they will not come again. Gives how many.
+pub fn pubsub_ack(name: &str, subscription: &str, messages: serde_json::Value) -> Result<i64, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "subscription", subscription)?;
+    let ids = ack_ids(&messages)?;
+    for chunk in ids.chunks(1000) {
+        call(&c, "POST", &format!("{}:acknowledge", p), Some(json!({ "ackIds": chunk })), "the acknowledgement")?;
+    }
+    Ok(ids.len() as i64)
+}
+
+/// Gives messages `seconds` more before they come again (0 to 600; 0: now, for another try or another subscriber). Gives how many.
+pub fn pubsub_modify_ack_deadline(name: &str, subscription: &str, messages: serde_json::Value, seconds: i64) -> Result<i64, String> {
+    let c = cfg(name)?;
+    let p = path_of(&c.project, "subscription", subscription)?;
+    let ids = ack_ids(&messages)?;
+    for chunk in ids.chunks(1000) {
+        call(&c, "POST", &format!("{}:modifyAckDeadline", p), Some(json!({ "ackIds": chunk, "ackDeadlineSeconds": seconds.clamp(0, 600) })), "the new deadline")?;
+    }
+    Ok(ids.len() as i64)
+}
+
+/// The access token calls are signed with (traded for the service account's JWT, or the one given), with its scope: for a look, or to call another Google API with it.
+pub fn pubsub_access_token(name: &str) -> Result<Value, String> {
+    let c = cfg(name)?;
+    let t = bearer(&c)?;
+    Ok(json!({ "token": t, "scope": SCOPE, "token_url": c.token_url }))
+}

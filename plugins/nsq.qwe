@@ -1,0 +1,93 @@
+// Sign-ups through NSQ: published over nsqd's HTTP API, taken five times a second by a consumer on
+// the "welcome-email" channel (found through nsqlookupd when NSQLOOKUPD_URL is set), finished,
+// or requeued once when the mail server says "try later"; a batch published at once and read by a
+// second channel; a reminder published 300 ms late; and the topic's stats.
+//
+//   NSQD_HTTP_URL=http://127.0.0.1:4151 NSQD_TCP_ADDRESS=127.0.0.1:4150 quillo run nsq.qwe      then open http://localhost:8080/signup?email=ada@example.com
+//
+// Needs nsqd (nsqd --lookupd-tcp-address=127.0.0.1:4160, with nsqlookupd running, or nsqd alone).
+
+use "nsq.qwer"
+
+let HTTP = env("NSQD_HTTP_URL", "http://127.0.0.1:4151")
+let FIND = env("NSQLOOKUPD_URL", "") != "" ? env("NSQLOOKUPD_URL", "") : env("NSQD_TCP_ADDRESS", "127.0.0.1:4150")
+let HEARTBEAT = int(env("NSQ_HEARTBEAT_MS", "30000")) ?? 30000
+
+// Topics and channels made first, so nothing published before a consumer comes is lost.
+let made = [
+    nsq_create_topic(HTTP, "signups"),
+    nsq_create_channel(HTTP, "signups", "welcome-email"),
+    nsq_create_channel(HTTP, "signups", "audit"),
+    nsq_create_topic(HTTP, "reminders"),
+    nsq_create_channel(HTTP, "reminders", "sms"),
+]
+let consumers = [
+    nsq_subscribe("emails", FIND, "signups", "welcome-email", { max_in_flight: 50, heartbeat_interval_ms: HEARTBEAT, client_id: "welcome-worker" }),
+    nsq_subscribe("audit", FIND, "signups", "audit", { max_in_flight: 10, heartbeat_interval_ms: HEARTBEAT }),
+    nsq_subscribe("sms", FIND, "reminders", "sms", { heartbeat_interval_ms: HEARTBEAT }),
+]
+
+let welcomed = []
+
+fn work() {
+    for m in nsq_receive("emails", 50, 0)? {
+        let s = json.parse(m.body)
+        if is_err(s) {
+            nsq_finish("emails", m)?                      // not ours to fix: dropped
+        } else if s.slow == true && m.attempts == 1 {
+            nsq_touch("emails", m)?                       // more time, then "try later"
+            nsq_requeue("emails", m, 0)?
+        } else {
+            welcomed = welcomed + [{ email: s.email, attempts: m.attempts }]
+            nsq_finish("emails", m)?
+        }
+    }
+    null
+}
+
+every(200, work)
+
+route GET /signup ? { email: str, slow: bool = false } {
+    { published: nsq_publish(HTTP, "signups", json.stringify({ email, slow }), {})? }
+}
+
+route GET /welcomed {
+    sleep(800)
+    { welcomed }
+}
+
+// Three at once (one with a newline in it); the audit channel gets its own copy of every sign-up.
+route GET /batch {
+    let n = nsq_publish_many(HTTP, "signups", [
+        json.stringify({ email: "cy@example.com" }),
+        json.stringify({ email: "di@example.com", note: "line one\nline two" }),
+        "not json",
+    ], {})?
+    sleep(300)
+    let seen = []
+    let more = nsq_receive("audit", 20, 2000)?
+    while len(more) > 0 {
+        for m in more { nsq_finish("audit", m)? }
+        seen = seen + (more | map((m) => m.body))
+        more = nsq_receive("audit", 20, 300)?
+    }
+    { published: n, audit_saw: len(seen), last: seen[len(seen) - 1] }
+}
+
+route GET /reminder {
+    let sent = now()
+    nsq_publish(HTTP, "reminders", "Your table is booked for 8 pm", { defer_ms: 300 })?
+    let m = nsq_receive("sms", 1, 5000)?[0] ?? reply 504 "the reminder did not come"
+    nsq_finish("sms", m)?
+    { body: m.body, late_enough: now() - sent >= 300 }
+}
+
+route GET /stats {
+    let t = nsq_stats(HTTP, "signups")?.topics[0]
+    let c = nsq_consumer_stats("emails")?
+    {
+        topic: t.topic_name, messages: t.message_count,
+        channels: t.channels | map((ch) => ch.channel_name) | sort,
+        consumer: { finished: c.finished, requeued: c.requeued, connected: c.connections[0].connected },
+    }
+}

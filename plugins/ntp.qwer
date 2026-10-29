@@ -1,0 +1,357 @@
+//! An SNTP/NTP client (RFC 5905, 4330): a server's time, this clock's offset from it and the round-trip delay, its stratum, reference and leap state, Kiss-o'-Death answers told apart; several servers asked at once and the best chosen by root distance; NTP timestamps converted both ways (eras included); and packets read and answered for a small time server on `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+
+use serde_json::{json, Value};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const LEAP: [&str; 4] = ["none", "insert second", "delete second", "unsynchronized"];
+const MODES: [&str; 8] = ["reserved", "symmetric active", "symmetric passive", "client", "server", "broadcast", "control", "private"];
+
+/// Seconds from 1900-01-01 (NTP's era 0) to 1970-01-01.
+const NTP_UNIX: u64 = 2_208_988_800;
+
+fn now_ns() -> i128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0)
+}
+
+/// Unix nanoseconds as a 64-bit NTP timestamp (era taken modulo 2^32).
+fn to_ntp(unix_ns: i128) -> u64 {
+    let secs = unix_ns.div_euclid(1_000_000_000) + NTP_UNIX as i128;
+    let frac = ((unix_ns.rem_euclid(1_000_000_000) as u128) << 32) / 1_000_000_000;
+    ((secs as u64 & 0xFFFF_FFFF) << 32) | (frac as u64 & 0xFFFF_FFFF)
+}
+
+/// A 64-bit NTP timestamp as Unix nanoseconds, in the era nearest `pivot_ns` (RFC 5905 6).
+fn from_ntp(ts: u64, pivot_ns: i128) -> i128 {
+    let secs = (ts >> 32) as i128;
+    let frac = ((ts & 0xFFFF_FFFF) as i128 * 1_000_000_000) >> 32;
+    let pivot = pivot_ns.div_euclid(1_000_000_000) + NTP_UNIX as i128;
+    let era = 1i128 << 32;
+    let mut best = secs;
+    let base = pivot - pivot.rem_euclid(era);
+    for e in [-era, 0, era] {
+        let cand = base + e + secs;
+        if (cand - pivot).abs() < (best - pivot).abs() {
+            best = cand;
+        }
+    }
+    (best - NTP_UNIX as i128) * 1_000_000_000 + frac
+}
+
+fn iso(unix_ns: i128) -> String {
+    let ms = unix_ns.div_euclid(1_000_000);
+    let secs = ms.div_euclid(1000) as i64;
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, sod / 3600, (sod / 60) % 60, sod % 60, ms.rem_euclid(1000))
+}
+
+fn sock_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    let mut all: Vec<SocketAddr> = with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.collect();
+    all.sort_by_key(|a| !a.is_ipv4());
+    all.into_iter().next().ok_or(format!("{} has no address", host))
+}
+
+fn be32(b: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+fn be64(b: &[u8], i: usize) -> u64 {
+    ((be32(b, i) as u64) << 32) | be32(b, i + 4) as u64
+}
+
+/// The reference ID as RFC 5905 says to read it: a source's code at stratum 0 and 1, an IPv4
+/// address above (or, for IPv6 servers, the first four bytes of an MD5: shown as hex).
+fn refid(stratum: u8, b: &[u8]) -> String {
+    let id = &b[12..16];
+    if stratum <= 1 {
+        id.iter().take_while(|c| **c != 0).map(|c| *c as char).filter(|c| c.is_ascii_graphic()).collect()
+    } else {
+        format!("{}.{}.{}.{}", id[0], id[1], id[2], id[3])
+    }
+}
+
+fn short_ms(v: u32) -> f64 {
+    // NTP short format: 16.16 seconds
+    (v as f64) / 65536.0 * 1000.0
+}
+
+fn round3(x: f64) -> f64 {
+    (x * 1000.0).round() / 1000.0
+}
+
+fn kod_meaning(code: &str) -> &'static str {
+    match code {
+        "RATE" => "asking too often: slow down (and leave several minutes between tries)",
+        "DENY" | "RSTR" => "this client is refused by the server's access rules",
+        "AUTH" | "AUTO" | "CRYP" | "NKEY" => "the server wants authentication",
+        "STEP" => "the server's clock was just stepped",
+        "INIT" => "the server has not synchronized yet",
+        "ACST" | "BCST" | "MCST" => "the server is in a mode that does not answer clients",
+        _ => "the server will not give the time",
+    }
+}
+
+struct Opt {
+    port: u16,
+    timeout: Duration,
+    version: u8,
+    retries: u32,
+}
+
+fn opt(o: &Value) -> Opt {
+    Opt {
+        port: o.get("port").and_then(|v| v.as_u64()).unwrap_or(123).clamp(1, 65535) as u16,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(2000).clamp(50, 60_000)),
+        version: o.get("version").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 4) as u8,
+        retries: o.get("retries").and_then(|v| v.as_u64()).unwrap_or(1).min(5) as u32,
+    }
+}
+
+fn query(server: &str, o: &Opt) -> Result<Value, String> {
+    let a = sock_addr(server, o.port)?;
+    let s = UdpSocket::bind(if a.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 1024];
+    for _ in 0..=o.retries {
+        let mut req = [0u8; 48];
+        req[0] = (o.version << 3) | 3; // leap 0, version, mode 3 (client)
+        let t1_ns = now_ns();
+        // RFC 5905 9.1 suggests random low bits in the transmit timestamp: they make the
+        // origin check stronger against spoofed answers
+        let t1 = to_ntp(t1_ns) ^ ((t1_ns as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) & 0x3FF);
+        req[40..48].copy_from_slice(&t1.to_be_bytes());
+        let sent_at = Instant::now();
+        s.send_to(&req, a).map_err(|e| format!("sending to {}: {}", a, e))?;
+        let until = sent_at + o.timeout;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            let (n, from) = match s.recv_from(&mut buf) {
+                Ok(x) => x,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err(format!("{} refused: no NTP server on UDP port {}", a, a.port())),
+                Err(e) => return Err(format!("reading from {}: {}", a, e)),
+            };
+            // T4 from the monotonic clock, so a clock step meanwhile does not spoil the delay
+            let t4_ns = t1_ns + sent_at.elapsed().as_nanos() as i128;
+            let b = &buf[..n];
+            if from.ip() != a.ip() || n < 48 || be64(b, 24) != t1 {
+                continue; // not the answer to this request (RFC 5905 8: the origin check)
+            }
+            let li = b[0] >> 6;
+            let vn = (b[0] >> 3) & 7;
+            let mode = b[0] & 7;
+            let stratum = b[1];
+            if mode != 4 && mode != 5 {
+                return Err(format!("{} answered in NTP mode {}, not as a server", a, mode));
+            }
+            if stratum == 0 {
+                let code = refid(0, b);
+                return Err(format!("{} sent a Kiss-o'-Death {:?}: {}", a, code, kod_meaning(&code)));
+            }
+            let t2 = be64(b, 32);
+            let t3 = be64(b, 40);
+            if t3 == 0 {
+                return Err(format!("{} sent a time of zero", a));
+            }
+            let t2n = from_ntp(t2, t1_ns);
+            let t3n = from_ntp(t3, t1_ns);
+            let offset = ((t2n - t1_ns) + (t3n - t4_ns)) as f64 / 2.0 / 1e6;
+            let delay = ((t4_ns - t1_ns) - (t3n - t2n)).max(0) as f64 / 1e6;
+            let root_delay = short_ms(be32(b, 4));
+            let root_disp = short_ms(be32(b, 8));
+            let precision = 2f64.powi(b[3] as i8 as i32);
+            let synced = li != 3 && stratum < 16;
+            let reft = be64(b, 16);
+            return Ok(json!({
+                "server": server, "address": a.to_string(),
+                "offset_ms": round3(offset), "delay_ms": round3(delay),
+                "stratum": stratum, "reference_id": refid(stratum, b),
+                "leap": LEAP[li as usize],
+                "synchronized": synced,
+                "version": vn, "mode": mode, "poll": b[2] as i8, "precision_s": precision,
+                "root_delay_ms": round3(root_delay), "root_dispersion_ms": round3(root_disp),
+                "root_distance_ms": round3(delay / 2.0 + root_delay / 2.0 + root_disp),
+                "reference_time": if reft == 0 { Value::Null } else { json!(iso(from_ntp(reft, t1_ns))) },
+                "server_time": iso(t3n),
+                "time": iso(now_ns() + (offset * 1e6) as i128),
+                "unix_ms": ((now_ns() + (offset * 1e6) as i128) / 1_000_000) as i64,
+            }));
+        }
+    }
+    Err(format!("no answer from {} in {} ms ({} tries): is UDP port {} open to it?", a, o.timeout.as_millis(), o.retries + 1, a.port()))
+}
+
+/// Asks one server (`"pool.ntp.org"`, `"time.example.com:123"`, an address) for the time:
+/// `{ offset_ms, delay_ms, stratum, reference_id, leap, synchronized, root_delay_ms,
+/// root_dispersion_ms, root_distance_ms, server_time, time, unix_ms, ... }`; `offset_ms` is how
+/// far this clock is behind (positive) or ahead. Options: `port`, `timeout_ms` (2000), `retries` (1), `version` (4).
+pub fn ntp_query(server: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    query(server, &opt(&options))
+}
+
+/// Asks several servers at once and picks the best: synchronized, no Kiss-o'-Death, the
+/// smallest root distance. `{ best, offset_ms, delay_ms, spread_ms, servers }`; `servers` has
+/// each answer or `{ server, error }`, and `spread_ms` is how far the good ones disagree.
+pub fn ntp_best(servers: Vec<String>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if servers.is_empty() {
+        return Err("give at least one server".into());
+    }
+    if servers.len() > 32 {
+        return Err("ask 32 servers at most".into());
+    }
+    let max_delay = options.get("max_delay_ms").and_then(|v| v.as_f64()).unwrap_or(1000.0);
+    let o = opt(&options);
+    let handles: Vec<_> = servers.iter().map(|s| {
+        let s = s.clone();
+        let o2 = Opt { port: o.port, timeout: o.timeout, version: o.version, retries: o.retries };
+        std::thread::spawn(move || (s.clone(), query(&s, &o2)))
+    }).collect();
+    let mut all = vec![];
+    let mut good: Vec<Value> = vec![];
+    for h in handles {
+        let (s, r) = h.join().map_err(|_| "a query thread failed".to_string())?;
+        match r {
+            Ok(v) => {
+                let ok = v["synchronized"].as_bool().unwrap_or(false) && v["delay_ms"].as_f64().unwrap_or(f64::MAX) <= max_delay;
+                let mut v2 = v.clone();
+                if !ok {
+                    v2["rejected"] = json!(if !v["synchronized"].as_bool().unwrap_or(false) { "not synchronized" } else { "delay too long" });
+                } else {
+                    good.push(v.clone());
+                }
+                all.push(v2);
+            }
+            Err(e) => all.push(json!({ "server": s, "error": e })),
+        }
+    }
+    if good.is_empty() {
+        return Err(format!("no server gave a usable time: {}", all.iter().map(|v| format!("{}: {}", v["server"].as_str().unwrap_or("?"), v.get("error").or(v.get("rejected")).and_then(|x| x.as_str()).unwrap_or("?"))).collect::<Vec<_>>().join("; ")));
+    }
+    good.sort_by(|a, b| a["root_distance_ms"].as_f64().unwrap_or(f64::MAX).partial_cmp(&b["root_distance_ms"].as_f64().unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
+    let offs: Vec<f64> = good.iter().filter_map(|g| g["offset_ms"].as_f64()).collect();
+    let spread = offs.iter().cloned().fold(f64::MIN, f64::max) - offs.iter().cloned().fold(f64::MAX, f64::min);
+    let best = &good[0];
+    Ok(json!({ "best": best["server"], "offset_ms": best["offset_ms"], "delay_ms": best["delay_ms"], "stratum": best["stratum"], "spread_ms": round3(spread), "servers": all }))
+}
+
+fn parse_ts(t: &str) -> Result<u64, String> {
+    let t = t.trim();
+    if let Some((a, b)) = t.split_once('.') {
+        if a.len() == 8 && b.len() == 8 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '.') {
+            let s = u32::from_str_radix(a, 16).map_err(|e| e.to_string())?;
+            let f = u32::from_str_radix(b, 16).map_err(|e| e.to_string())?;
+            return Ok(((s as u64) << 32) | f as u64);
+        }
+    }
+    if t.len() == 16 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return u64::from_str_radix(t, 16).map_err(|e| e.to_string());
+    }
+    Err(format!("`{}` is not an NTP timestamp: write it in hex, as seconds.fraction (\"e4b0c3a1.80000000\") or 16 digits", t))
+}
+
+/// An NTP timestamp (hex `"e4b0c3a1.80000000"` or 16 digits) as `{ unix_ms, iso, era, seconds, fraction }`,
+/// in the era nearest now (2036's wrap handled), or nearest `pivot_unix_ms` when given (0 for now).
+pub fn ntp_from_timestamp(timestamp: &str, pivot_unix_ms: i64) -> Result<serde_json::Value, String> {
+    let ts = parse_ts(timestamp)?;
+    let pivot = if pivot_unix_ms == 0 { now_ns() } else { pivot_unix_ms as i128 * 1_000_000 };
+    let ns = from_ntp(ts, pivot);
+    let era = (ns.div_euclid(1_000_000_000) + NTP_UNIX as i128).div_euclid(1i128 << 32);
+    Ok(json!({ "unix_ms": (ns.div_euclid(1_000_000)) as i64, "iso": iso(ns), "era": era as i64, "seconds": ts >> 32, "fraction": ts & 0xFFFF_FFFF }))
+}
+
+/// Milliseconds since 1970 as an NTP timestamp, `"e4b0c3a1.80000000"` (seconds.fraction in hex).
+pub fn ntp_timestamp(unix_ms: i64) -> String {
+    let ts = to_ntp(unix_ms as i128 * 1_000_000);
+    format!("{:08x}.{:08x}", ts >> 32, ts & 0xFFFF_FFFF)
+}
+
+fn bytes_of(b: &[i64]) -> Result<Vec<u8>, String> {
+    b.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect()
+}
+
+/// Reads an NTP packet (as a `udp.listen` handler gets `p.bytes`): `{ leap, version, mode,
+/// mode_name, stratum, poll, reference_id, origin, receive, transmit }`, timestamps as hex.
+pub fn ntp_parse(bytes: Vec<i64>) -> Result<serde_json::Value, String> {
+    let b = bytes_of(&bytes)?;
+    if b.len() < 48 {
+        return Err(format!("an NTP packet is at least 48 bytes, not {}", b.len()));
+    }
+    let mode = b[0] & 7;
+    let ts = |i: usize| {
+        let v = be64(&b, i);
+        format!("{:08x}.{:08x}", v >> 32, v & 0xFFFF_FFFF)
+    };
+    Ok(json!({
+        "leap": b[0] >> 6, "version": (b[0] >> 3) & 7, "mode": mode,
+        "mode_name": MODES[mode as usize],
+        "stratum": b[1], "poll": b[2] as i8, "precision": b[3] as i8, "reference_id": refid(b[1], &b),
+        "reference": ts(16), "origin": ts(24), "receive": ts(32), "transmit": ts(40),
+    }))
+}
+
+/// The answer to a client's request as bytes for `udp.reply`, from this machine's clock (RFC
+/// 5905 server mode): options `stratum` (2; 1 with a `reference` code like "GPS"), `reference`
+/// (an IPv4 address or a code of up to 4 letters), `root_delay_ms`, `root_dispersion_ms`.
+pub fn ntp_reply(request: Vec<i64>, options: serde_json::Value) -> Result<Vec<u8>, String> {
+    let received = now_ns();
+    let b = bytes_of(&request)?;
+    if b.len() < 48 {
+        return Err("an NTP request is at least 48 bytes".into());
+    }
+    if b[0] & 7 != 3 && b[0] & 7 != 1 {
+        return Err(format!("mode {} is not a client's request", b[0] & 7));
+    }
+    let stratum = options.get("stratum").and_then(|v| v.as_u64()).unwrap_or(2).clamp(1, 15) as u8;
+    let reference = options.get("reference").and_then(|v| v.as_str()).unwrap_or(if stratum == 1 { "LOCL" } else { "127.0.0.1" });
+    let mut r = [0u8; 48];
+    let vn = ((b[0] >> 3) & 7).clamp(1, 4);
+    r[0] = (vn << 3) | 4;
+    r[1] = stratum;
+    r[2] = b[2];
+    r[3] = (-20i8) as u8; // about a microsecond
+    let short = |ms: f64| ((ms / 1000.0) * 65536.0) as u32;
+    r[4..8].copy_from_slice(&short(options.get("root_delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.0)).to_be_bytes());
+    r[8..12].copy_from_slice(&short(options.get("root_dispersion_ms").and_then(|v| v.as_f64()).unwrap_or(10.0)).to_be_bytes());
+    let id: [u8; 4] = match reference.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if stratum > 1 => ip.octets(),
+        _ => {
+            let mut x = [0u8; 4];
+            for (i, c) in reference.bytes().take(4).enumerate() {
+                x[i] = c;
+            }
+            x
+        }
+    };
+    r[12..16].copy_from_slice(&id);
+    r[16..24].copy_from_slice(&to_ntp(received - 16_000_000_000).to_be_bytes());
+    r[24..32].copy_from_slice(&b[40..48]); // origin = the client's transmit time
+    r[32..40].copy_from_slice(&to_ntp(received).to_be_bytes());
+    r[40..48].copy_from_slice(&to_ntp(now_ns()).to_be_bytes());
+    Ok(r.to_vec())
+}

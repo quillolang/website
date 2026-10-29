@@ -1,0 +1,507 @@
+//! A WebSocket client for other services' sockets (exchange feeds, chat and bot gateways, devices): connections by name over ws:// or wss:// with headers and subprotocols, text and binary sent, what arrives kept in a buffer to read when the program wants, pings, keepalive, closing, and reconnecting by itself.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "1"
+//! base64 = "0.22"
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::CloseFrame;
+use tungstenite::{Message, WebSocket};
+
+// ---------------------------------------------------------------- the stream: plain or TLS
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(s) => s.read(b),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+fn tls_config(ca_file: Option<&str>) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_file {
+        Some(f) => {
+            let data = std::fs::read(f).map_err(|e| format!("cannot read the CA file {}: {}", f, e))?;
+            for c in rustls_pemfile::certs(&mut &data[..]) {
+                roots.add(c.map_err(|e| format!("{}: {}", f, e))?).map_err(|e| format!("{}: {}", f, e))?;
+            }
+            if roots.is_empty() {
+                return Err(format!("{} has no PEM certificate", f));
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+fn would_block(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
+#[derive(Clone)]
+struct Options {
+    url: String,
+    headers: Vec<(String, String)>,
+    protocols: Vec<String>,
+    timeout: Duration,
+    buffer: usize,
+    reconnect: bool,
+    ca_file: Option<String>,
+    ping_every: Option<Duration>,
+}
+
+fn options(url: &str, o: &Value) -> Result<Options, String> {
+    let mut headers = vec![];
+    if let Some(h) = o["headers"].as_object() {
+        for (k, v) in h {
+            let v = match v { Value::String(s) => s.clone(), other => other.to_string() };
+            headers.push((k.clone(), v));
+        }
+    } else if !o["headers"].is_null() {
+        return Err("`headers` is a map of names to values".into());
+    }
+    let protocols = match &o["protocols"] {
+        Value::Null => vec![],
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().map(|p| p.as_str().map(|s| s.to_string()).ok_or("`protocols` is a list of names")).collect::<Result<_, _>>()?,
+        _ => return Err("`protocols` is a list of names".into()),
+    };
+    Ok(Options {
+        url: url.to_string(),
+        headers,
+        protocols,
+        timeout: Duration::from_millis(o["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 120_000) as u64),
+        buffer: o["buffer"].as_i64().unwrap_or(1000).clamp(1, 1_000_000) as usize,
+        reconnect: o["reconnect"].as_bool().unwrap_or(true),
+        ca_file: o["ca_file"].as_str().map(|s| s.to_string()),
+        ping_every: o["ping_every_ms"].as_i64().filter(|&n| n > 0).map(|n| Duration::from_millis(n.max(100) as u64)),
+    })
+}
+
+/// Opens the socket and does the handshake; gives it with the chosen subprotocol and the answer's headers.
+/// A server may choose none of the subprotocols asked for (RFC 6455 4.2.2), which tungstenite
+/// takes for an error: then the handshake is done again without asking, and `protocol` is null.
+fn open(o: &Options) -> Result<(WebSocket<Stream>, Option<String>, Value), String> {
+    match open_once(o) {
+        Err(e) if !o.protocols.is_empty() && e.contains("Server sent no subprotocol") => {
+            let mut plain = o.clone();
+            plain.protocols.clear();
+            open_once(&plain)
+        }
+        r => r,
+    }
+}
+
+fn open_once(o: &Options) -> Result<(WebSocket<Stream>, Option<String>, Value), String> {
+    let mut req = o.url.as_str().into_client_request().map_err(|e| format!("{:?} is not a WebSocket URL (ws:// or wss://): {}", o.url, e))?;
+    let uri = req.uri().clone();
+    let tls = match uri.scheme_str() {
+        Some("ws") => false,
+        Some("wss") => true,
+        other => return Err(format!("a WebSocket URL starts with ws:// or wss://, not {:?}", other.unwrap_or(""))),
+    };
+    let host = uri.host().ok_or("the URL has no host")?.trim_matches(|c| c == '[' || c == ']').to_string();
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    for (k, v) in &o.headers {
+        let name = tungstenite::http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("{:?} is not a header name", k))?;
+        let val = tungstenite::http::HeaderValue::from_str(v).map_err(|_| format!("the value of header {} is not valid", k))?;
+        req.headers_mut().insert(name, val);
+    }
+    if !o.protocols.is_empty() {
+        req.headers_mut().insert("Sec-WebSocket-Protocol", tungstenite::http::HeaderValue::from_str(&o.protocols.join(", ")).map_err(|_| "bad subprotocol names")?);
+    }
+    let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    let tcp = TcpStream::connect_timeout(&addr, o.timeout).map_err(|e| format!("cannot connect to {}: {}", addr, e))?;
+    tcp.set_read_timeout(Some(o.timeout)).map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(o.timeout)).map_err(|e| e.to_string())?;
+    let _ = tcp.set_nodelay(true);
+    let stream = if tls {
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("{:?}: {}", host, e))?;
+        let conn = rustls::ClientConnection::new(tls_config(o.ca_file.as_deref())?, name).map_err(|e| e.to_string())?;
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        while s.conn.is_handshaking() {
+            s.conn.complete_io(&mut s.sock).map_err(|e| format!("TLS with {} failed: {}", host, e))?;
+        }
+        Stream::Tls(Box::new(s))
+    } else {
+        Stream::Plain(tcp)
+    };
+    let (ws, resp) = tungstenite::client::client(req, stream).map_err(|e| match e {
+        tungstenite::HandshakeError::Interrupted(_) => format!("{} did not finish the WebSocket handshake within {} ms", o.url, o.timeout.as_millis()),
+        tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) => format!("{} refused the WebSocket upgrade: HTTP {}", o.url, r.status()),
+        tungstenite::HandshakeError::Failure(e) => format!("the WebSocket handshake with {} failed: {}", o.url, e),
+    })?;
+    let protocol = resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(p) = &protocol {
+        if !o.protocols.iter().any(|x| x == p) {
+            return Err(format!("the server chose the subprotocol {:?}, which was not asked for", p));
+        }
+    }
+    let mut headers = serde_json::Map::new();
+    for (k, v) in resp.headers() {
+        headers.insert(k.as_str().to_string(), json!(v.to_str().unwrap_or("")));
+    }
+    ws.get_ref().tcp().set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
+    Ok((ws, protocol, Value::Object(headers)))
+}
+
+// ---------------------------------------------------------------- connections
+
+enum Cmd {
+    Send(Message, Sender<Result<(), String>>),
+    Close(u16, String),
+}
+
+#[derive(Default)]
+struct State {
+    inbox: VecDeque<Value>,
+    connected: bool,
+    closed: bool,
+    protocol: Option<String>,
+    headers: Value,
+    received: u64,
+    sent: u64,
+    dropped: u64,
+    reconnects: u64,
+    last_error: Option<String>,
+    last_pong_at: Option<u64>,
+    connected_at: Option<u64>,
+}
+
+struct Conn {
+    opts: Options,
+    state: Mutex<State>,
+    arrived: Condvar,
+    tx: Mutex<Sender<Cmd>>,
+    done: Mutex<bool>,
+    finished: Condvar,
+}
+
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn push(c: &Conn, v: Value) {
+    let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.inbox.len() >= c.opts.buffer {
+        s.inbox.pop_front();
+        s.dropped += 1;
+    }
+    s.inbox.push_back(v);
+    drop(s);
+    c.arrived.notify_all();
+}
+
+fn as_value(m: &Message) -> Option<Value> {
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let at = now_ms();
+    Some(match m {
+        Message::Text(t) => json!({ "kind": "text", "text": t.as_str(), "size": t.len(), "at": at }),
+        Message::Binary(b) => json!({ "kind": "binary", "base64": b64(b), "size": b.len(), "at": at }),
+        Message::Pong(b) => json!({ "kind": "pong", "text": String::from_utf8_lossy(b), "at": at }),
+        Message::Close(f) => json!({ "kind": "close", "code": f.as_ref().map(|f| u16::from(f.code)), "reason": f.as_ref().map(|f| f.reason.as_str().to_string()), "at": at }),
+        Message::Ping(_) | Message::Frame(_) => return None,
+    })
+}
+
+/// The connection's thread: reads into the buffer, writes what is sent, answers pings, and
+/// opens the connection again (0.5 s, 1 s, 2 s ... up to 30 s apart) when it drops.
+fn run(c: Arc<Conn>, mut ws: WebSocket<Stream>, rx: Receiver<Cmd>) {
+    let mut last_ping = Instant::now();
+    let mut backoff = Duration::from_millis(500);
+    'outer: loop {
+        let mut closing_since: Option<Instant> = None;
+        let why: Option<String> = loop {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    Cmd::Send(m, reply) => {
+                        let r = ws.send(m).map_err(|e| e.to_string());
+                        if r.is_ok() {
+                            c.state.lock().unwrap_or_else(|e| e.into_inner()).sent += 1;
+                        }
+                        let _ = reply.send(r);
+                    }
+                    Cmd::Close(code, reason) => {
+                        let _ = ws.close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }));
+                        closing_since = Some(Instant::now());
+                    }
+                }
+            }
+            match ws.read() {
+                Ok(m) => {
+                    if let Some(v) = as_value(&m) {
+                        if v["kind"] == "pong" {
+                            c.state.lock().unwrap_or_else(|e| e.into_inner()).last_pong_at = Some(now_ms());
+                        }
+                        let is_close = v["kind"] == "close";
+                        c.state.lock().unwrap_or_else(|e| e.into_inner()).received += 1;
+                        push(&c, v);
+                        if is_close && closing_since.is_none() {
+                            // tungstenite answers the close; the server ends the TCP connection next.
+                            closing_since = Some(Instant::now());
+                        }
+                    }
+                }
+                Err(tungstenite::Error::Io(e)) if would_block(&e) => {}
+                Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => break None,
+                Err(e) => break Some(e.to_string()),
+            }
+            let _ = ws.flush();
+            if let Some(since) = closing_since {
+                if since.elapsed() > Duration::from_secs(2) {
+                    break None;
+                }
+            }
+            if let Some(every) = c.opts.ping_every {
+                if last_ping.elapsed() >= every && closing_since.is_none() {
+                    let _ = ws.send(Message::Ping(Vec::new().into()));
+                    last_ping = Instant::now();
+                }
+            }
+        };
+        let stop = {
+            let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.connected = false;
+            if let Some(w) = &why {
+                s.last_error = Some(w.clone());
+            }
+            s.closed || !c.opts.reconnect
+        };
+        if stop {
+            break 'outer;
+        }
+        // Dropped (by the network or by the server): open it again until closed by ws_close.
+        loop {
+            let wait_until = Instant::now() + backoff;
+            while Instant::now() < wait_until {
+                if c.state.lock().unwrap_or_else(|e| e.into_inner()).closed {
+                    break 'outer;
+                }
+                // Sends while down fail at once.
+                while let Ok(cmd) = rx.try_recv() {
+                    if let Cmd::Send(_, reply) = cmd {
+                        let _ = reply.send(Err("the connection is down and being opened again".into()));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            match open(&c.opts) {
+                Ok((w, protocol, headers)) => {
+                    ws = w;
+                    let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.connected = true;
+                    s.reconnects += 1;
+                    s.protocol = protocol;
+                    s.headers = headers;
+                    s.connected_at = Some(now_ms());
+                    backoff = Duration::from_millis(500);
+                    continue 'outer;
+                }
+                Err(e) => {
+                    c.state.lock().unwrap_or_else(|e| e.into_inner()).last_error = Some(e);
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
+    c.state.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
+    *c.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    c.finished.notify_all();
+}
+
+fn get(name: &str) -> Result<Arc<Conn>, String> {
+    let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(name)).cloned().ok_or(format!("no WebSocket connection named {:?}: open it with ws_connect", name))
+}
+
+fn status(name: &str, c: &Conn) -> Value {
+    let s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+    json!({
+        "name": name, "url": c.opts.url, "connected": s.connected, "protocol": s.protocol, "waiting": s.inbox.len(), "received": s.received, "sent": s.sent,
+        "dropped": s.dropped, "reconnects": s.reconnects, "last_error": s.last_error, "last_pong_at": s.last_pong_at, "connected_at": s.connected_at, "headers": s.headers,
+    })
+}
+
+/// Opens a connection kept under `name` (a second call with the same name and URL gives the open one). `options`: `{ headers: { authorization: "..." }, protocols: ["graphql-transport-ws"], timeout_ms (10000, for connecting and each send), buffer (1000 messages kept; when full the oldest go, counted in `dropped`), reconnect (true: a dropped connection is opened again, 0.5 s to 30 s apart), ping_every_ms (keepalive pings), ca_file (a PEM file to trust for wss://) }`. Gives the connection's status: `{ name, url, connected, protocol, headers, ... }`.
+pub fn ws_connect(name: &str, url: &str, options: serde_json::Value) -> Result<Value, String> {
+    if let Ok(c) = get(name) {
+        let same = c.opts.url == url && !c.state.lock().unwrap_or_else(|e| e.into_inner()).closed;
+        if same {
+            return Ok(status(name, &c));
+        }
+        let _ = ws_close(name, 1000, "replaced");
+    }
+    let o = self::options(url, &options)?;
+    let (ws, protocol, headers) = open(&o)?;
+    let (tx, rx) = channel();
+    let c = Arc::new(Conn {
+        opts: o,
+        state: Mutex::new(State { connected: true, protocol, headers, connected_at: Some(now_ms()), ..Default::default() }),
+        arrived: Condvar::new(),
+        tx: Mutex::new(tx),
+        done: Mutex::new(false),
+        finished: Condvar::new(),
+    });
+    let c2 = c.clone();
+    std::thread::Builder::new().name(format!("ws-{}", name)).spawn(move || run(c2, ws, rx)).map_err(|e| e.to_string())?;
+    CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c.clone());
+    Ok(status(name, &c))
+}
+
+fn send(name: &str, m: Message) -> Result<i64, String> {
+    let c = get(name)?;
+    {
+        let s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.closed {
+            return Err(format!("the connection {:?} is closed", name));
+        }
+        if !s.connected {
+            return Err(format!("the connection {:?} is down{}", name, s.last_error.as_ref().map(|e| format!(" ({})", e)).unwrap_or_default()));
+        }
+    }
+    let size = m.len() as i64;
+    let (rtx, rrx) = channel();
+    c.tx.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::Send(m, rtx)).map_err(|_| format!("the connection {:?} has stopped", name))?;
+    match rrx.recv_timeout(c.opts.timeout + Duration::from_millis(100)) {
+        Ok(r) => r.map(|_| size),
+        Err(_) => Err(format!("sending on {:?} took more than {} ms", name, c.opts.timeout.as_millis())),
+    }
+}
+
+/// Sends `text` as a text message; gives its size in bytes.
+pub fn ws_send(name: &str, text: &str) -> Result<i64, String> {
+    send(name, Message::text(text.to_string()))
+}
+
+/// Sends any value as JSON text (what most APIs want: `ws_send_json("feed", { op: "subscribe", args: ["trades"] })`).
+pub fn ws_send_json(name: &str, value: serde_json::Value) -> Result<i64, String> {
+    send(name, Message::text(value.to_string()))
+}
+
+/// Sends a binary message, its bytes given in base64.
+pub fn ws_send_binary(name: &str, base64: &str) -> Result<i64, String> {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD.decode(base64.trim()).map_err(|e| format!("not base64: {}", e))?;
+    send(name, Message::binary(b))
+}
+
+/// Sends a ping with `text` (up to 125 bytes); the pong comes into the buffer as `{ kind: "pong", text }`.
+pub fn ws_ping(name: &str, text: &str) -> Result<i64, String> {
+    if text.len() > 125 {
+        return Err("a ping carries at most 125 bytes".into());
+    }
+    send(name, Message::Ping(text.as_bytes().to_vec().into()))
+}
+
+/// Up to `max` messages from the buffer, oldest first, waiting up to `wait_ms` for one when none is there (0: no wait). Each is `{ kind: "text", text }`, `{ kind: "binary", base64 }`, `{ kind: "pong", text }` or `{ kind: "close", code, reason }`, with `size` and `at` (milliseconds).
+pub fn ws_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = get(name)?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 300_000) as u64);
+    let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+    while s.inbox.is_empty() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        s = c.arrived.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = (max.max(1) as usize).min(s.inbox.len());
+    Ok(s.inbox.drain(..n).collect())
+}
+
+/// The text messages from the buffer read as JSON (up to `max`, waiting up to `wait_ms`); those that are not JSON come as `{ text }`.
+pub fn ws_receive_json(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    Ok(ws_receive(name, max, wait_ms)?
+        .into_iter()
+        .filter(|m| m["kind"] == "text")
+        .map(|m| serde_json::from_str(m["text"].as_str().unwrap_or("")).unwrap_or_else(|_| json!({ "text": m["text"] })))
+        .collect())
+}
+
+/// How a connection is: `{ name, url, connected, protocol, waiting, received, sent, dropped, reconnects, last_error, last_pong_at, connected_at, headers }`.
+pub fn ws_status(name: &str) -> Result<Value, String> {
+    let c = get(name)?;
+    Ok(status(name, &c))
+}
+
+/// The open connections' statuses.
+pub fn ws_list() -> Vec<Value> {
+    let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<(String, Arc<Conn>)> = g.as_ref().map(|m| m.iter().map(|(k, c)| (k.clone(), c.clone())).collect()).unwrap_or_default();
+    drop(g);
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.iter().map(|(k, c)| status(k, c)).collect()
+}
+
+/// Closes the connection with `code` (1000: normal) and `reason`, waits up to 2 s for the server's answer, and forgets it; gives how many messages were left unread.
+pub fn ws_close(name: &str, code: i64, reason: &str) -> Result<i64, String> {
+    let c = get(name)?;
+    let code = u16::try_from(code).ok().filter(|&c| c == 1000 || (3000..5000).contains(&c) || (1001..=1014).contains(&c)).ok_or(format!("{} is not a close code to send (1000, or 3000 to 4999)", code))?;
+    c.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+    let _ = c.tx.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::Close(code, reason.chars().take(120).collect()));
+    let mut done = c.done.lock().unwrap_or_else(|e| e.into_inner());
+    let until = Instant::now() + Duration::from_millis(2500);
+    while !*done {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        done = c.finished.wait_timeout(done, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(done);
+    CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    let left = c.state.lock().unwrap_or_else(|e| e.into_inner()).inbox.len() as i64;
+    Ok(left)
+}

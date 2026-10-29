@@ -15,7 +15,7 @@ root makes the pages from `catalog.json` and the files themselves.
    `use "<slug>.qwer"`, and a route or two that show the functions at work.
 3. Add it to `catalog.json`: `slug`, `name`, `group` (one of the groups in
    `plugins.qwe`), `tags`, `summary`, and `try`, the requests to make and what each
-   answer must contain. `needs` (`"smtp"`, `"redis"`, `"http"` or `"printer"`) starts a stand-in server, `env`
+   answer must contain. `needs` (`"smtp"`, `"redis"`, `"http"`, `"printer"`, or a module in `standins/`) starts a stand-in server, `env`
    sets variables, and `files` lists other files to download beside it.
 4. Run `QUILLO=/path/to/quillo node plugins/test.mjs <slug>`: it builds the plugin, runs
    the example and makes the `try` requests. `export.sh` runs every plugin's test.
@@ -71,6 +71,9 @@ Each with a one-line repro, for the next FEEDBACK report:
 - A plugin's `pub fn f() -> serde_json::Map<String, serde_json::Value>` is "not exported", nor is `serde_json::Map` taken as a parameter type; `Value` and `std::collections::HashMap<String, serde_json::Value>` are.
 - A plugin parameter named like one of the file's private functions hides it inside that function: "expected function, found `&str`".
 - `quillo check` says "ok" for a program whose plugin does not compile: the Rust error only shows at `quillo run` (an `ocr.qwer` calling `.take()` on a `Box<dyn Read>` without `use std::io::Read`).
+- A field of a bound JSON body read through `json` is null, silently: `route POST /a { json: { speed: int } } = { v: json.speed }` gives `null` and `quillo check` says ok; the value is bound as `speed`. (`graphql_parse.qwe` had `guard(json.query)`.)
+- `reply` is a keyword, so it cannot be a variable: `let reply = f()` is refused, a name RPC code reaches for.
+- SIGTERM does not stop a server while a plugin call is blocked: the process keeps its port until `kill -9`, so the next start finds "Address already in use".
 
 ## The first 37
 
@@ -135,6 +138,48 @@ Crate traps met in these:
 - Services read their base URL from env (`<SERVICE>_API_URL`, `SINK_URL` in tests), so a test
   never reaches the real service.
 
+## Protocols and message brokers
+
+Written on 2026-10-30, 39 in two new groups. **Messaging**: mqtt, nats (with JetStream),
+amqp (RabbitMQ), kafka, zeromq, redis_streams, pusher, stomp, beanstalkd, nsq, sqs, pubsub,
+azure_servicebus. **Protocols**: grpc (a `.proto` read at run time), json_rpc, xml_rpc, soap,
+websocket_client, webdav, proxy_protocol, syslog, statsd, influx, coap, snmp, mdns,
+wake_on_lan, ntp, tftp, radius, s7 (Siemens PLCs), ldap, ftp, imap, pop3, smpp, iso8583,
+fix_protocol, mllp. A plugin cannot call a program, so subscriptions buffer on a thread of
+their own and `<x>_receive(name, max, wait_ms)` hands over what came: drain it from an
+`every` tick or a route.
+
+Their tests run against stand-ins in `standins/` (any `needs` that is not built in names one),
+written from the protocols' specifications; `proto_tls.mjs` and `protocols_tls.mjs` hold test
+CAs. Most were also tried against the real thing: nginx, Apache mod_dav, Artemis, nsqd,
+ElasticMQ, the Pub/Sub emulator, InfluxDB 2 and 3, Telegraf, net-snmp, python-snap7, aiocoap,
+pyrad, UnboundID, pyftpdlib, GreenMail, jsmpp, pyiso8583, QuickFIX/J and python-hl7. Not tried
+against real servers: mqtt, nats, amqp, kafka and redis_streams (stand-ins only), beanstalkd
+and Service Bus, and the brokers' TLS and SASL options.
+
+Crate traps met in these:
+
+- **rustls everywhere:** crates' `rustls` features often mean aws-lc-rs (C): rumqttc's
+  `use-rustls-no-provider`, async-nats with `ring`, ldap3 `tls-rustls-ring`, suppaftp
+  `rustls-ring`; redis 0.32's `tls-rustls` uses the process-wide provider, so install ring's
+  first. gRPC over TLS needs ALPN `h2`. A rustls stream cannot be split for a reader thread.
+- **rumqttc 0.25:** 10 KiB packets by default (`set_max_packet_size`); panics on a v5 keep-alive
+  under 5 s and on `clean_session(false)` with an empty client id; `publish` returns no ack.
+- **async-nats 0.51** parses `user:pass@` in the URL but never sends it.
+- **zeromq 0.7:** `connect` waits forever; REQ/PUSH fail with no peer instead of queueing; a REQ
+  whose request timed out must be rebuilt; give subscribers a moment before the first publish.
+- **rskafka 0.6:** default features build zstd and lz4 from C; no retry deadline by default; no
+  consumer groups. **lapin 4:** `ShortString::from` panics past 255 bytes.
+- **suppaftp 12:** no read timeout on the greeting (connect your own `TcpStream`), none on passive
+  data either. **ldap3 0.12:** `SearchEntry::construct` panics on referrals (`EntriesOnly`).
+- **tungstenite 0.26:** `features = ["handshake"]` with your own rustls stream; a server picking no
+  subprotocol is an error; a read timeout is `WouldBlock` on macOS.
+- **prost-reflect 0.14:** JSON writes 64-bit ints as strings and skips defaults unless told.
+- **mdns-sd 0.13:** one browse per service type per daemon. RustCrypto: md-5/sha1/sha2 0.10 with
+  hmac 0.12 and aes/des 0.8; don't mix in the newer lines.
+- **Node stand-ins:** close a dgram socket a moment after its last send; end a TLS socket a moment
+  after its handshake; retry a bind on EADDRINUSE.
+
 ## Ideas, to write later
 
 Each idea has the crate to start from. A star (★) marks those that fill a gap in the
@@ -143,7 +188,6 @@ standard library people meet early.
 ### Security and sign-in
 
 - ★ **passkeys**: WebAuthn registration and sign-in (`webauthn-rs`).
-- **ldap**: sign in against Active Directory or LDAP, and read groups (`ldap3`).
 - **saml**: SAML 2.0 sign-in for enterprises (`samael`; needs libxml2, so harder).
 
 ### Data formats
@@ -169,11 +213,8 @@ standard library people meet early.
 
 - **mongodb**: MongoDB's find, insert, update and aggregate (`mongodb` with its sync API).
 - **apns**: push notifications to iPhones (`a2`).
-- **imap**: read an inbox, for replies by email (`imap`).
 - **sftp**: files to and from SFTP servers, for partners who still use them (`russh-sftp`).
 - **gcs** and **azure_blob**: signed links for Google Cloud Storage and Azure (by hand, or their crates).
-- **nats** and **mqtt**: publish and subscribe to NATS and MQTT brokers (`nats`, `rumqttc`).
-- **kafka**: produce and consume Kafka topics (`rdkafka`; needs librdkafka, so harder).
 
 ### Places
 
@@ -188,11 +229,7 @@ standard library people meet early.
   `pandoc`, `imagemagick`, `pg_dump`, run with arguments as a list (never a shell
   string), a timeout and an output limit.
 - **cli_args**: argument parsing for Quillo scripts run from the command line (`clap`).
-- **grpc**: call gRPC services from a `.proto` file, unary calls first (`tonic`, `prost`,
-  with a runtime in a `static`).
-- **json_rpc**: JSON-RPC 2.0 clients and servers' message handling, batches included.
 - **thrift** and **capnp**: Apache Thrift and Cap'n Proto messages and clients.
-- **xml_rpc** and **soap**: the older enterprise APIs: requests built, answers read.
 
 ### Hardware
 

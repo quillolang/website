@@ -1,0 +1,586 @@
+//! LDAP and Active Directory: people signed in by search-then-bind (with Active Directory's reasons: locked out, disabled, password expired), searches with filters and every page read, a user's groups (nested ones by AD's matching rule in chain), entries added, changed and deleted, over LDAPS or StartTLS, and values escaped for filters and DNs.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ldap3 = { version = "=0.12.1", default-features = false, features = ["sync", "tls-rustls-ring"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// ---- Options, TCP with timeouts, and TLS by rustls (ring) ----
+
+fn o_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn o_i64(o: &Value, k: &str, d: i64) -> i64 {
+    match o.get(k) {
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).unwrap_or(d),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
+        _ => d,
+    }
+}
+
+fn o_bool(o: &Value, k: &str, d: bool) -> bool {
+    match o.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        _ => d,
+    }
+}
+
+/// `timeout_ms` from the options (10 s when not given).
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o_i64(o, "timeout_ms", 10_000).clamp(100, 600_000) as u64)
+}
+
+/// Takes any certificate: for `insecure: true`, on a test bench only.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The certificates in PEM text.
+fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[a + 27..];
+        let Some(b) = body.find("-----END CERTIFICATE-----") else { break };
+        out.push(b64_decode(&body[..b]));
+        rest = &body[b + 25..];
+    }
+    out
+}
+
+/// A rustls client set up from the options: Mozilla's roots, plus `ca` (PEM text, or a PEM file's path); `insecure: true` takes any certificate.
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let config = if o_bool(o, "insecure", false) {
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAny(provider))).with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        if let Some(ca) = o_str(o, "ca").filter(|s| !s.trim().is_empty()) {
+            let text = if ca.contains("-----BEGIN") { ca.clone() } else { std::fs::read_to_string(&ca).map_err(|e| format!("cannot read the ca file {}: {}", ca, e))? };
+            let certs = pem_certs(&text);
+            if certs.is_empty() {
+                return Err("`ca` holds no PEM certificate (-----BEGIN CERTIFICATE-----)".into());
+            }
+            for c in certs {
+                roots.add(rustls::pki_types::CertificateDer::from(c)).map_err(|e| format!("a `ca` certificate cannot be used: {}", e))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+
+// ---- Connections ----
+
+struct Dir {
+    url: String,
+    opts: Value,
+    conn: Option<ldap3::LdapConn>,
+}
+
+static DIRS: Mutex<Option<HashMap<String, Arc<Mutex<Dir>>>>> = Mutex::new(None);
+
+fn lerr(e: ldap3::LdapError) -> String {
+    match e {
+        ldap3::LdapError::LdapResult { result } => result_text(&result),
+        e => {
+            let s = e.to_string();
+            if s.contains("timeout") || s.contains("elapsed") { format!("the directory did not answer in time (timeout_ms): {}", s) } else { s }
+        }
+    }
+}
+
+fn rc_name(rc: u32) -> &'static str {
+    match rc {
+        0 => "success",
+        1 => "operations error",
+        2 => "protocol error",
+        3 => "time limit exceeded",
+        4 => "size limit exceeded",
+        7 => "authentication method not supported",
+        8 => "stronger authentication required",
+        10 => "referral",
+        11 => "administrative limit exceeded",
+        12 => "unavailable critical extension",
+        13 => "confidentiality required (use TLS)",
+        16 => "no such attribute",
+        17 => "undefined attribute type",
+        19 => "constraint violation",
+        20 => "attribute or value exists",
+        21 => "invalid attribute syntax",
+        32 => "no such object",
+        34 => "invalid DN syntax",
+        48 => "inappropriate authentication",
+        49 => "invalid credentials",
+        50 => "insufficient access rights",
+        51 => "busy",
+        52 => "unavailable",
+        53 => "unwilling to perform",
+        64 => "naming violation",
+        65 => "object class violation",
+        66 => "not allowed on non-leaf",
+        67 => "not allowed on RDN",
+        68 => "entry already exists",
+        69 => "object class modifications prohibited",
+        80 => "other",
+        _ => "error",
+    }
+}
+
+fn result_text(r: &ldap3::LdapResult) -> String {
+    let mut s = format!("LDAP {} ({})", rc_name(r.rc), r.rc);
+    if !r.text.is_empty() {
+        s.push_str(&format!(": {}", r.text.trim()));
+    }
+    if !r.matched.is_empty() && r.rc == 32 {
+        s.push_str(&format!(" (the directory has {} but nothing below it by that name)", r.matched));
+    }
+    s
+}
+
+fn check(r: ldap3::LdapResult) -> Result<ldap3::LdapResult, String> {
+    if r.rc == 0 { Ok(r) } else { Err(result_text(&r)) }
+}
+
+fn local(url: &str) -> bool {
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("");
+    host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]")
+}
+
+fn open(url: &str, o: &Value) -> Result<ldap3::LdapConn, String> {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("ldap://") && !lower.starts_with("ldaps://") {
+        return Err(format!("{} is not an LDAP URL: ldap://host (StartTLS with starttls: true) or ldaps://host", url));
+    }
+    let starttls = o_bool(o, "starttls", false);
+    let secure = lower.starts_with("ldaps://") || starttls;
+    let t = timeout_of(o);
+    let settings = ldap3::LdapConnSettings::new().set_conn_timeout(t).set_starttls(starttls && !lower.starts_with("ldaps://")).set_config(tls_config(o)?);
+    let mut conn = ldap3::LdapConn::with_settings(settings, url).map_err(|e| format!("cannot reach {}: {}", url, lerr(e)))?;
+    if let Some(dn) = o_str(o, "bind_dn").filter(|d| !d.is_empty()) {
+        let pw = o_str(o, "password").unwrap_or_default();
+        if pw.is_empty() {
+            return Err("bind_dn without a password: an empty password is an unauthenticated bind, which signs in no one".into());
+        }
+        if !secure && !o_bool(o, "allow_plain_password", local(url)) {
+            return Err(format!("{} without TLS would get the password in clear: use ldaps://, starttls: true, or allow_plain_password: true", url));
+        }
+        let r = conn.with_timeout(t).simple_bind(&dn, &pw).map_err(lerr)?;
+        check(r).map_err(|e| format!("the service account could not bind: {}", e))?;
+    }
+    Ok(conn)
+}
+
+fn dir(name: &str) -> Result<Arc<Mutex<Dir>>, String> {
+    let g = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no directory {}: call ldap_connect first", name))
+}
+
+/// Runs `f` on the named connection, opening it again (and binding) when it was dropped; once more after a broken connection.
+fn with<T>(name: &str, f: impl Fn(&mut ldap3::LdapConn, &Value) -> Result<T, String>) -> Result<T, String> {
+    let d = dir(name)?;
+    let mut g = d.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..2 {
+        if g.conn.as_mut().map_or(true, |c| c.is_closed()) {
+            let c = open(&g.url, &g.opts)?;
+            g.conn = Some(c);
+        }
+        let opts = g.opts.clone();
+        let r = f(g.conn.as_mut().unwrap(), &opts);
+        match &r {
+            Err(e) if attempt == 0 && !e.starts_with("LDAP ") && !e.starts_with("TRUNCATED") && !e.starts_with("give ") && !e.contains("not a ") => {
+                g.conn = None;
+                continue;
+            }
+            _ => return r,
+        }
+    }
+    unreachable!()
+}
+
+// ---- Entries ----
+
+fn sid(b: &[u8]) -> Option<String> {
+    if b.len() < 8 || b[0] != 1 || b.len() != 8 + 4 * b[1] as usize {
+        return None;
+    }
+    let auth = b[2..8].iter().fold(0u64, |a, x| a << 8 | *x as u64);
+    let subs: Vec<String> = b[8..].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_string()).collect();
+    Some(format!("S-{}-{}-{}", b[0], auth, subs.join("-")))
+}
+
+fn guid(b: &[u8]) -> Option<String> {
+    if b.len() != 16 {
+        return None;
+    }
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    ))
+}
+
+fn b64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for chunk in b.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, x)| acc | (*x as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            s.push(if i <= chunk.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    s
+}
+
+/// An entry as `{ dn, attrs: { name: [values] } }`; binary values as base64, objectSid and objectGUID written as Windows writes them.
+fn entry(e: ldap3::ResultEntry) -> Option<Value> {
+    let se = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ldap3::SearchEntry::construct(e))).ok()?;
+    let mut attrs = serde_json::Map::new();
+    let mut names: Vec<&String> = se.attrs.keys().chain(se.bin_attrs.keys()).collect();
+    names.sort_by_key(|n| n.to_ascii_lowercase());
+    names.dedup();
+    for n in names {
+        let mut vals: Vec<Value> = se.attrs.get(n).map(|v| v.iter().map(|s| json!(s)).collect()).unwrap_or_default();
+        for b in se.bin_attrs.get(n).into_iter().flatten() {
+            let low = n.to_ascii_lowercase();
+            let shown = if low == "objectsid" || low == "sidhistory" { sid(b) } else if low == "objectguid" { guid(b) } else { None };
+            vals.push(json!(shown.unwrap_or_else(|| b64(b))));
+        }
+        attrs.insert(n.clone(), Value::Array(vals));
+    }
+    Some(json!({ "dn": se.dn, "attrs": attrs }))
+}
+
+fn scope_of(o: &Value) -> Result<ldap3::Scope, String> {
+    match o_str(o, "scope").unwrap_or_else(|| "sub".into()).to_ascii_lowercase().as_str() {
+        "sub" | "subtree" => Ok(ldap3::Scope::Subtree),
+        "one" | "onelevel" | "children" => Ok(ldap3::Scope::OneLevel),
+        "base" => Ok(ldap3::Scope::Base),
+        x => Err(format!("give scope \"sub\", \"one\" or \"base\", not {}", x)),
+    }
+}
+
+fn search_on(c: &mut ldap3::LdapConn, base: &str, filter: &str, attrs: &[String], o: &Value, defaults: &Value) -> Result<Vec<Value>, String> {
+    ldap3::parse_filter(filter).map_err(|_| format!("{} is not an LDAP filter: write it like (&(objectClass=user)(sAMAccountName=jdoe)), with values through ldap_escape", filter))?;
+    let scope = scope_of(o)?;
+    let limit = o_i64(o, "limit", o_i64(defaults, "limit", 10_000)).max(1) as usize;
+    let page = o_i64(o, "page_size", o_i64(defaults, "page_size", 500));
+    let t = timeout_of(if o.get("timeout_ms").is_some() { o } else { defaults });
+    let want: Vec<String> = if attrs.is_empty() { vec!["*".into()] } else { attrs.to_vec() };
+    let mut out = vec![];
+    let mut adapters: Vec<Box<dyn ldap3::adapters::Adapter<_, _>>> = vec![Box::new(ldap3::adapters::EntriesOnly::new())];
+    if page > 0 {
+        adapters.push(Box::new(ldap3::adapters::PagedResults::new(page.min(i32::MAX as i64) as i32)));
+    }
+    c.with_timeout(t);
+    let mut s = c.streaming_search_with(adapters, base, scope, filter, want).map_err(lerr)?;
+    let mut truncated = false;
+    while let Some(e) = s.next().map_err(lerr)? {
+        if out.len() >= limit {
+            truncated = true;
+            break;
+        }
+        if let Some(v) = entry(e) {
+            out.push(v);
+        }
+    }
+    if truncated {
+        // The rest of the answer is not read: this connection is dropped, and the next call opens another.
+        return Err(format!("TRUNCATED:{}", serde_json::to_string(&out).unwrap_or_default()));
+    }
+    let r = s.result();
+    if r.rc == 4 {
+        return Err(format!("{}: the server stops there; page the search (page_size) or narrow the filter", result_text(&r)));
+    }
+    if r.rc != 0 {
+        return Err(result_text(&r));
+    }
+    Ok(out)
+}
+
+fn attr_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+        _ => vec![],
+    }
+}
+
+fn values(v: &Value) -> HashSet<String> {
+    match v {
+        Value::Array(a) => a.iter().filter_map(|x| match x {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
+            _ => None,
+        }).collect(),
+        Value::String(s) => [s.clone()].into(),
+        Value::Number(n) => [n.to_string()].into(),
+        Value::Bool(b) => [if *b { "TRUE" } else { "FALSE" }.to_string()].into(),
+        _ => HashSet::new(),
+    }
+}
+
+/// Opens a directory connection called `name` to `url` (ldaps://host, or ldap://host with `starttls: true`) and binds as the service account. Options: `bind_dn`, `password` (none: anonymous), `starttls`, `ca` (a CA's PEM, text or file), `insecure`, `timeout_ms` (10000), `page_size` (500 entries a page for searches; 0: no paging), `limit` (10000 entries at most a search), `allow_plain_password`. It is opened again by itself after a dropped connection. Gives `{ name, url, tls, bound_as, who }`.
+pub fn ldap_connect(name: &str, url: &str, opts: serde_json::Value) -> Result<Value, String> {
+    let mut conn = open(url, &opts)?;
+    // Who the server says we are (the WhoAmI extended operation), where it answers it; its parser panics on an empty answer.
+    let who = conn
+        .with_timeout(timeout_of(&opts))
+        .extended(ldap3::exop::WhoAmI)
+        .ok()
+        .and_then(|r| r.success().ok())
+        .and_then(|(e, _)| if e.val.is_some() { std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.parse::<ldap3::exop::WhoAmIResp>())).ok() } else { None })
+        .map(|w| w.authzid);
+    let tls = if url.to_ascii_lowercase().starts_with("ldaps://") { "ldaps" } else if o_bool(&opts, "starttls", false) { "starttls" } else { "none" };
+    let d = Arc::new(Mutex::new(Dir { url: url.to_string(), opts: opts.clone(), conn: Some(conn) }));
+    DIRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), d);
+    Ok(json!({ "name": name, "url": url, "tls": tls, "bound_as": o_str(&opts, "bind_dn"), "who": who }))
+}
+
+/// Entries under `base` that match `filter` (build it with ldap_escape for values people typed): `[{ dn, attrs: { name: [values] } }]`, every page read. `attrs` is a list of names (empty: all). Options: `scope` ("sub", "one", "base"), `page_size`, `limit` (past it, `{ truncated: true, entries }` is the error value's text), `timeout_ms`.
+pub fn ldap_search(name: &str, base: &str, filter: &str, attrs: serde_json::Value, opts: serde_json::Value) -> Result<Vec<Value>, String> {
+    let wanted = attr_list(&attrs);
+    let r = with(name, |c, d| search_on(c, base, filter, &wanted, &opts, d));
+    match r {
+        Err(e) if e.starts_with("TRUNCATED:") => {
+            if let Ok(d) = dir(name) {
+                d.lock().unwrap_or_else(|e| e.into_inner()).conn = None;
+            }
+            Err(format!("more than `limit` entries match: narrow the filter, or raise limit ({} read)", serde_json::from_str::<Vec<Value>>(&e[10..]).map_or(0, |v| v.len())))
+        }
+        r => r,
+    }
+}
+
+fn ad_reason(text: &str) -> Option<&'static str> {
+    let t = text.to_ascii_lowercase();
+    let code = t.split("data ").nth(1).map(|s| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>())?;
+    Some(match code.as_str() {
+        "525" => "no such user",
+        "52e" => "wrong password",
+        "530" => "not allowed to sign in at this time",
+        "531" => "not allowed to sign in from this computer",
+        "532" => "password expired",
+        "533" => "account disabled",
+        "568" => "too many security IDs",
+        "701" => "account expired",
+        "773" => "must change password",
+        "775" => "account locked out",
+        _ => return None,
+    })
+}
+
+/// Checks a person's user name and password: finds them under `base` with `user_filter`, where `{user}` stands for the escaped user name (`(&(objectClass=user)(sAMAccountName={user}))` for Active Directory, `(uid={user})` for OpenLDAP), then binds as the entry found, on a connection of its own. Gives `{ ok: true, dn, attrs }` or `{ ok: false, reason }` (no such user, wrong password, and Active Directory's account locked out, disabled, password expired...). Options: `attrs` to read from the entry.
+pub fn ldap_sign_in(name: &str, base: &str, user_filter: &str, username: &str, password: &str, opts: serde_json::Value) -> Result<Value, String> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Ok(json!({ "ok": false, "reason": "give a user name and a password (an empty password is an anonymous bind, which every server accepts)" }));
+    }
+    if !user_filter.contains("{user}") {
+        return Err("user_filter needs {user} where the user name goes, like (uid={user})".into());
+    }
+    let filter = user_filter.replace("{user}", &ldap3::ldap_escape(username));
+    let wanted = attr_list(opts.get("attrs").unwrap_or(&Value::Null));
+    let mut o = opts.clone();
+    o["limit"] = json!(2);
+    o["page_size"] = json!(0);
+    let found = with(name, |c, d| search_on(c, base, &filter, &wanted, &o, d));
+    let found = match found {
+        Err(e) if e.starts_with("TRUNCATED:") => {
+            if let Ok(d) = dir(name) {
+                d.lock().unwrap_or_else(|e| e.into_inner()).conn = None;
+            }
+            return Ok(json!({ "ok": false, "reason": "more than one entry has that user name: make user_filter narrower" }));
+        }
+        r => r?,
+    };
+    if found.is_empty() {
+        return Ok(json!({ "ok": false, "reason": "no such user" }));
+    }
+    let user = &found[0];
+    let dn = user["dn"].as_str().unwrap_or("").to_string();
+    let (url, dopts) = {
+        let d = dir(name)?;
+        let g = d.lock().unwrap_or_else(|e| e.into_inner());
+        (g.url.clone(), g.opts.clone())
+    };
+    let mut bo = dopts.clone();
+    bo["bind_dn"] = Value::Null;
+    let mut conn = open(&url, &bo)?;
+    let secure = url.to_ascii_lowercase().starts_with("ldaps://") || o_bool(&dopts, "starttls", false);
+    if !secure && !o_bool(&dopts, "allow_plain_password", local(&url)) {
+        return Err(format!("{} without TLS would get the password in clear", url));
+    }
+    let r = conn.with_timeout(timeout_of(&dopts)).simple_bind(&dn, password).map_err(lerr)?;
+    let _ = conn.unbind();
+    if r.rc == 0 {
+        return Ok(json!({ "ok": true, "dn": dn, "attrs": user["attrs"] }));
+    }
+    let reason = if r.rc == 49 { ad_reason(&r.text).unwrap_or("wrong password").to_string() } else { result_text(&r) };
+    Ok(json!({ "ok": false, "reason": reason, "dn": dn }))
+}
+
+/// The groups `user_dn` is in, found under `base`: `[{ dn, cn }]`. Options: `nested` (true: groups inside groups too, by Active Directory's LDAP_MATCHING_RULE_IN_CHAIN; "walk": asked level by level, for other servers), `uid` (also posixGroup memberUid), `limit`.
+pub fn ldap_groups(name: &str, user_dn: &str, base: &str, opts: serde_json::Value) -> Result<Vec<Value>, String> {
+    let kinds = "(|(objectClass=group)(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=posixGroup))";
+    let dn = ldap3::ldap_escape(user_dn).to_string();
+    let uid = o_str(&opts, "uid").map(|u| format!("(memberUid={})", ldap3::ldap_escape(&u))).unwrap_or_default();
+    let attrs = vec!["cn".to_string()];
+    let pick = |v: &Value| json!({ "dn": v["dn"], "cn": v["attrs"]["cn"][0] });
+    let nested = opts.get("nested").cloned().unwrap_or(Value::Bool(false));
+    if nested == Value::Bool(true) {
+        let filter = format!("(&{}(member:1.2.840.113556.1.4.1941:={}))", kinds, dn);
+        return Ok(ldap_search(name, base, &filter, json!(attrs), opts.clone())?.iter().map(pick).collect());
+    }
+    let direct = |of: &str| -> Result<Vec<Value>, String> {
+        let d = ldap3::ldap_escape(of).to_string();
+        let filter = format!("(&{}(|(member={d})(uniqueMember={d}){}))", kinds, if of == user_dn { uid.clone() } else { String::new() }, d = d);
+        ldap_search(name, base, &filter, json!(attrs), opts.clone())
+    };
+    let mut seen: Vec<Value> = vec![];
+    let mut todo = vec![user_dn.to_string()];
+    let walk = nested.as_str() == Some("walk");
+    for _depth in 0..if walk { 10 } else { 1 } {
+        let mut next = vec![];
+        for of in &todo {
+            for g in direct(of)? {
+                let gdn = g["dn"].as_str().unwrap_or("").to_string();
+                if !seen.iter().any(|s| s["dn"].as_str().map_or(false, |x| x.eq_ignore_ascii_case(&gdn))) {
+                    seen.push(pick(&g));
+                    next.push(gdn);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        todo = next;
+    }
+    Ok(seen)
+}
+
+/// Adds the entry `dn` with `attrs` (`{ objectClass: ["inetOrgPerson"], cn: "Ada Lovelace", ... }`, a value or a list each).
+pub fn ldap_add(name: &str, dn: &str, attrs: serde_json::Value) -> Result<bool, String> {
+    let m = attrs.as_object().ok_or("attrs is a map of attribute names to a value or a list of values")?;
+    let list: Vec<(String, HashSet<String>)> = m.iter().map(|(k, v)| (k.clone(), values(v))).filter(|(_, v)| !v.is_empty()).collect();
+    with(name, |c, d| {
+        let r = c.with_timeout(timeout_of(d)).add(dn, list.clone()).map_err(lerr)?;
+        check(r).map(|_| true)
+    })
+}
+
+/// Changes the entry `dn`: `changes` is a list of `{ op: "add" | "replace" | "delete", attr, values }` (delete with no values removes the attribute), or a map `{ attr: value }`, each replaced.
+pub fn ldap_modify(name: &str, dn: &str, changes: serde_json::Value) -> Result<bool, String> {
+    let mut mods: Vec<ldap3::Mod<String>> = vec![];
+    match &changes {
+        Value::Object(m) => {
+            for (k, v) in m {
+                mods.push(ldap3::Mod::Replace(k.clone(), values(v)));
+            }
+        }
+        Value::Array(a) => {
+            for ch in a {
+                let attr = o_str(ch, "attr").ok_or("each change needs `attr`")?;
+                let vals = values(ch.get("values").or(ch.get("value")).unwrap_or(&Value::Null));
+                mods.push(match o_str(ch, "op").unwrap_or_default().to_ascii_lowercase().as_str() {
+                    "add" => ldap3::Mod::Add(attr, vals),
+                    "replace" => ldap3::Mod::Replace(attr, vals),
+                    "delete" => ldap3::Mod::Delete(attr, vals),
+                    x => return Err(format!("op {:?}: add, replace or delete", x)),
+                });
+            }
+        }
+        _ => return Err("changes are a list of { op, attr, values } or a map of attributes to replace".into()),
+    }
+    if mods.is_empty() {
+        return Err("no changes given".into());
+    }
+    with(name, |c, d| {
+        let r = c.with_timeout(timeout_of(d)).modify(dn, mods.clone()).map_err(lerr)?;
+        check(r).map(|_| true)
+    })
+}
+
+/// Deletes the entry `dn` (one without children).
+pub fn ldap_delete(name: &str, dn: &str) -> Result<bool, String> {
+    with(name, |c, d| {
+        let r = c.with_timeout(timeout_of(d)).delete(dn).map_err(lerr)?;
+        check(r).map(|_| true)
+    })
+}
+
+/// A value made safe to put in a filter (RFC 4515): `*`, `(`, `)`, `\` and NUL escaped, so `ad*` stays three letters.
+pub fn ldap_escape(value: &str) -> String {
+    ldap3::ldap_escape(value).to_string()
+}
+
+/// A value made safe to put in a DN (RFC 4514): `,`, `+`, `"`, `\`, `<`, `>`, `;`, `=` and leading `#` or spaces escaped.
+pub fn ldap_escape_dn(value: &str) -> String {
+    ldap3::dn_escape(value).to_string()
+}
+
+/// Unbinds and closes the connection `name`; whether there was one.
+pub fn ldap_close(name: &str) -> bool {
+    let d = DIRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    match d {
+        Some(d) => {
+            if let Some(mut c) = d.lock().unwrap_or_else(|e| e.into_inner()).conn.take() {
+                let _ = c.unbind();
+            }
+            true
+        }
+        None => false,
+    }
+}

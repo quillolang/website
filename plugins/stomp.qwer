@@ -1,0 +1,989 @@
+//! STOMP 1.2 messaging with ActiveMQ, Artemis, RabbitMQ's STOMP plugin and other brokers: a connection kept open by name with heart-beats and reconnection, sends with headers and receipts, subscriptions in auto, client and client-individual ack modes buffered in memory for the program to take, ack and nack, and transactions (BEGIN, COMMIT, ABORT); TLS with stomp+ssl://.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn split(self) -> Result<(Reader, Writer), String> {
+        match self {
+            Stream::Plain(s) => Ok((Box::new(s.try_clone().map_err(|e| e.to_string())?), Box::new(s))),
+            Stream::Tls(t) => {
+                let t = Arc::new(Tls { s: Mutex::new(*t), waiting: std::sync::atomic::AtomicUsize::new(0) });
+                Ok((Box::new(TlsHalf(t.clone())), Box::new(TlsHalf(t))))
+            }
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(t) => t.read(b),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(t) => t.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(t) => t.flush(),
+        }
+    }
+}
+
+type Reader = Box<dyn Read + Send>;
+type Writer = Box<dyn Write + Send>;
+
+/// A TLS stream shared by the reading thread and the senders: the reader steps aside while a sender waits.
+struct Tls {
+    s: Mutex<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+struct TlsHalf(Arc<Tls>);
+impl Read for TlsHalf {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        while self.0.waiting.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.0.s.lock().unwrap_or_else(|e| e.into_inner()).read(b)
+    }
+}
+impl Write for TlsHalf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut g = self.0.s.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        g.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut g = self.0.s.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        g.flush()
+    }
+}
+
+#[derive(Clone)]
+struct Cfg {
+    url: String,
+    host: String,
+    port: u16,
+    tls: bool,
+    login: Option<String>,
+    passcode: Option<String>,
+    vhost: String,
+    client_id: Option<String>,
+    ca_file: Option<String>,
+    hb: (u64, u64),
+    timeout: Duration,
+    max: usize,
+}
+
+#[derive(Clone)]
+struct Sub {
+    destination: String,
+    ack: String,
+    headers: Vec<(String, String)>,
+}
+
+struct State {
+    connected: bool,
+    closing: bool,
+    generation: u64,
+    msgs: VecDeque<Value>,
+    receipts: HashMap<String, Result<(), String>>,
+    pending: HashMap<String, u64>,
+    subs: BTreeMap<String, Sub>,
+    server: Value,
+    send_every: u64,
+    expect_every: u64,
+    last_write: Instant,
+    last_read: Instant,
+    last_error: Option<String>,
+    received: u64,
+    acked: u64,
+    nacked: u64,
+    sent: u64,
+    reconnects: u64,
+    next_id: u64,
+}
+
+struct Conn {
+    cfg: Cfg,
+    io: Mutex<Option<Writer>>,
+    st: Mutex<State>,
+    cond: Condvar,
+}
+
+/// The connections, by the name given to `stomp_connect`; each has a thread that reads its frames.
+static CONNS: Mutex<Option<HashMap<String, Arc<Conn>>>> = Mutex::new(None);
+
+fn conn(name: &str) -> Result<Arc<Conn>, String> {
+    CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(name).cloned().ok_or(format!(
+        "no STOMP connection named `{}`: call stomp_connect(\"{}\", \"stomp://127.0.0.1:61613\", {{}}) first",
+        name, name
+    ))
+}
+
+impl Conn {
+    fn st(&self) -> MutexGuard<'_, State> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+// ---- Frames ----
+
+struct Frame {
+    command: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Frame {
+    fn header(&self, k: &str) -> Option<&str> {
+        self.headers.iter().find(|(h, _)| h == k).map(|(_, v)| v.as_str())
+    }
+}
+
+fn escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\r' => o.push_str("\\r"),
+            '\n' => o.push_str("\\n"),
+            ':' => o.push_str("\\c"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn unescape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            o.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('r') => o.push('\r'),
+            Some('n') => o.push('\n'),
+            Some('c') => o.push(':'),
+            Some('\\') => o.push('\\'),
+            Some(x) => {
+                o.push('\\');
+                o.push(x);
+            }
+            None => o.push('\\'),
+        }
+    }
+    o
+}
+
+fn encode(command: &str, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let plain = command == "CONNECT" || command == "STOMP";
+    let mut out = Vec::with_capacity(64 + body.len());
+    out.extend_from_slice(command.as_bytes());
+    out.push(b'\n');
+    for (k, v) in headers {
+        if plain {
+            out.extend_from_slice(format!("{}:{}\n", k, v.replace(['\n', '\r'], " ")).as_bytes());
+        } else {
+            out.extend_from_slice(format!("{}:{}\n", escape(k), escape(v)).as_bytes());
+        }
+    }
+    out.push(b'\n');
+    out.extend_from_slice(body);
+    out.push(0);
+    out
+}
+
+/// The next whole frame in `buf` (taken out of it), or None when more bytes are needed. Heart-beats (EOLs between frames) are skipped; `beat` says one was seen.
+fn decode(buf: &mut Vec<u8>, beat: &mut bool) -> Result<Option<Frame>, String> {
+    let mut start = 0;
+    while start < buf.len() && (buf[start] == b'\n' || buf[start] == b'\r') {
+        start += 1;
+        *beat = true;
+    }
+    if start > 0 {
+        buf.drain(..start);
+    }
+    let Some(head_end) = find(buf, b"\n\n").map(|i| (i, 2)).into_iter().chain(find(buf, b"\r\n\r\n").map(|i| (i, 4))).min_by_key(|(i, _)| *i) else {
+        if buf.len() > 1 << 20 {
+            return Err("a STOMP frame's headers are over 1 MB".into());
+        }
+        return Ok(None);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end.0]).to_string();
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+    let command = lines.next().unwrap_or("").to_string();
+    let plain = command == "CONNECTED";
+    let mut headers: Vec<(String, String)> = vec![];
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let (k, v) = if plain { (k.to_string(), v.to_string()) } else { (unescape(k), unescape(v)) };
+            headers.push((k, v));
+        }
+    }
+    let body_start = head_end.0 + head_end.1;
+    let len = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.trim().parse::<usize>().ok());
+    let (body, end) = match len {
+        Some(n) => {
+            if buf.len() < body_start + n + 1 {
+                return Ok(None);
+            }
+            if buf[body_start + n] != 0 {
+                return Err(format!("a {} frame's body is longer than its content-length", command));
+            }
+            (buf[body_start..body_start + n].to_vec(), body_start + n + 1)
+        }
+        None => match buf[body_start..].iter().position(|b| *b == 0) {
+            Some(i) => (buf[body_start..body_start + i].to_vec(), body_start + i + 1),
+            None => return Ok(None),
+        },
+    };
+    buf.drain(..end);
+    Ok(Some(Frame { command, headers, body }))
+}
+
+fn find(h: &[u8], n: &[u8]) -> Option<usize> {
+    h.windows(n.len()).position(|w| w == n)
+}
+
+// ---- Connecting ----
+
+fn parse_url(url: &str) -> Result<(bool, String, u16, Option<String>, Option<String>, Option<String>), String> {
+    let (scheme, rest) = url.split_once("://").ok_or(format!("`{}` is not a URL like stomp://127.0.0.1:61613", url))?;
+    let tls = match scheme.to_ascii_lowercase().as_str() {
+        "stomp" | "tcp" => false,
+        "stomp+ssl" | "stomps" | "ssl" | "stomp+tls" => true,
+        s => return Err(format!("`{}`: the scheme is stomp:// or stomp+ssl://, not {}://", url, s)),
+    };
+    let (auth, hostpart) = match rest.rsplit_once('@') {
+        Some((a, h)) => (Some(a), h),
+        None => (None, rest),
+    };
+    let (hostport, path) = match hostpart.split_once('/') {
+        Some((h, p)) => (h, if p.is_empty() { None } else { Some(pct(p)) }),
+        None => (hostpart, None),
+    };
+    let (host, port) = if let Some(r) = hostport.strip_prefix('[') {
+        let (h, p) = r.split_once(']').ok_or(format!("`{}`: an IPv6 address is closed with ]", url))?;
+        (h.to_string(), p.trim_start_matches(':').to_string())
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (hostport.to_string(), String::new()),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("`{}` has no host", url));
+    }
+    let port = if port.is_empty() { if tls { 61614 } else { 61613 } } else { port.parse().map_err(|_| format!("`{}`: `{}` is not a port", url, port))? };
+    let (login, pass) = match auth {
+        Some(a) => match a.split_once(':') {
+            Some((u, p)) => (Some(pct(u)), Some(pct(p))),
+            None => (Some(pct(a)), None),
+        },
+        None => (None, None),
+    };
+    Ok((tls, host, port, login, pass, path))
+}
+
+/// The URL without its password, for messages.
+fn redact(url: &str) -> String {
+    match (url.split_once("://"), url.rfind('@')) {
+        (Some((scheme, rest)), Some(_)) => {
+            let (auth, host) = rest.rsplit_once('@').unwrap_or(("", rest));
+            let user = auth.split(':').next().unwrap_or("");
+            format!("{}://{}@{}", scheme, user, host)
+        }
+        _ => url.to_string(),
+    }
+}
+
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Mozilla's roots, and the certificates in `ca_file` (PEM) for a broker with a private CA.
+fn tls_config(ca_file: &Option<String>) -> Result<Arc<rustls::ClientConfig>, String> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = ca_file {
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(path).map_err(|e| format!("ca_file {}: {}", path, e))?;
+        let mut n = 0;
+        for c in certs {
+            roots.add(c.map_err(|e| format!("ca_file {}: {}", path, e))?).map_err(|e| format!("ca_file {}: {}", path, e))?;
+            n += 1;
+        }
+        if n == 0 {
+            return Err(format!("ca_file {} has no PEM certificate", path));
+        }
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+/// Opens the socket, says CONNECT and reads CONNECTED: the stream's two halves, the server's headers, and what was left after the frame.
+fn open(cfg: &Cfg) -> Result<(Reader, Writer, Frame, Vec<u8>), String> {
+    let addrs: Vec<SocketAddr> = (cfg.host.as_str(), cfg.port).to_socket_addrs().map_err(|e| format!("{}: {}", cfg.host, e))?.collect();
+    let mut last = format!("{} has no address", cfg.host);
+    let mut sock = None;
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, cfg.timeout) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => last = format!("cannot reach the STOMP broker at {}: {}", a, e),
+        }
+    }
+    let sock = sock.ok_or(last)?;
+    let _ = sock.set_nodelay(true);
+    sock.set_write_timeout(Some(cfg.timeout)).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    let mut io = if cfg.tls {
+        let name = rustls::pki_types::ServerName::try_from(cfg.host.clone()).map_err(|_| format!("`{}` is not a host name for TLS", cfg.host))?;
+        let c = rustls::ClientConnection::new(tls_config(&cfg.ca_file)?, name).map_err(|e| e.to_string())?;
+        Stream::Tls(Box::new(rustls::StreamOwned::new(c, sock)))
+    } else {
+        Stream::Plain(sock)
+    };
+    let mut h: Vec<(String, String)> = vec![("accept-version".into(), "1.2".into()), ("host".into(), cfg.vhost.clone())];
+    if let Some(l) = &cfg.login {
+        h.push(("login".into(), l.clone()));
+    }
+    if let Some(p) = &cfg.passcode {
+        h.push(("passcode".into(), p.clone()));
+    }
+    if let Some(c) = &cfg.client_id {
+        h.push(("client-id".into(), c.clone()));
+    }
+    h.push(("heart-beat".into(), format!("{},{}", cfg.hb.0, cfg.hb.1)));
+    io.write_all(&encode("CONNECT", &h, b"")).map_err(|e| format!("{}: {}", cfg.url, e))?;
+    io.flush().map_err(|e| e.to_string())?;
+    let until = Instant::now() + cfg.timeout;
+    let mut buf = vec![];
+    let mut chunk = [0u8; 8192];
+    let mut beat = false;
+    loop {
+        if let Some(f) = decode(&mut buf, &mut beat)? {
+            match f.command.as_str() {
+                "CONNECTED" => {
+                    let (r, w) = io.split()?;
+                    return Ok((r, w, f, buf));
+                }
+                "ERROR" => {
+                    let msg = f.header("message").unwrap_or("").to_string();
+                    let body = String::from_utf8_lossy(&f.body).trim().to_string();
+                    return Err(format!("the broker refused the connection: {}{}", msg, if body.is_empty() || body == msg { String::new() } else { format!(" ({})", body) }));
+                }
+                c => return Err(format!("the broker answered CONNECT with {}", c)),
+            }
+        }
+        if Instant::now() > until {
+            return Err(format!("the broker at {} did not answer CONNECT in time (is it a STOMP port?)", cfg.url));
+        }
+        match io.read(&mut chunk) {
+            Ok(0) => return Err(format!("the broker at {} closed the connection after CONNECT (wrong virtual host, login or protocol?)", cfg.url)),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("{}: {}", cfg.url, e)),
+        }
+    }
+}
+
+fn negotiate(cfg: &Cfg, f: &Frame) -> (u64, u64) {
+    let (sx, sy) = f
+        .header("heart-beat")
+        .and_then(|h| h.split_once(','))
+        .map(|(a, b)| (a.trim().parse::<u64>().unwrap_or(0), b.trim().parse::<u64>().unwrap_or(0)))
+        .unwrap_or((0, 0));
+    let send_every = if cfg.hb.0 == 0 || sy == 0 { 0 } else { cfg.hb.0.max(sy) };
+    let expect_every = if cfg.hb.1 == 0 || sx == 0 { 0 } else { cfg.hb.1.max(sx) };
+    (send_every, expect_every)
+}
+
+fn server_info(f: &Frame) -> Value {
+    json!({ "version": f.header("version").unwrap_or("1.0"), "server": f.header("server"), "session": f.header("session"), "heart_beat": f.header("heart-beat") })
+}
+
+fn sub_frame(id: &str, s: &Sub, receipt: Option<&str>) -> Vec<u8> {
+    let mut h = vec![("id".to_string(), id.to_string()), ("destination".to_string(), s.destination.clone()), ("ack".to_string(), s.ack.clone())];
+    h.extend(s.headers.iter().cloned());
+    if let Some(r) = receipt {
+        h.push(("receipt".into(), r.into()));
+    }
+    encode("SUBSCRIBE", &h, b"")
+}
+
+fn write_raw(c: &Conn, bytes: &[u8]) -> Result<(), String> {
+    let mut io = c.io.lock().unwrap_or_else(|e| e.into_inner());
+    let r = match io.as_mut() {
+        Some(s) => s.write_all(bytes).and_then(|_| s.flush()).map_err(|e| format!("{}: {}", c.cfg.url, e)),
+        None => Err("not connected".into()),
+    };
+    if r.is_err() {
+        *io = None;
+        drop(io);
+        let mut st = c.st();
+        st.connected = false;
+        st.last_error = r.as_ref().err().cloned();
+        c.cond.notify_all();
+    } else {
+        c.st().last_write = Instant::now();
+    }
+    r
+}
+
+/// Sends a frame, waiting up to the timeout for the connection to come back when it is down.
+fn send_frame(c: &Conn, bytes: &[u8]) -> Result<u64, String> {
+    let until = Instant::now() + c.cfg.timeout;
+    let mut st = c.st();
+    while !st.connected && !st.closing {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("not connected to {}: {}", c.cfg.url, st.last_error.clone().unwrap_or_else(|| "connecting".into())));
+        }
+        st = c.cond.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    if st.closing {
+        return Err("the connection is closed".into());
+    }
+    let generation = st.generation;
+    drop(st);
+    write_raw(c, bytes)?;
+    Ok(generation)
+}
+
+fn new_id(c: &Conn, prefix: &str) -> String {
+    let mut st = c.st();
+    st.next_id += 1;
+    format!("{}-{}", prefix, st.next_id)
+}
+
+fn await_receipt(c: &Conn, id: &str) -> Result<(), String> {
+    let until = Instant::now() + c.cfg.timeout;
+    let mut st = c.st();
+    loop {
+        if let Some(r) = st.receipts.remove(id) {
+            return r;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("no RECEIPT from the broker for {} in {} ms", id, c.cfg.timeout.as_millis()));
+        }
+        st = c.cond.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+fn on_frame(c: &Conn, f: Frame) {
+    let mut st = c.st();
+    match f.command.as_str() {
+        "MESSAGE" => {
+            let mut headers = Map::new();
+            for (k, v) in &f.headers {
+                if !headers.contains_key(k) {
+                    headers.insert(k.clone(), json!(v));
+                }
+            }
+            let sub = f.header("subscription").unwrap_or("").to_string();
+            let mode = st.subs.get(&sub).map(|s| s.ack.clone()).unwrap_or_else(|| "auto".into());
+            let ack = if mode == "auto" { None } else { f.header("ack").or(f.header("message-id")).map(str::to_string) };
+            if let Some(a) = &ack {
+                let g = st.generation;
+                st.pending.insert(a.clone(), g);
+            }
+            let body = String::from_utf8_lossy(&f.body).to_string();
+            st.msgs.push_back(json!({
+                "subscription": sub, "destination": f.header("destination"), "message_id": f.header("message-id"),
+                "ack": ack, "redelivered": f.header("redelivered").map(|r| r == "true").unwrap_or(false),
+                "headers": headers, "body": body,
+            }));
+            st.received += 1;
+        }
+        "RECEIPT" => {
+            if let Some(id) = f.header("receipt-id") {
+                st.receipts.insert(id.to_string(), Ok(()));
+            }
+        }
+        "ERROR" => {
+            let head = f.header("message").unwrap_or("").to_string();
+            let msg = format!(
+                "the broker sent ERROR: {}{}",
+                head,
+                match String::from_utf8_lossy(&f.body).trim() {
+                    "" => String::new(),
+                    b if b == head => String::new(),
+                    b => format!(" ({})", b.chars().take(500).collect::<String>()),
+                }
+            );
+            if let Some(id) = f.header("receipt-id") {
+                st.receipts.insert(id.to_string(), Err(msg.clone()));
+            }
+            st.last_error = Some(msg);
+            // The broker closes the connection after an ERROR.
+            st.connected = false;
+            drop(st);
+            *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            c.cond.notify_all();
+            return;
+        }
+        _ => {}
+    }
+    drop(st);
+    c.cond.notify_all();
+}
+
+/// The reader: frames to the buffer, heart-beats both ways, and reconnecting when the broker goes away.
+fn run(c: Arc<Conn>, first: Reader, mut buf: Vec<u8>) {
+    let mut rd: Option<Reader> = Some(first);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        if c.st().closing {
+            return;
+        }
+        if !c.st().connected {
+            buf.clear();
+            rd = None;
+            match open(&c.cfg) {
+                Ok((r, w, f, rest)) => {
+                    let (send_every, expect_every) = negotiate(&c.cfg, &f);
+                    *c.io.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+                    rd = Some(r);
+                    buf = rest;
+                    let subs: Vec<(String, Sub)> = c.st().subs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let mut ok = true;
+                    for (id, s) in &subs {
+                        if write_raw(&c, &sub_frame(id, s, None)).is_err() {
+                            ok = false;
+                        }
+                    }
+                    if ok {
+                        let mut st = c.st();
+                        st.connected = true;
+                        st.generation += 1;
+                        st.reconnects += 1;
+                        st.server = server_info(&f);
+                        st.send_every = send_every;
+                        st.expect_every = expect_every;
+                        st.last_read = Instant::now();
+                        st.pending.clear();
+                        drop(st);
+                        c.cond.notify_all();
+                        backoff = Duration::from_millis(250);
+                    } else {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(10));
+                    }
+                }
+                Err(e) => {
+                    c.st().last_error = Some(e);
+                    c.cond.notify_all();
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+            }
+            continue;
+        }
+        // The program has not taken what is buffered: stop reading, and the broker waits.
+        let (full, send_every, expect_every, last_write, last_read) = {
+            let st = c.st();
+            (st.msgs.len() >= c.cfg.max, st.send_every, st.expect_every, st.last_write, st.last_read)
+        };
+        if send_every > 0 && last_write.elapsed() >= Duration::from_millis(send_every) {
+            let _ = write_raw(&c, b"\n");
+        }
+        if full {
+            c.st().last_read = Instant::now();
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if expect_every > 0 && last_read.elapsed() > Duration::from_millis(expect_every * 2 + 1000) {
+            let mut st = c.st();
+            st.connected = false;
+            st.last_error = Some(format!("no heart-beat from the broker in {} ms: connecting again", expect_every * 2 + 1000));
+            drop(st);
+            *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            c.cond.notify_all();
+            continue;
+        }
+        let r = match rd.as_mut() {
+            Some(s) => s.read(&mut chunk),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "closed")),
+        };
+        match r {
+            Ok(0) => {
+                let mut st = c.st();
+                if !st.closing {
+                    st.last_error = Some(format!("the broker at {} closed the connection", c.cfg.url));
+                }
+                st.connected = false;
+                drop(st);
+                *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                c.cond.notify_all();
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                c.st().last_read = Instant::now();
+                let mut beat = false;
+                loop {
+                    match decode(&mut buf, &mut beat) {
+                        Ok(Some(f)) => on_frame(&c, f),
+                        Ok(None) => break,
+                        Err(e) => {
+                            let mut st = c.st();
+                            st.last_error = Some(e);
+                            st.connected = false;
+                            drop(st);
+                            *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => {
+                let mut st = c.st();
+                if !st.closing {
+                    st.last_error = Some(format!("{}: {}", c.cfg.url, e));
+                }
+                st.connected = false;
+                drop(st);
+                *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                c.cond.notify_all();
+            }
+        }
+    }
+}
+
+fn header_list(v: &Value) -> Result<Vec<(String, String)>, String> {
+    match v {
+        Value::Null => Ok(vec![]),
+        Value::Object(m) => Ok(m
+            .iter()
+            .map(|(k, v)| (k.clone(), match v { Value::String(s) => s.clone(), other => other.to_string() }))
+            .collect()),
+        _ => Err("`headers` is a map of header names to values".into()),
+    }
+}
+
+fn close_conn(c: &Conn) {
+    let mut st = c.st();
+    st.closing = true;
+    st.connected = false;
+    drop(st);
+    if let Some(mut s) = c.io.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = s.write_all(&encode("DISCONNECT", &[], b""));
+        let _ = s.flush();
+    }
+    c.cond.notify_all();
+}
+
+/// Connects (or connects again) as `name` to `url`: `stomp://user:pass@host:61613` or `stomp+ssl://host:61614` (TLS, checked against Mozilla's roots).
+/// Options: `login`, `passcode`, `host` (the virtual host: "/" for RabbitMQ; the URL's host, else), `heart_beat` ([send_ms, expect_ms]; [10000, 10000]; [0, 0] for none), `client_id` (for durable subscriptions), `ca_file` (PEM certificates to trust besides Mozilla's roots, for TLS), `timeout_ms` (10000, for connecting, receipts and sends), `buffer` (messages held until taken; 10000). Gives `{ name, version, server, session, heart_beat }`.
+/// A thread reads the broker's frames. When the connection breaks it connects again, with the same subscriptions; messages not yet acked are sent again by the broker then.
+pub fn stomp_connect(name: &str, url: &str, options: serde_json::Value) -> Result<Value, String> {
+    let (tls, host, port, ulogin, upass, path) = parse_url(url)?;
+    let hb = match &options["heart_beat"] {
+        Value::Null => (10_000, 10_000),
+        Value::Array(a) if a.len() == 2 => (a[0].as_u64().ok_or("heart_beat is [send_ms, expect_ms]")?, a[1].as_u64().ok_or("heart_beat is [send_ms, expect_ms]")?),
+        _ => return Err("heart_beat is [send_ms, expect_ms], like [10000, 10000]".into()),
+    };
+    let cfg = Cfg {
+        url: redact(url),
+        vhost: options["host"].as_str().map(str::to_string).or(path).unwrap_or_else(|| host.clone()),
+        host,
+        port,
+        tls,
+        login: options["login"].as_str().map(str::to_string).or(ulogin),
+        passcode: options["passcode"].as_str().map(str::to_string).or(upass),
+        client_id: options["client_id"].as_str().map(str::to_string),
+        ca_file: options["ca_file"].as_str().map(str::to_string),
+        hb,
+        timeout: Duration::from_millis(options["timeout_ms"].as_u64().unwrap_or(10_000).clamp(100, 300_000)),
+        max: options["buffer"].as_u64().unwrap_or(10_000).clamp(1, 1_000_000) as usize,
+    };
+    let (reader, io, f, rest) = open(&cfg)?;
+    let (send_every, expect_every) = negotiate(&cfg, &f);
+    let info = server_info(&f);
+    let c = Arc::new(Conn {
+        cfg,
+        io: Mutex::new(Some(io)),
+        st: Mutex::new(State {
+            connected: true,
+            closing: false,
+            generation: 1,
+            msgs: VecDeque::new(),
+            receipts: HashMap::new(),
+            pending: HashMap::new(),
+            subs: BTreeMap::new(),
+            server: info.clone(),
+            send_every,
+            expect_every,
+            last_write: Instant::now(),
+            last_read: Instant::now(),
+            last_error: None,
+            received: 0,
+            acked: 0,
+            nacked: 0,
+            sent: 0,
+            reconnects: 0,
+            next_id: 0,
+        }),
+        cond: Condvar::new(),
+    });
+    let old = CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c.clone());
+    if let Some(o) = old {
+        close_conn(&o);
+    }
+    let c2 = c.clone();
+    std::thread::Builder::new().name(format!("stomp-{}", name)).spawn(move || run(c2, reader, rest)).map_err(|e| e.to_string())?;
+    let mut out = info;
+    out["name"] = json!(name);
+    out["heart_beat"] = json!([send_every, expect_every]);
+    Ok(out)
+}
+
+/// Sends `body` to `destination` (`/queue/orders`, `/topic/prices`, `/exchange/...` on RabbitMQ). Options: `headers` (a map: `persistent`, `priority`, `expires`, `reply-to`, your own), `content_type` ("text/plain"), `receipt` (true: wait until the broker says it has it), `transaction`. Gives `{ receipt }`: its id, or null.
+pub fn stomp_send(name: &str, destination: &str, body: &str, options: serde_json::Value) -> Result<Value, String> {
+    if destination.is_empty() {
+        return Err("a destination is needed: /queue/name or /topic/name".into());
+    }
+    let c = conn(name)?;
+    let mut h = vec![("destination".to_string(), destination.to_string())];
+    h.push(("content-type".into(), options["content_type"].as_str().unwrap_or("text/plain").to_string()));
+    h.push(("content-length".into(), body.len().to_string()));
+    if let Some(t) = options["transaction"].as_str() {
+        h.push(("transaction".into(), t.to_string()));
+    }
+    for (k, v) in header_list(&options["headers"])? {
+        if !matches!(k.as_str(), "destination" | "content-length" | "receipt" | "transaction") {
+            h.push((k, v));
+        }
+    }
+    let receipt = if options["receipt"].as_bool() == Some(true) { Some(new_id(&c, "send")) } else { None };
+    if let Some(r) = &receipt {
+        h.push(("receipt".into(), r.clone()));
+    }
+    send_frame(&c, &encode("SEND", &h, body.as_bytes()))?;
+    c.st().sent += 1;
+    if let Some(r) = &receipt {
+        await_receipt(&c, r)?;
+    }
+    Ok(json!({ "receipt": receipt }))
+}
+
+/// Subscribes to `destination`; messages are kept until `stomp_receive` takes them. Options: `id` (made up when not given), `ack` ("auto": nothing to ack; "client": an ack covers the messages before it; "client-individual": one by one), `headers` (`selector`, `prefetch-count`, `activemq.subscriptionName`, `durable`...), `receipt` (true unless false: wait until the broker has taken it, so a refused destination is an error here). Gives the subscription id.
+pub fn stomp_subscribe(name: &str, destination: &str, options: serde_json::Value) -> Result<String, String> {
+    if destination.is_empty() {
+        return Err("a destination is needed: /queue/name or /topic/name".into());
+    }
+    let ack = options["ack"].as_str().unwrap_or("auto").to_string();
+    if !matches!(ack.as_str(), "auto" | "client" | "client-individual") {
+        return Err(format!("the ack mode is \"auto\", \"client\" or \"client-individual\", not \"{}\"", ack));
+    }
+    let c = conn(name)?;
+    let id = match options["id"].as_str() {
+        Some(i) if !i.is_empty() => i.to_string(),
+        _ => new_id(&c, "sub"),
+    };
+    let s = Sub { destination: destination.to_string(), ack, headers: header_list(&options["headers"])? };
+    let receipt = if options["receipt"].as_bool() != Some(false) { Some(new_id(&c, "subscribe")) } else { None };
+    c.st().subs.insert(id.clone(), s.clone());
+    if let Err(e) = send_frame(&c, &sub_frame(&id, &s, receipt.as_deref())) {
+        c.st().subs.remove(&id);
+        return Err(e);
+    }
+    if let Some(r) = &receipt {
+        if let Err(e) = await_receipt(&c, r) {
+            c.st().subs.remove(&id);
+            return Err(e);
+        }
+    }
+    Ok(id)
+}
+
+/// Ends the subscription `id`; its messages still buffered stay there. Whether it was one.
+pub fn stomp_unsubscribe(name: &str, id: &str) -> Result<bool, String> {
+    let c = conn(name)?;
+    if c.st().subs.remove(id).is_none() {
+        return Ok(false);
+    }
+    let r = new_id(&c, "unsubscribe");
+    send_frame(&c, &encode("UNSUBSCRIBE", &[("id".into(), id.into()), ("receipt".into(), r.clone())], b""))?;
+    await_receipt(&c, &r)?;
+    Ok(true)
+}
+
+/// Takes up to `max` buffered messages (of the subscription `subscription`, or of all with ""), waiting up to `wait_ms` for the first. Each is `{ subscription, destination, message_id, ack, redelivered, headers, body }`; `ack` is what to give `stomp_ack` (null in auto mode).
+pub fn stomp_receive(name: &str, subscription: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = conn(name)?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 300_000) as u64);
+    let max = max.clamp(1, 100_000) as usize;
+    let mut st = c.st();
+    loop {
+        let mine = |m: &Value| subscription.is_empty() || m["subscription"] == subscription;
+        if st.msgs.iter().any(mine) {
+            let mut out = vec![];
+            let mut keep = VecDeque::new();
+            while let Some(m) = st.msgs.pop_front() {
+                if out.len() < max && mine(&m) {
+                    out.push(m);
+                } else {
+                    keep.push_back(m);
+                }
+            }
+            st.msgs = keep;
+            return Ok(out);
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || st.closing {
+            return Ok(vec![]);
+        }
+        st = c.cond.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+fn ack_id(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Ok(s.clone()),
+        Value::Object(_) => v["ack"].as_str().map(str::to_string).ok_or("this message has nothing to ack: its subscription is in auto mode".to_string()),
+        _ => Err("ack takes a message from stomp_receive, or its `ack` id".into()),
+    }
+}
+
+fn ack_or_nack(name: &str, message: &Value, transaction: &str, command: &str) -> Result<bool, String> {
+    let c = conn(name)?;
+    let id = ack_id(message)?;
+    {
+        let st = c.st();
+        match st.pending.get(&id) {
+            Some(g) if *g != st.generation => return Err("the connection was opened again since this message came: the broker sends it again".into()),
+            _ => {}
+        }
+    }
+    let mut h = vec![("id".to_string(), id.clone())];
+    if !transaction.is_empty() {
+        h.push(("transaction".into(), transaction.into()));
+    }
+    send_frame(&c, &encode(command, &h, b""))?;
+    let mut st = c.st();
+    st.pending.remove(&id);
+    if command == "ACK" { st.acked += 1 } else { st.nacked += 1 }
+    Ok(true)
+}
+
+/// Acknowledges a message (the map `stomp_receive` gave, or its `ack` id): the broker forgets it. `transaction` is "" or a transaction begun with `stomp_begin`.
+pub fn stomp_ack(name: &str, message: serde_json::Value, transaction: &str) -> Result<bool, String> {
+    ack_or_nack(name, &message, transaction, "ACK")
+}
+
+/// Refuses a message: the broker sends it again, or to its dead-letter queue, as it is set up.
+pub fn stomp_nack(name: &str, message: serde_json::Value, transaction: &str) -> Result<bool, String> {
+    ack_or_nack(name, &message, transaction, "NACK")
+}
+
+fn tx(name: &str, command: &str, id: &str) -> Result<String, String> {
+    if id.is_empty() {
+        return Err("a transaction needs a name".into());
+    }
+    let c = conn(name)?;
+    let r = new_id(&c, &command.to_ascii_lowercase());
+    send_frame(&c, &encode(command, &[("transaction".into(), id.into()), ("receipt".into(), r.clone())], b""))?;
+    await_receipt(&c, &r)?;
+    Ok(id.to_string())
+}
+
+/// Begins the transaction `id`: sends and acks given it take effect together at `stomp_commit`, or not at all at `stomp_abort`. Waits for the broker's receipt.
+pub fn stomp_begin(name: &str, id: &str) -> Result<String, String> {
+    tx(name, "BEGIN", id)
+}
+
+/// Commits the transaction `id`, and waits for the broker's receipt.
+pub fn stomp_commit(name: &str, id: &str) -> Result<String, String> {
+    tx(name, "COMMIT", id)
+}
+
+/// Aborts the transaction `id`: its sends are dropped and its acks undone. Waits for the broker's receipt.
+pub fn stomp_abort(name: &str, id: &str) -> Result<String, String> {
+    tx(name, "ABORT", id)
+}
+
+/// The connection's state: `{ connected, server, heart_beat, subscriptions, buffered, received, sent, acked, nacked, reconnects, last_error }`.
+pub fn stomp_stats(name: &str) -> Result<Value, String> {
+    let c = conn(name)?;
+    let st = c.st();
+    Ok(json!({
+        "connected": st.connected, "server": st.server, "heart_beat": [st.send_every, st.expect_every],
+        "subscriptions": st.subs.iter().map(|(k, s)| json!({ "id": k, "destination": s.destination, "ack": s.ack })).collect::<Vec<_>>(),
+        "buffered": st.msgs.len(), "received": st.received, "sent": st.sent, "acked": st.acked, "nacked": st.nacked,
+        "reconnects": st.reconnects, "last_error": st.last_error,
+    }))
+}
+
+/// Says DISCONNECT (waiting for the broker's receipt, so what was sent has arrived) and closes the connection; whether there was one. Messages not acked go back to the broker.
+pub fn stomp_close(name: &str) -> Result<bool, String> {
+    let c = CONNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    let Some(c) = c else { return Ok(false) };
+    if c.st().connected {
+        let r = new_id(&c, "disconnect");
+        if write_raw(&c, &encode("DISCONNECT", &[("receipt".into(), r.clone())], b"")).is_ok() {
+            let _ = await_receipt(&c, &r);
+        }
+    }
+    let mut st = c.st();
+    st.closing = true;
+    st.connected = false;
+    drop(st);
+    *c.io.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    c.cond.notify_all();
+    Ok(true)
+}

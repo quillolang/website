@@ -1,0 +1,95 @@
+// A shop's orders through RabbitMQ: a topic exchange routes each order to the EU warehouse's
+// queue and to an audit queue; a publish waits for the broker's confirm; the audit queue is read
+// one message at a time; a worker drains the warehouse queue five times a second and acks what
+// it handled; and prices come back by RPC from a responder that runs on a tick.
+//
+//   AMQP_URL=amqp://guest:guest@127.0.0.1:5672/%2f quillo run amqp.qwe      then open http://localhost:8080/orders/new?id=1001
+//
+// Needs an AMQP 0-9-1 broker (RabbitMQ: docker run -p 5672:5672 rabbitmq:4).
+
+use "amqp.qwer"
+
+let URL = env("AMQP_URL", "amqp://guest:guest@127.0.0.1:5672/%2f")
+
+// Two connections: the app publishes and asks; the worker consumes and answers.
+let opened = [amqp_connect("app", URL, { timeout_ms: 5000 }), amqp_connect("worker", URL, { prefetch: 20 })]
+
+fn topology() {
+    amqp_exchange("app", "shop", "topic", { durable: true })?
+    amqp_queue("app", "orders.eu", { durable: true, arguments: { "x-dead-letter-exchange": "shop", "x-dead-letter-routing-key": "failed.eu" } })?
+    amqp_queue("app", "audit", { durable: true, arguments: { "x-message-ttl": 86400000 } })?
+    amqp_queue("app", "failed", { durable: true })?
+    amqp_queue("app", "rpc.prices", {})?
+    amqp_bind("app", "orders.eu", "shop", "order.eu.*", {})?
+    amqp_bind("app", "audit", "shop", "order.#", {})?
+    amqp_bind("app", "failed", "shop", "failed.#", {})?
+    amqp_consume("worker", "orders.eu", { prefetch: 50 })?
+    amqp_consume("worker", "rpc.prices", {})?
+}
+let ready = topology()
+
+let processed = []
+
+// The warehouse: up to 50 orders a tick; a broken one is nacked without requeue, so it goes to
+// the dead-letter exchange and lands in "failed".
+fn work() {
+    for order in amqp_receive("worker", "orders.eu", 50, 0)? {
+        if order.json.items == null {
+            amqp_nack("worker", order, false)?
+        } else {
+            processed = processed + [order.properties.message_id]
+            amqp_ack("worker", order)?
+        }
+    }
+}
+every(200, work)
+
+// The price service: answers each request on rpc.prices to its reply_to.
+let PRICES = { "TEA-01": 4.5, "MUG-02": 12.0 }
+fn answer_prices() {
+    for req in amqp_receive("worker", "rpc.prices", 20, 0)? {
+        let sku = req.body
+        amqp_reply("worker", req, { sku: sku, price: PRICES[sku] ?? null }, {})?
+        amqp_ack("worker", req)?
+    }
+}
+every(100, answer_prices)
+
+// An order published with its properties, waiting for the broker's confirm; then one that no
+// queue takes, published as mandatory, comes back.
+route GET /orders/new ? { id: int = 1001, country: str = "fr" } {
+    let order = { id: id, items: [{ sku: "TEA-01", qty: 2 }], country: country }
+    let sent = amqp_publish("app", "shop", `order.eu.${country}`, order, {
+        message_id: `order-${id}`, persistent: true, headers: { source: "web", attempt: 1 }, app_id: "shop",
+    })?
+    let lost = amqp_publish("app", "shop", "invoice.us", "nobody listens here", { mandatory: true })?
+    { sent: sent, lost: lost }
+}
+
+// A broken order: the worker nacks it and the broker dead-letters it into "failed".
+route GET /orders/broken = amqp_publish("app", "shop", "order.eu.de", { id: 9 }, { message_id: "order-9" })?
+
+// The audit queue, read one message at a time (basic.get), each acked after it is read.
+route GET /audit {
+    let first = amqp_get("app", "audit", {})?
+    if first == null { return { audit: null } }
+    amqp_ack("app", first)?
+    let missing = amqp_get("app", "no-such-queue", {})
+    {
+        audit: { message_id: first.properties.message_id, key: first.routing_key, headers: first.properties.headers, order: first.json, left: first.message_count },
+        missing: is_err(missing) ? missing.error : null,
+    }
+}
+
+// What the worker handled, and what was dead-lettered (after a tick or two).
+route GET /processed {
+    sleep(600)
+    let failed = amqp_get("app", "failed", { no_ack: true })?
+    { processed: processed, failed: failed.properties.message_id, status: amqp_status("worker")?.consumers }
+}
+
+// A price asked by RPC: the request waits for the responder's tick to answer.
+route GET /price ? { sku: str = "TEA-01" } {
+    let answer = amqp_rpc("app", "", "rpc.prices", sku, { timeout_ms: 3000 })?
+    { price: answer.json, correlation: answer.properties.correlation_id != null }
+}

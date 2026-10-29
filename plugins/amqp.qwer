@@ -1,0 +1,1013 @@
+//! RabbitMQ and other AMQP 0-9-1 brokers: exchanges, queues and bindings declared, messages published with properties and publisher confirms, read one at a time or from a buffered consumer with manual ack, nack and reject, and RPC with reply-to and a correlation id.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! lapin = { version = "=4.12.3", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
+//! tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+
+use lapin::message::{BasicReturnMessage, Delivery, DeliveryResult};
+use lapin::options::*;
+use lapin::types::{AMQPValue, FieldArray, FieldTable, LongString, ShortString};
+use lapin::{BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, Notify};
+
+/// At most this many deliveries wait in a consumer's buffer; past it a new one is given back to the broker (nack, requeue).
+const BUFFER_MAX: usize = 10_000;
+
+// ---------------------------------------------------------------- runtime
+
+fn rt() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("quillo-amqp")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot start the AMQP runtime: {}", e))
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// Runs `f` on the plugin's runtime and waits for it (from any thread, inside a runtime or not).
+fn run<T: Send + 'static>(f: impl Future<Output = Result<T, String>> + Send + 'static) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt()?.spawn(async move {
+        let _ = tx.send(f.await);
+    });
+    rx.recv().map_err(|_| "the AMQP call stopped unexpectedly (a bug in the plugin)".to_string())?
+}
+
+// ---------------------------------------------------------------- state
+
+struct Consumer {
+    queue: String,
+    options: Value,
+    buf: Mutex<VecDeque<Value>>,
+    notify: Notify,
+    channel: Mutex<Option<Channel>>,
+    tag: Mutex<String>,
+    key: Mutex<u64>,
+    ended: Mutex<Option<String>>,
+}
+
+struct Rpc {
+    queue: String,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+}
+
+enum Decl {
+    Exchange(String, String, Value),
+    Queue(String, Value),
+    Bind(String, String, String, Value),
+}
+
+struct State {
+    conn: Option<Connection>,
+    ch: Option<Channel>,
+    generation: u64,
+    /// The open channels deliveries can be settled on, by a number never reused (lapin reuses channel ids).
+    channels: HashMap<u64, Channel>,
+    ch_key: u64,
+    /// Deliveries handed out and not yet acked, nacked or rejected: (channel key, delivery tag).
+    unsettled: Arc<Mutex<HashSet<(u64, u64)>>>,
+    consumers: HashMap<String, Arc<Consumer>>,
+    decls: Vec<Decl>,
+    rpc: Option<Rpc>,
+    published: u64,
+    confirmed: u64,
+    nacked: u64,
+    last_error: Option<String>,
+}
+
+struct Broker {
+    url: String,
+    options: Value,
+    timeout: u64,
+    state: tokio::sync::Mutex<State>,
+}
+
+static BROKERS: Mutex<Option<HashMap<String, Arc<Broker>>>> = Mutex::new(None);
+
+fn broker(name: &str) -> Result<Arc<Broker>, String> {
+    let g = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(name).cloned())
+        .ok_or_else(|| format!("no AMQP connection named `{}`: call amqp_connect(\"{}\", url, {{}}) first", name, name))
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))).unwrap_or(d)
+}
+fn opt_bool(o: &Value, k: &str, d: bool) -> bool {
+    o.get(k).and_then(|v| v.as_bool()).unwrap_or(d)
+}
+fn opt_str<'a>(o: &'a Value, k: &str) -> Option<&'a str> {
+    o.get(k).and_then(|v| v.as_str())
+}
+
+fn check_options(o: &Value, what: &str, known: &[&str]) -> Result<(), String> {
+    match o {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !known.contains(&k.as_str()) {
+                    return Err(format!("{}: unknown option `{}` (known: {})", what, k, known.join(", ")));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("{}: the options must be a map, like {{}}", what)),
+    }
+}
+
+fn short(s: &str, what: &str) -> Result<ShortString, String> {
+    ShortString::try_new(s).map_err(|_| format!("{} is {} bytes long: AMQP allows at most 255", what, s.len()))
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn hint(code: u16) -> &'static str {
+    match code {
+        403 => "the user may not do this in this virtual host (check its permissions), or the user name or password is wrong",
+        404 => "it does not exist: declare it first with amqp_exchange or amqp_queue",
+        405 => "the queue is exclusive to another connection",
+        406 => "it already exists with other settings: declare it with the same kind and flags, or delete it first",
+        320 => "the broker is shutting the connection down",
+        501..=505 => "the broker and the client disagree on the protocol",
+        506 => "the broker is out of resources",
+        530 => "the broker does not allow this",
+        540 => "the broker does not implement this",
+        _ => "",
+    }
+}
+
+fn explain(what: &str, e: &lapin::Error) -> String {
+    match e.kind() {
+        lapin::ErrorKind::ProtocolError(a) => {
+            let code: u16 = a.get_id();
+            let text = a.get_message().as_str();
+            let h = if text.contains("delivery tag") {
+                "a message was settled twice, or on another channel; the broker closed the channel and the next call opens another"
+            } else {
+                hint(code)
+            };
+            if h.is_empty() {
+                format!("{}: the broker said {} {}", what, code, a.get_message())
+            } else {
+                format!("{}: the broker said {} {}: {}", what, code, a.get_message(), h)
+            }
+        }
+        lapin::ErrorKind::IOError(io) => format!("{}: {} (is the broker running, and the URL right?)", what, io),
+        lapin::ErrorKind::InvalidChannelState(..) | lapin::ErrorKind::InvalidConnectionState(..) => {
+            format!("{}: {} (the connection or channel was closed; the next call opens it again)", what, e)
+        }
+        _ => format!("{}: {}", what, e),
+    }
+}
+
+async fn tmo<T>(ms: u64, what: &str, f: impl Future<Output = lapin::Result<T>>) -> Result<T, String> {
+    match tokio::time::timeout(Duration::from_millis(ms), f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(explain(what, &e)),
+        Err(_) => Err(format!("{}: no answer from the broker in {} ms (raise timeout_ms in amqp_connect's options, or check the broker)", what, ms)),
+    }
+}
+
+// ---------------------------------------------------------------- values
+
+fn to_amqp(v: &Value) -> AMQPValue {
+    match v {
+        Value::Null => AMQPValue::Void,
+        Value::Bool(b) => AMQPValue::Boolean(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                AMQPValue::LongLongInt(i)
+            } else {
+                AMQPValue::Double(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Value::String(s) => AMQPValue::LongString(LongString::from(s.as_str())),
+        Value::Array(a) => {
+            let mut fa = FieldArray::default();
+            for x in a {
+                fa.push(to_amqp(x));
+            }
+            AMQPValue::FieldArray(fa)
+        }
+        Value::Object(_) => AMQPValue::FieldTable(to_table(v).unwrap_or_default()),
+    }
+}
+
+fn to_table(v: &Value) -> Result<FieldTable, String> {
+    let mut t = FieldTable::default();
+    match v {
+        Value::Null => {}
+        Value::Object(m) => {
+            for (k, x) in m {
+                t.insert(short(k, "a header name")?, to_amqp(x));
+            }
+        }
+        _ => return Err("headers and arguments must be a map".into()),
+    }
+    Ok(t)
+}
+
+fn from_amqp(v: &AMQPValue) -> Value {
+    match v {
+        AMQPValue::Boolean(b) => json!(b),
+        AMQPValue::ShortShortInt(i) => json!(i),
+        AMQPValue::ShortShortUInt(i) => json!(i),
+        AMQPValue::ShortInt(i) => json!(i),
+        AMQPValue::ShortUInt(i) => json!(i),
+        AMQPValue::LongInt(i) => json!(i),
+        AMQPValue::LongUInt(i) => json!(i),
+        AMQPValue::LongLongInt(i) => json!(i),
+        AMQPValue::Float(f) => json!(*f as f64),
+        AMQPValue::Double(f) => json!(f),
+        AMQPValue::DecimalValue(d) => json!(d.value as f64 / 10f64.powi(d.scale as i32)),
+        AMQPValue::ShortString(s) => json!(s.as_str()),
+        AMQPValue::LongString(s) => json!(String::from_utf8_lossy(s.as_bytes())),
+        AMQPValue::FieldArray(a) => Value::Array(a.as_slice().iter().map(from_amqp).collect()),
+        AMQPValue::Timestamp(t) => json!(t),
+        AMQPValue::FieldTable(t) => from_table(t),
+        AMQPValue::ByteArray(b) => json!(b64(b.as_slice())),
+        AMQPValue::Void => Value::Null,
+    }
+}
+
+fn from_table(t: &FieldTable) -> Value {
+    Value::Object(t.inner().iter().map(|(k, v)| (k.as_str().to_string(), from_amqp(v))).collect())
+}
+
+const PROPS: &[&str] = &[
+    "content_type", "content_encoding", "headers", "persistent", "delivery_mode", "priority", "correlation_id", "reply_to",
+    "expiration", "message_id", "timestamp", "type", "user_id", "app_id", "mandatory",
+];
+
+/// The body's bytes and the properties, from Quillo values: a text body is sent as it is, anything else as JSON.
+fn message(body: &Value, props: &Value) -> Result<(Vec<u8>, BasicProperties, bool), String> {
+    check_options(props, "the message's properties", PROPS)?;
+    let (bytes, json_body) = match body {
+        Value::Null => (vec![], false),
+        Value::String(s) => (s.as_bytes().to_vec(), false),
+        other => (serde_json::to_vec(other).map_err(|e| e.to_string())?, true),
+    };
+    let mut p = BasicProperties::default();
+    let s = |k: &str| -> Result<Option<ShortString>, String> {
+        match props.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(v)) => short(v, k).map(Some),
+            Some(Value::Number(n)) => short(&n.to_string(), k).map(Some),
+            Some(_) => Err(format!("the property `{}` must be text", k)),
+        }
+    };
+    if let Some(v) = s("content_type")? {
+        p = p.with_content_type(v);
+    } else if json_body {
+        p = p.with_content_type("application/json".into());
+    }
+    if let Some(v) = s("content_encoding")? { p = p.with_content_encoding(v); }
+    if let Some(v) = s("correlation_id")? { p = p.with_correlation_id(v); }
+    if let Some(v) = s("reply_to")? { p = p.with_reply_to(v); }
+    if let Some(v) = s("expiration")? { p = p.with_expiration(v); }
+    if let Some(v) = s("message_id")? { p = p.with_message_id(v); }
+    if let Some(v) = s("type")? { p = p.with_type(v); }
+    if let Some(v) = s("user_id")? { p = p.with_user_id(v); }
+    if let Some(v) = s("app_id")? { p = p.with_app_id(v); }
+    if let Some(h) = props.get("headers") {
+        if !h.is_null() {
+            p = p.with_headers(to_table(h)?);
+        }
+    }
+    if opt_bool(props, "persistent", false) {
+        p = p.with_delivery_mode(2);
+    } else if let Some(m) = props.get("delivery_mode").and_then(|v| v.as_u64()) {
+        if m != 1 && m != 2 {
+            return Err("delivery_mode is 1 (transient) or 2 (persistent)".into());
+        }
+        p = p.with_delivery_mode(m as u8);
+    }
+    if let Some(v) = props.get("priority") {
+        let n = v.as_u64().filter(|n| *n <= 255).ok_or("priority is a whole number from 0 to 255 (RabbitMQ uses 0 to 9)")?;
+        p = p.with_priority(n as u8);
+    }
+    if let Some(v) = props.get("timestamp") {
+        p = p.with_timestamp(v.as_u64().ok_or("timestamp is seconds since 1970, a whole number")?);
+    }
+    Ok((bytes, p, opt_bool(props, "mandatory", false)))
+}
+
+fn props_value(p: &BasicProperties) -> Value {
+    let mut m = Map::new();
+    let mut put = |k: &str, v: &Option<ShortString>| {
+        if let Some(v) = v {
+            m.insert(k.to_string(), json!(v.as_str()));
+        }
+    };
+    put("content_type", p.content_type());
+    put("content_encoding", p.content_encoding());
+    put("correlation_id", p.correlation_id());
+    put("reply_to", p.reply_to());
+    put("expiration", p.expiration());
+    put("message_id", p.message_id());
+    put("type", p.kind());
+    put("user_id", p.user_id());
+    put("app_id", p.app_id());
+    if let Some(h) = p.headers() {
+        m.insert("headers".into(), from_table(h));
+    }
+    if let Some(d) = p.delivery_mode() {
+        m.insert("delivery_mode".into(), json!(d));
+        m.insert("persistent".into(), json!(*d == 2));
+    }
+    if let Some(v) = p.priority() {
+        m.insert("priority".into(), json!(v));
+    }
+    if let Some(v) = p.timestamp() {
+        m.insert("timestamp".into(), json!(v));
+    }
+    Value::Object(m)
+}
+
+fn delivery_value(d: &Delivery, queue: &str, channel: u64, generation: u64) -> Value {
+    let props = props_value(&d.properties);
+    let mut m = Map::new();
+    m.insert("queue".into(), json!(queue));
+    m.insert("exchange".into(), json!(d.exchange.as_str()));
+    m.insert("routing_key".into(), json!(d.routing_key.as_str()));
+    m.insert("redelivered".into(), json!(d.redelivered));
+    match std::str::from_utf8(&d.data) {
+        Ok(s) => {
+            m.insert("body".into(), json!(s));
+            let is_json = props.get("content_type").and_then(|c| c.as_str()).is_some_and(|c| c.contains("json"));
+            if is_json {
+                if let Ok(v) = serde_json::from_str::<Value>(s) {
+                    m.insert("json".into(), v);
+                }
+            }
+        }
+        Err(_) => {
+            m.insert("body".into(), Value::Null);
+            m.insert("body_base64".into(), json!(b64(&d.data)));
+        }
+    }
+    m.insert("properties".into(), props);
+    m.insert("delivery_tag".into(), json!(d.delivery_tag));
+    m.insert("channel".into(), json!(channel));
+    m.insert("generation".into(), json!(generation));
+    Value::Object(m)
+}
+
+fn returned_value(r: &BasicReturnMessage) -> Value {
+    json!({ "code": r.reply_code, "text": r.reply_text.as_str(), "routing_key": r.delivery.routing_key.as_str() })
+}
+
+// ---------------------------------------------------------------- connection
+
+fn exchange_kind(kind: &str) -> ExchangeKind {
+    match kind {
+        "direct" => ExchangeKind::Direct,
+        "fanout" => ExchangeKind::Fanout,
+        "topic" => ExchangeKind::Topic,
+        "headers" => ExchangeKind::Headers,
+        other => ExchangeKind::Custom(other.to_string()),
+    }
+}
+
+async fn declare(ch: &Channel, d: &Decl, ms: u64) -> Result<Value, String> {
+    match d {
+        Decl::Exchange(name, kind, o) => {
+            let opts = ExchangeDeclareOptions {
+                passive: opt_bool(o, "passive", false),
+                durable: opt_bool(o, "durable", false),
+                auto_delete: opt_bool(o, "auto_delete", false),
+                internal: opt_bool(o, "internal", false),
+                nowait: false,
+            };
+            let args = to_table(o.get("arguments").unwrap_or(&Value::Null))?;
+            let what = format!("declaring the exchange `{}`", name);
+            tmo(ms, &what, ch.exchange_declare(short(name, "the exchange name")?, exchange_kind(kind), opts, args)).await?;
+            Ok(json!({ "exchange": name, "kind": kind }))
+        }
+        Decl::Queue(name, o) => {
+            let opts = QueueDeclareOptions {
+                passive: opt_bool(o, "passive", false),
+                durable: opt_bool(o, "durable", false),
+                exclusive: opt_bool(o, "exclusive", false),
+                auto_delete: opt_bool(o, "auto_delete", false),
+                nowait: false,
+            };
+            let args = to_table(o.get("arguments").unwrap_or(&Value::Null))?;
+            let what = format!("declaring the queue `{}`", name);
+            let q = tmo(ms, &what, ch.queue_declare(short(name, "the queue name")?, opts, args)).await?;
+            Ok(json!({ "queue": q.name().as_str(), "messages": q.message_count(), "consumers": q.consumer_count() }))
+        }
+        Decl::Bind(queue, exchange, key, o) => {
+            let args = to_table(o.get("arguments").unwrap_or(&Value::Null))?;
+            let what = format!("binding the queue `{}` to the exchange `{}`", queue, exchange);
+            tmo(
+                ms,
+                &what,
+                ch.queue_bind(short(queue, "the queue name")?, short(exchange, "the exchange name")?, short(key, "the routing key")?, QueueBindOptions::default(), args),
+            )
+            .await?;
+            Ok(json!({ "queue": queue, "exchange": exchange, "routing_key": key }))
+        }
+    }
+}
+
+static CHANNEL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn track(st: &mut State, ch: &Channel) -> u64 {
+    let k = CHANNEL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    st.channels.insert(k, ch.clone());
+    k
+}
+
+async fn open_channel(conn: &Connection, ms: u64, confirm: bool) -> Result<Channel, String> {
+    let ch = tmo(ms, "opening a channel", conn.create_channel()).await?;
+    if confirm {
+        tmo(ms, "turning on publisher confirms", ch.confirm_select(ConfirmSelectOptions::default())).await?;
+    }
+    Ok(ch)
+}
+
+async fn start_consumer(b: &Broker, st: &mut State, c: &Arc<Consumer>) -> Result<(), String> {
+    let conn = st.conn.as_ref().ok_or("not connected")?;
+    let ch = open_channel(conn, b.timeout, false).await?;
+    let prefetch = opt_u64(&c.options, "prefetch", opt_u64(&b.options, "prefetch", 100)).min(65535) as u16;
+    tmo(b.timeout, "setting the prefetch count", ch.basic_qos(prefetch, BasicQosOptions::default())).await?;
+    let tag = opt_str(&c.options, "consumer_tag").unwrap_or("");
+    let opts = BasicConsumeOptions { no_local: false, no_ack: false, exclusive: opt_bool(&c.options, "exclusive", false), nowait: false };
+    let args = to_table(c.options.get("arguments").unwrap_or(&Value::Null))?;
+    let what = format!("consuming from the queue `{}`", c.queue);
+    let consumer = tmo(b.timeout, &what, ch.basic_consume(short(&c.queue, "the queue name")?, short(tag, "the consumer tag")?, opts, args)).await?;
+    *c.tag.lock().unwrap_or_else(|e| e.into_inner()) = consumer.tag().as_str().to_string();
+    *c.ended.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *c.channel.lock().unwrap_or_else(|e| e.into_inner()) = Some(ch.clone());
+    let old = *c.key.lock().unwrap_or_else(|e| e.into_inner());
+    if old != 0 {
+        st.channels.remove(&old);
+        st.unsettled.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| *k != old);
+    }
+    let id = track(st, &ch);
+    *c.key.lock().unwrap_or_else(|e| e.into_inner()) = id;
+    let (cc, gen, us) = (c.clone(), st.generation, st.unsettled.clone());
+    consumer.set_delegate(move |d: DeliveryResult| {
+        let (c, ch, unsettled) = (cc.clone(), ch.clone(), us.clone());
+        async move {
+            match d {
+                Ok(Some(d)) => {
+                    let full = c.buf.lock().unwrap_or_else(|e| e.into_inner()).len() >= BUFFER_MAX;
+                    if full {
+                        let _ = ch.basic_nack(d.delivery_tag, BasicNackOptions { multiple: false, requeue: true }).await;
+                        return;
+                    }
+                    let v = delivery_value(&d, &c.queue, id, gen);
+                    unsettled.lock().unwrap_or_else(|e| e.into_inner()).insert((id, d.delivery_tag));
+                    c.buf.lock().unwrap_or_else(|e| e.into_inner()).push_back(v);
+                }
+                Ok(None) => {
+                    *c.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("the consumer of `{}` was cancelled (the queue was deleted, or amqp_cancel)", c.queue));
+                }
+                Err(e) => {
+                    *c.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(explain(&format!("consuming from `{}`", c.queue), &e));
+                }
+            }
+            c.notify.notify_waiters();
+        }
+    });
+    Ok(())
+}
+
+/// The main channel (in confirm mode), opening the connection again, its declarations and its consumers, when it was lost.
+async fn ensure(b: &Broker, st: &mut State) -> Result<Channel, String> {
+    if let Some(conn) = &st.conn {
+        if conn.status().connected() {
+            if let Some(ch) = &st.ch {
+                if ch.status().connected() {
+                    return Ok(ch.clone());
+                }
+                let old = st.ch_key;
+                st.channels.remove(&old);
+                st.unsettled.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| *k != old);
+            }
+            // A channel error (404, 406...) closes only the channel: open another one.
+            let ch = open_channel(conn, b.timeout, true).await?;
+            st.ch_key = track(st, &ch);
+            st.ch = Some(ch.clone());
+            st.rpc = None;
+            return Ok(ch);
+        }
+    }
+    connect(b, st).await
+}
+
+async fn connect(b: &Broker, st: &mut State) -> Result<Channel, String> {
+    st.conn = None;
+    st.ch = None;
+    st.rpc = None;
+    st.channels.clear();
+    st.unsettled.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut url = b.url.clone();
+    if let Some(h) = b.options.get("heartbeat").and_then(|v| v.as_u64()) {
+        if !url.contains("heartbeat=") {
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str(&format!("heartbeat={}", h));
+        }
+    }
+    let mut tls = lapin::tcp::OwnedTLSConfig::default();
+    if let Some(ca) = opt_str(&b.options, "ca_file") {
+        tls.cert_chain = Some(std::fs::read_to_string(ca).map_err(|e| format!("cannot read ca_file {}: {}", ca, e))?);
+    }
+    let mut props = ConnectionProperties::default();
+    if let Some(n) = opt_str(&b.options, "connection_name") {
+        props = props.with_connection_name(n.into());
+    }
+    let runtime = lapin::runtime::default_runtime().map_err(|e| e.to_string())?;
+    let shown = shown_url(&b.url);
+    let what = format!("connecting to {}", shown);
+    let conn = tmo(b.timeout, &what, Connection::connect_with_config(&url, props, tls, runtime)).await?;
+    let ch = open_channel(&conn, b.timeout, true).await?;
+    st.generation += 1;
+    st.ch_key = track(st, &ch);
+    st.conn = Some(conn);
+    st.ch = Some(ch.clone());
+    // What was declared before is declared again (server-named queues are not: they died with the old connection).
+    let decls = std::mem::take(&mut st.decls);
+    for d in &decls {
+        declare(&ch, d, b.timeout).await?;
+    }
+    st.decls = decls;
+    let consumers: Vec<Arc<Consumer>> = st.consumers.values().cloned().collect();
+    for c in consumers {
+        // Deliveries buffered from the old connection cannot be acked: the broker gives them again.
+        c.buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        start_consumer(b, st, &c).await?;
+    }
+    Ok(ch)
+}
+
+fn shown_url(url: &str) -> String {
+    // amqp://user:secret@host/ shown without the password.
+    match (url.find("://"), url.rfind('@')) {
+        (Some(s), Some(at)) if at > s => {
+            let cred = &url[s + 3..at];
+            let user = cred.split(':').next().unwrap_or("");
+            format!("{}{}@{}", &url[..s + 3], user, &url[at + 1..])
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// Runs `f` with the broker's state and its main channel; an error that lost the connection is kept for amqp_status.
+fn with<T: Send + 'static, F, Fut>(name: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce(Arc<Broker>, Channel) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send,
+{
+    let b = broker(name)?;
+    run(async move {
+        let ch = {
+            let mut st = b.state.lock().await;
+            match ensure(&b, &mut st).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    st.last_error = Some(e.clone());
+                    return Err(e);
+                }
+            }
+        };
+        f(b, ch).await
+    })
+}
+
+fn remember(st: &mut State, d: Decl) {
+    let same = |a: &Decl| match (a, &d) {
+        (Decl::Exchange(x, ..), Decl::Exchange(y, ..)) => x == y,
+        (Decl::Queue(x, _), Decl::Queue(y, _)) => x == y,
+        (Decl::Bind(q, e, k, _), Decl::Bind(q2, e2, k2, _)) => q == q2 && e == e2 && k == k2,
+        _ => false,
+    };
+    st.decls.retain(|a| !same(a));
+    st.decls.push(d);
+}
+
+// ---------------------------------------------------------------- functions
+
+/// Opens a connection to an AMQP 0-9-1 broker (amqp:// or amqps://user:pass@host:5672/vhost) and keeps it under `name`; options: timeout_ms (10000), heartbeat (s), prefetch (100), ca_file (PEM), connection_name.
+pub fn amqp_connect(name: &str, url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_connect", &["timeout_ms", "heartbeat", "prefetch", "ca_file", "connection_name"])?;
+    if !(url.starts_with("amqp://") || url.starts_with("amqps://")) {
+        return Err(format!("`{}` is not an AMQP URL: write amqp://user:password@host:5672/vhost (or amqps:// for TLS)", url));
+    }
+    let b = Arc::new(Broker {
+        url: url.to_string(),
+        timeout: opt_u64(&options, "timeout_ms", 10_000).clamp(100, 600_000),
+        options,
+        state: tokio::sync::Mutex::new(State {
+            conn: None, ch: None, generation: 0, channels: HashMap::new(), ch_key: 0, unsettled: Arc::new(Mutex::new(HashSet::new())), consumers: HashMap::new(), decls: vec![], rpc: None,
+            published: 0, confirmed: 0, nacked: 0, last_error: None,
+        }),
+    });
+    let old = {
+        let mut g = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(HashMap::new).insert(name.to_string(), b.clone())
+    };
+    let shown = shown_url(url);
+    let n = name.to_string();
+    run(async move {
+        if let Some(old) = old {
+            let st = old.state.lock().await;
+            if let Some(c) = &st.conn {
+                let _ = tokio::time::timeout(Duration::from_secs(2), c.close(200, "replaced".into())).await;
+            }
+        }
+        let mut st = b.state.lock().await;
+        connect(&b, &mut st).await?;
+        Ok(json!({ "name": n, "url": shown, "connected": true }))
+    })
+}
+
+/// Closes the connection named `name` (its consumers stop; unacked messages go back to their queues); whether there was one.
+pub fn amqp_close(name: &str) -> Result<bool, String> {
+    let b = {
+        let mut g = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_mut().and_then(|m| m.remove(name))
+    };
+    let Some(b) = b else { return Ok(false) };
+    run(async move {
+        let mut st = b.state.lock().await;
+        if let Some(c) = st.conn.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(b.timeout), c.close(200, "bye".into())).await;
+        }
+        st.ch = None;
+        st.consumers.clear();
+        Ok(true)
+    })
+}
+
+/// How the connection is: connected, times it was opened, messages published, confirmed and nacked, each consumer's buffered count, and the last error.
+pub fn amqp_status(name: &str) -> Result<serde_json::Value, String> {
+    let b = broker(name)?;
+    run(async move {
+        let st = b.state.lock().await;
+        let connected = st.conn.as_ref().is_some_and(|c| c.status().connected());
+        let consumers: Map<String, Value> = st
+            .consumers
+            .iter()
+            .map(|(q, c)| {
+                (
+                    q.clone(),
+                    json!({
+                        "buffered": c.buf.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                        "consumer_tag": c.tag.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                        "ended": c.ended.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    }),
+                )
+            })
+            .collect();
+        Ok(json!({
+            "connected": connected, "opened": st.generation, "published": st.published, "confirmed": st.confirmed,
+            "nacked": st.nacked, "consumers": consumers, "last_error": st.last_error,
+        }))
+    })
+}
+
+/// Declares an exchange of `kind` (direct, fanout, topic, headers); options: durable, auto_delete, internal, passive (only check it exists), arguments.
+pub fn amqp_exchange(name: &str, exchange: &str, kind: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_exchange", &["durable", "auto_delete", "internal", "passive", "arguments"])?;
+    if exchange.is_empty() || exchange.starts_with("amq.") {
+        return Err(format!("`{}`: the default exchange and the amq.* ones are the broker's; declare another name", exchange));
+    }
+    let d = Decl::Exchange(exchange.to_string(), kind.to_string(), options);
+    with(name, move |b, ch| async move {
+        let v = declare(&ch, &d, b.timeout).await?;
+        remember(&mut *b.state.lock().await, d);
+        Ok(v)
+    })
+}
+
+/// Declares a queue (`""`: the broker names it) and gives its name and counts; options: durable, exclusive, auto_delete, passive, arguments (x-message-ttl, x-dead-letter-exchange, x-max-length, x-queue-type...).
+pub fn amqp_queue(name: &str, queue: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_queue", &["durable", "exclusive", "auto_delete", "passive", "arguments"])?;
+    let d = Decl::Queue(queue.to_string(), options);
+    with(name, move |b, ch| async move {
+        let v = declare(&ch, &d, b.timeout).await?;
+        if !queue_is_server_named(&d) {
+            remember(&mut *b.state.lock().await, d);
+        }
+        Ok(v)
+    })
+}
+
+fn queue_is_server_named(d: &Decl) -> bool {
+    matches!(d, Decl::Queue(n, _) if n.is_empty())
+}
+
+/// Binds a queue to an exchange with a routing key (a topic pattern with `*` and `#` for a topic exchange); options: arguments (for a headers exchange: x-match and the headers).
+pub fn amqp_bind(name: &str, queue: &str, exchange: &str, routing_key: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_bind", &["arguments"])?;
+    let d = Decl::Bind(queue.to_string(), exchange.to_string(), routing_key.to_string(), options);
+    with(name, move |b, ch| async move {
+        let v = declare(&ch, &d, b.timeout).await?;
+        remember(&mut *b.state.lock().await, d);
+        Ok(v)
+    })
+}
+
+async fn publish_on(b: &Broker, ch: &Channel, exchange: &str, key: &str, body: &Value, props: &Value) -> Result<Value, String> {
+    let (bytes, p, mandatory) = message(body, props)?;
+    let what = format!("publishing to `{}` with the key `{}`", if exchange.is_empty() { "(default)" } else { exchange }, key);
+    let confirm = tmo(
+        b.timeout,
+        &what,
+        ch.basic_publish(short(exchange, "the exchange name")?, short(key, "the routing key")?, BasicPublishOptions { mandatory, immediate: false }, &bytes, p),
+    )
+    .await?;
+    let c = tmo(b.timeout, &format!("waiting for the broker to confirm {}", what.replacen("publishing", "the message", 1)), confirm).await?;
+    let mut st = b.state.lock().await;
+    st.published += 1;
+    Ok(match c {
+        Confirmation::Ack(r) => {
+            st.confirmed += 1;
+            json!({ "confirmed": true, "returned": r.as_ref().map(returned_value), "bytes": bytes.len() })
+        }
+        Confirmation::Nack(r) => {
+            st.nacked += 1;
+            json!({ "confirmed": false, "returned": r.as_ref().map(returned_value), "bytes": bytes.len() })
+        }
+        Confirmation::NotRequested => json!({ "confirmed": null, "returned": null, "bytes": bytes.len() }),
+    })
+}
+
+/// Publishes `body` (text as it is, anything else as JSON) to `exchange` (`""`: the queue named by the key) and waits for the broker's confirm: `confirmed` true (ack) or false (nack), and `returned` when a mandatory message had no queue; properties: content_type, headers, correlation_id, reply_to, message_id, expiration, priority, persistent, type, app_id, timestamp, mandatory.
+pub fn amqp_publish(name: &str, exchange: &str, routing_key: &str, body: serde_json::Value, properties: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (exchange, key) = (exchange.to_string(), routing_key.to_string());
+    with(name, move |b, ch| async move { publish_on(&b, &ch, &exchange, &key, &body, &properties).await })
+}
+
+/// Takes one message from `queue` (basic.get), or null when it is empty; it is acked with amqp_ack unless options say no_ack: true. The answer has `message_count`, what is left.
+pub fn amqp_get(name: &str, queue: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_get", &["no_ack"])?;
+    let queue = queue.to_string();
+    with(name, move |b, ch| async move {
+        let what = format!("getting a message from the queue `{}`", queue);
+        let no_ack = opt_bool(&options, "no_ack", false);
+        let got = tmo(b.timeout, &what, ch.basic_get(short(&queue, "the queue name")?, BasicGetOptions { no_ack })).await?;
+        let (gen, key, unsettled) = {
+            let st = b.state.lock().await;
+            (st.generation, st.ch_key, st.unsettled.clone())
+        };
+        Ok(match got {
+            None => Value::Null,
+            Some(m) => {
+                if !no_ack {
+                    unsettled.lock().unwrap_or_else(|e| e.into_inner()).insert((key, m.delivery.delivery_tag));
+                }
+                let mut v = delivery_value(&m.delivery, &queue, key, gen);
+                v["message_count"] = json!(m.message_count);
+                v
+            }
+        })
+    })
+}
+
+/// Starts a consumer on `queue` with manual acks, into a buffer that amqp_receive drains; options: prefetch (unacked messages the broker sends at most, 100), exclusive, consumer_tag, arguments. Again on the same queue: nothing new.
+pub fn amqp_consume(name: &str, queue: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_consume", &["prefetch", "exclusive", "consumer_tag", "arguments"])?;
+    let queue = queue.to_string();
+    with(name, move |b, _ch| async move {
+        let mut st = b.state.lock().await;
+        if let Some(c) = st.consumers.get(&queue).cloned() {
+            let alive = c.channel.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|ch| ch.status().connected());
+            if alive && c.ended.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                let tag = c.tag.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                return Ok(json!({ "queue": queue, "consumer_tag": tag, "new": false }));
+            }
+        }
+        let c = Arc::new(Consumer {
+            queue: queue.clone(), options, buf: Mutex::new(VecDeque::new()), notify: Notify::new(),
+            channel: Mutex::new(None), tag: Mutex::new(String::new()), key: Mutex::new(0), ended: Mutex::new(None),
+        });
+        start_consumer(&b, &mut st, &c).await?;
+        st.consumers.insert(queue.clone(), c.clone());
+        let tag = c.tag.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Ok(json!({ "queue": queue, "consumer_tag": tag, "new": true }))
+    })
+}
+
+/// What the consumer of `queue` has received: at most `max` deliveries, waiting up to `wait_ms` for the first (0: only what is there). Each is to be acked, nacked or rejected.
+pub fn amqp_receive(name: &str, queue: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let queue = queue.to_string();
+    let max = max.clamp(1, BUFFER_MAX as i64) as usize;
+    let wait = Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    with(name, move |b, _ch| async move {
+        let c = {
+            let mut st = b.state.lock().await;
+            let c = st.consumers.get(&queue).cloned().ok_or_else(|| {
+                format!("nothing consumes the queue `{}` on this connection: call amqp_consume(name, \"{}\", {{}}) first", queue, queue)
+            })?;
+            let dead = c.channel.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|ch| !ch.status().connected());
+            if dead {
+                c.buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                start_consumer(&b, &mut st, &c).await?;
+            }
+            c
+        };
+        let until = Instant::now() + wait;
+        loop {
+            let notified = c.notify.notified();
+            {
+                let mut buf = c.buf.lock().unwrap_or_else(|e| e.into_inner());
+                if !buf.is_empty() {
+                    let n = max.min(buf.len());
+                    return Ok(buf.drain(..n).collect());
+                }
+            }
+            if let Some(e) = c.ended.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                return Err(e);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(vec![]);
+            }
+            let _ = tokio::time::timeout(left, notified).await;
+        }
+    })
+}
+
+fn tag_of(b: &State, d: &Value) -> Result<(Channel, u64), String> {
+    let tag = d.get("delivery_tag").and_then(|v| v.as_u64()).ok_or("pass the message itself, as amqp_get or amqp_receive gave it (it has delivery_tag and channel)")?;
+    let ch = d.get("channel").and_then(|v| v.as_u64()).ok_or("the message has no `channel`: pass it as amqp_get or amqp_receive gave it")?;
+    let gen = d.get("generation").and_then(|v| v.as_u64()).unwrap_or(b.generation);
+    if gen != b.generation {
+        return Err("this message came on a connection that has since been opened again: the broker delivers it again, settle that one".into());
+    }
+    let c = b.channels.get(&ch).filter(|c| c.status().connected()).ok_or(
+        "the channel this message came on is closed: the broker gives the message again, settle that one",
+    )?;
+    // A second ack of one message would close the channel (and lose its other deliveries): refuse it here.
+    if !b.unsettled.lock().unwrap_or_else(|e| e.into_inner()).remove(&(ch, tag)) {
+        return Err(format!("the message {} was already acked, nacked or rejected (or taken with no_ack): each message is settled once", tag));
+    }
+    Ok((c.clone(), tag))
+}
+
+fn settle(name: &str, delivery: serde_json::Value, how: &'static str, requeue: bool) -> Result<bool, String> {
+    with(name, move |b, _ch| async move {
+        let (ch, tag) = tag_of(&*b.state.lock().await, &delivery)?;
+        let what = format!("{} the message {}", how, tag);
+        match how {
+            "acking" => tmo(b.timeout, &what, ch.basic_ack(tag, BasicAckOptions { multiple: false })).await?,
+            "nacking" => tmo(b.timeout, &what, ch.basic_nack(tag, BasicNackOptions { multiple: false, requeue })).await?,
+            _ => tmo(b.timeout, &what, ch.basic_reject(tag, BasicRejectOptions { requeue })).await?,
+        }
+        Ok(true)
+    })
+}
+
+/// Acknowledges a message from amqp_get or amqp_receive: the broker forgets it.
+pub fn amqp_ack(name: &str, delivery: serde_json::Value) -> Result<bool, String> {
+    settle(name, delivery, "acking", false)
+}
+
+/// Negatively acknowledges a message: with `requeue` it goes back to its queue (marked redelivered), else it is dropped or dead-lettered.
+pub fn amqp_nack(name: &str, delivery: serde_json::Value, requeue: bool) -> Result<bool, String> {
+    settle(name, delivery, "nacking", requeue)
+}
+
+/// Rejects a message (basic.reject): with `requeue` it goes back to its queue, else it is dropped or dead-lettered.
+pub fn amqp_reject(name: &str, delivery: serde_json::Value, requeue: bool) -> Result<bool, String> {
+    settle(name, delivery, "rejecting", requeue)
+}
+
+/// Stops the consumer of `queue`; what it had buffered and not yet given out goes back to the queue. Gives how many went back.
+pub fn amqp_cancel(name: &str, queue: &str) -> Result<i64, String> {
+    let queue = queue.to_string();
+    with(name, move |b, _ch| async move {
+        let c = b.state.lock().await.consumers.remove(&queue);
+        let Some(c) = c else { return Ok(0) };
+        let ch = c.channel.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(ch) = ch else { return Ok(0) };
+        if !ch.status().connected() {
+            return Ok(0);
+        }
+        let tag = c.tag.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        tmo(b.timeout, &format!("cancelling the consumer of `{}`", queue), ch.basic_cancel(short(&tag, "the consumer tag")?, BasicCancelOptions::default())).await?;
+        let left: Vec<Value> = c.buf.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+        for d in &left {
+            if let Some(t) = d.get("delivery_tag").and_then(|v| v.as_u64()) {
+                let key = *c.key.lock().unwrap_or_else(|e| e.into_inner());
+                b.state.lock().await.unsettled.lock().unwrap_or_else(|e| e.into_inner()).remove(&(key, t));
+                let _ = tmo(b.timeout, "giving back a message", ch.basic_nack(t, BasicNackOptions { multiple: false, requeue: true })).await;
+            }
+        }
+        Ok(left.len() as i64)
+    })
+}
+
+static RPC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Sends a request and waits for its answer: publishes `body` (mandatory, so a request no queue takes fails at once) with reply_to (an exclusive queue of this connection) and a new correlation_id, and gives the reply message; options: timeout_ms (10000), properties.
+pub fn amqp_rpc(name: &str, exchange: &str, routing_key: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_options(&options, "amqp_rpc", &["timeout_ms", "properties"])?;
+    let (exchange, key) = (exchange.to_string(), routing_key.to_string());
+    with(name, move |b, ch| async move {
+        let wait = opt_u64(&options, "timeout_ms", b.timeout).clamp(1, 600_000);
+        let (reply_to, pending) = {
+            let mut st = b.state.lock().await;
+            if st.rpc.is_none() {
+                let q = tmo(b.timeout, "declaring the reply queue", ch.queue_declare("".into(), QueueDeclareOptions { exclusive: true, auto_delete: true, ..Default::default() }, FieldTable::default())).await?;
+                let queue = q.name().as_str().to_string();
+                let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+                let opts = BasicConsumeOptions { no_ack: true, ..Default::default() };
+                let consumer = tmo(b.timeout, "consuming the reply queue", ch.basic_consume(q.name().clone(), "".into(), opts, FieldTable::default())).await?;
+                let (p, qn, gen, id) = (pending.clone(), queue.clone(), st.generation, 0u64);
+                consumer.set_delegate(move |d: DeliveryResult| {
+                    let (p, qn) = (p.clone(), qn.clone());
+                    async move {
+                        if let Ok(Some(d)) = d {
+                            if let Some(cid) = d.properties.correlation_id() {
+                                let tx = p.lock().unwrap_or_else(|e| e.into_inner()).remove(cid.as_str());
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(delivery_value(&d, &qn, id, gen));
+                                }
+                            }
+                        }
+                    }
+                });
+                st.rpc = Some(Rpc { queue, pending });
+            }
+            let r = st.rpc.as_ref().ok_or("no reply queue")?;
+            (r.queue.clone(), r.pending.clone())
+        };
+        let cid = format!("rpc-{}-{}", std::process::id(), RPC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let mut props = match options.get("properties") {
+            Some(Value::Object(m)) => m.clone(),
+            None | Some(Value::Null) => Map::new(),
+            _ => return Err("amqp_rpc: properties must be a map".into()),
+        };
+        props.insert("reply_to".into(), json!(reply_to));
+        props.insert("correlation_id".into(), json!(cid));
+        props.entry("mandatory").or_insert(json!(true));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap_or_else(|e| e.into_inner()).insert(cid.clone(), tx);
+        let sent = publish_on(&b, &ch, &exchange, &key, &body, &Value::Object(props)).await;
+        let sent = match sent {
+            Ok(s) => s,
+            Err(e) => {
+                pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+                return Err(e);
+            }
+        };
+        if sent.get("returned").is_some_and(|r| !r.is_null()) {
+            pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+            let at = if exchange.is_empty() { "the default exchange".to_string() } else { format!("the exchange `{}`", exchange) };
+            return Err(format!("no queue takes requests at {} with the key `{}`: declare the responder's queue first", at, key));
+        }
+        match tokio::time::timeout(Duration::from_millis(wait), rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err("the connection was lost while waiting for the reply: try again".into()),
+            Err(_) => {
+                pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+                Err(format!("no reply to the request in {} ms: is a responder consuming `{}`?", wait, key))
+            }
+        }
+    })
+}
+
+/// Answers a request received with amqp_get or amqp_receive: publishes `body` to its reply_to queue with its correlation_id (acking the request is still yours to do).
+pub fn amqp_reply(name: &str, request: serde_json::Value, body: serde_json::Value, properties: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = request.get("properties").cloned().unwrap_or(Value::Null);
+    let reply_to = p.get("reply_to").and_then(|v| v.as_str()).ok_or("this message has no reply_to: it was not sent as a request (amqp_rpc sends them)")?.to_string();
+    let mut props = match properties {
+        Value::Object(m) => m,
+        Value::Null => Map::new(),
+        _ => return Err("amqp_reply: properties must be a map".into()),
+    };
+    if let Some(c) = p.get("correlation_id") {
+        props.insert("correlation_id".into(), c.clone());
+    }
+    with(name, move |b, ch| async move { publish_on(&b, &ch, "", &reply_to, &body, &Value::Object(props)).await })
+}

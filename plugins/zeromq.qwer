@@ -1,0 +1,517 @@
+//! ZeroMQ sockets in pure Rust (ZMTP 3 over TCP): PUB/SUB with topic prefixes, REQ/REP request and reply, PUSH/PULL work queues, bind and connect, multi-part messages, and buffers the program drains.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! zeromq = { version = "=0.7.0", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+//! tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+//! bytes = "1"
+//! base64 = "0.22"
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeromq::{Socket, SocketRecv, SocketSend};
+
+// Each socket lives in a task of its own on a tokio runtime kept in a static (2 threads); calls
+// send it commands and wait, each with a timeout (`timeout_ms`, 10 s by default). SUB, PULL and REP
+// sockets read all the time into a bounded buffer (`buffer`, 10000 messages; when full the oldest is
+// dropped and counted). A REP socket takes one request at a time, as ZeroMQ wants: the next is read
+// once zmq_reply has answered (or after `reply_timeout_ms`, 30 s, with an empty reply).
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("zeromq").enable_all().build().expect("a tokio runtime"))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Pub,
+    Sub,
+    Req,
+    Rep,
+    Push,
+    Pull,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self { Kind::Pub => "pub", Kind::Sub => "sub", Kind::Req => "req", Kind::Rep => "rep", Kind::Push => "push", Kind::Pull => "pull" }
+    }
+    fn reads(self) -> bool {
+        matches!(self, Kind::Sub | Kind::Pull | Kind::Rep)
+    }
+}
+
+enum Sock {
+    Pub(zeromq::PubSocket),
+    Sub(zeromq::SubSocket),
+    Req(zeromq::ReqSocket),
+    Rep(zeromq::RepSocket),
+    Push(zeromq::PushSocket),
+    Pull(zeromq::PullSocket),
+}
+
+fn new_sock(k: Kind) -> Sock {
+    match k {
+        Kind::Pub => Sock::Pub(zeromq::PubSocket::new()),
+        Kind::Sub => Sock::Sub(zeromq::SubSocket::new()),
+        Kind::Req => Sock::Req(zeromq::ReqSocket::new()),
+        Kind::Rep => Sock::Rep(zeromq::RepSocket::new()),
+        Kind::Push => Sock::Push(zeromq::PushSocket::new()),
+        Kind::Pull => Sock::Pull(zeromq::PullSocket::new()),
+    }
+}
+
+macro_rules! each {
+    ($s:expr, $x:ident => $e:expr) => {
+        match $s {
+            Sock::Pub($x) => $e,
+            Sock::Sub($x) => $e,
+            Sock::Req($x) => $e,
+            Sock::Rep($x) => $e,
+            Sock::Push($x) => $e,
+            Sock::Pull($x) => $e,
+        }
+    };
+}
+
+type Reply = std::sync::mpsc::Sender<Result<Value, String>>;
+
+enum Cmd {
+    Bind(String, Reply),
+    Connect(String, Duration, Reply),
+    Subscribe(String, bool, Reply),
+    Send(zeromq::ZmqMessage, Duration, Reply),
+    Request(zeromq::ZmqMessage, Duration, Reply),
+    Answer(u64, zeromq::ZmqMessage, Reply),
+    Close(Reply),
+}
+
+struct Inbox {
+    msgs: VecDeque<Value>,
+    received: u64,
+    dropped: u64,
+}
+
+struct Handle {
+    kind: Kind,
+    tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    inbox: Arc<(Mutex<Inbox>, Condvar)>,
+    timeout: Duration,
+    binds: Mutex<Vec<String>>,
+    connects: Mutex<Vec<String>>,
+}
+
+static SOCKS: Mutex<Option<HashMap<String, Arc<Handle>>>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn get(name: &str) -> Result<Arc<Handle>, String> {
+    lock(&SOCKS).as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no ZeroMQ socket named `{}`: call zmq_socket(\"{}\", kind, options) first", name, name))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn opt_i64(o: &Value, k: &str) -> Result<Option<i64>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(format!("`{}` must be a whole number", k)),
+        Some(v) => Err(format!("`{}` must be a whole number, not {}", k, v)),
+    }
+}
+
+fn check_keys(o: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
+    match o {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(format!("{} has no option `{}`; it takes {}", what, k, allowed.join(", ")));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("{} options must be a map", what)),
+    }
+}
+
+fn frame(v: &Value) -> Result<bytes::Bytes, String> {
+    match v {
+        Value::String(s) => Ok(bytes::Bytes::from(s.clone().into_bytes())),
+        Value::Null => Ok(bytes::Bytes::new()),
+        Value::Object(m) if m.len() == 1 && m.contains_key("base64") => {
+            let b = m.get("base64").and_then(|x| x.as_str()).ok_or("`base64` must be text")?;
+            base64::engine::general_purpose::STANDARD.decode(b.trim()).map(bytes::Bytes::from).map_err(|e| format!("a frame's base64 is not valid: {}", e))
+        }
+        other => Ok(bytes::Bytes::from(other.to_string().into_bytes())),
+    }
+}
+
+/// A message: text is one frame, a list is one frame per item (multi-part), `{ base64 }` bytes, anything else JSON.
+fn message(v: &Value) -> Result<zeromq::ZmqMessage, String> {
+    let frames: Vec<bytes::Bytes> = match v {
+        Value::Array(a) => a.iter().map(frame).collect::<Result<_, _>>()?,
+        other => vec![frame(other)?],
+    };
+    if frames.is_empty() {
+        return Err("a message needs at least one frame".into());
+    }
+    zeromq::ZmqMessage::try_from(frames).map_err(|e| e.to_string())
+}
+
+fn message_json(m: &zeromq::ZmqMessage, kind: Kind, id: Option<u64>) -> Value {
+    let mut texts = vec![];
+    let mut b64 = vec![];
+    let mut binary = false;
+    for f in m.iter() {
+        match std::str::from_utf8(f) {
+            Ok(s) => {
+                texts.push(json!(s));
+                b64.push(Value::Null);
+            }
+            Err(_) => {
+                binary = true;
+                texts.push(Value::Null);
+                b64.push(json!(base64::engine::general_purpose::STANDARD.encode(f)));
+            }
+        }
+    }
+    let mut o = serde_json::Map::new();
+    if kind == Kind::Sub && texts.len() > 1 {
+        o.insert("topic".into(), texts[0].clone());
+    }
+    o.insert("payload".into(), texts.last().cloned().unwrap_or(Value::Null));
+    o.insert("frames".into(), Value::Array(texts));
+    if binary {
+        o.insert("frames_base64".into(), Value::Array(b64));
+    }
+    if let Some(i) = id {
+        o.insert("id".into(), json!(i));
+    }
+    o.insert("at".into(), json!(now_ms()));
+    Value::Object(o)
+}
+
+fn zerr(e: zeromq::ZmqError) -> String {
+    let s = e.to_string();
+    if s.contains("Address already in use") || s.contains("os error 48") || s.contains("os error 98") {
+        format!("{}: another program has that port; pick another, or tcp://127.0.0.1:0 for any free one", s)
+    } else {
+        s
+    }
+}
+
+fn endpoint_ok(ep: &str) -> Result<(), String> {
+    if !ep.starts_with("tcp://") {
+        return Err(format!("{:?}: write a ZeroMQ endpoint like tcp://127.0.0.1:5555 (tcp:// is the transport this plugin has)", ep));
+    }
+    Ok(())
+}
+
+/// The task that owns one socket.
+async fn actor(kind: Kind, mut rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>, inbox: Arc<(Mutex<Inbox>, Condvar)>, cap: usize, reply_timeout: Duration) {
+    let mut sock = new_sock(kind);
+    let mut connected: Vec<String> = vec![];
+    let mut subs: Vec<String> = vec![];
+    let mut next_id = 0u64;
+    // A REP request waiting for its answer: (id, deadline).
+    let mut waiting: Option<(u64, tokio::time::Instant)> = None;
+    let push = |m: Value| {
+        let mut st = lock(&inbox.0);
+        if st.msgs.len() >= cap {
+            st.msgs.pop_front();
+            st.dropped += 1;
+        }
+        st.msgs.push_back(m);
+        st.received += 1;
+        drop(st);
+        inbox.1.notify_all();
+    };
+    loop {
+        let reading = kind.reads() && waiting.is_none();
+        let rep_deadline = waiting.map(|w| w.1);
+        let cmd = tokio::select! {
+            c = rx.recv() => match c { Some(c) => Some(c), None => return },
+            got = async {
+                match &mut sock {
+                    Sock::Sub(s) => s.recv().await,
+                    Sock::Pull(s) => s.recv().await,
+                    Sock::Rep(s) => s.recv().await,
+                    _ => std::future::pending().await,
+                }
+            }, if reading => {
+                match got {
+                    Ok(m) => {
+                        if kind == Kind::Rep {
+                            next_id += 1;
+                            waiting = Some((next_id, tokio::time::Instant::now() + reply_timeout));
+                            push(message_json(&m, kind, Some(next_id)));
+                        } else {
+                            push(message_json(&m, kind, None));
+                        }
+                    }
+                    // No peer yet, or one went away: wait a little rather than spin.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+                None
+            },
+            _ = async { match rep_deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } }, if rep_deadline.is_some() => {
+                // Nobody answered in time: an empty reply frees the REP socket for the next request.
+                if let Sock::Rep(s) = &mut sock {
+                    let _ = s.send(zeromq::ZmqMessage::from("")).await;
+                }
+                waiting = None;
+                None
+            },
+        };
+        let cmd = match cmd { Some(c) => c, None => continue };
+        match cmd {
+            Cmd::Bind(ep, r) => {
+                let res = each!(&mut sock, s => s.bind(&ep).await);
+                let _ = r.send(res.map(|e| json!(e.to_string())).map_err(zerr));
+            }
+            Cmd::Connect(ep, t, r) => {
+                let res = tokio::time::timeout(t, each!(&mut sock, s => s.connect(&ep))).await;
+                let _ = r.send(match res {
+                    Ok(Ok(())) => {
+                        connected.push(ep.clone());
+                        Ok(json!(ep))
+                    }
+                    Ok(Err(e)) => Err(zerr(e)),
+                    Err(_) => Err(format!("nothing answered at {} within {} ms: bind that endpoint first, or check the address", ep, t.as_millis())),
+                });
+            }
+            Cmd::Subscribe(prefix, on, r) => {
+                let res = match &mut sock {
+                    Sock::Sub(s) => if on { s.subscribe(&prefix).await } else { s.unsubscribe(&prefix).await },
+                    _ => Ok(()),
+                };
+                if res.is_ok() {
+                    subs.retain(|p| p != &prefix);
+                    if on {
+                        subs.push(prefix.clone());
+                    }
+                }
+                let _ = r.send(res.map(|_| json!(prefix)).map_err(zerr));
+            }
+            Cmd::Send(m, t, r) => {
+                let deadline = tokio::time::Instant::now() + t;
+                let res = loop {
+                    let res = match &mut sock {
+                        Sock::Pub(s) => s.send(m.clone()).await,
+                        Sock::Push(s) => s.send(m.clone()).await,
+                        _ => Err(zeromq::ZmqError::Other("this socket kind does not send on its own")),
+                    };
+                    match res {
+                        // PUSH waits for a peer, as ZeroMQ's PUSH blocks without one.
+                        Err(zeromq::ZmqError::ReturnToSender { .. }) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(20)).await,
+                        other => break other,
+                    }
+                };
+                let _ = r.send(res.map(|_| json!(true)).map_err(|e| match e {
+                    zeromq::ZmqError::ReturnToSender { .. } => format!("no peer took the message within {} ms: connect a PULL socket first", t.as_millis()),
+                    e => zerr(e),
+                }));
+            }
+            Cmd::Request(m, t, r) => {
+                let deadline = tokio::time::Instant::now() + t;
+                let res: Result<Value, String> = async {
+                    let s = match &mut sock {
+                        Sock::Req(s) => s,
+                        _ => return Err("zmq_request is for REQ sockets".to_string()),
+                    };
+                    loop {
+                        match s.send(m.clone()).await {
+                            Ok(()) => break,
+                            Err(zeromq::ZmqError::ReturnToSender { .. }) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(20)).await,
+                            Err(zeromq::ZmqError::ReturnToSender { reason, .. }) => return Err(format!("could not send the request: {} (connect the REQ socket to a REP one first)", reason)),
+                            Err(e) => return Err(zerr(e)),
+                        }
+                    }
+                    match tokio::time::timeout_at(deadline, s.recv()).await {
+                        Ok(Ok(m)) => Ok(message_json(&m, Kind::Req, None)),
+                        Ok(Err(e)) => Err(zerr(e)),
+                        Err(_) => Err(format!("no reply within {} ms", t.as_millis())),
+                    }
+                }
+                .await;
+                if res.is_err() {
+                    // A REQ socket that sent without a reply cannot send again: start it over, on the same endpoints.
+                    sock = new_sock(kind);
+                    for ep in connected.clone() {
+                        let _ = tokio::time::timeout(Duration::from_millis(500), each!(&mut sock, s => s.connect(&ep))).await;
+                    }
+                }
+                let _ = r.send(res);
+            }
+            Cmd::Answer(id, m, r) => {
+                let res = match (&mut sock, waiting) {
+                    (Sock::Rep(s), Some((w, _))) if w == id => {
+                        waiting = None;
+                        s.send(m).await.map(|_| json!(true)).map_err(zerr)
+                    }
+                    (Sock::Rep(_), Some((w, _))) => Err(format!("request {} is not the one waiting (that is {}): a REP socket answers its requests in turn", id, w)),
+                    (Sock::Rep(_), None) => Err(format!("request {} was already answered, or waited too long and got an empty reply", id)),
+                    _ => Err("zmq_reply is for REP sockets".into()),
+                };
+                let _ = r.send(res);
+            }
+            Cmd::Close(r) => {
+                let _ = each!(sock, s => s.close().await);
+                let _ = r.send(Ok(json!(true)));
+                return;
+            }
+        }
+    }
+}
+
+fn ask(h: &Handle, t: Duration, make: impl FnOnce(Reply) -> Cmd) -> Result<Value, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.tx.send(make(tx)).map_err(|_| "the socket is closed".to_string())?;
+    match rx.recv_timeout(t + Duration::from_millis(1000)) {
+        Ok(r) => r,
+        Err(_) => Err(format!("the socket did not answer within {} ms", t.as_millis())),
+    }
+}
+
+/// Makes a ZeroMQ socket named `name`: kind is "pub", "sub", "req", "rep", "push" or "pull"; options: buffer (10000 messages kept for SUB, PULL and REP), timeout_ms (10000), reply_timeout_ms (30000, how long a REP request may wait for zmq_reply).
+pub fn zmq_socket(name: &str, kind: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = &options;
+    check_keys(o, &["buffer", "timeout_ms", "reply_timeout_ms"], "zmq_socket")?;
+    if name.is_empty() {
+        return Err("give the socket a name, like \"events\"".into());
+    }
+    let k = match kind.to_ascii_lowercase().as_str() {
+        "pub" => Kind::Pub,
+        "sub" => Kind::Sub,
+        "req" => Kind::Req,
+        "rep" => Kind::Rep,
+        "push" => Kind::Push,
+        "pull" => Kind::Pull,
+        other => return Err(format!("{:?} is not a socket kind here: pub, sub, req, rep, push or pull", other)),
+    };
+    let cap = opt_i64(o, "buffer")?.unwrap_or(10_000).clamp(1, 1_000_000) as usize;
+    let timeout = Duration::from_millis(opt_i64(o, "timeout_ms")?.unwrap_or(10_000).clamp(10, 600_000) as u64);
+    let reply_timeout = Duration::from_millis(opt_i64(o, "reply_timeout_ms")?.unwrap_or(30_000).clamp(10, 3_600_000) as u64);
+    let _ = zmq_close(name);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let inbox = Arc::new((Mutex::new(Inbox { msgs: VecDeque::new(), received: 0, dropped: 0 }), Condvar::new()));
+    rt().spawn(actor(k, rx, inbox.clone(), cap, reply_timeout));
+    lock(&SOCKS).get_or_insert_with(HashMap::new).insert(name.to_string(), Arc::new(Handle { kind: k, tx, inbox, timeout, binds: Mutex::new(vec![]), connects: Mutex::new(vec![]) }));
+    Ok(json!({ "name": name, "kind": k.name() }))
+}
+
+/// Binds the socket to `endpoint` (tcp://127.0.0.1:5555, tcp://0.0.0.0:5555, or port 0 for any free one) and gives the endpoint it got.
+pub fn zmq_bind(name: &str, endpoint: &str) -> Result<String, String> {
+    endpoint_ok(endpoint)?;
+    let h = get(name)?;
+    let ep = ask(&h, h.timeout, |r| Cmd::Bind(endpoint.to_string(), r))?;
+    let ep = ep.as_str().unwrap_or(endpoint).to_string();
+    lock(&h.binds).push(ep.clone());
+    Ok(ep)
+}
+
+/// Connects the socket to a bound `endpoint`; waits until the peer answers (at most timeout_ms).
+pub fn zmq_connect(name: &str, endpoint: &str) -> Result<String, String> {
+    endpoint_ok(endpoint)?;
+    let h = get(name)?;
+    let t = h.timeout;
+    ask(&h, t, |r| Cmd::Connect(endpoint.to_string(), t, r))?;
+    lock(&h.connects).push(endpoint.to_string());
+    Ok(endpoint.to_string())
+}
+
+/// Subscribes a SUB socket to messages whose first frame starts with `prefix` ("" for all).
+pub fn zmq_subscribe(name: &str, prefix: &str) -> Result<String, String> {
+    let h = get(name)?;
+    if h.kind != Kind::Sub {
+        return Err(format!("`{}` is a {} socket: only SUB sockets subscribe", name, h.kind.name()));
+    }
+    ask(&h, h.timeout, |r| Cmd::Subscribe(prefix.to_string(), true, r))?;
+    Ok(prefix.to_string())
+}
+
+/// Ends a SUB socket's subscription to `prefix`.
+pub fn zmq_unsubscribe(name: &str, prefix: &str) -> Result<String, String> {
+    let h = get(name)?;
+    if h.kind != Kind::Sub {
+        return Err(format!("`{}` is a {} socket: only SUB sockets subscribe", name, h.kind.name()));
+    }
+    ask(&h, h.timeout, |r| Cmd::Subscribe(prefix.to_string(), false, r))?;
+    Ok(prefix.to_string())
+}
+
+/// Sends a message on a PUB or PUSH socket: text is one frame, a list is a multi-part message ([topic, payload] for PUB/SUB), `{ base64 }` bytes. PUB drops it when no one subscribes; PUSH waits for a peer up to timeout_ms.
+pub fn zmq_send(name: &str, message_value: serde_json::Value) -> Result<bool, String> {
+    let h = get(name)?;
+    if !matches!(h.kind, Kind::Pub | Kind::Push) {
+        return Err(format!("`{}` is a {} socket: zmq_send is for PUB and PUSH (zmq_request for REQ, zmq_reply for REP)", name, h.kind.name()));
+    }
+    let m = message(&message_value)?;
+    let t = h.timeout;
+    ask(&h, t, |r| Cmd::Send(m, t, r)).map(|_| true)
+}
+
+/// Sends a request on a REQ socket and waits for the reply, at most `timeout_ms` (0: the socket's timeout): { payload, frames }.
+pub fn zmq_request(name: &str, message_value: serde_json::Value, timeout_ms: i64) -> Result<serde_json::Value, String> {
+    let h = get(name)?;
+    if h.kind != Kind::Req {
+        return Err(format!("`{}` is a {} socket: zmq_request is for REQ sockets", name, h.kind.name()));
+    }
+    let m = message(&message_value)?;
+    let t = if timeout_ms > 0 { Duration::from_millis(timeout_ms.min(600_000) as u64) } else { h.timeout };
+    ask(&h, t, |r| Cmd::Request(m, t, r))
+}
+
+/// Answers the REP request with this `id` (from zmq_receive); the socket reads the next request after it.
+pub fn zmq_reply(name: &str, id: i64, message_value: serde_json::Value) -> Result<bool, String> {
+    let h = get(name)?;
+    if h.kind != Kind::Rep {
+        return Err(format!("`{}` is a {} socket: zmq_reply is for REP sockets", name, h.kind.name()));
+    }
+    let m = message(&message_value)?;
+    ask(&h, h.timeout, |r| Cmd::Answer(id.max(0) as u64, m, r)).map(|_| true)
+}
+
+/// Takes up to `max` messages a SUB, PULL or REP socket has read, oldest first, waiting up to `wait_ms` for the first (0: only what is there): each { payload (the last frame), frames, topic (SUB, several frames), id (REP), at }.
+pub fn zmq_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let h = get(name)?;
+    if !h.kind.reads() {
+        return Err(format!("`{}` is a {} socket, which does not receive: use a SUB, PULL or REP socket (or zmq_request on REQ)", name, h.kind.name()));
+    }
+    let max = max.clamp(1, 100_000) as usize;
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut st = lock(&h.inbox.0);
+    while st.msgs.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        st = h.inbox.1.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = max.min(st.msgs.len());
+    Ok(st.msgs.drain(..n).collect())
+}
+
+/// What the socket is: its kind, endpoints bound and connected, and messages buffered, received and dropped (the buffer was full).
+pub fn zmq_status(name: &str) -> Result<serde_json::Value, String> {
+    let h = get(name)?;
+    let st = lock(&h.inbox.0);
+    Ok(json!({ "kind": h.kind.name(), "bound": *lock(&h.binds), "connected": *lock(&h.connects), "buffered": st.msgs.len(), "received": st.received, "dropped": st.dropped }))
+}
+
+/// Closes the socket (its binds and connections) and forgets it; whether there was one.
+pub fn zmq_close(name: &str) -> Result<bool, String> {
+    let h = match lock(&SOCKS).as_mut().and_then(|m| m.remove(name)) {
+        Some(h) => h,
+        None => return Ok(false),
+    };
+    let _ = ask(&h, Duration::from_millis(2000), Cmd::Close);
+    Ok(true)
+}

@@ -1,0 +1,748 @@
+//! A RADIUS client (RFC 2865, 2866, 2869, 3579, 5997): Access-Requests with PAP or CHAP and a Message-Authenticator, Access-Accept, Reject and Challenge read and checked, Accounting Start, Stop and Interim-Update, Status-Server, attributes by name (vendor-specific ones of Cisco, Microsoft, MikroTik, WISPr, Juniper and Fortinet too); and packets read, passwords checked and replies built for a server written with `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! md-5 = "0.10"
+//! hmac = "0.12"
+//! getrandom = "0.2"
+
+use md5::{Digest, Md5};
+use serde_json::{json, Map, Value};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------------------------
+// The dictionary
+
+#[derive(Clone, Copy, PartialEq)]
+enum K {
+    Text,
+    Octets,
+    Ip,
+    Ip6,
+    Int,
+    Date,
+    Password,
+}
+
+const ATTRS: &[(u8, &str, K)] = &[
+    (1, "User-Name", K::Text), (2, "User-Password", K::Password), (3, "CHAP-Password", K::Octets), (4, "NAS-IP-Address", K::Ip),
+    (5, "NAS-Port", K::Int), (6, "Service-Type", K::Int), (7, "Framed-Protocol", K::Int), (8, "Framed-IP-Address", K::Ip),
+    (9, "Framed-IP-Netmask", K::Ip), (10, "Framed-Routing", K::Int), (11, "Filter-Id", K::Text), (12, "Framed-MTU", K::Int),
+    (13, "Framed-Compression", K::Int), (14, "Login-IP-Host", K::Ip), (15, "Login-Service", K::Int), (16, "Login-TCP-Port", K::Int),
+    (18, "Reply-Message", K::Text), (19, "Callback-Number", K::Text), (20, "Callback-Id", K::Text), (22, "Framed-Route", K::Text),
+    (24, "State", K::Octets), (25, "Class", K::Octets), (27, "Session-Timeout", K::Int), (28, "Idle-Timeout", K::Int),
+    (29, "Termination-Action", K::Int), (30, "Called-Station-Id", K::Text), (31, "Calling-Station-Id", K::Text),
+    (32, "NAS-Identifier", K::Text), (33, "Proxy-State", K::Octets), (40, "Acct-Status-Type", K::Int), (41, "Acct-Delay-Time", K::Int),
+    (42, "Acct-Input-Octets", K::Int), (43, "Acct-Output-Octets", K::Int), (44, "Acct-Session-Id", K::Text),
+    (45, "Acct-Authentic", K::Int), (46, "Acct-Session-Time", K::Int), (47, "Acct-Input-Packets", K::Int),
+    (48, "Acct-Output-Packets", K::Int), (49, "Acct-Terminate-Cause", K::Int), (50, "Acct-Multi-Session-Id", K::Text),
+    (51, "Acct-Link-Count", K::Int), (52, "Acct-Input-Gigawords", K::Int), (53, "Acct-Output-Gigawords", K::Int),
+    (55, "Event-Timestamp", K::Date), (60, "CHAP-Challenge", K::Octets), (61, "NAS-Port-Type", K::Int), (62, "Port-Limit", K::Int),
+    (79, "EAP-Message", K::Octets), (80, "Message-Authenticator", K::Octets), (85, "Acct-Interim-Interval", K::Int),
+    (87, "NAS-Port-Id", K::Text), (88, "Framed-Pool", K::Text), (95, "NAS-IPv6-Address", K::Ip6), (101, "Error-Cause", K::Int),
+];
+
+// vendor, type, name, kind
+const VSAS: &[(u32, u8, &str, K)] = &[
+    (9, 1, "Cisco-AVPair", K::Text), (9, 2, "Cisco-NAS-Port", K::Text),
+    (311, 7, "MS-MPPE-Encryption-Policy", K::Int), (311, 8, "MS-MPPE-Encryption-Types", K::Int),
+    (311, 25, "MS-Primary-DNS-Server", K::Ip), (311, 26, "MS-Secondary-DNS-Server", K::Ip),
+    (14988, 1, "Mikrotik-Recv-Limit", K::Int), (14988, 2, "Mikrotik-Xmit-Limit", K::Int), (14988, 3, "Mikrotik-Group", K::Text),
+    (14988, 8, "Mikrotik-Rate-Limit", K::Text), (14988, 10, "Mikrotik-Address-List", K::Text),
+    (14122, 1, "WISPr-Location-ID", K::Text), (14122, 2, "WISPr-Location-Name", K::Text), (14122, 4, "WISPr-Redirection-URL", K::Text),
+    (14122, 7, "WISPr-Bandwidth-Max-Up", K::Int), (14122, 8, "WISPr-Bandwidth-Max-Down", K::Int), (14122, 9, "WISPr-Session-Terminate-Time", K::Text),
+    (2636, 1, "Juniper-Local-User-Name", K::Text), (2636, 2, "Juniper-Allow-Commands", K::Text), (2636, 3, "Juniper-Deny-Commands", K::Text),
+    (12356, 1, "Fortinet-Group-Name", K::Text), (12356, 3, "Fortinet-Access-Profile", K::Text),
+];
+
+const ENUMS: &[(u8, u32, &str)] = &[
+    (6, 1, "Login-User"), (6, 2, "Framed-User"), (6, 3, "Callback-Login-User"), (6, 4, "Callback-Framed-User"), (6, 5, "Outbound-User"),
+    (6, 6, "Administrative-User"), (6, 7, "NAS-Prompt-User"), (6, 8, "Authenticate-Only"), (6, 10, "Call-Check"), (6, 11, "Callback-Administrative"),
+    (7, 1, "PPP"), (7, 2, "SLIP"), (7, 7, "GPRS-PDP-Context"),
+    (29, 0, "Default"), (29, 1, "RADIUS-Request"),
+    (40, 1, "Start"), (40, 2, "Stop"), (40, 3, "Interim-Update"), (40, 7, "Accounting-On"), (40, 8, "Accounting-Off"),
+    (45, 1, "RADIUS"), (45, 2, "Local"), (45, 3, "Remote"), (45, 4, "Diameter"),
+    (49, 1, "User-Request"), (49, 2, "Lost-Carrier"), (49, 3, "Lost-Service"), (49, 4, "Idle-Timeout"), (49, 5, "Session-Timeout"),
+    (49, 6, "Admin-Reset"), (49, 7, "Admin-Reboot"), (49, 8, "Port-Error"), (49, 9, "NAS-Error"), (49, 10, "NAS-Request"),
+    (49, 11, "NAS-Reboot"), (49, 12, "Port-Unneeded"), (49, 13, "Port-Preempted"), (49, 14, "Port-Suspended"), (49, 15, "Service-Unavailable"),
+    (49, 16, "Callback"), (49, 17, "User-Error"), (49, 18, "Host-Request"),
+    (61, 0, "Async"), (61, 1, "Sync"), (61, 2, "ISDN"), (61, 5, "Virtual"), (61, 15, "Ethernet"), (61, 18, "Wireless-Other"), (61, 19, "Wireless-802.11"),
+];
+
+fn code_name(c: u8) -> String {
+    match c {
+        1 => "Access-Request",
+        2 => "Access-Accept",
+        3 => "Access-Reject",
+        4 => "Accounting-Request",
+        5 => "Accounting-Response",
+        11 => "Access-Challenge",
+        12 => "Status-Server",
+        13 => "Status-Client",
+        40 => "Disconnect-Request",
+        41 => "Disconnect-ACK",
+        42 => "Disconnect-NAK",
+        43 => "CoA-Request",
+        44 => "CoA-ACK",
+        45 => "CoA-NAK",
+        _ => return format!("Code-{}", c),
+    }
+    .to_string()
+}
+
+fn code_of(name: &str) -> Result<u8, String> {
+    for c in [1u8, 2, 3, 4, 5, 11, 12, 13, 40, 41, 42, 43, 44, 45] {
+        if code_name(c).eq_ignore_ascii_case(name) {
+            return Ok(c);
+        }
+    }
+    Err(format!("unknown RADIUS code {:?}: Access-Accept, Access-Reject, Access-Challenge, Accounting-Response, CoA-ACK...", name))
+}
+
+/// (type, vendor) for a name: `User-Name`, `Mikrotik-Rate-Limit`, or `Attr-26` / `Vendor-9-1` for any.
+fn lookup(name: &str) -> Result<(u8, Option<(u32, u8)>, K), String> {
+    if let Some(a) = ATTRS.iter().find(|a| a.1.eq_ignore_ascii_case(name)) {
+        return Ok((a.0, None, a.2));
+    }
+    if let Some(v) = VSAS.iter().find(|v| v.2.eq_ignore_ascii_case(name)) {
+        return Ok((26, Some((v.0, v.1)), v.3));
+    }
+    if let Some(n) = name.strip_prefix("Attr-") {
+        let t: u8 = n.parse().map_err(|_| format!("`{}`: Attr-<1..255>", name))?;
+        return Ok((t, None, K::Octets));
+    }
+    if let Some(r) = name.strip_prefix("Vendor-") {
+        let (v, t) = r.split_once('-').ok_or_else(|| format!("`{}`: Vendor-<vendor id>-<type>", name))?;
+        return Ok((26, Some((v.parse().map_err(|_| format!("`{}`: the vendor id is a number", name))?, t.parse().map_err(|_| format!("`{}`: the type is 0 to 255", name))?)), K::Octets));
+    }
+    Err(format!("unknown RADIUS attribute `{}`: use a name like User-Name, NAS-Identifier, Session-Timeout, Cisco-AVPair, Mikrotik-Rate-Limit; or Attr-<n> and Vendor-<id>-<n> with hex values", name))
+}
+
+fn name_of(t: u8) -> (String, K) {
+    ATTRS.iter().find(|a| a.0 == t).map(|a| (a.1.to_string(), a.2)).unwrap_or((format!("Attr-{}", t), K::Octets))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    let h: String = s.trim().trim_start_matches("0x").chars().filter(|c| !matches!(c, ':' | ' ')).collect();
+    if h.len() % 2 == 1 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("`{}` is not hex", s));
+    }
+    Ok((0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect())
+}
+
+fn enc_value(t: u8, k: K, v: &Value, name: &str) -> Result<Vec<u8>, String> {
+    let text = || -> Result<String, String> { v.as_str().map(|s| s.to_string()).or_else(|| if v.is_number() { Some(v.to_string()) } else { None }).ok_or_else(|| format!("{} takes text, not {}", name, v)) };
+    Ok(match k {
+        K::Text => text()?.into_bytes(),
+        K::Octets | K::Password => match v {
+            Value::String(s) if t == 25 || t == 24 || t == 33 => {
+                // Class, State and Proxy-State: hex when it reads as hex, else the text
+                unhex(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+            }
+            Value::String(s) => unhex(s).map_err(|_| format!("{} takes hex", name))?,
+            _ => return Err(format!("{} takes hex text", name)),
+        },
+        K::Ip => text()?.parse::<Ipv4Addr>().map_err(|_| format!("{} takes an IPv4 address, not {}", name, v))?.octets().to_vec(),
+        K::Ip6 => text()?.parse::<Ipv6Addr>().map_err(|_| format!("{} takes an IPv6 address, not {}", name, v))?.octets().to_vec(),
+        K::Int | K::Date => {
+            let n: u32 = match v {
+                Value::Number(n) => n.as_u64().filter(|x| *x <= u32::MAX as u64).ok_or_else(|| format!("{} takes 0 to 4294967295", name))? as u32,
+                Value::String(s) => match ENUMS.iter().find(|e| e.0 == t && e.2.eq_ignore_ascii_case(s)) {
+                    Some(e) => e.1,
+                    None => s.parse().map_err(|_| {
+                        let names: Vec<&str> = ENUMS.iter().filter(|e| e.0 == t).map(|e| e.2).collect();
+                        if names.is_empty() { format!("{} takes a number", name) } else { format!("{} takes a number or one of {}", name, names.join(", ")) }
+                    })?,
+                },
+                _ => return Err(format!("{} takes a number", name)),
+            };
+            n.to_be_bytes().to_vec()
+        }
+    })
+}
+
+fn dec_value(t: u8, k: K, b: &[u8]) -> Value {
+    match k {
+        K::Text => match std::str::from_utf8(b) {
+            Ok(s) => json!(s),
+            Err(_) => json!(hex(b)),
+        },
+        K::Ip if b.len() == 4 => json!(Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()),
+        K::Ip6 if b.len() == 16 => json!(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap()).to_string()),
+        K::Int | K::Date if b.len() == 4 => {
+            let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            match ENUMS.iter().find(|e| e.0 == t && e.1 == n) {
+                Some(e) => json!(e.2),
+                None => json!(n),
+            }
+        }
+        _ if t == 25 || t == 24 => match std::str::from_utf8(b) {
+            Ok(s) if s.chars().all(|c| !c.is_control()) => json!(s),
+            _ => json!(hex(b)),
+        },
+        _ => json!(hex(b)),
+    }
+}
+
+/// Attributes from a map of names to values (a list for an attribute that repeats).
+fn encode_attrs(attrs: &Value) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let m = match attrs {
+        Value::Null => return Ok(out),
+        Value::Object(m) => m,
+        _ => return Err("attributes are a map: { \"NAS-Identifier\": \"ap-hall-2\", \"Cisco-AVPair\": [\"a=1\", \"b=2\"] }".into()),
+    };
+    for (name, v) in m {
+        let (t, vendor, k) = lookup(name)?;
+        if t == 2 || t == 80 || t == 3 {
+            return Err(format!("{} is made by the plugin: leave it out of the attributes", name));
+        }
+        let vals: Vec<&Value> = match v {
+            Value::Array(a) => a.iter().collect(),
+            x => vec![x],
+        };
+        for x in vals {
+            let body = enc_value(if vendor.is_some() { 0 } else { t }, k, x, name)?;
+            match vendor {
+                None => {
+                    if body.len() > 253 {
+                        return Err(format!("{} is longer than RADIUS's 253 bytes", name));
+                    }
+                    out.push(t);
+                    out.push((body.len() + 2) as u8);
+                    out.extend(body);
+                }
+                Some((vid, vt)) => {
+                    if body.len() > 247 {
+                        return Err(format!("{} is longer than the 247 bytes a vendor attribute holds", name));
+                    }
+                    out.push(26);
+                    out.push((body.len() + 8) as u8);
+                    out.extend_from_slice(&vid.to_be_bytes());
+                    out.push(vt);
+                    out.push((body.len() + 2) as u8);
+                    out.extend(body);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn attr(t: u8, v: &[u8]) -> Vec<u8> {
+    let mut a = vec![t, (v.len() + 2) as u8];
+    a.extend_from_slice(v);
+    a
+}
+
+/// (type, value) pairs; vendor attributes as (26, whole value).
+fn split_attrs(b: &[u8]) -> Result<Vec<(u8, Vec<u8>, usize)>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if i + 2 > b.len() {
+            return Err("an attribute cut short".into());
+        }
+        let l = b[i + 1] as usize;
+        if l < 2 || i + l > b.len() {
+            return Err(format!("attribute {} has a bad length ({})", b[i], l));
+        }
+        out.push((b[i], b[i + 2..i + l].to_vec(), i));
+        i += l;
+    }
+    Ok(out)
+}
+
+fn put(m: &mut Map<String, Value>, k: String, v: Value) {
+    match m.get_mut(&k) {
+        Some(Value::Array(a)) => a.push(v),
+        Some(old) => {
+            let o = old.take();
+            *old = json!([o, v]);
+        }
+        None => {
+            m.insert(k, v);
+        }
+    }
+}
+
+fn decode_attrs(list: &[(u8, Vec<u8>, usize)]) -> Map<String, Value> {
+    let mut m = Map::new();
+    for (t, v, _) in list {
+        if *t == 26 && v.len() >= 6 {
+            let vid = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+            let mut j = 4;
+            let mut any = false;
+            while j + 2 <= v.len() {
+                let vt = v[j];
+                let vl = v[j + 1] as usize;
+                if vl < 2 || j + vl > v.len() {
+                    break;
+                }
+                any = true;
+                let body = &v[j + 2..j + vl];
+                match VSAS.iter().find(|x| x.0 == vid && x.1 == vt) {
+                    Some(x) => put(&mut m, x.2.to_string(), dec_value(0, x.3, body)),
+                    None => put(&mut m, format!("Vendor-{}-{}", vid, vt), json!(hex(body))),
+                }
+                j += vl;
+            }
+            if !any {
+                put(&mut m, format!("Vendor-{}", vid), json!(hex(&v[4..])));
+            }
+            continue;
+        }
+        if *t == 2 || *t == 80 {
+            continue; // shown on their own
+        }
+        let (n, k) = name_of(*t);
+        put(&mut m, n, dec_value(*t, k, v));
+    }
+    m
+}
+
+// ---------------------------------------------------------------------------------------------
+// Crypto
+
+fn md5(parts: &[&[u8]]) -> [u8; 16] {
+    let mut h = Md5::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
+fn hmac_md5(key: &[u8], msg: &[u8]) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
+    let mut m = <Hmac<Md5> as Mac>::new_from_slice(key).expect("any key length");
+    m.update(msg);
+    m.finalize().into_bytes().into()
+}
+
+/// RFC 2865 5.2: the password padded to 16 bytes and hidden with MD5(secret + previous block).
+fn hide_password(pw: &[u8], secret: &[u8], ra: &[u8]) -> Result<Vec<u8>, String> {
+    if pw.len() > 128 {
+        return Err("a RADIUS password is at most 128 bytes".into());
+    }
+    let mut p = pw.to_vec();
+    if p.is_empty() || p.len() % 16 != 0 {
+        p.resize((p.len() / 16 + 1) * 16, 0);
+    }
+    let mut out = vec![];
+    let mut prev = ra.to_vec();
+    for chunk in p.chunks(16) {
+        let b = md5(&[secret, &prev]);
+        let c: Vec<u8> = chunk.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect();
+        prev = c.clone();
+        out.extend(c);
+    }
+    Ok(out)
+}
+
+fn reveal_password(c: &[u8], secret: &[u8], ra: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    let mut prev = ra.to_vec();
+    for chunk in c.chunks(16) {
+        let b = md5(&[secret, &prev]);
+        out.extend(chunk.iter().zip(b.iter()).map(|(x, y)| x ^ y));
+        prev = chunk.to_vec();
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// 16 bytes from the system's random source: Request Authenticators must be unpredictable.
+fn random16() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    if getrandom::getrandom(&mut b).is_err() {
+        // no system source: time and a counter, hashed (still unique)
+        static N: OnceLock<Mutex<u64>> = OnceLock::new();
+        let mut g = N.get_or_init(|| Mutex::new(0)).lock().unwrap_or_else(|e| e.into_inner());
+        *g += 1;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        b = md5(&[&t.to_be_bytes(), &g.to_be_bytes()]);
+    }
+    b
+}
+
+fn next_id() -> u8 {
+    random16()[0]
+}
+
+fn packet(code: u8, id: u8, auth: &[u8; 16], attrs: &[u8]) -> Vec<u8> {
+    let mut p = vec![code, id];
+    p.extend_from_slice(&((20 + attrs.len()) as u16).to_be_bytes());
+    p.extend_from_slice(auth);
+    p.extend_from_slice(attrs);
+    p
+}
+
+/// Puts the Message-Authenticator (HMAC-MD5 over the packet with it zeroed) in place.
+fn sign_message_authenticator(p: &mut [u8], secret: &[u8], at: usize) {
+    for x in &mut p[at + 2..at + 18] {
+        *x = 0;
+    }
+    let mac = hmac_md5(secret, p);
+    p[at + 2..at + 18].copy_from_slice(&mac);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The exchange
+
+fn sock_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let h = host.trim();
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") { h.to_string() } else { format!("{}:{}", h, port) }
+    } else if h.matches(':').count() == 1 {
+        h.to_string()
+    } else if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    };
+    let mut all: Vec<SocketAddr> = with_port.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.collect();
+    all.sort_by_key(|a| !a.is_ipv4());
+    all.into_iter().next().ok_or(format!("{} has no address", host))
+}
+
+struct Opt {
+    port: u16,
+    timeout: Duration,
+    retries: u32,
+    require_ma: bool,
+}
+
+fn opt(o: &Value, port: u16) -> Opt {
+    Opt {
+        port: o.get("port").and_then(|v| v.as_u64()).unwrap_or(port as u64).clamp(1, 65535) as u16,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000).clamp(50, 60_000)),
+        retries: o.get("retries").and_then(|v| v.as_u64()).unwrap_or(2).min(10) as u32,
+        require_ma: o.get("require_message_authenticator").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
+/// Sends a request and waits for the answer with its ID whose authenticator checks out.
+fn exchange(server: &str, secret: &[u8], req: &[u8], o: &Opt) -> Result<(Vec<u8>, u64), String> {
+    let a = sock_addr(server, o.port)?;
+    let s = UdpSocket::bind(if a.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 4096];
+    let started = Instant::now();
+    let mut bad: Option<String> = None;
+    for _ in 0..=o.retries {
+        s.send_to(req, a).map_err(|e| format!("sending to {}: {}", a, e))?;
+        let until = Instant::now() + o.timeout;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            let (n, from) = match s.recv_from(&mut buf) {
+                Ok(x) => x,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err(format!("{} refused: no RADIUS server on UDP port {}", a, a.port())),
+                Err(e) => return Err(format!("reading from {}: {}", a, e)),
+            };
+            let r = &buf[..n];
+            if from != a || n < 20 || r[1] != req[1] {
+                continue;
+            }
+            let len = u16::from_be_bytes([r[2], r[3]]) as usize;
+            if len < 20 || len > n {
+                continue;
+            }
+            let r = &r[..len];
+            // Response Authenticator = MD5(Code + ID + Length + Request Authenticator + Attributes + Secret)
+            let want = md5(&[&r[..4], &req[4..20], &r[20..], secret]);
+            if want != r[4..20] {
+                bad = Some("an answer came whose authenticator is wrong: the shared secret differs (or it was not from the server)".into());
+                continue;
+            }
+            let attrs = split_attrs(&r[20..])?;
+            match attrs.iter().find(|x| x.0 == 80) {
+                Some((_, v, at)) => {
+                    if v.len() != 16 {
+                        return Err("a Message-Authenticator that is not 16 bytes".into());
+                    }
+                    let mut copy = r.to_vec();
+                    copy[4..20].copy_from_slice(&req[4..20]);
+                    let mac = {
+                        let i = 20 + at;
+                        for x in &mut copy[i + 2..i + 18] {
+                            *x = 0;
+                        }
+                        hmac_md5(secret, &copy)
+                    };
+                    if mac[..] != v[..] {
+                        bad = Some("an answer came whose Message-Authenticator is wrong".into());
+                        continue;
+                    }
+                }
+                None if o.require_ma && matches!(r[0], 2 | 3 | 11) => {
+                    bad = Some("the answer has no Message-Authenticator, which require_message_authenticator asks for (BlastRADIUS, CVE-2024-3596)".into());
+                    continue;
+                }
+                None => {}
+            }
+            return Ok((r.to_vec(), started.elapsed().as_millis() as u64));
+        }
+    }
+    Err(bad.unwrap_or_else(|| format!("no answer from {} in {} ms ({} tries): a wrong shared secret (servers drop those without a word), this client not allowed in the server's client list, or a firewall", a, o.timeout.as_millis(), o.retries + 1)))
+}
+
+fn nas_attrs(o: &Value) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let nas_id = o.get("nas_identifier").and_then(|v| v.as_str()).unwrap_or("quillo");
+    out.extend(attr(32, nas_id.as_bytes()));
+    if let Some(ip) = o.get("nas_ip").and_then(|v| v.as_str()) {
+        out.extend(attr(4, &ip.parse::<Ipv4Addr>().map_err(|_| format!("nas_ip {:?} is not an IPv4 address", ip))?.octets()));
+    }
+    Ok(out)
+}
+
+fn reply_json(r: &[u8], ms: u64) -> Result<Value, String> {
+    let attrs = split_attrs(&r[20..])?;
+    let m = decode_attrs(&attrs);
+    let code = r[0];
+    let msg = match m.get("Reply-Message") {
+        Some(Value::Array(a)) => json!(a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n")),
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
+    let state = attrs.iter().find(|x| x.0 == 24).map(|x| json!(hex(&x.1))).unwrap_or(Value::Null);
+    Ok(json!({
+        "code": code_name(code), "accepted": code == 2, "rejected": code == 3, "challenge": code == 11,
+        "reply_message": msg, "state": state, "attributes": Value::Object(m), "id": r[1], "ms": ms,
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The functions
+
+/// Asks a RADIUS server (port 1812, or `host:port`) whether `user` may sign in with `password`:
+/// `{ code, accepted, rejected, challenge, reply_message, state, attributes }`. Options: `method`
+/// ("pap" or "chap"), `attributes` (a map: `{ "NAS-Port-Type": "Wireless-802.11", "Called-Station-Id": "..." }`),
+/// `nas_identifier` ("quillo"), `nas_ip`, `state` (hex, to answer a challenge), `timeout_ms`
+/// (3000), `retries` (2), `require_message_authenticator` (false). A Message-Authenticator
+/// is always sent first, and checked in the answer when there is one.
+pub fn radius_auth(server: &str, secret: &str, user: &str, password: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if secret.is_empty() {
+        return Err("the shared secret is empty: give the one the server has for this client".into());
+    }
+    let o = if options.is_object() { options } else { json!({}) };
+    let op = opt(&o, 1812);
+    let ra = random16();
+    let id = next_id();
+    let s = secret.as_bytes();
+    // Message-Authenticator first, as RFC 3579 allows and BlastRADIUS guidance asks
+    let mut attrs = attr(80, &[0u8; 16]);
+    attrs.extend(attr(1, user.as_bytes()));
+    match o.get("method").and_then(|v| v.as_str()).unwrap_or("pap").to_lowercase().as_str() {
+        "pap" => attrs.extend(attr(2, &hide_password(password.as_bytes(), s, &ra)?)),
+        "chap" => {
+            let chap_id = next_id();
+            let challenge = random16();
+            let resp = md5(&[&[chap_id], password.as_bytes(), &challenge]);
+            let mut v = vec![chap_id];
+            v.extend_from_slice(&resp);
+            attrs.extend(attr(3, &v));
+            attrs.extend(attr(60, &challenge));
+        }
+        m => return Err(format!("method {:?}: use \"pap\" or \"chap\"", m)),
+    }
+    if let Some(st) = o.get("state").and_then(|v| v.as_str()) {
+        attrs.extend(attr(24, &unhex(st)?));
+    }
+    attrs.extend(nas_attrs(&o)?);
+    attrs.extend(encode_attrs(o.get("attributes").unwrap_or(&Value::Null))?);
+    if attrs.len() + 20 > 4096 {
+        return Err("the request is longer than RADIUS's 4096 bytes".into());
+    }
+    let mut p = packet(1, id, &ra, &attrs);
+    sign_message_authenticator(&mut p, s, 20);
+    let (r, ms) = exchange(server, s, &p, &op)?;
+    reply_json(&r, ms)
+}
+
+/// Sends an Accounting-Request (port 1813): `status` is "start", "stop", "interim" (or
+/// "accounting-on", "accounting-off"); options `session_id` (needed but for on/off), `user`,
+/// `attributes` (`Acct-Session-Time`, `Acct-Input-Octets`, `Acct-Terminate-Cause`, `Framed-IP-Address`...),
+/// `nas_identifier`, `nas_ip`, `timeout_ms`, `retries`. `{ code, ok, ms }` once the server answered.
+pub fn radius_accounting(server: &str, secret: &str, status: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if secret.is_empty() {
+        return Err("the shared secret is empty".into());
+    }
+    let o = if options.is_object() { options } else { json!({}) };
+    let op = opt(&o, 1813);
+    let st: u32 = match status.to_lowercase().replace('_', "-").as_str() {
+        "start" => 1,
+        "stop" => 2,
+        "interim" | "interim-update" | "update" => 3,
+        "accounting-on" | "on" => 7,
+        "accounting-off" | "off" => 8,
+        x => return Err(format!("status {:?}: use start, stop, interim, accounting-on or accounting-off", x)),
+    };
+    let session = o.get("session_id").and_then(|v| v.as_str());
+    if session.is_none() && st <= 3 {
+        return Err("accounting start, stop and interim need a session_id (the same for all three)".into());
+    }
+    let mut attrs = attr(40, &st.to_be_bytes());
+    if let Some(sid) = session {
+        attrs.extend(attr(44, sid.as_bytes()));
+    }
+    if let Some(u) = o.get("user").and_then(|v| v.as_str()) {
+        attrs.extend(attr(1, u.as_bytes()));
+    }
+    attrs.extend(nas_attrs(&o)?);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
+    attrs.extend(attr(55, &now.to_be_bytes()));
+    attrs.extend(encode_attrs(o.get("attributes").unwrap_or(&Value::Null))?);
+    let id = next_id();
+    let s = secret.as_bytes();
+    // Request Authenticator = MD5(Code + ID + Length + 16 zero octets + Attributes + Secret)
+    let mut p = packet(4, id, &[0u8; 16], &attrs);
+    let ra = md5(&[&p, s]);
+    p[4..20].copy_from_slice(&ra);
+    let (r, ms) = exchange(server, s, &p, &op)?;
+    if r[0] != 5 {
+        return Err(format!("the server answered {} to an Accounting-Request", code_name(r[0])));
+    }
+    let names = ["", "Start", "Stop", "Interim-Update", "", "", "", "Accounting-On", "Accounting-Off"];
+    Ok(json!({ "code": code_name(r[0]), "ok": true, "status": names[st as usize], "ms": ms }))
+}
+
+/// Status-Server (RFC 5997): whether the server is up and knows this client's secret:
+/// `{ code, ok, ms }`, to watch a server without a test user. Port 1812 unless given.
+pub fn radius_status(server: &str, secret: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let o = if options.is_object() { options } else { json!({}) };
+    let op = opt(&o, 1812);
+    let s = secret.as_bytes();
+    let mut attrs = attr(80, &[0u8; 16]);
+    attrs.extend(nas_attrs(&o)?);
+    let mut p = packet(12, next_id(), &random16(), &attrs);
+    sign_message_authenticator(&mut p, s, 20);
+    let (r, ms) = exchange(server, s, &p, &op)?;
+    Ok(json!({ "code": code_name(r[0]), "ok": r[0] == 2 || r[0] == 5, "ms": ms }))
+}
+
+fn bytes_of(b: &[i64]) -> Result<Vec<u8>, String> {
+    b.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte (0 to 255)", x))).collect()
+}
+
+/// Reads a RADIUS packet as a `udp.listen` handler gets it (`p.bytes`), for a server:
+/// `{ code, id, user, password (PAP, revealed with the secret), chap, attributes,
+/// message_authenticator (true, false, or null when absent), authentic (an accounting
+/// request's authenticator) }`.
+pub fn radius_parse(bytes: Vec<i64>, secret: &str) -> Result<serde_json::Value, String> {
+    let b = bytes_of(&bytes)?;
+    if b.len() < 20 {
+        return Err("a RADIUS packet is at least 20 bytes".into());
+    }
+    let len = u16::from_be_bytes([b[2], b[3]]) as usize;
+    if len < 20 || len > b.len() {
+        return Err(format!("the packet says {} bytes and has {}", len, b.len()));
+    }
+    let b = &b[..len];
+    let s = secret.as_bytes();
+    let attrs = split_attrs(&b[20..])?;
+    let m = decode_attrs(&attrs);
+    let mut out = Map::new();
+    out.insert("code".into(), json!(code_name(b[0])));
+    out.insert("id".into(), json!(b[1]));
+    out.insert("authenticator".into(), json!(hex(&b[4..20])));
+    out.insert("user".into(), m.get("User-Name").cloned().unwrap_or(Value::Null));
+    let pw = attrs.iter().find(|x| x.0 == 2).map(|x| String::from_utf8_lossy(&reveal_password(&x.1, s, &b[4..20])).to_string());
+    out.insert("password".into(), json!(pw));
+    let chap = attrs.iter().find(|x| x.0 == 3).map(|x| {
+        let ch = attrs.iter().find(|y| y.0 == 60).map(|y| y.1.clone()).unwrap_or_else(|| b[4..20].to_vec());
+        json!({ "id": x.1.first(), "response": hex(&x.1[1.min(x.1.len())..]), "challenge": hex(&ch) })
+    });
+    out.insert("chap".into(), chap.unwrap_or(Value::Null));
+    let ma = attrs.iter().find(|x| x.0 == 80).map(|(_, v, at)| {
+        let mut copy = b.to_vec();
+        if b[0] == 4 || b[0] == 40 || b[0] == 43 {
+            for x in &mut copy[4..20] {
+                *x = 0;
+            }
+        }
+        let i = 20 + at;
+        for x in &mut copy[i + 2..i + 18] {
+            *x = 0;
+        }
+        hmac_md5(s, &copy)[..] == v[..]
+    });
+    out.insert("message_authenticator".into(), json!(ma));
+    if matches!(b[0], 4 | 40 | 43) {
+        let mut z = b.to_vec();
+        for x in &mut z[4..20] {
+            *x = 0;
+        }
+        out.insert("authentic".into(), json!(md5(&[&z, s])[..] == b[4..20]));
+    }
+    out.insert("attributes".into(), Value::Object(m));
+    Ok(Value::Object(out))
+}
+
+/// Whether an Access-Request carries `password`, by PAP (revealed with the secret) or CHAP
+/// (MD5 of the CHAP ID, the password and the challenge); false for a request with neither.
+pub fn radius_password_ok(bytes: Vec<i64>, secret: &str, password: &str) -> Result<bool, String> {
+    let b = bytes_of(&bytes)?;
+    if b.len() < 20 || b[0] != 1 {
+        return Err("not an Access-Request".into());
+    }
+    let len = (u16::from_be_bytes([b[2], b[3]]) as usize).min(b.len());
+    let attrs = split_attrs(&b[20..len])?;
+    if let Some((_, c, _)) = attrs.iter().find(|x| x.0 == 2) {
+        if c.is_empty() || c.len() % 16 != 0 {
+            return Ok(false);
+        }
+        return Ok(reveal_password(c, secret.as_bytes(), &b[4..20]) == password.as_bytes());
+    }
+    if let Some((_, c, _)) = attrs.iter().find(|x| x.0 == 3) {
+        if c.len() != 17 {
+            return Ok(false);
+        }
+        let ch = attrs.iter().find(|y| y.0 == 60).map(|y| y.1.clone()).unwrap_or_else(|| b[4..20].to_vec());
+        return Ok(md5(&[&c[..1], password.as_bytes(), &ch])[..] == c[1..]);
+    }
+    Ok(false)
+}
+
+/// The answer to a request as bytes for `udp.reply`: `code` "Access-Accept", "Access-Reject",
+/// "Access-Challenge" or "Accounting-Response" (also CoA/Disconnect ACK and NAK), with
+/// `attributes` (`{ "Reply-Message": "Welcome", "Session-Timeout": 3600 }`); the Response
+/// Authenticator made, a Message-Authenticator added to Access answers, Proxy-State copied.
+pub fn radius_reply(request: Vec<i64>, secret: &str, code: &str, attributes: serde_json::Value) -> Result<Vec<u8>, String> {
+    let b = bytes_of(&request)?;
+    if b.len() < 20 {
+        return Err("the request is not a RADIUS packet".into());
+    }
+    let c = code_of(code)?;
+    let s = secret.as_bytes();
+    let len = (u16::from_be_bytes([b[2], b[3]]) as usize).min(b.len());
+    let req_attrs = split_attrs(&b[20..len])?;
+    let access = matches!(c, 2 | 3 | 11);
+    let mut attrs = if access { attr(80, &[0u8; 16]) } else { vec![] };
+    attrs.extend(encode_attrs(&attributes)?);
+    for (t, v, _) in &req_attrs {
+        if *t == 33 {
+            attrs.extend(attr(33, v)); // Proxy-State goes back as it came (RFC 2865 5.33)
+        }
+    }
+    let mut p = packet(c, b[1], <&[u8; 16]>::try_from(&b[4..20]).unwrap(), &attrs);
+    if access {
+        // over the packet with the Request Authenticator in place (RFC 3579 3.2)
+        sign_message_authenticator(&mut p, s, 20);
+    }
+    let resp = md5(&[&p[..4], &b[4..20], &p[20..], s]);
+    p[4..20].copy_from_slice(&resp);
+    Ok(p)
+}

@@ -1,0 +1,344 @@
+//! Bonjour, mDNS and DNS-SD on the local network (RFC 6762, 6763), in pure Rust: services browsed by type (_ipp._tcp printers, _printer._tcp, _http._tcp, _googlecast._tcp, _airplay._tcp, _hap._tcp...) with their host, port, addresses and TXT records, the service types a network has, .local host names resolved, this program's own services advertised and withdrawn, and a type watched in the background, its comings and goings buffered for the program to read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! mdns-sd = "=0.13.11"
+
+use mdns_sd::{HostnameResolutionEvent, ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// A daemon of its own for one browse or watch: mdns-sd keeps one browse per type in a
+/// daemon, so two at once in one daemon would take each other's answers.
+fn fresh() -> Result<ServiceDaemon, String> {
+    ServiceDaemon::new().map_err(|e| format!("cannot start mDNS (UDP port 5353, multicast 224.0.0.251): {}", e))
+}
+
+/// The daemon that answers for the services this program advertises.
+fn daemon() -> Result<ServiceDaemon, String> {
+    static D: OnceLock<Mutex<Option<ServiceDaemon>>> = OnceLock::new();
+    let m = D.get_or_init(|| Mutex::new(None));
+    let mut g = m.lock().map_err(|_| "the mDNS daemon is poisoned".to_string())?;
+    if let Some(d) = g.as_ref() {
+        return Ok(d.clone());
+    }
+    let d = ServiceDaemon::new().map_err(|e| format!("cannot start mDNS (UDP port 5353, multicast 224.0.0.251): {}", e))?;
+    *g = Some(d.clone());
+    Ok(d)
+}
+
+/// `_ipp._tcp`, `_ipp._tcp.local`, `_printer._tcp.local.` all to `_ipp._tcp.local.`; a
+/// subtype as `_universal._sub._ipp._tcp`.
+fn service_type(t: &str) -> Result<String, String> {
+    let mut s = t.trim().trim_end_matches('.').to_string();
+    if s.ends_with(".local") {
+        s.truncate(s.len() - 6);
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    let n = parts.len();
+    if n < 2 || !parts[n - 2].starts_with('_') || !(parts[n - 1] == "_tcp" || parts[n - 1] == "_udp") {
+        return Err(format!("`{}` is not a service type: write it like _ipp._tcp, _http._tcp or _googlecast._tcp", t));
+    }
+    if parts[n - 2].len() > 16 {
+        return Err(format!("`{}`: a service name is at most 15 characters after its _ (RFC 6335)", t));
+    }
+    Ok(format!("{}.local.", s))
+}
+
+fn txt_map(info: &ServiceInfo) -> Map<String, Value> {
+    let mut m = Map::new();
+    for p in info.get_properties().iter() {
+        let v = match p.val() {
+            None => Value::Bool(true), // a key with no `=`: present
+            Some(b) => match std::str::from_utf8(b) {
+                Ok(s) => json!(s),
+                Err(_) => json!(b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
+            },
+        };
+        m.insert(p.key().to_string(), v);
+    }
+    m
+}
+
+fn addrs_sorted(set: &std::collections::HashSet<IpAddr>) -> Vec<String> {
+    let mut v: Vec<&IpAddr> = set.iter().collect();
+    v.sort_by_key(|a| (a.is_ipv6(), a.to_string()));
+    v.iter().map(|a| a.to_string()).collect()
+}
+
+fn instance_of(fullname: &str, ty: &str) -> String {
+    fullname.strip_suffix(ty).map(|s| s.trim_end_matches('.')).unwrap_or(fullname).replace("\\032", " ").replace("\\.", ".")
+}
+
+fn info_json(info: &ServiceInfo) -> Value {
+    let ty = info.get_type().to_string();
+    json!({
+        "name": instance_of(info.get_fullname(), &ty),
+        "fullname": info.get_fullname(),
+        "type": ty,
+        "subtype": info.get_subtype(),
+        "host": info.get_hostname(),
+        "port": info.get_port(),
+        "addresses": addrs_sorted(info.get_addresses()),
+        "txt": Value::Object(txt_map(info)),
+        "priority": info.get_priority(),
+        "weight": info.get_weight(),
+    })
+}
+
+/// Browses for a service type (`"_ipp._tcp"`, `"_http._tcp"`, `"_googlecast._tcp"`, a subtype
+/// `"_universal._sub._ipp._tcp"`) for `wait_ms` (1 to 30000): each service found and resolved,
+/// `{ name, fullname, type, host, port, addresses, txt }`, sorted by name.
+pub fn mdns_browse(service: &str, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let ty = service_type(service)?;
+    let d = fresh()?;
+    let rx = d.browse(&ty).map_err(|e| format!("cannot browse {}: {}", ty, e))?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(1, 30_000) as u64);
+    let mut found: HashMap<String, Value> = HashMap::new();
+    let mut gone: BTreeSet<String> = BTreeSet::new();
+    while let Ok(ev) = rx.recv_deadline(until) {
+        match ev {
+            ServiceEvent::ServiceResolved(info) => {
+                gone.remove(info.get_fullname());
+                let v = info_json(&info);
+                // the same service on another interface: its addresses together
+                match found.get_mut(info.get_fullname()) {
+                    Some(old) => {
+                        let mut a: BTreeSet<String> = old["addresses"].as_array().map(|x| x.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default();
+                        a.extend(v["addresses"].as_array().map(|x| x.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default());
+                        let mut a: Vec<String> = a.into_iter().collect();
+                        a.sort_by_key(|s| (s.contains(':'), s.clone()));
+                        old["addresses"] = json!(a);
+                    }
+                    None => {
+                        found.insert(info.get_fullname().to_string(), v);
+                    }
+                }
+            }
+            ServiceEvent::ServiceRemoved(_, full) => {
+                gone.insert(full);
+            }
+            _ => {}
+        }
+    }
+    let _ = d.stop_browse(&ty);
+    let _ = d.shutdown();
+    let mut out: Vec<Value> = found.into_iter().filter(|(k, _)| !gone.contains(k)).map(|(_, v)| v).collect();
+    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(out)
+}
+
+/// The service types on the network (DNS-SD's `_services._dns-sd._udp` query) found in `wait_ms`:
+/// `["_airplay._tcp", "_ipp._tcp", ...]`, sorted.
+pub fn mdns_service_types(wait_ms: i64) -> Result<Vec<String>, String> {
+    let d = fresh()?;
+    let meta = "_services._dns-sd._udp.local.";
+    let rx = d.browse(meta).map_err(|e| format!("cannot browse service types: {}", e))?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(1, 30_000) as u64);
+    let mut types = BTreeSet::new();
+    while let Ok(ev) = rx.recv_deadline(until) {
+        if let ServiceEvent::ServiceFound(_, full) = ev {
+            let t = full.trim_end_matches('.').trim_end_matches(".local").to_string();
+            if t.contains("._tcp") || t.contains("._udp") {
+                types.insert(t);
+            }
+        }
+    }
+    let _ = d.stop_browse(meta);
+    let _ = d.shutdown();
+    Ok(types.into_iter().collect())
+}
+
+/// The addresses of a `.local` host name (`"printer-2f.local"`) found in `wait_ms`, IPv4 first.
+pub fn mdns_resolve(host: &str, wait_ms: i64) -> Result<Vec<String>, String> {
+    let mut h = host.trim().trim_end_matches('.').to_string();
+    if !h.ends_with(".local") {
+        return Err(format!("`{}` is not a .local name: mDNS resolves names like printer.local (others go through DNS)", host));
+    }
+    h.push('.');
+    let d = fresh()?;
+    let ms = wait_ms.clamp(1, 30_000) as u64;
+    let rx = d.resolve_hostname(&h, Some(ms)).map_err(|e| format!("cannot resolve {}: {}", host, e))?;
+    let until = Instant::now() + Duration::from_millis(ms + 200);
+    let mut all = std::collections::HashSet::new();
+    while let Ok(ev) = rx.recv_deadline(until) {
+        match ev {
+            HostnameResolutionEvent::AddressesFound(_, a) => {
+                all.extend(a);
+                // more may come from other interfaces: a short wait for them
+                let more = Instant::now() + Duration::from_millis(150);
+                while let Ok(HostnameResolutionEvent::AddressesFound(_, b)) = rx.recv_deadline(more.min(until)) {
+                    all.extend(b);
+                }
+                break;
+            }
+            HostnameResolutionEvent::SearchTimeout(_) | HostnameResolutionEvent::SearchStopped(_) => break,
+            _ => {}
+        }
+    }
+    let _ = d.stop_resolve_hostname(&h);
+    let _ = d.shutdown();
+    Ok(addrs_sorted(&all))
+}
+
+fn local_host() -> String {
+    let raw = std::env::var("HOSTNAME").ok().or_else(|| std::fs::read_to_string("/etc/hostname").ok()).unwrap_or_else(|| "server".into());
+    let clean: String = raw.trim().split('.').next().unwrap_or("server").chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' }).collect();
+    format!("quillo-{}.local.", if clean.is_empty() { "server".into() } else { clean })
+}
+
+fn advertised() -> &'static Mutex<BTreeSet<String>> {
+    static A: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Advertises a service of this program's own (`"Line 3 dashboard"`, `"_http._tcp"`, 8080,
+/// `{ path: "/line3" }`) until `mdns_unadvertise` or the end of the process. Options: `host`
+/// (the .local name to answer for; `quillo-<hostname>.local.` unless given), `addresses` (a
+/// list; every address of this machine unless given). `{ fullname, host, port, addresses }`.
+pub fn mdns_advertise(name: &str, service: &str, port: i64, txt: std::collections::HashMap<String, String>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let ty = service_type(service)?;
+    if name.trim().is_empty() || name.len() > 63 {
+        return Err("a service's name is 1 to 63 bytes".into());
+    }
+    if !(1..=65535).contains(&port) {
+        return Err("port is 1 to 65535".into());
+    }
+    let mut host = options.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(local_host);
+    if !host.ends_with('.') {
+        host.push('.');
+    }
+    if !host.ends_with(".local.") {
+        return Err(format!("host {:?} must end in .local", host));
+    }
+    let props: Vec<(String, String)> = txt.into_iter().collect();
+    let addrs: Vec<IpAddr> = match options.get("addresses").and_then(|v| v.as_array()) {
+        Some(list) => list.iter().map(|a| a.as_str().and_then(|s| s.parse::<IpAddr>().ok()).ok_or_else(|| format!("{} is not an IP address", a))).collect::<Result<_, _>>()?,
+        None => vec![],
+    };
+    let auto = addrs.is_empty();
+    let info = ServiceInfo::new(&ty, name.trim(), &host, &addrs[..], port as u16, &props[..]).map_err(|e| format!("cannot describe the service: {}", e))?;
+    let info = if auto { info.enable_addr_auto() } else { info };
+    let full = info.get_fullname().to_string();
+    let d = daemon()?;
+    d.register(info).map_err(|e| format!("cannot advertise {}: {}", full, e))?;
+    advertised().lock().map_err(|_| "poisoned".to_string())?.insert(full.clone());
+    Ok(json!({ "fullname": full, "name": name.trim(), "type": ty, "host": host, "port": port, "addresses": if auto { json!("all of this machine's") } else { json!(addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>()) } }))
+}
+
+/// Withdraws an advertised service (its fullname, or its name and type as `"Line 3 dashboard._http._tcp"`):
+/// the network is told it is gone. True when it was advertised.
+pub fn mdns_unadvertise(fullname: &str) -> Result<bool, String> {
+    let mut f = fullname.trim().to_string();
+    if !f.ends_with(".local.") {
+        f = format!("{}.local.", f.trim_end_matches('.').trim_end_matches(".local"));
+    }
+    if !advertised().lock().map_err(|_| "poisoned".to_string())?.remove(&f) {
+        return Ok(false);
+    }
+    let rx = daemon()?.unregister(&f).map_err(|e| e.to_string())?;
+    let _ = rx.recv_timeout(Duration::from_secs(2));
+    Ok(true)
+}
+
+struct Watch {
+    stop: Arc<AtomicBool>,
+    queue: Arc<Mutex<(VecDeque<Value>, u64)>>,
+    ty: String,
+}
+
+fn watches() -> &'static Mutex<HashMap<String, Watch>> {
+    static W: OnceLock<Mutex<HashMap<String, Watch>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Watches a service type under `name` in the background: each service that comes
+/// (`{ event: "up", ...the service }`, when resolved) or goes (`{ event: "down", fullname }`)
+/// is kept (the last 1000; when full the oldest go) for `mdns_receive`. Watching a name again
+/// keeps the watch it has.
+pub fn mdns_watch(name: &str, service: &str) -> Result<serde_json::Value, String> {
+    let ty = service_type(service)?;
+    if let Some(w) = watches().lock().map_err(|_| "poisoned".to_string())?.get(name) {
+        if w.ty == ty {
+            return Ok(json!({ "name": name, "type": ty, "watching": true }));
+        }
+    }
+    mdns_close(name);
+    let d = fresh()?;
+    let rx = d.browse(&ty).map_err(|e| format!("cannot browse {}: {}", ty, e))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let queue = Arc::new(Mutex::new((VecDeque::new(), 0u64)));
+    let (st, q, t2) = (stop.clone(), queue.clone(), ty.clone());
+    std::thread::spawn(move || {
+        while !st.load(Ordering::Relaxed) {
+            let ev = match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(e) => e,
+                Err(flume_err) => {
+                    if flume_err.to_string().contains("disconnected") {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let v = match ev {
+                ServiceEvent::ServiceResolved(info) => {
+                    let mut v = info_json(&info);
+                    v["event"] = json!("up");
+                    v
+                }
+                ServiceEvent::ServiceRemoved(_, full) => json!({ "event": "down", "fullname": full, "name": instance_of(&full, &t2) }),
+                _ => continue,
+            };
+            if let Ok(mut g) = q.lock() {
+                if g.0.len() >= 1000 {
+                    g.0.pop_front();
+                    g.1 += 1;
+                }
+                g.0.push_back(v);
+            }
+        }
+        let _ = d.stop_browse(&t2);
+        let _ = d.shutdown();
+    });
+    watches().lock().map_err(|_| "poisoned".to_string())?.insert(name.to_string(), Watch { stop, queue, ty: ty.clone() });
+    Ok(json!({ "name": name, "type": ty, "watching": true }))
+}
+
+/// What the watch `name` saw since the last call, oldest first, up to `max`, waiting up to
+/// `wait_ms` for something: `up` and `down` events (the first has `missed` when the buffer overflowed).
+pub fn mdns_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let q = watches().lock().map_err(|_| "poisoned".to_string())?.get(name).map(|w| w.queue.clone()).ok_or_else(|| format!("no mDNS watch named {:?}: call mdns_watch first", name))?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 60_000) as u64);
+    loop {
+        {
+            let mut g = q.lock().map_err(|_| "poisoned".to_string())?;
+            if !g.0.is_empty() || Instant::now() >= until {
+                let n = (max.max(1) as usize).min(g.0.len());
+                let mut out: Vec<Value> = g.0.drain(..n).collect();
+                if g.1 > 0 {
+                    if let Some(f) = out.first_mut() {
+                        f["missed"] = json!(g.1);
+                    }
+                    g.1 = 0;
+                }
+                return Ok(out);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Stops the watch `name`: true when there was one.
+pub fn mdns_close(name: &str) -> bool {
+    match watches().lock().ok().and_then(|mut m| m.remove(name)) {
+        Some(w) => {
+            w.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}

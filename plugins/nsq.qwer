@@ -1,0 +1,723 @@
+//! NSQ messaging: messages published through nsqd's HTTP API (one, many at once, or deferred), topics and channels made and their stats read, and consumers on its TCP protocol (IDENTIFY, SUB, RDY, FIN, REQ, TOUCH, heart-beats, TLS and AUTH) that connect to one nsqd or to every nsqd nsqlookupd knows for the topic, and buffer messages for the program to take and finish.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+// ---- HTTP: publishing, topics, stats, lookup ----
+
+fn base(url: &str) -> Result<String, String> {
+    let u = url.trim().trim_end_matches('/');
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return Err(format!("`{}` is not nsqd's HTTP address, like http://127.0.0.1:4151", url));
+    }
+    Ok(u.to_string())
+}
+
+fn name_ok(kind: &str, n: &str) -> Result<(), String> {
+    let core = n.strip_suffix("#ephemeral").unwrap_or(n);
+    if n.is_empty() || n.len() > 64 || core.is_empty() || !core.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Err(format!("`{}` is not a {} name: 1 to 64 letters, digits, . _ and -, ending in #ephemeral or not", n, kind));
+    }
+    Ok(())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn agent(timeout_ms: i64) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_millis(timeout_ms.clamp(100, 120_000) as u64)).build()
+}
+
+/// An agent for the publishing calls: `timeout_ms`, and `ca_file` for an https:// nsqd with its own CA.
+fn agent_for(o: &Value) -> Result<ureq::Agent, String> {
+    let mut b = ureq::AgentBuilder::new().timeout(Duration::from_millis(timeout_of(o).clamp(100, 120_000) as u64));
+    if let Some(ca) = o["ca_file"].as_str() {
+        b = b.tls_config(tls_config(&Some(ca.to_string()))?);
+    }
+    Ok(b.build())
+}
+
+fn timeout_of(o: &Value) -> i64 {
+    o["timeout_ms"].as_i64().unwrap_or(10_000)
+}
+
+fn answer(r: Result<ureq::Response, ureq::Error>, what: &str) -> Result<String, String> {
+    match r {
+        Ok(r) => r.into_string().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&body).ok().and_then(|v| v["message"].as_str().map(str::to_string)).unwrap_or(body);
+            Err(format!("nsqd refused {}: {} {}", what, code, msg.trim()))
+        }
+        Err(e) => Err(format!("cannot reach nsqd for {}: {}", what, e)),
+    }
+}
+
+/// Publishes one message to `topic` through nsqd's HTTP API (`url` is like http://127.0.0.1:4151). Options: `defer_ms` (deliver it that much later: dpub), `timeout_ms` (10000), `ca_file` (PEM, for an https:// nsqd with its own CA). True when nsqd took it.
+pub fn nsq_publish(url: &str, topic: &str, body: &str, options: serde_json::Value) -> Result<bool, String> {
+    name_ok("topic", topic)?;
+    if body.is_empty() {
+        return Err("NSQ does not take an empty message".into());
+    }
+    let mut u = format!("{}/pub?topic={}", base(url)?, enc(topic));
+    if let Some(d) = options["defer_ms"].as_i64() {
+        if d < 0 {
+            return Err("defer_ms is 0 or more".into());
+        }
+        u.push_str(&format!("&defer={}", d));
+    }
+    let r = agent_for(&options)?.post(&u).send_bytes(body.as_bytes());
+    Ok(answer(r, "the message")?.trim() == "OK")
+}
+
+/// Publishes several messages to `topic` in one request (mpub, in its binary form, so a message may hold newlines). Gives how many were sent.
+pub fn nsq_publish_many(url: &str, topic: &str, bodies: Vec<String>, options: serde_json::Value) -> Result<i64, String> {
+    name_ok("topic", topic)?;
+    if bodies.is_empty() {
+        return Ok(0);
+    }
+    if bodies.iter().any(|b| b.is_empty()) {
+        return Err("NSQ does not take an empty message".into());
+    }
+    let mut data = Vec::with_capacity(4 + bodies.iter().map(|b| b.len() + 4).sum::<usize>());
+    data.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
+    for b in &bodies {
+        data.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        data.extend_from_slice(b.as_bytes());
+    }
+    let u = format!("{}/mpub?topic={}&binary=true", base(url)?, enc(topic));
+    let r = agent_for(&options)?.post(&u).send_bytes(&data);
+    answer(r, "the messages")?;
+    Ok(bodies.len() as i64)
+}
+
+/// Makes `topic` on nsqd (it is also made by the first message or subscriber). True when done.
+pub fn nsq_create_topic(url: &str, topic: &str) -> Result<bool, String> {
+    name_ok("topic", topic)?;
+    let r = agent(10_000).post(&format!("{}/topic/create?topic={}", base(url)?, enc(topic))).call();
+    answer(r, "the topic").map(|_| true)
+}
+
+/// Makes `channel` on `topic`, so messages published before the first consumer comes are kept for it.
+pub fn nsq_create_channel(url: &str, topic: &str, channel: &str) -> Result<bool, String> {
+    name_ok("topic", topic)?;
+    name_ok("channel", channel)?;
+    let r = agent(10_000).post(&format!("{}/channel/create?topic={}&channel={}", base(url)?, enc(topic), enc(channel))).call();
+    answer(r, "the channel").map(|_| true)
+}
+
+/// nsqd's stats for `topic` ("" for all): `{ version, health, topics: [{ topic_name, depth, message_count, channels: [{ channel_name, depth, in_flight_count, requeue_count, clients }] }] }`.
+pub fn nsq_stats(url: &str, topic: &str) -> Result<Value, String> {
+    let mut u = format!("{}/stats?format=json", base(url)?);
+    if !topic.is_empty() {
+        u.push_str(&format!("&topic={}", enc(topic)));
+    }
+    let text = answer(agent(10_000).get(&u).call(), "stats")?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("nsqd's stats are not JSON: {}", e))?;
+    // nsqd before 1.0 wrapped its answers in { status_code, data }.
+    Ok(if v.get("data").is_some() && v.get("status_code").is_some() { v["data"].clone() } else { v })
+}
+
+/// Asks nsqlookupd (`url` like http://127.0.0.1:4161) which nsqd have `topic`: `{ channels, producers: [{ address, http, hostname, version }] }`, `address` being the TCP one consumers connect to.
+pub fn nsq_lookup(url: &str, topic: &str) -> Result<Value, String> {
+    name_ok("topic", topic)?;
+    let r = agent(10_000).get(&format!("{}/lookup?topic={}", base(url)?, enc(topic))).set("Accept", "application/vnd.nsq; version=1.0").call();
+    let text = match r {
+        Err(ureq::Error::Status(404, _)) => return Ok(json!({ "channels": [], "producers": [] })),
+        r => answer(r, "the lookup")?,
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("nsqlookupd's answer is not JSON: {}", e))?;
+    let v = if v.get("data").is_some() && v.get("status_code").is_some() { v["data"].clone() } else { v };
+    let producers: Vec<Value> = v["producers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    let host = p["broadcast_address"].as_str().or(p["hostname"].as_str()).unwrap_or("");
+                    let host = if host.contains(':') { format!("[{}]", host) } else { host.to_string() };
+                    json!({
+                        "address": format!("{}:{}", host, p["tcp_port"].as_i64().unwrap_or(4150)),
+                        "http": format!("http://{}:{}", host, p["http_port"].as_i64().unwrap_or(4151)),
+                        "hostname": p["hostname"], "version": p["version"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({ "channels": v["channels"].clone(), "producers": producers }))
+}
+
+// ---- TCP: consumers ----
+
+type Reader = Box<dyn Read + Send>;
+type Writer = Box<dyn Write + Send>;
+
+struct Tls {
+    s: Mutex<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    waiting: AtomicUsize,
+}
+struct TlsHalf(Arc<Tls>);
+impl Read for TlsHalf {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        while self.0.waiting.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.0.s.lock().unwrap_or_else(|e| e.into_inner()).read(b)
+    }
+}
+impl Write for TlsHalf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut g = self.0.s.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+        g.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut g = self.0.s.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+        g.flush()
+    }
+}
+
+#[derive(Clone)]
+struct Cfg {
+    topic: String,
+    channel: String,
+    rdy: u64,
+    identify: Value,
+    auth: Option<String>,
+    tls: bool,
+    ca_file: Option<String>,
+    timeout: Duration,
+}
+
+struct Link {
+    writer: Option<Writer>,
+    connected: bool,
+    last_error: Option<String>,
+    server: Value,
+}
+
+struct Consumer {
+    cfg: Cfg,
+    lookupd: Option<String>,
+    links: Mutex<HashMap<String, Arc<Mutex<Link>>>>,
+    st: Mutex<State>,
+    cond: Condvar,
+}
+
+struct State {
+    closing: bool,
+    msgs: VecDeque<Value>,
+    owner: HashMap<String, String>,
+    received: u64,
+    finished: u64,
+    requeued: u64,
+    heartbeats: u64,
+    errors: VecDeque<String>,
+}
+
+/// The consumers, by the name given to `nsq_subscribe`; each nsqd connection has a thread that reads it.
+static CONSUMERS: Mutex<Option<HashMap<String, Arc<Consumer>>>> = Mutex::new(None);
+
+impl Consumer {
+    fn st(&self) -> MutexGuard<'_, State> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn note(&self, e: String) {
+        let mut st = self.st();
+        st.errors.push_back(e);
+        while st.errors.len() > 20 {
+            st.errors.pop_front();
+        }
+    }
+}
+
+fn consumer(name: &str) -> Result<Arc<Consumer>, String> {
+    CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(name).cloned().ok_or(format!(
+        "no NSQ consumer named `{}`: call nsq_subscribe(\"{}\", \"127.0.0.1:4150\", topic, channel, {{}}) first",
+        name, name
+    ))
+}
+
+fn tls_config(ca_file: &Option<String>) -> Result<Arc<rustls::ClientConfig>, String> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = ca_file {
+        for c in rustls::pki_types::CertificateDer::pem_file_iter(path).map_err(|e| format!("ca_file {}: {}", path, e))? {
+            roots.add(c.map_err(|e| format!("ca_file {}: {}", path, e))?).map_err(|e| format!("ca_file {}: {}", path, e))?;
+        }
+    }
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+/// One frame: (type, data). 0 is a response, 1 an error, 2 a message.
+fn read_frame(r: &mut dyn Read, buf: &mut Vec<u8>, until: Option<Instant>) -> std::io::Result<Option<(u32, Vec<u8>)>> {
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if buf.len() >= 4 {
+            let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if size < 4 || size > 64 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a frame of {} bytes", size)));
+            }
+            if buf.len() >= 4 + size {
+                let kind = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let data = buf[8..4 + size].to_vec();
+                buf.drain(..4 + size);
+                return Ok(Some((kind, data)));
+            }
+        }
+        if let Some(u) = until {
+            if Instant::now() > u {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "nsqd did not answer in time"));
+            }
+        }
+        match r.read(&mut chunk) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "nsqd closed the connection")),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if until.is_none() {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn expect_ok(r: &mut dyn Read, buf: &mut Vec<u8>, until: Instant, what: &str) -> Result<Vec<u8>, String> {
+    loop {
+        match read_frame(r, buf, Some(until)).map_err(|e| format!("{}: {}", what, e))? {
+            Some((0, d)) if d == b"_heartbeat_" => continue,
+            Some((0, d)) => return Ok(d),
+            Some((1, d)) => return Err(format!("nsqd refused {}: {}", what, String::from_utf8_lossy(&d))),
+            Some((k, _)) => return Err(format!("nsqd sent a frame of type {} for {}", k, what)),
+            None => continue,
+        }
+    }
+}
+
+fn sized(cmd: &str, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(cmd.len() + 5 + body.len());
+    v.extend_from_slice(cmd.as_bytes());
+    v.push(b'\n');
+    v.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// Connects to one nsqd: magic, IDENTIFY (and TLS, AUTH), SUB, RDY. The two halves, what nsqd said, and bytes already read.
+fn open(addr: &str, cfg: &Cfg) -> Result<(Reader, Writer, Value, Vec<u8>), String> {
+    let (host, _) = addr.rsplit_once(':').ok_or(format!("`{}` is not host:port", addr))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let addrs: Vec<SocketAddr> = addr.to_socket_addrs().map_err(|e| format!("{}: {}", addr, e))?.collect();
+    let mut sock = None;
+    let mut last = format!("{} has no address", addr);
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, cfg.timeout) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => last = format!("cannot reach nsqd at {}: {}", a, e),
+        }
+    }
+    let mut sock = sock.ok_or(last)?;
+    let _ = sock.set_nodelay(true);
+    sock.set_write_timeout(Some(cfg.timeout)).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let until = Instant::now() + cfg.timeout;
+    let mut buf = vec![];
+    sock.write_all(b"  V2").map_err(|e| e.to_string())?;
+    let mut ident = cfg.identify.clone();
+    ident["feature_negotiation"] = json!(true);
+    ident["tls_v1"] = json!(cfg.tls);
+    sock.write_all(&sized("IDENTIFY", ident.to_string().as_bytes())).map_err(|e| e.to_string())?;
+    let said = expect_ok(&mut sock, &mut buf, until, "IDENTIFY")?;
+    let server: Value = serde_json::from_slice(&said).unwrap_or_else(|_| json!({ "answer": String::from_utf8_lossy(&said) }));
+    let (mut reader, mut writer): (Reader, Writer) = if cfg.tls {
+        if server["tls_v1"].as_bool() != Some(true) {
+            return Err(format!("nsqd at {} does not offer TLS (start it with --tls-cert and --tls-key)", addr));
+        }
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| format!("`{}` is not a host name for TLS", host))?;
+        let conn = rustls::ClientConnection::new(tls_config(&cfg.ca_file)?, name).map_err(|e| e.to_string())?;
+        let t = Arc::new(Tls { s: Mutex::new(rustls::StreamOwned::new(conn, sock)), waiting: AtomicUsize::new(0) });
+        let mut r: Reader = Box::new(TlsHalf(t.clone()));
+        buf.clear();
+        // After the handshake, nsqd says OK over TLS.
+        expect_ok(&mut r, &mut buf, until, "the TLS upgrade").map_err(|e| if e.contains("UnknownIssuer") { format!("{} (for nsqd's own CA, give ca_file)", e) } else { e })?;
+        (r, Box::new(TlsHalf(t)))
+    } else {
+        let r = sock.try_clone().map_err(|e| e.to_string())?;
+        (Box::new(r), Box::new(sock))
+    };
+    if server["auth_required"].as_bool() == Some(true) {
+        let secret = cfg.auth.clone().ok_or(format!("nsqd at {} asks for AUTH: give {{ auth_secret }}", addr))?;
+        writer.write_all(&sized("AUTH", secret.as_bytes())).map_err(|e| e.to_string())?;
+        expect_ok(&mut reader, &mut buf, until, "AUTH")?;
+    }
+    writer.write_all(format!("SUB {} {}\n", cfg.topic, cfg.channel).as_bytes()).map_err(|e| e.to_string())?;
+    expect_ok(&mut reader, &mut buf, until, "SUB")?;
+    let max_rdy = server["max_rdy_count"].as_u64().unwrap_or(2500);
+    writer.write_all(format!("RDY {}\n", cfg.rdy.min(max_rdy)).as_bytes()).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok((reader, writer, server, buf))
+}
+
+fn write_to(link: &Arc<Mutex<Link>>, bytes: &[u8]) -> Result<(), String> {
+    let mut l = link.lock().unwrap_or_else(|e| e.into_inner());
+    let r = match l.writer.as_mut() {
+        Some(w) => w.write_all(bytes).and_then(|_| w.flush()).map_err(|e| e.to_string()),
+        None => Err("not connected".into()),
+    };
+    if let Err(e) = &r {
+        l.connected = false;
+        l.writer = None;
+        l.last_error = Some(e.clone());
+    }
+    r
+}
+
+/// Reads one nsqd connection, connecting again (with a growing pause) while the consumer lives and, with nsqlookupd, while the nsqd is still listed.
+fn run(c: Arc<Consumer>, addr: String, link: Arc<Mutex<Link>>) {
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        if c.st().closing || !c.links.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&addr) {
+            return;
+        }
+        let (mut reader, writer, server, mut buf) = match open(&addr, &c.cfg) {
+            Ok(x) => x,
+            Err(e) => {
+                {
+                    let mut l = link.lock().unwrap_or_else(|e| e.into_inner());
+                    l.last_error = Some(e.clone());
+                    l.connected = false;
+                }
+                c.note(e);
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(15));
+                continue;
+            }
+        };
+        backoff = Duration::from_millis(250);
+        {
+            let mut l = link.lock().unwrap_or_else(|e| e.into_inner());
+            l.writer = Some(writer);
+            l.connected = true;
+            l.server = server;
+        }
+        c.cond.notify_all();
+        loop {
+            if c.st().closing {
+                return;
+            }
+            if !link.lock().unwrap_or_else(|e| e.into_inner()).connected {
+                break;
+            }
+            match read_frame(&mut reader, &mut buf, None) {
+                Ok(None) => {}
+                Ok(Some((0, d))) if d == b"_heartbeat_" => {
+                    c.st().heartbeats += 1;
+                    let _ = write_to(&link, b"NOP\n");
+                }
+                Ok(Some((0, d))) if d == b"CLOSE_WAIT" => {
+                    return;
+                }
+                Ok(Some((0, _))) => {}
+                Ok(Some((1, d))) => {
+                    let e = String::from_utf8_lossy(&d).to_string();
+                    c.note(format!("nsqd at {}: {}", addr, e));
+                    // These leave the connection open; the others close it.
+                    if !(e.starts_with("E_FIN_FAILED") || e.starts_with("E_REQ_FAILED") || e.starts_with("E_TOUCH_FAILED")) {
+                        let mut l = link.lock().unwrap_or_else(|e| e.into_inner());
+                        l.connected = false;
+                        l.writer = None;
+                        l.last_error = Some(e);
+                    }
+                }
+                Ok(Some((2, d))) if d.len() >= 26 => {
+                    let ts = i64::from_be_bytes(d[0..8].try_into().unwrap_or([0; 8]));
+                    let attempts = u16::from_be_bytes([d[8], d[9]]);
+                    let id = String::from_utf8_lossy(&d[10..26]).to_string();
+                    let body = String::from_utf8_lossy(&d[26..]).to_string();
+                    let mut st = c.st();
+                    st.owner.insert(id.clone(), addr.clone());
+                    st.msgs.push_back(json!({ "id": id, "body": body, "attempts": attempts, "timestamp": ts / 1_000_000, "nsqd": addr }));
+                    st.received += 1;
+                    drop(st);
+                    c.cond.notify_all();
+                }
+                Ok(Some((k, _))) => c.note(format!("nsqd at {} sent a frame of type {}", addr, k)),
+                Err(e) => {
+                    let mut l = link.lock().unwrap_or_else(|e| e.into_inner());
+                    l.connected = false;
+                    l.writer = None;
+                    l.last_error = Some(e.to_string());
+                    drop(l);
+                    c.note(format!("nsqd at {}: {}", addr, e));
+                }
+            }
+        }
+        // Messages from the broken connection cannot be finished any more: nsqd sends them again.
+        let mut st = c.st();
+        st.msgs.retain(|m| m["nsqd"] != addr.as_str());
+        st.owner.retain(|_, a| a != &addr);
+    }
+}
+
+fn add_link(c: &Arc<Consumer>, addr: &str) -> Result<(), String> {
+    let mut links = c.links.lock().unwrap_or_else(|e| e.into_inner());
+    if links.contains_key(addr) {
+        return Ok(());
+    }
+    let link = Arc::new(Mutex::new(Link { writer: None, connected: false, last_error: None, server: Value::Null }));
+    links.insert(addr.to_string(), link.clone());
+    drop(links);
+    let (c2, a2) = (c.clone(), addr.to_string());
+    std::thread::Builder::new().name(format!("nsq-{}", addr)).spawn(move || run(c2, a2, link)).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Asks nsqlookupd for the topic's nsqd now and then, connecting to new ones and leaving those no longer listed.
+fn poll_lookupd(c: Arc<Consumer>, url: String, every: Duration) {
+    loop {
+        std::thread::sleep(every);
+        if c.st().closing {
+            return;
+        }
+        match nsq_lookup(&url, &c.cfg.topic) {
+            Ok(v) => {
+                let now: Vec<String> = v["producers"].as_array().map(|a| a.iter().filter_map(|p| p["address"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+                for a in &now {
+                    let _ = add_link(&c, a);
+                }
+                let mut links = c.links.lock().unwrap_or_else(|e| e.into_inner());
+                let gone: Vec<String> = links.keys().filter(|k| !now.contains(k)).cloned().collect();
+                for g in gone {
+                    if let Some(l) = links.remove(&g) {
+                        let _ = write_to(&l, b"CLS\n");
+                    }
+                }
+            }
+            Err(e) => c.note(e),
+        }
+    }
+}
+
+/// Subscribes as `name` to `topic` on `channel` (each channel gets every message; consumers on one channel share them). `address` is one nsqd's TCP address (`127.0.0.1:4150`, or a list of them), or nsqlookupd's HTTP address (`http://127.0.0.1:4161`) to connect to every nsqd that has the topic, asking again every `lookup_interval_ms` (60000).
+/// Options: `max_in_flight` (messages nsqd sends before some are finished: 100, which also bounds what is buffered here), `msg_timeout_ms` (time to finish one before nsqd sends it again), `heartbeat_interval_ms`, `client_id`, `hostname`, `tls` (true: upgrade with TLS), `ca_file`, `auth_secret`, `timeout_ms` (10000). Gives `{ name, nsqd }` once the first connection is up.
+pub fn nsq_subscribe(name: &str, address: serde_json::Value, topic: &str, channel: &str, options: serde_json::Value) -> Result<Value, String> {
+    name_ok("topic", topic)?;
+    name_ok("channel", channel)?;
+    let mut identify = json!({ "user_agent": "quillo-nsq/1.0", "client_id": options["client_id"].as_str().unwrap_or("quillo"), "hostname": options["hostname"].as_str().unwrap_or("quillo") });
+    if let Some(ms) = options["msg_timeout_ms"].as_i64() {
+        identify["msg_timeout"] = json!(ms);
+    }
+    if let Some(ms) = options["heartbeat_interval_ms"].as_i64() {
+        identify["heartbeat_interval"] = json!(ms);
+    }
+    let cfg = Cfg {
+        topic: topic.to_string(),
+        channel: channel.to_string(),
+        rdy: options["max_in_flight"].as_u64().unwrap_or(100).clamp(1, 100_000),
+        identify,
+        auth: options["auth_secret"].as_str().map(str::to_string),
+        tls: options["tls"].as_bool().unwrap_or(false),
+        ca_file: options["ca_file"].as_str().map(str::to_string),
+        timeout: Duration::from_millis(options["timeout_ms"].as_u64().unwrap_or(10_000).clamp(100, 120_000)),
+    };
+    let list: Vec<String> = match &address {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => return Err("the address is nsqd's host:port, a list of them, or nsqlookupd's http:// address".into()),
+    };
+    if list.is_empty() {
+        return Err("no nsqd address given".into());
+    }
+    let lookupd = if list[0].starts_with("http://") || list[0].starts_with("https://") { Some(list[0].clone()) } else { None };
+    let addrs: Vec<String> = match &lookupd {
+        Some(u) => nsq_lookup(u, topic)?["producers"].as_array().map(|a| a.iter().filter_map(|p| p["address"].as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        None => list,
+    };
+    let c = Arc::new(Consumer {
+        cfg,
+        lookupd: lookupd.clone(),
+        links: Mutex::new(HashMap::new()),
+        st: Mutex::new(State { closing: false, msgs: VecDeque::new(), owner: HashMap::new(), received: 0, finished: 0, requeued: 0, heartbeats: 0, errors: VecDeque::new() }),
+        cond: Condvar::new(),
+    });
+    if let Some(old) = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), c.clone()) {
+        close_consumer(&old);
+    }
+    for a in &addrs {
+        add_link(&c, a)?;
+    }
+    if let Some(u) = lookupd {
+        let every = Duration::from_millis(options["lookup_interval_ms"].as_u64().unwrap_or(60_000).clamp(1000, 3_600_000));
+        let c2 = c.clone();
+        std::thread::Builder::new().name("nsq-lookupd".into()).spawn(move || poll_lookupd(c2, u, every)).map_err(|e| e.to_string())?;
+    }
+    // Wait (up to the timeout) for the connections to be up, so what is published next is seen; when every one has failed, a wrong address, topic or secret is an error now.
+    let until = Instant::now() + c.cfg.timeout;
+    loop {
+        let states: Vec<(bool, Option<String>, Value)> = c
+            .links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|l| {
+                let l = l.lock().unwrap_or_else(|e| e.into_inner());
+                (l.connected, l.last_error.clone(), l.server.clone())
+            })
+            .collect();
+        if states.iter().all(|s| s.0) {
+            let server = states.first().map(|s| s.2.clone()).unwrap_or(Value::Null);
+            return Ok(json!({ "name": name, "nsqd": addrs, "lookupd": c.lookupd, "server": server }));
+        }
+        let failed: Vec<String> = states.iter().filter(|s| !s.0).filter_map(|s| s.1.clone()).collect();
+        if (!states.is_empty() && failed.len() == states.len() && !states.iter().any(|s| s.0)) || Instant::now() > until {
+            if states.iter().any(|s| s.0) {
+                return Ok(json!({ "name": name, "nsqd": addrs, "lookupd": c.lookupd, "not_yet": failed }));
+            }
+            CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+            close_consumer(&c);
+            return Err(failed.first().cloned().unwrap_or_else(|| "no nsqd connection came up in time".into()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Takes up to `max` buffered messages, waiting up to `wait_ms` for the first: `{ id, body, attempts, timestamp, nsqd }` each (`timestamp` in ms since 1970, when it was published). Finish each with `nsq_finish`, or `nsq_requeue` it; one not finished in time is sent again by nsqd.
+pub fn nsq_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = consumer(name)?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 300_000) as u64);
+    let mut st = c.st();
+    loop {
+        if !st.msgs.is_empty() {
+            let n = (max.max(1) as usize).min(st.msgs.len());
+            return Ok(st.msgs.drain(..n).collect());
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || st.closing {
+            return Ok(vec![]);
+        }
+        st = c.cond.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+fn id_of(m: &Value) -> Result<String, String> {
+    match m {
+        Value::String(s) => Ok(s.clone()),
+        Value::Object(_) => m["id"].as_str().map(str::to_string).ok_or("this message has no id".into()),
+        _ => Err("give the message from nsq_receive, or its id".into()),
+    }
+}
+
+fn to_owner(name: &str, message: &Value, cmd: impl Fn(&str) -> String, forget: bool) -> Result<bool, String> {
+    let c = consumer(name)?;
+    let id = id_of(message)?;
+    if id.len() != 16 {
+        return Err(format!("`{}` is not an NSQ message id (16 characters)", id));
+    }
+    let addr = {
+        let st = c.st();
+        match st.owner.get(&id) {
+            Some(a) => a.clone(),
+            None => return Ok(false),
+        }
+    };
+    let link = c.links.lock().unwrap_or_else(|e| e.into_inner()).get(&addr).cloned();
+    let Some(link) = link else { return Ok(false) };
+    write_to(&link, cmd(&id).as_bytes())?;
+    if forget {
+        c.st().owner.remove(&id);
+    }
+    Ok(true)
+}
+
+/// Finishes a message (the map from `nsq_receive`, or its id): nsqd forgets it. False when it is not one this consumer holds (its connection broke: nsqd sends it again).
+pub fn nsq_finish(name: &str, message: serde_json::Value) -> Result<bool, String> {
+    let r = to_owner(name, &message, |id| format!("FIN {}\n", id), true)?;
+    if r {
+        consumer(name)?.st().finished += 1;
+    }
+    Ok(r)
+}
+
+/// Gives a message back to nsqd, to be sent again after `delay_ms` (0: now), its `attempts` counted up.
+pub fn nsq_requeue(name: &str, message: serde_json::Value, delay_ms: i64) -> Result<bool, String> {
+    let d = delay_ms.max(0);
+    let r = to_owner(name, &message, move |id| format!("REQ {} {}\n", id, d), true)?;
+    if r {
+        consumer(name)?.st().requeued += 1;
+    }
+    Ok(r)
+}
+
+/// Asks for more time on a message: its timeout starts again.
+pub fn nsq_touch(name: &str, message: serde_json::Value) -> Result<bool, String> {
+    to_owner(name, &message, |id| format!("TOUCH {}\n", id), false)
+}
+
+/// The consumer's state: `{ topic, channel, connections: [{ nsqd, connected, last_error }], buffered, received, finished, requeued, heartbeats, errors }`.
+pub fn nsq_consumer_stats(name: &str) -> Result<Value, String> {
+    let c = consumer(name)?;
+    let links: Vec<Value> = c
+        .links
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(a, l)| {
+            let l = l.lock().unwrap_or_else(|e| e.into_inner());
+            json!({ "nsqd": a, "connected": l.connected, "last_error": l.last_error, "version": l.server["version"], "tls": l.server["tls_v1"] })
+        })
+        .collect();
+    let st = c.st();
+    Ok(json!({
+        "topic": c.cfg.topic, "channel": c.cfg.channel, "connections": links, "buffered": st.msgs.len(),
+        "received": st.received, "finished": st.finished, "requeued": st.requeued, "heartbeats": st.heartbeats,
+        "errors": st.errors.iter().cloned().collect::<Vec<_>>(),
+    }))
+}
+
+fn close_consumer(c: &Arc<Consumer>) {
+    for l in c.links.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = write_to(l, b"CLS\n");
+    }
+    // Let nsqd answer CLOSE_WAIT before the threads stop reading.
+    std::thread::sleep(Duration::from_millis(100));
+    c.st().closing = true;
+    c.links.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    c.cond.notify_all();
+}
+
+/// Closes the consumer `name`: CLS to each nsqd, so it stops sending; messages not finished go back to the channel. Whether there was one.
+pub fn nsq_close(name: &str) -> Result<bool, String> {
+    let c = CONSUMERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    match c {
+        Some(c) => {
+            close_consumer(&c);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}

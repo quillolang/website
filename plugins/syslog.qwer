@@ -1,0 +1,546 @@
+//! Syslog messages built and read, RFC 5424 with structured data and the older BSD format (RFC 3164), and sent to a log server over UDP, TCP (octet counting or newline framing) or TLS, with connections kept open; and parsing for packets taken with `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "1"
+
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const FACILITIES: [&str; 24] = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron", "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"];
+const SEVERITIES: [&str; 8] = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+fn facility(v: &Value) -> Result<u8, String> {
+    match v {
+        Value::Null => Ok(1),
+        Value::Number(n) => n.as_u64().filter(|&x| x < 24).map(|x| x as u8).ok_or(format!("a facility number is 0 to 23, not {}", n)),
+        Value::String(s) => {
+            let s = s.to_lowercase();
+            FACILITIES.iter().position(|f| *f == s).map(|x| x as u8).ok_or(format!("unknown facility {:?}: one of {}", s, FACILITIES.join(", ")))
+        }
+        _ => Err(format!("`facility` is a name or a number, not {}", v)),
+    }
+}
+
+fn severity(v: &Value) -> Result<u8, String> {
+    match v {
+        Value::Null => Ok(6),
+        Value::Number(n) => n.as_u64().filter(|&x| x < 8).map(|x| x as u8).ok_or(format!("a severity number is 0 to 7, not {}", n)),
+        Value::String(s) => {
+            let s = s.to_lowercase();
+            let s = match s.as_str() { "emergency" | "panic" => "emerg", "critical" => "crit", "error" => "err", "warn" => "warning", "informational" => "info", x => x };
+            SEVERITIES.iter().position(|f| *f == s).map(|x| x as u8).ok_or(format!("unknown severity {:?}: one of {}", s, SEVERITIES.join(", ")))
+        }
+        _ => Err(format!("`severity` is a name or a number, not {}", v)),
+    }
+}
+
+fn time_of(v: &Value) -> Result<DateTime<FixedOffset>, String> {
+    match v {
+        Value::Null => Ok(Utc::now().fixed_offset()),
+        Value::Number(n) => {
+            let ms = n.as_f64().unwrap_or(0.0) as i64;
+            Utc.timestamp_millis_opt(ms).single().map(|t| t.fixed_offset()).ok_or(format!("{} is not a time in milliseconds", n))
+        }
+        Value::String(s) => DateTime::parse_from_rfc3339(s).map_err(|e| format!("`time` {:?} is not an RFC 3339 time (2026-10-30T12:00:00Z): {}", s, e)),
+        _ => Err("`time` is milliseconds since 1970 or RFC 3339 text".into()),
+    }
+}
+
+/// A header field: printable ASCII with no spaces, cut to its maximum, `-` when empty.
+fn header_field(v: &Value, name: &str, max: usize) -> Result<String, String> {
+    let s = match v {
+        Value::Null => return Ok("-".into()),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err(format!("`{}` is text", name)),
+    };
+    if s.is_empty() {
+        return Ok("-".into());
+    }
+    if let Some(c) = s.chars().find(|c| !(('!'..='~').contains(c))) {
+        return Err(format!("`{}` {:?} may hold only printable ASCII with no spaces ({:?} is not)", name, s, c));
+    }
+    Ok(s.chars().take(max).collect())
+}
+
+fn sd_name(s: &str, what: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 32 || s.chars().any(|c| !(('!'..='~').contains(&c)) || c == '=' || c == ']' || c == '"') {
+        return Err(format!("{} {:?} must be 1 to 32 printable ASCII characters without spaces, =, ] or \"", what, s));
+    }
+    Ok(())
+}
+
+fn sd_value(v: &Value) -> String {
+    let s = match v { Value::String(s) => s.clone(), Value::Null => String::new(), other => other.to_string() };
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace(']', "\\]")
+}
+
+fn structured(sd: &Value) -> Result<String, String> {
+    let map = match sd {
+        Value::Null => return Ok("-".into()),
+        Value::Object(m) if m.is_empty() => return Ok("-".into()),
+        Value::Object(m) => m,
+        _ => return Err("`structured_data` is a map: `{ \"origin\": { ip: \"10.0.0.5\" }, \"order@32473\": { id: \"42\" } }`".into()),
+    };
+    let mut out = String::new();
+    for (id, params) in map {
+        sd_name(id, "an SD-ID")?;
+        out.push('[');
+        out.push_str(id);
+        let params = params.as_object().ok_or(format!("the element {:?} is a map of names to values", id))?;
+        for (k, v) in params {
+            sd_name(k, "a parameter name")?;
+            let values: Vec<&Value> = match v { Value::Array(a) => a.iter().collect(), other => vec![other] };
+            for v in values {
+                out.push_str(&format!(" {}=\"{}\"", k, sd_value(v)));
+            }
+        }
+        out.push(']');
+    }
+    Ok(out)
+}
+
+fn format_message(m: &Value) -> Result<String, String> {
+    if !m.is_object() {
+        return Err("a message is a map: `{ severity: \"err\", app: \"shop\", message: \"payment failed\" }`".into());
+    }
+    let pri = facility(&m["facility"])? as u32 * 8 + severity(&m["severity"])? as u32;
+    let t = time_of(&m["time"])?;
+    let text = match &m["message"] { Value::Null => String::new(), Value::String(s) => s.clone(), other => other.to_string() };
+    let host = if m["host"].is_null() { hostname() } else { header_field(&m["host"], "host", 255)? };
+    let format = match &m["format"] { Value::Null => "5424".to_string(), Value::String(s) => s.to_lowercase(), Value::Number(n) => n.to_string(), _ => String::new() };
+    match format.as_str() {
+        "5424" | "rfc5424" => {
+            let mut s = format!(
+                "<{}>1 {} {} {} {} {} {}",
+                pri,
+                t.to_rfc3339_opts(SecondsFormat::Millis, true),
+                host,
+                header_field(&m["app"], "app", 48)?,
+                header_field(&m["procid"], "procid", 128)?,
+                header_field(&m["msgid"], "msgid", 32)?,
+                structured(&m["structured_data"])?
+            );
+            if !text.is_empty() {
+                s.push(' ');
+                if m["bom"].as_bool().unwrap_or(false) {
+                    s.push('\u{feff}');
+                }
+                s.push_str(&text);
+            }
+            Ok(s)
+        }
+        "3164" | "rfc3164" | "bsd" => {
+            let local = t;
+            let tag = match (&m["app"], &m["procid"]) {
+                (Value::Null, _) => String::new(),
+                (a, Value::Null) => format!("{}: ", header_field(a, "app", 32)?),
+                (a, p) => format!("{}[{}]: ", header_field(a, "app", 32)?, header_field(p, "procid", 128)?),
+            };
+            Ok(format!("<{}>{} {:>2} {} {} {}{}", pri, MONTHS[local.month0() as usize], local.day(), local.format("%H:%M:%S"), host, tag, text))
+        }
+        f => Err(format!("`format` is \"5424\" or \"3164\", not {:?}", f)),
+    }
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()).or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string())).filter(|h| !h.is_empty() && h.chars().all(|c| ('!'..='~').contains(&c))).unwrap_or_else(|| "-".into())
+}
+
+/// A message as syslog text. `message` is `{ format: "5424" (default) | "3164", facility: "local0" | 0..23 (user unless given), severity: "info" | "err" | 0..7 (info unless given), time (milliseconds or RFC 3339; now unless given), host, app, procid, msgid, structured_data: { "id@32473": { name: "value" } } (5424 only; a list gives a parameter several times), message, bom: true }`.
+pub fn syslog_format(message: serde_json::Value) -> Result<String, String> {
+    format_message(&message)
+}
+
+// ---------------------------------------------------------------- reading
+
+fn field<'a>(s: &'a str) -> (&'a str, &'a str) {
+    match s.find(' ') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    }
+}
+
+fn nil(s: &str) -> Value {
+    if s == "-" { Value::Null } else { json!(s) }
+}
+
+fn parse_sd(mut s: &str) -> Result<(Value, &str), String> {
+    if let Some(rest) = s.strip_prefix('-') {
+        return Ok((json!({}), rest.strip_prefix(' ').unwrap_or(rest)));
+    }
+    let mut out = serde_json::Map::new();
+    while s.starts_with('[') {
+        let end_id = s.find(|c| c == ' ' || c == ']').ok_or("an SD element is not closed with ]")?;
+        let id = &s[1..end_id];
+        sd_name(id, "an SD-ID")?;
+        s = &s[end_id..];
+        let mut params = serde_json::Map::new();
+        loop {
+            if let Some(rest) = s.strip_prefix(']') {
+                s = rest;
+                break;
+            }
+            s = s.strip_prefix(' ').ok_or(format!("in [{}: a space or ] expected", id))?;
+            let eq = s.find('=').ok_or(format!("in [{}: a parameter without =", id))?;
+            let name = &s[..eq];
+            sd_name(name, "a parameter name")?;
+            s = s[eq + 1..].strip_prefix('"').ok_or(format!("in [{}: the value of {} is not quoted", id, name))?;
+            let mut val = String::new();
+            let mut chars = s.char_indices();
+            let mut end = None;
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some((_, n @ ('"' | '\\' | ']'))) => val.push(n),
+                        Some((_, n)) => { val.push('\\'); val.push(n); }
+                        None => break,
+                    },
+                    '"' => { end = Some(i); break; }
+                    c => val.push(c),
+                }
+            }
+            let end = end.ok_or(format!("in [{}: the value of {} is not closed with \"", id, name))?;
+            s = &s[end + 1..];
+            match params.get_mut(name) {
+                Some(Value::Array(a)) => a.push(json!(val)),
+                Some(old) => { let first = old.take(); *old = json!([first, val]); }
+                None => { params.insert(name.to_string(), json!(val)); }
+            }
+        }
+        out.insert(id.to_string(), Value::Object(params));
+    }
+    Ok((Value::Object(out), s.strip_prefix(' ').unwrap_or(s)))
+}
+
+fn pri(s: &str) -> Result<(u32, &str), String> {
+    let s = s.strip_prefix('<').ok_or("a syslog message starts with <PRI>, like <34>")?;
+    let end = s.find('>').filter(|&e| e >= 1 && e <= 3).ok_or("a syslog <PRI> is 1 to 3 digits in < >")?;
+    let p: u32 = s[..end].parse().map_err(|_| format!("<{}> is not a priority", &s[..end]))?;
+    if p > 191 || (end > 1 && s.starts_with('0')) {
+        return Err(format!("<{}> is not a priority (0 to 191)", &s[..end]));
+    }
+    Ok((p, &s[end + 1..]))
+}
+
+fn base(p: u32, format: &str) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("format".into(), json!(format));
+    m.insert("priority".into(), json!(p));
+    m.insert("facility".into(), json!(FACILITIES[(p / 8) as usize]));
+    m.insert("facility_code".into(), json!(p / 8));
+    m.insert("severity".into(), json!(SEVERITIES[(p % 8) as usize]));
+    m.insert("severity_code".into(), json!(p % 8));
+    m
+}
+
+fn parse_5424(p: u32, s: &str) -> Result<Value, String> {
+    let mut m = base(p, "5424");
+    let (v, s) = field(s);
+    m.insert("version".into(), json!(v.parse::<i64>().map_err(|_| "not a version")?));
+    let (t, s) = field(s);
+    let time = if t == "-" { Value::Null } else {
+        let d = DateTime::parse_from_rfc3339(t).map_err(|e| format!("the time {:?} is not RFC 3339: {}", t, e))?;
+        json!(d.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    };
+    m.insert("time".into(), time);
+    m.insert("time_text".into(), json!(t));
+    let (h, s) = field(s);
+    let (a, s) = field(s);
+    let (pid, s) = field(s);
+    let (mid, s) = field(s);
+    for (k, v) in [("host", h), ("app", a), ("procid", pid), ("msgid", mid)] {
+        if v.is_empty() {
+            return Err(format!("the RFC 5424 header ends before `{}`", k));
+        }
+        m.insert(k.into(), nil(v));
+    }
+    let (sd, rest) = parse_sd(s)?;
+    m.insert("structured_data".into(), sd);
+    m.insert("message".into(), json!(rest.strip_prefix('\u{feff}').unwrap_or(rest)));
+    Ok(Value::Object(m))
+}
+
+fn parse_3164(p: u32, s: &str) -> Value {
+    let mut m = base(p, "3164");
+    let mut rest = s;
+    // "Oct 30 09:15:02" (the day padded with a space), with no year: this year, or last year
+    // when that would be more than a day ahead.
+    let mut time = Value::Null;
+    if s.len() >= 15 && MONTHS.contains(&&s[..3]) {
+        let stamp = s[..15].replace("  ", " ");
+        let now = Utc::now();
+        for year in [now.year(), now.year() - 1] {
+            if let Ok(t) = NaiveDateTime::parse_from_str(&format!("{} {}", year, stamp), "%Y %b %d %H:%M:%S") {
+                let t = Utc.from_utc_datetime(&t);
+                if t <= now + chrono::Duration::days(1) {
+                    time = json!(t.to_rfc3339_opts(SecondsFormat::Secs, true));
+                    break;
+                }
+            }
+        }
+        if !time.is_null() {
+            m.insert("time_text".into(), json!(&s[..15]));
+            rest = s[15..].strip_prefix(' ').unwrap_or(&s[15..]);
+        }
+    }
+    m.insert("time".into(), time.clone());
+    let (mut host, mut app, mut pid) = (Value::Null, Value::Null, Value::Null);
+    if !time.is_null() {
+        let (h, r) = field(rest);
+        // A host has no colon or bracket; "su: ..." with no host is a tag.
+        if !h.ends_with(':') && !h.contains('[') {
+            host = json!(h);
+            rest = r;
+        }
+    }
+    let tag_end = rest.find(|c: char| c == ':' || c == '[' || c == ' ');
+    if let Some(e) = tag_end {
+        let tag = &rest[..e];
+        if !tag.is_empty() && tag.len() <= 48 && tag.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+            let after = &rest[e..];
+            if let Some(a) = after.strip_prefix('[') {
+                if let Some(close) = a.find("]:") {
+                    app = json!(tag);
+                    pid = json!(&a[..close]);
+                    rest = a[close + 2..].strip_prefix(' ').unwrap_or(&a[close + 2..]);
+                }
+            } else if let Some(a) = after.strip_prefix(':') {
+                app = json!(tag);
+                rest = a.strip_prefix(' ').unwrap_or(a);
+            }
+        }
+    }
+    m.insert("version".into(), Value::Null);
+    m.insert("host".into(), host);
+    m.insert("app".into(), app);
+    m.insert("procid".into(), pid);
+    m.insert("msgid".into(), Value::Null);
+    m.insert("structured_data".into(), json!({}));
+    m.insert("message".into(), json!(rest));
+    Value::Object(m)
+}
+
+fn parse_one(text: &str) -> Result<Value, String> {
+    let t = text.trim_end_matches(|c| c == '\n' || c == '\r' || c == '\0');
+    let (p, rest) = pri(t)?;
+    if rest.starts_with("1 ") {
+        parse_5424(p, rest)
+    } else {
+        Ok(parse_3164(p, rest))
+    }
+}
+
+/// One syslog message read, either format (found by itself): `{ format: "5424" | "3164", priority, facility, facility_code, severity, severity_code, version, time (UTC, RFC 3339, or null), time_text, host, app, procid, msgid, structured_data: { id: { name: value } } (a parameter given twice is a list), message }`. Pass a `udp.listen` packet's `p.text` straight in.
+pub fn syslog_parse(text: &str) -> Result<Value, String> {
+    parse_one(text)
+}
+
+/// The messages in a TCP stream's or file's text, framed by octet counting (`57 <34>1 ...`, RFC 6587) or one per line, found by itself: a list of messages as `syslog_parse` gives them, and `{ error, text }` for any that did not read.
+pub fn syslog_parse_many(text: &str) -> Vec<Value> {
+    let mut out = vec![];
+    let mut s = text;
+    loop {
+        s = s.trim_start_matches(|c| c == '\n' || c == '\r' || c == ' ');
+        if s.is_empty() {
+            break;
+        }
+        let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let frame: &str;
+        if digits > 0 && s.as_bytes().get(digits) == Some(&b' ') {
+            let n: usize = s[..digits].parse().unwrap_or(0);
+            let start = digits + 1;
+            let mut end = (start + n).min(s.len());
+            while !s.is_char_boundary(end) { end -= 1; }
+            frame = &s[start..end];
+            s = &s[end..];
+        } else {
+            let end = s.find('\n').unwrap_or(s.len());
+            frame = &s[..end];
+            s = &s[end..];
+        }
+        out.push(parse_one(frame).unwrap_or_else(|e| json!({ "error": e, "text": frame })));
+    }
+    out
+}
+
+// ---------------------------------------------------------------- sending
+
+enum Conn {
+    Tcp(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => { s.write_all(b)?; s.flush() }
+            Conn::Tls(s) => { s.write_all(b)?; s.flush() }
+        }
+    }
+}
+
+static CONNS: Mutex<Option<HashMap<String, Conn>>> = Mutex::new(None);
+
+fn tls_config(ca_file: Option<&str>) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_file {
+        Some(f) => {
+            let data = std::fs::read(f).map_err(|e| format!("cannot read the CA file {}: {}", f, e))?;
+            for c in rustls_pemfile::certs(&mut &data[..]) {
+                roots.add(c.map_err(|e| format!("{}: {}", f, e))?).map_err(|e| format!("{}: {}", f, e))?;
+            }
+            if roots.is_empty() {
+                return Err(format!("{} has no PEM certificate", f));
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+struct Target {
+    scheme: String,
+    host: String,
+    addr: SocketAddr,
+}
+
+fn target(url: &str) -> Result<Target, String> {
+    let (scheme, rest) = url.split_once("://").ok_or(format!("{:?}: write udp://host:514, tcp://host:514 or tls://host:6514", url))?;
+    let scheme = scheme.to_lowercase();
+    let default = match scheme.as_str() { "udp" | "tcp" => 514, "tls" => 6514, s => return Err(format!("{}:// is not a syslog transport: udp, tcp or tls", s)) };
+    let hp = rest.trim_end_matches('/');
+    let (host, port) = if let Some(h) = hp.strip_prefix('[') {
+        let (h, p) = h.split_once(']').ok_or("an IPv6 address is written [::1]:514")?;
+        (h.to_string(), p.strip_prefix(':').map(|p| p.parse::<u16>()).transpose().map_err(|_| "bad port")?.unwrap_or(default))
+    } else {
+        match hp.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("{:?} is not a port", p))?),
+            None => (hp.to_string(), default),
+        }
+    };
+    let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{} has no address", host))?;
+    Ok(Target { scheme, host, addr })
+}
+
+fn connect(t: &Target, opts: &Value, timeout: Duration) -> Result<Conn, String> {
+    let s = TcpStream::connect_timeout(&t.addr, timeout).map_err(|e| format!("cannot connect to the log server at {}: {}", t.addr, e))?;
+    s.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    let _ = s.set_nodelay(true);
+    if t.scheme == "tcp" {
+        return Ok(Conn::Tcp(s));
+    }
+    let cfg = tls_config(opts["ca_file"].as_str())?;
+    let name_text = opts["server_name"].as_str().unwrap_or(&t.host).to_string();
+    let name = rustls::pki_types::ServerName::try_from(name_text.clone()).map_err(|e| format!("{:?} is not a server name: {}", name_text, e))?;
+    let conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
+    let mut tls = rustls::StreamOwned::new(conn, s);
+    s_read_timeout(&tls.sock, timeout);
+    while tls.conn.is_handshaking() {
+        tls.conn.complete_io(&mut tls.sock).map_err(|e| format!("TLS with {} failed: {}", t.addr, e))?;
+    }
+    Ok(Conn::Tls(Box::new(tls)))
+}
+
+fn s_read_timeout(s: &TcpStream, t: Duration) {
+    let _ = s.set_read_timeout(Some(t));
+}
+
+fn frame(text: &str, framing: &str) -> Vec<u8> {
+    if framing == "newline" {
+        format!("{}\n", text.replace('\n', " ")).into_bytes()
+    } else {
+        format!("{} {}", text.len(), text).into_bytes()
+    }
+}
+
+fn texts(messages: &[Value]) -> Result<Vec<String>, String> {
+    messages.iter().map(|m| match m { Value::String(s) => Ok(s.clone()), other => format_message(other) }).collect()
+}
+
+fn send_all(url: &str, msgs: &[Value], opts: &Value) -> Result<Value, String> {
+    let t = target(url)?;
+    let timeout = Duration::from_millis(opts["timeout_ms"].as_i64().unwrap_or(10_000).clamp(100, 120_000) as u64);
+    let texts = texts(msgs)?;
+    if t.scheme == "udp" {
+        let bind = if t.addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let sock = UdpSocket::bind(bind).map_err(|e| e.to_string())?;
+        let mut bytes = 0;
+        for m in &texts {
+            if m.len() > 65_507 {
+                return Err(format!("a UDP message is at most 65507 bytes, this one {} (send it over tcp:// instead)", m.len()));
+            }
+            bytes += sock.send_to(m.as_bytes(), t.addr).map_err(|e| format!("sending to {}: {}", t.addr, e))?;
+        }
+        return Ok(json!({ "transport": "udp", "messages": texts.len(), "bytes": bytes }));
+    }
+    let framing = match opts["framing"].as_str().unwrap_or("octet") { "octet" | "octet-counting" => "octet", "newline" | "lf" => "newline", f => return Err(format!("`framing` is \"octet\" or \"newline\", not {:?}", f)) };
+    let mut payload = vec![];
+    for m in &texts {
+        payload.extend(frame(m, framing));
+    }
+    let key = format!("{}|{}|{}", url, opts["ca_file"].as_str().unwrap_or(""), opts["server_name"].as_str().unwrap_or(""));
+    let mut guard = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    let conns = guard.get_or_insert_with(HashMap::new);
+    let mut reconnected = false;
+    // A kept connection the server closed fails on the write (or the one after): open it again once.
+    for attempt in 0..2 {
+        if !conns.contains_key(&key) {
+            conns.insert(key.clone(), connect(&t, opts, timeout)?);
+            reconnected = attempt > 0 || reconnected;
+        }
+        let c = conns.get_mut(&key).unwrap();
+        match c.write_all(&payload) {
+            Ok(()) => return Ok(json!({ "transport": t.scheme, "framing": framing, "messages": texts.len(), "bytes": payload.len(), "reconnected": reconnected })),
+            Err(e) => {
+                conns.remove(&key);
+                if attempt == 1 {
+                    return Err(format!("sending to {}: {}", t.addr, e));
+                }
+                reconnected = true;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Sends `message` (syslog text, or a map as `syslog_format` takes) to `url`: `udp://host:514`, `tcp://host:514` or `tls://host:6514`. TCP and TLS connections stay open for the next message and are opened again when the server dropped them. `options`: `{ framing: "octet" (RFC 6587, the default) | "newline", timeout_ms (10000), ca_file (a PEM file to trust instead of the public roots), server_name }`. Gives `{ transport, messages, bytes }`.
+pub fn syslog_send(url: &str, message: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    send_all(url, &[message], &options)
+}
+
+/// Several messages at once (each text or a map), in one write for TCP and TLS.
+pub fn syslog_send_many(url: &str, messages: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    send_all(url, &messages, &options)
+}
+
+/// Closes the kept connections to `url` (all of them for `""`); how many were open.
+pub fn syslog_close(url: &str) -> i64 {
+    let mut guard = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    let conns = guard.get_or_insert_with(HashMap::new);
+    let keys: Vec<String> = conns.keys().filter(|k| url.is_empty() || k.starts_with(&format!("{}|", url))).cloned().collect();
+    for k in &keys {
+        if let Some(Conn::Tls(mut s)) = conns.remove(k) {
+            s.conn.send_close_notify();
+            let _ = s.conn.complete_io(&mut s.sock);
+        }
+    }
+    keys.len() as i64
+}

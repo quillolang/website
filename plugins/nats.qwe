@@ -1,0 +1,91 @@
+// An order system on NATS: orders published with headers to `orders.<region>.created`, an audit
+// subscription with a `*` wildcard drained by a tick, a price service in a queue group answering
+// requests (another tick), and a JetStream stream that keeps orders, with de-duplication by id.
+//
+//   NATS_URL=nats://127.0.0.1:4222 quillo run nats.qwe
+//   then open http://localhost:8080/publish, /audit, /price, /nobody and /stream
+//
+// It needs a NATS server (nats-server -js for JetStream): NATS_URL says where, tls:// for TLS.
+
+use "nats.qwer"
+
+let url = env("NATS_URL", "nats://127.0.0.1:4222")
+let audit = []
+
+// The connection, made on first use, with its two subscriptions.
+fn bus() {
+    if (nats_status("bus") ?? null) == null {
+        nats_connect("bus", url, { client_name: "orders-app", timeout_ms: 3000 })?
+        nats_subscribe("bus", "orders.*.created", { id: "audit" })?
+        nats_subscribe("bus", "prices.get", { queue: "pricing", id: "prices" })?
+    }
+    "bus"
+}
+
+// The audit feed: what arrived on orders.*.created, the last 100.
+fn drain_audit(wait_ms: int) {
+    let name = bus() ?? null
+    if name == null { return 0 }
+    let got = nats_receive(name, "audit", 100, wait_ms) ?? []
+    let all = audit + got
+    audit = slice(all, -100, len(all))
+    len(got)
+}
+every(500, () => drain_audit(0), { name: "nats-audit" })
+
+// The price service: each request is answered on its reply subject. Another copy of this program
+// joins the same queue group, and NATS gives each request to one of them.
+let prices = { "sku-7": 4.5, "sku-9": 12.0 }
+fn answer_prices() {
+    let name = bus() ?? null
+    if name == null { return 0 }
+    let asked = nats_receive(name, "prices", 50, 0) ?? []
+    for m in asked {
+        if m.reply != null {
+            nats_publish(name, m.reply, { sku: m.payload, price: prices[m.payload] ?? null }, { headers: { "Served-By": "pricing-1" } })
+        }
+    }
+    len(asked)
+}
+every(100, answer_prices, { name: "nats-prices" })
+
+route GET /publish {
+    let name = bus()?
+    nats_publish(name, "orders.eu.created", { id: 1001, total: 42.5 }, { headers: { "Order-Id": "1001", "Content-Type": "application/json" } })?
+}
+
+route GET /audit {
+    drain_audit(1000)
+    { count: len(audit), orders: audit | map((m) => { subject: m.subject, order: json.parse(m.payload) ?? m.payload, order_id: m.headers["Order-Id"] ?? null }) }
+}
+
+// A request answered by the price service's tick, with a timeout.
+route GET /price {
+    let name = bus()?
+    let answer = nats_request(name, "prices.get", "sku-7", { timeout_ms: 3000 })?
+    { answer: json.parse(answer.payload)?, served_by: answer.headers["Served-By"] }
+}
+
+// No one subscribes to `stock.check`: NATS says so at once, rather than waiting for the timeout.
+route GET /nobody {
+    let name = bus()?
+    { error: nats_request(name, "stock.check", "sku-7", { timeout_ms: 3000 }).error }
+}
+
+// JetStream keeps every order; the same msg_id twice is stored once.
+route GET /stream {
+    let name = bus()?
+    let stream = nats_js_stream(name, "ORDERS", { subjects: ["orders.>"], storage: "memory", max_age_s: 86400 })?
+    let first = nats_js_publish(name, "orders.us.created", { id: 2002, total: 18.0 }, { msg_id: "order-2002" })?
+    let again = nats_js_publish(name, "orders.us.created", { id: 2002, total: 18.0 }, { msg_id: "order-2002" })?
+    let kept = nats_js_get(name, "ORDERS", first.seq)?
+    {
+        subjects: stream.config.subjects,
+        first: first,
+        again: again,
+        kept: { subject: kept.subject, seq: kept.seq, order: json.parse(kept.payload)?, msg_id: kept.headers["Nats-Msg-Id"] },
+        messages: nats_js_info(name, "ORDERS")?.state.messages,
+    }
+}
+
+route GET /status = nats_status(bus()?)?

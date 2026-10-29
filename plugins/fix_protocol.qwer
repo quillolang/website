@@ -1,0 +1,1140 @@
+//! FIX 4.2 and 4.4 for trading links: messages built and read (SOH framing, BodyLength and CheckSum worked out and checked, repeating groups, tag names and the meanings of common values), and a session over TCP or TLS kept on its own thread: Logon, heartbeats and test requests, sequence numbers (kept in a file if you like), gap fills, NewOrderSingle sent and ExecutionReports received, Logout.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! webpki-roots = "1"
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+// ---- Options, TCP with timeouts, and TLS by rustls (ring) ----
+
+fn o_str(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn o_i64(o: &Value, k: &str, d: i64) -> i64 {
+    match o.get(k) {
+        Some(Value::Number(n)) => n.as_i64().or(n.as_f64().map(|f| f as i64)).unwrap_or(d),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(d),
+        _ => d,
+    }
+}
+
+fn o_bool(o: &Value, k: &str, d: bool) -> bool {
+    match o.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        _ => d,
+    }
+}
+
+/// `timeout_ms` from the options (10 s when not given).
+fn timeout_of(o: &Value) -> Duration {
+    Duration::from_millis(o_i64(o, "timeout_ms", 10_000).clamp(100, 600_000) as u64)
+}
+
+/// `host`, `host:port`, `[v6]:port` or a bare IPv6 address, with the protocol's port when none is given.
+fn split_host(host: &str, default_port: u16) -> Result<(String, u16), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given: write host or host:port".into());
+    }
+    let (name, port) = if let Some(rest) = h.strip_prefix('[') {
+        let end = rest.find(']').ok_or(format!("{}: a [ without its ]", host))?;
+        let after = &rest[end + 1..];
+        (rest[..end].to_string(), after.strip_prefix(':').map(|p| p.to_string()))
+    } else if h.matches(':').count() == 1 {
+        let (a, b) = h.split_once(':').unwrap();
+        (a.to_string(), Some(b.to_string()))
+    } else {
+        (h.to_string(), None)
+    };
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("{}: the port is not a number from 1 to 65535", host))?,
+        None => default_port,
+    };
+    Ok((name, port))
+}
+
+/// Connects with a time limit to each address the name has, and keeps the limit on reads and writes.
+fn connect(name: &str, port: u16, t: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = (name, port).to_socket_addrs().map_err(|e| format!("{}: {}", name, e))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{} has no address", name));
+    }
+    let mut last = String::new();
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, t) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(t));
+                let _ = s.set_write_timeout(Some(t));
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = format!("cannot reach {}: {}", a, e),
+        }
+    }
+    Err(last)
+}
+
+/// Takes any certificate: for `insecure: true`, on a test bench only.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The certificates in PEM text.
+fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[a + 27..];
+        let Some(b) = body.find("-----END CERTIFICATE-----") else { break };
+        out.push(b64_decode(&body[..b]));
+        rest = &body[b + 25..];
+    }
+    out
+}
+
+/// A rustls client set up from the options: Mozilla's roots, plus `ca` (PEM text, or a PEM file's path); `insecure: true` takes any certificate.
+fn tls_config(o: &Value) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let config = if o_bool(o, "insecure", false) {
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAny(provider))).with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        if let Some(ca) = o_str(o, "ca").filter(|s| !s.trim().is_empty()) {
+            let text = if ca.contains("-----BEGIN") { ca.clone() } else { std::fs::read_to_string(&ca).map_err(|e| format!("cannot read the ca file {}: {}", ca, e))? };
+            let certs = pem_certs(&text);
+            if certs.is_empty() {
+                return Err("`ca` holds no PEM certificate (-----BEGIN CERTIFICATE-----)".into());
+            }
+            for c in certs {
+                roots.add(rustls::pki_types::CertificateDer::from(c)).map_err(|e| format!("a `ca` certificate cannot be used: {}", e))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(b),
+            Stream::Tls(s) => match s.read(b) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                r => r,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(b),
+            Stream::Tls(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// TLS over a connected socket, the handshake done now so a bad certificate is said at once. `server_name` in the options overrides the name checked.
+fn tls_wrap(mut tcp: TcpStream, name: &str, o: &Value) -> Result<Stream, String> {
+    let config = tls_config(o)?;
+    let sni = o_str(o, "server_name").unwrap_or_else(|| name.to_string());
+    let server = rustls::pki_types::ServerName::try_from(sni.clone()).map_err(|_| format!("{} is not a name TLS can check", sni))?;
+    let mut conn = rustls::ClientConnection::new(config, server).map_err(|e| e.to_string())?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).map_err(|e| format!("TLS with {} failed: {} (a private CA? pass its PEM as `ca`)", name, e))?;
+    }
+    Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+
+// ---- The dictionary ----
+
+const TAGS: &[(u32, &str)] = &[
+    (1, "Account"), (6, "AvgPx"), (7, "BeginSeqNo"), (8, "BeginString"), (9, "BodyLength"), (10, "CheckSum"), (11, "ClOrdID"),
+    (12, "Commission"), (13, "CommType"), (14, "CumQty"), (15, "Currency"), (16, "EndSeqNo"), (17, "ExecID"), (18, "ExecInst"),
+    (19, "ExecRefID"), (20, "ExecTransType"), (21, "HandlInst"), (22, "SecurityIDSource"), (30, "LastMkt"), (31, "LastPx"),
+    (32, "LastQty"), (34, "MsgSeqNum"), (35, "MsgType"), (36, "NewSeqNo"), (37, "OrderID"), (38, "OrderQty"), (39, "OrdStatus"),
+    (40, "OrdType"), (41, "OrigClOrdID"), (43, "PossDupFlag"), (44, "Price"), (45, "RefSeqNum"), (48, "SecurityID"),
+    (49, "SenderCompID"), (50, "SenderSubID"), (52, "SendingTime"), (54, "Side"), (55, "Symbol"), (56, "TargetCompID"),
+    (57, "TargetSubID"), (58, "Text"), (59, "TimeInForce"), (60, "TransactTime"), (63, "SettlType"), (64, "SettlDate"),
+    (65, "SymbolSfx"), (66, "ListID"), (75, "TradeDate"), (78, "NoAllocs"), (79, "AllocAccount"), (80, "AllocQty"),
+    (97, "PossResend"), (98, "EncryptMethod"), (99, "StopPx"), (100, "ExDestination"), (102, "CxlRejReason"),
+    (103, "OrdRejReason"), (106, "Issuer"), (107, "SecurityDesc"), (108, "HeartBtInt"), (110, "MinQty"), (111, "MaxFloor"),
+    (112, "TestReqID"), (114, "LocateReqd"), (115, "OnBehalfOfCompID"), (116, "OnBehalfOfSubID"), (117, "QuoteID"),
+    (122, "OrigSendingTime"), (123, "GapFillFlag"), (126, "ExpireTime"), (128, "DeliverToCompID"), (131, "QuoteReqID"),
+    (132, "BidPx"), (133, "OfferPx"), (134, "BidSize"), (135, "OfferSize"), (136, "NoMiscFees"), (137, "MiscFeeAmt"),
+    (138, "MiscFeeCurr"), (139, "MiscFeeType"), (141, "ResetSeqNumFlag"), (146, "NoRelatedSym"), (150, "ExecType"),
+    (151, "LeavesQty"), (152, "CashOrderQty"), (167, "SecurityType"), (168, "EffectiveTime"), (200, "MaturityMonthYear"),
+    (207, "SecurityExchange"), (262, "MDReqID"), (263, "SubscriptionRequestType"), (264, "MarketDepth"), (265, "MDUpdateType"),
+    (267, "NoMDEntryTypes"), (268, "NoMDEntries"), (269, "MDEntryType"), (270, "MDEntryPx"), (271, "MDEntrySize"),
+    (272, "MDEntryDate"), (273, "MDEntryTime"), (279, "MDUpdateAction"), (336, "TradingSessionID"), (371, "RefTagID"),
+    (372, "RefMsgType"), (373, "SessionRejectReason"), (379, "BusinessRejectRefID"), (380, "BusinessRejectReason"),
+    (383, "MaxMessageSize"), (434, "CxlRejResponseTo"), (447, "PartyIDSource"), (448, "PartyID"), (452, "PartyRole"),
+    (453, "NoPartyIDs"), (460, "Product"), (461, "CFICode"), (526, "SecondaryClOrdID"), (553, "Username"), (554, "Password"),
+    (555, "NoLegs"), (600, "LegSymbol"), (624, "LegSide"), (687, "LegQty"), (789, "NextExpectedMsgSeqNum"),
+    (1128, "ApplVerID"), (1137, "DefaultApplVerID"),
+];
+
+const MSG_TYPES: &[(&str, &str)] = &[
+    ("0", "Heartbeat"), ("1", "TestRequest"), ("2", "ResendRequest"), ("3", "Reject"), ("4", "SequenceReset"), ("5", "Logout"),
+    ("6", "IOI"), ("7", "Advertisement"), ("8", "ExecutionReport"), ("9", "OrderCancelReject"), ("A", "Logon"), ("B", "News"),
+    ("C", "Email"), ("D", "NewOrderSingle"), ("E", "NewOrderList"), ("F", "OrderCancelRequest"), ("G", "OrderCancelReplaceRequest"),
+    ("H", "OrderStatusRequest"), ("J", "AllocationInstruction"), ("P", "AllocationInstructionAck"), ("Q", "DontKnowTrade"),
+    ("R", "QuoteRequest"), ("S", "Quote"), ("V", "MarketDataRequest"), ("W", "MarketDataSnapshotFullRefresh"),
+    ("X", "MarketDataIncrementalRefresh"), ("Y", "MarketDataRequestReject"), ("Z", "QuoteCancel"), ("j", "BusinessMessageReject"),
+    ("AE", "TradeCaptureReport"), ("BE", "UserRequest"), ("BF", "UserResponse"),
+];
+
+/// Repeating groups: the count tag, and the tags an entry may hold (the first one starts each entry).
+const GROUPS: &[(u32, &[u32])] = &[
+    (453, &[448, 447, 452, 802]),
+    (802, &[523, 803]),
+    (78, &[79, 661, 736, 467, 80, 81]),
+    (136, &[137, 138, 139, 891]),
+    (146, &[55, 65, 48, 22, 460, 461, 167, 200, 207, 106, 107, 54, 38, 40, 44, 15, 1, 555]),
+    (267, &[269]),
+    (268, &[279, 269, 278, 280, 55, 65, 48, 22, 270, 15, 271, 272, 273, 274, 275, 336, 276, 277, 282, 283, 284, 286, 287, 288, 289, 290, 346, 290, 58]),
+    (555, &[600, 601, 602, 603, 608, 609, 610, 611, 616, 624, 687, 566, 654]),
+    (73, &[11, 67, 1, 54, 55, 38, 40, 44]),
+];
+
+fn tag_name(t: u32) -> Option<&'static str> {
+    TAGS.iter().find(|x| x.0 == t).map(|x| x.1)
+}
+
+fn tag_number(name: &str) -> Option<u32> {
+    let n = name.trim();
+    if let Ok(t) = n.parse::<u32>() {
+        return Some(t);
+    }
+    TAGS.iter().find(|x| x.1.eq_ignore_ascii_case(n)).map(|x| x.0)
+}
+
+fn type_name(t: &str) -> &'static str {
+    MSG_TYPES.iter().find(|x| x.0 == t).map_or("", |x| x.1)
+}
+
+fn type_code(t: &str) -> String {
+    MSG_TYPES.iter().find(|x| x.1.eq_ignore_ascii_case(t)).map_or(t.to_string(), |x| x.0.to_string())
+}
+
+fn meaning(tag: u32, v: &str) -> Option<&'static str> {
+    Some(match (tag, v) {
+        (54, "1") => "buy",
+        (54, "2") => "sell",
+        (54, "3") => "buy minus",
+        (54, "4") => "sell plus",
+        (54, "5") => "sell short",
+        (54, "6") => "sell short exempt",
+        (39, "0") | (150, "0") => "new",
+        (39, "1") | (150, "1") => "partially filled",
+        (39, "2") | (150, "2") => "filled",
+        (39, "3") | (150, "3") => "done for day",
+        (39, "4") | (150, "4") => "canceled",
+        (39, "5") | (150, "5") => "replaced",
+        (39, "6") | (150, "6") => "pending cancel",
+        (39, "7") | (150, "7") => "stopped",
+        (39, "8") | (150, "8") => "rejected",
+        (39, "9") | (150, "9") => "suspended",
+        (39, "A") | (150, "A") => "pending new",
+        (39, "B") | (150, "B") => "calculated",
+        (39, "C") | (150, "C") => "expired",
+        (39, "E") | (150, "E") => "pending replace",
+        (150, "F") => "trade",
+        (150, "I") => "order status",
+        (40, "1") => "market",
+        (40, "2") => "limit",
+        (40, "3") => "stop",
+        (40, "4") => "stop limit",
+        (59, "0") => "day",
+        (59, "1") => "good till cancel",
+        (59, "2") => "at the opening",
+        (59, "3") => "immediate or cancel",
+        (59, "4") => "fill or kill",
+        (59, "6") => "good till date",
+        (59, "7") => "at the close",
+        (103, "0") => "broker option",
+        (103, "1") => "unknown symbol",
+        (103, "2") => "exchange closed",
+        (103, "3") => "order exceeds limit",
+        (103, "5") => "unknown order",
+        (103, "6") => "duplicate order",
+        (103, "13") => "incorrect quantity",
+        (373, "0") => "invalid tag number",
+        (373, "1") => "required tag missing",
+        (373, "5") => "value is incorrect for this tag",
+        (373, "6") => "incorrect data format",
+        (373, "9") => "CompID problem",
+        (373, "10") => "SendingTime accuracy problem",
+        (373, "11") => "invalid MsgType",
+        _ => return None,
+    })
+}
+
+// ---- Messages ----
+
+fn now_fix() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let t = d.as_secs() as i64;
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dd = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}{:02}{:02}-{:02}:{:02}:{:02}.{:03}", y, m, dd, secs / 3600, secs % 3600 / 60, secs % 60, d.subsec_millis())
+}
+
+fn text_of(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(if *b { "Y" } else { "N" }.to_string()),
+        _ => Err(format!("{} cannot be a FIX value: give text, a number or a list of maps for a group", v)),
+    }
+}
+
+/// The fields of a map as (tag, value) pairs in order, groups written out after their count.
+fn flatten(fields: &Value, out: &mut Vec<(u32, String)>) -> Result<(), String> {
+    let m = match fields {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        _ => return Err("fields are a map of tag (number or name) to value: { Symbol: \"IBM\", \"54\": 1 }".into()),
+    };
+    for (k, v) in m {
+        let tag = tag_number(k).ok_or(format!("{} is not a tag number or a tag name this plugin knows: write its number", k))?;
+        if v.is_null() {
+            continue;
+        }
+        if let Value::Array(entries) = v {
+            out.push((tag, entries.len().to_string()));
+            for e in entries {
+                flatten(e, out)?;
+            }
+        } else {
+            let s = text_of(v)?;
+            if s.contains('\u{1}') {
+                return Err(format!("the value of tag {} holds the SOH separator", tag));
+            }
+            out.push((tag, s));
+        }
+    }
+    Ok(())
+}
+
+const HEADER_ORDER: &[u32] = &[49, 56, 115, 128, 50, 57, 34, 43, 97, 52, 122];
+
+fn checksum(b: &[u8]) -> u32 {
+    b.iter().map(|&x| x as u32).sum::<u32>() % 256
+}
+
+/// A whole message: BeginString and BodyLength first, the header fields in order, the body, CheckSum last.
+fn encode(begin: &str, msg_type: &str, pairs: &[(u32, String)]) -> String {
+    let mut header: Vec<&(u32, String)> = pairs.iter().filter(|p| HEADER_ORDER.contains(&p.0)).collect();
+    header.sort_by_key(|p| HEADER_ORDER.iter().position(|h| *h == p.0));
+    let mut body = format!("35={}\u{1}", msg_type);
+    for (t, v) in header {
+        body.push_str(&format!("{}={}\u{1}", t, v));
+    }
+    for (t, v) in pairs.iter().filter(|p| !HEADER_ORDER.contains(&p.0) && ![8, 9, 10, 35].contains(&p.0)) {
+        body.push_str(&format!("{}={}\u{1}", t, v));
+    }
+    let head = format!("8={}\u{1}9={}\u{1}", begin, body.len());
+    let all = format!("{}{}", head, body);
+    format!("{}10={:03}\u{1}", all, checksum(all.as_bytes()))
+}
+
+/// Splits a message into (tag, value) pairs; `|` stands for SOH when the text has no SOH.
+fn pairs_of(text: &str) -> Result<Vec<(u32, String)>, String> {
+    let sep = if text.contains('\u{1}') { '\u{1}' } else { '|' };
+    let mut out = vec![];
+    for part in text.trim_end_matches(['\r', '\n']).split(sep) {
+        if part.is_empty() {
+            continue;
+        }
+        let (t, v) = part.split_once('=').ok_or(format!("{:?} is not tag=value", part))?;
+        let tag = t.trim().parse::<u32>().map_err(|_| format!("{:?} is not a tag number", t))?;
+        out.push((tag, v.to_string()));
+    }
+    Ok(out)
+}
+
+fn group_members(tag: u32, extra: &Value) -> Option<Vec<u32>> {
+    if let Some(Value::Array(list)) = extra.get(tag.to_string()) {
+        return Some(list.iter().filter_map(|x| x.as_u64().map(|n| n as u32).or_else(|| x.as_str().and_then(tag_number))).collect());
+    }
+    if let Some(Value::Array(list)) = tag_name(tag).and_then(|n| extra.get(n)) {
+        return Some(list.iter().filter_map(|x| x.as_u64().map(|n| n as u32).or_else(|| x.as_str().and_then(tag_number))).collect());
+    }
+    GROUPS.iter().find(|g| g.0 == tag).map(|g| g.1.to_vec())
+}
+
+fn key_of(tag: u32) -> String {
+    tag_name(tag).map_or(tag.to_string(), |n| n.to_string())
+}
+
+/// Reads pairs from `i` into a map until a tag that `stop` rejects; groups become lists of maps.
+fn read_fields(p: &[(u32, String)], i: &mut usize, member: &dyn Fn(u32) -> bool, first: Option<u32>, extra: &Value, problems: &mut Vec<String>) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    let start = *i;
+    while *i < p.len() {
+        let (t, v) = (&p[*i].0, &p[*i].1);
+        if !member(*t) || (*i > start && Some(*t) == first) {
+            break;
+        }
+        *i += 1;
+        if let Some(members) = group_members(*t, extra) {
+            let n: usize = v.parse().unwrap_or(0);
+            let mut entries = vec![];
+            for _ in 0..n {
+                if *i >= p.len() || !members.contains(&p[*i].0) {
+                    break;
+                }
+                let delim = p[*i].0;
+                let ms = members.clone();
+                let e = read_fields(p, i, &|x| ms.contains(&x), Some(delim), extra, problems);
+                entries.push(Value::Object(e));
+            }
+            if entries.len() != n {
+                problems.push(format!("{} says {} entries, {} found", key_of(*t), n, entries.len()));
+            }
+            m.insert(key_of(*t), Value::Array(entries));
+            continue;
+        }
+        let k = key_of(*t);
+        if m.contains_key(&k) {
+            problems.push(format!("tag {} twice outside a group", t));
+            // Keep the first; a repeated tag is a malformed message.
+            continue;
+        }
+        m.insert(k, json!(v));
+    }
+    m
+}
+
+fn parse_msg(text: &str, extra: &Value) -> Result<Value, String> {
+    let p = pairs_of(text)?;
+    let mut problems = vec![];
+    if p.len() < 3 || p[0].0 != 8 || p[1].0 != 9 || p[2].0 != 35 {
+        problems.push("a message starts 8=, 9=, 35=".to_string());
+    }
+    let sep = if text.contains('\u{1}') { "\u{1}" } else { "|" };
+    // BodyLength counts from after 9=...SOH to just before 10=; CheckSum sums every byte before 10=.
+    let soh_text = text.replace(sep, "\u{1}");
+    // The bytes as sent: UTF-8, or Latin-1 when a counterparty wrote that (each is tried).
+    let mut forms: Vec<Vec<u8>> = vec![soh_text.as_bytes().to_vec()];
+    if soh_text.chars().all(|c| (c as u32) < 256) && !soh_text.is_ascii() {
+        forms.push(soh_text.chars().map(|c| c as u32 as u8).collect());
+    }
+    let declared: usize = p.iter().find(|x| x.0 == 9).and_then(|x| x.1.parse().ok()).unwrap_or(0);
+    let given: u32 = p.iter().find(|x| x.0 == 10).and_then(|x| x.1.parse().ok()).unwrap_or(999);
+    let find = |b: &[u8], pat: &[u8]| b.windows(pat.len()).position(|w| w == pat);
+    let rfind = |b: &[u8], pat: &[u8]| b.windows(pat.len()).rposition(|w| w == pat);
+    let mut checks = vec![];
+    for f in &forms {
+        if let (Some(a), Some(z)) = (find(f, b"\x019=").map(|a| a + 1), rfind(f, b"\x0110=")) {
+            let after9 = f[a..].iter().position(|&c| c == 1).map(|x| a + x + 1).unwrap_or(a);
+            checks.push((z + 1 - after9.min(z + 1), checksum(&f[..z + 1])));
+        }
+    }
+    if checks.is_empty() {
+        problems.push("no BodyLength or no CheckSum".to_string());
+    } else if !checks.iter().any(|c| c.0 == declared && c.1 == given) {
+        let (actual, sum) = checks[0];
+        if declared != actual {
+            problems.push(format!("BodyLength says {}, the body is {}", declared, actual));
+        }
+        if sum != given {
+            problems.push(format!("CheckSum says {:03}, the bytes sum to {:03}", given, sum));
+        }
+    }
+    let mut i = 0;
+    let fields = read_fields(&p, &mut i, &|_| true, None, extra, &mut problems);
+    let mt = p.iter().find(|x| x.0 == 35).map(|x| x.1.clone()).unwrap_or_default();
+    let mut meanings = serde_json::Map::new();
+    for (t, v) in &p {
+        if let Some(m) = meaning(*t, v) {
+            meanings.insert(key_of(*t), json!(m));
+        }
+    }
+    let get = |t: u32| p.iter().find(|x| x.0 == t).map(|x| x.1.clone());
+    let mut out = json!({
+        "begin": get(8),
+        "msg_type": mt,
+        "name": type_name(&mt),
+        "seq": get(34).and_then(|s| s.parse::<i64>().ok()),
+        "sender": get(49),
+        "target": get(56),
+        "valid": problems.is_empty(),
+        "problems": problems,
+        "fields": fields,
+        "meanings": meanings,
+    });
+    if mt == "8" {
+        let num = |t: u32| get(t).and_then(|s| s.parse::<f64>().ok());
+        out["order"] = json!({
+            "cl_ord_id": get(11), "order_id": get(37), "symbol": get(55),
+            "side": get(54).and_then(|v| meaning(54, &v)), "status": get(39).and_then(|v| meaning(39, &v)),
+            "exec_type": get(150).and_then(|v| meaning(150, &v)),
+            "last_qty": num(32), "last_px": num(31), "cum_qty": num(14), "leaves_qty": num(151), "avg_px": num(6), "text": get(58),
+        });
+    }
+    Ok(out)
+}
+
+fn shown(msg: &str) -> String {
+    msg.replace('\u{1}', "|")
+}
+
+// ---- Sessions ----
+
+struct Shared {
+    state: String,
+    seq_out: i64,
+    seq_in: i64,
+    queue: VecDeque<Value>,
+    dropped: u64,
+    last_error: Option<String>,
+    outbox: VecDeque<String>,
+    stop: bool,
+}
+
+struct Session {
+    cfg: Value,
+    begin: String,
+    sender: String,
+    target: String,
+    heartbeat: i64,
+    capacity: usize,
+    shared: Mutex<Shared>,
+    ready: Condvar,
+}
+
+static SESSIONS: Mutex<Option<HashMap<String, Arc<Session>>>> = Mutex::new(None);
+
+fn session(name: &str) -> Result<Arc<Session>, String> {
+    let g = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no FIX session {}: call fix_connect first", name))
+}
+
+fn lock(s: &Session) -> std::sync::MutexGuard<'_, Shared> {
+    s.shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn save_seqs(s: &Session, sh: &Shared) {
+    if let Some(path) = o_str(&s.cfg, "store") {
+        let _ = std::fs::write(&path, json!({ "seq_out": sh.seq_out, "seq_in": sh.seq_in, "sender": s.sender, "target": s.target }).to_string());
+    }
+}
+
+/// Builds a session message with the next sequence number and queues it for the I/O thread.
+fn queue_msg(s: &Session, sh: &mut Shared, msg_type: &str, mut pairs: Vec<(u32, String)>) -> (i64, String) {
+    let seq = sh.seq_out;
+    sh.seq_out += 1;
+    pairs.retain(|p| ![8, 9, 10, 35, 34, 49, 56, 52].contains(&p.0));
+    let mut all = vec![(49, s.sender.clone()), (56, s.target.clone()), (34, seq.to_string()), (52, now_fix())];
+    all.extend(pairs);
+    let text = encode(&s.begin, msg_type, &all);
+    sh.outbox.push_back(text.clone());
+    save_seqs(s, sh);
+    (seq, text)
+}
+
+/// Takes whole messages off the front of the buffer (by BodyLength); garbage before 8= is dropped.
+fn frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let find = |b: &[u8], pat: &[u8], from: usize| b.get(from..).and_then(|r| r.windows(pat.len()).position(|w| w == pat)).map(|i| i + from);
+    let mut out = vec![];
+    loop {
+        let Some(start) = find(buf, b"8=", 0) else {
+            if buf.len() > 1 {
+                let keep = buf.split_off(buf.len() - 1);
+                *buf = keep;
+            }
+            return out;
+        };
+        if start > 0 {
+            buf.drain(..start);
+        }
+        let Some(p9) = find(buf, b"\x019=", 0) else { return out };
+        let Some(e9) = find(buf, b"\x01", p9 + 3) else { return out };
+        let Some(len) = std::str::from_utf8(&buf[p9 + 3..e9]).ok().and_then(|t| t.parse::<usize>().ok()) else {
+            buf.drain(..2);
+            continue;
+        };
+        let end_body = e9 + 1 + len;
+        // 10=nnn SOH follows the body.
+        if buf.len() < end_body + 7 {
+            return out;
+        }
+        if &buf[end_body..end_body + 3] != b"10=" {
+            // A wrong BodyLength: skip to the next message.
+            buf.drain(..2);
+            continue;
+        }
+        let Some(soh) = find(buf, b"\x01", end_body) else { return out };
+        let msg: Vec<u8> = buf.drain(..soh + 1).collect();
+        // FIX is ASCII; Latin-1 text fields are read as Latin-1.
+        out.push(match String::from_utf8(msg) {
+            Ok(s) => s,
+            Err(e) => e.into_bytes().iter().map(|&c| c as char).collect(),
+        });
+    }
+}
+
+fn open_stream(cfg: &Value, host: &str) -> Result<Stream, String> {
+    let (name, port) = split_host(host, 0)?;
+    if port == 0 {
+        return Err(format!("{}: give the port (host:port)", host));
+    }
+    let tcp = connect(&name, port, timeout_of(cfg))?;
+    if o_bool(cfg, "tls", false) { tls_wrap(tcp, &name, cfg) } else { Ok(Stream::Plain(tcp)) }
+}
+
+fn write_all(st: &mut Stream, text: &str) -> Result<(), String> {
+    st.write_all(text.as_bytes()).and_then(|_| st.flush()).map_err(|e| format!("cannot write: {}", e))
+}
+
+/// Connects and logs on, waiting for the counterparty's Logon.
+fn logon(s: &Session, reset: bool) -> Result<(Stream, Vec<u8>), String> {
+    let host = o_str(&s.cfg, "host").unwrap_or_default();
+    let mut st = open_stream(&s.cfg, &host)?;
+    let mut pairs = vec![(98, "0".to_string()), (108, s.heartbeat.to_string())];
+    if reset {
+        pairs.push((141, "Y".into()));
+    }
+    if let Some(u) = o_str(&s.cfg, "username") {
+        pairs.push((553, u));
+    }
+    if let Some(p) = o_str(&s.cfg, "password") {
+        pairs.push((554, p));
+    }
+    if s.begin == "FIXT.1.1" {
+        pairs.push((1137, o_str(&s.cfg, "default_appl_ver_id").unwrap_or_else(|| "9".into())));
+    }
+    let text = {
+        let mut sh = lock(s);
+        if reset {
+            sh.seq_out = 1;
+            sh.seq_in = 1;
+        }
+        sh.outbox.clear();
+        let (_, t) = queue_msg(s, &mut sh, "A", pairs);
+        sh.outbox.clear();
+        t
+    };
+    write_all(&mut st, &text)?;
+    let until = Instant::now() + timeout_of(&s.cfg);
+    let mut buf = vec![];
+    let mut b = [0u8; 8192];
+    let _ = st.tcp().set_read_timeout(Some(Duration::from_millis(100)));
+    while Instant::now() < until {
+        match st.read(&mut b) {
+            Ok(0) => return Err(format!("{} closed the connection after our Logon: wrong CompIDs or password?", host)),
+            Ok(n) => buf.extend_from_slice(&b[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+        let mut msgs = frames(&mut buf);
+        if msgs.is_empty() {
+            continue;
+        }
+        let first = msgs.remove(0);
+        let m = parse_msg(&first, &Value::Null)?;
+        match m["msg_type"].as_str() {
+            Some("A") => {
+                let mut sh = lock(s);
+                let seq = m["seq"].as_i64().unwrap_or(1);
+                // A gap at logon is asked for again, as the rest of the session would.
+                if seq > sh.seq_in {
+                    let from = sh.seq_in;
+                    queue_msg(s, &mut sh, "2", vec![(7, from.to_string()), (16, "0".into())]);
+                } else {
+                    sh.seq_in = seq + 1;
+                }
+                sh.state = "logged on".into();
+                save_seqs(s, &sh);
+                drop(sh);
+                // What came right after the Logon goes back for the I/O thread.
+                let mut rest: Vec<u8> = msgs.join("").into_bytes();
+                rest.extend(buf);
+                return Ok((st, rest));
+            }
+            Some("5") => return Err(format!("{} logged us out: {}", host, m["fields"]["Text"].as_str().unwrap_or("no reason given"))),
+            _ => return Err(format!("{} answered our Logon with {}", host, shown(&first))),
+        }
+    }
+    Err(format!("{} did not answer our Logon in time (timeout_ms)", host))
+}
+
+fn handle(s: &Session, st: &mut Stream, text: &str, test_sent: &mut Option<(String, Instant)>) -> Result<bool, String> {
+    let m = parse_msg(text, s.cfg.get("groups").unwrap_or(&Value::Null))?;
+    if !m["valid"].as_bool().unwrap_or(false) {
+        // A garbled message is ignored, as the FIX session rules say.
+        return Ok(true);
+    }
+    let mt = m["msg_type"].as_str().unwrap_or("").to_string();
+    let seq = m["seq"].as_i64().unwrap_or(0);
+    let f = &m["fields"];
+    let mut sh = lock(s);
+    if mt == "4" {
+        let new_seq = f["NewSeqNo"].as_str().and_then(|x| x.parse::<i64>().ok()).unwrap_or(sh.seq_in);
+        if f["GapFillFlag"].as_str() != Some("Y") || seq >= sh.seq_in {
+            sh.seq_in = new_seq.max(sh.seq_in);
+        }
+        save_seqs(s, &sh);
+        return Ok(true);
+    }
+    if seq > sh.seq_in {
+        let from = sh.seq_in;
+        queue_msg(s, &mut sh, "2", vec![(7, from.to_string()), (16, "0".into())]);
+        return Ok(true);
+    }
+    if seq < sh.seq_in {
+        if f["PossDupFlag"].as_str() == Some("Y") {
+            return Ok(true);
+        }
+        let reason = format!("MsgSeqNum too low, expecting {} but received {}", sh.seq_in, seq);
+        queue_msg(s, &mut sh, "5", vec![(58, reason.clone())]);
+        sh.last_error = Some(reason.clone());
+        sh.state = "logged out".into();
+        let out: Vec<String> = sh.outbox.drain(..).collect();
+        drop(sh);
+        for o in out {
+            let _ = write_all(st, &o);
+        }
+        return Err(reason);
+    }
+    sh.seq_in = seq + 1;
+    save_seqs(s, &sh);
+    match mt.as_str() {
+        "0" => {
+            if let (Some(id), Some((want, _))) = (f["TestReqID"].as_str(), test_sent.as_ref()) {
+                if id == want {
+                    *test_sent = None;
+                }
+            }
+        }
+        "1" => {
+            let id = f["TestReqID"].as_str().unwrap_or("").to_string();
+            queue_msg(s, &mut sh, "0", vec![(112, id)]);
+        }
+        "2" => {
+            // Messages are not stored to be sent again: the range is filled with a gap fill, so no
+            // order goes out twice.
+            let begin = f["BeginSeqNo"].as_str().and_then(|x| x.parse::<i64>().ok()).unwrap_or(1);
+            let next = sh.seq_out;
+            let gap = encode(&s.begin, "4", &[(49, s.sender.clone()), (56, s.target.clone()), (34, begin.to_string()), (43, "Y".into()), (52, now_fix()), (122, now_fix()), (123, "Y".into()), (36, next.to_string())]);
+            sh.outbox.push_back(gap);
+        }
+        "5" => {
+            if sh.state != "logging out" {
+                queue_msg(s, &mut sh, "5", vec![]);
+            }
+            sh.state = "logged out".into();
+            sh.last_error = f["Text"].as_str().map(|t| format!("the counterparty logged out: {}", t));
+            let out: Vec<String> = sh.outbox.drain(..).collect();
+            drop(sh);
+            for o in out {
+                let _ = write_all(st, &o);
+            }
+            s.ready.notify_all();
+            return Ok(false);
+        }
+        "A" => {}
+        _ => {
+            if sh.queue.len() >= s.capacity {
+                sh.queue.pop_front();
+                sh.dropped += 1;
+            }
+            let mut m = m;
+            m["text"] = json!(shown(text));
+            sh.queue.push_back(m);
+            drop(sh);
+            s.ready.notify_all();
+        }
+    }
+    Ok(true)
+}
+
+/// The session's thread: writes what is queued, reads and answers, keeps the heartbeat, and logs on again after a dropped connection.
+fn run(s: Arc<Session>, mut st: Stream, mut buf: Vec<u8>) {
+    let hb = Duration::from_secs(s.heartbeat.max(1) as u64);
+    let mut last_out = Instant::now();
+    let mut last_in = Instant::now();
+    let mut test_sent: Option<(String, Instant)> = None;
+    let mut b = [0u8; 16384];
+    let _ = st.tcp().set_read_timeout(Some(Duration::from_millis(20)));
+    let mut backoff = 1u64;
+    loop {
+        let (out, stop, state) = {
+            let mut sh = lock(&s);
+            (sh.outbox.drain(..).collect::<Vec<String>>(), sh.stop, sh.state.clone())
+        };
+        let mut broken: Option<String> = None;
+        for o in out {
+            if let Err(e) = write_all(&mut st, &o) {
+                broken = Some(e);
+                break;
+            }
+            last_out = Instant::now();
+        }
+        if stop && state == "logged out" {
+            return;
+        }
+        if broken.is_none() {
+            match st.read(&mut b) {
+                Ok(0) => broken = Some("the counterparty closed the connection".into()),
+                Ok(n) => {
+                    buf.extend_from_slice(&b[..n]);
+                    last_in = Instant::now();
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => broken = Some(e.to_string()),
+            }
+            for msg in frames(&mut buf) {
+                match handle(&s, &mut st, &msg, &mut test_sent) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(e) => {
+                        let mut sh = lock(&s);
+                        sh.last_error = Some(e);
+                        return;
+                    }
+                }
+            }
+        }
+        if broken.is_none() {
+            let mut sh = lock(&s);
+            if sh.state == "logged on" {
+                if last_out.elapsed() >= hb {
+                    queue_msg(&s, &mut sh, "0", vec![]);
+                }
+                if last_in.elapsed() >= hb + hb / 5 {
+                    match &test_sent {
+                        None => {
+                            let id = format!("TEST{}", sh.seq_out);
+                            queue_msg(&s, &mut sh, "1", vec![(112, id.clone())]);
+                            test_sent = Some((id, Instant::now()));
+                        }
+                        Some((_, at)) if at.elapsed() >= hb => broken = Some("no answer to a TestRequest: the link is dead".into()),
+                        _ => {}
+                    }
+                }
+            }
+            if sh.state == "logging out" && last_in.elapsed() > timeout_of(&s.cfg) {
+                sh.state = "logged out".into();
+                return;
+            }
+        }
+        if let Some(e) = broken {
+            {
+                let mut sh = lock(&s);
+                if sh.stop || sh.state == "logged out" {
+                    sh.state = "logged out".into();
+                    return;
+                }
+                sh.state = "reconnecting".into();
+                sh.last_error = Some(e);
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(backoff));
+                if lock(&s).stop {
+                    lock(&s).state = "logged out".into();
+                    return;
+                }
+                match logon(&s, o_bool(&s.cfg, "reset_on_reconnect", false)) {
+                    Ok((new_st, rest)) => {
+                        st = new_st;
+                        buf = rest;
+                        let _ = st.tcp().set_read_timeout(Some(Duration::from_millis(20)));
+                        last_in = Instant::now();
+                        last_out = Instant::now();
+                        test_sent = None;
+                        backoff = 1;
+                        break;
+                    }
+                    Err(e) => {
+                        lock(&s).last_error = Some(e);
+                        backoff = (backoff * 2).min(30);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Builds a FIX message: `msg_type` ("D" or a name, "NewOrderSingle"), `fields` a map of tag (number or name) to value, a group as a list of maps under its count tag. Options: `begin` ("FIX.4.4"), `sender`, `target`, `seq`, `sep` ("|" to show it; SOH by default). BodyLength, SendingTime and CheckSum are worked out.
+pub fn fix_build(msg_type: &str, fields: serde_json::Value, opts: serde_json::Value) -> Result<String, String> {
+    let mut pairs = vec![];
+    flatten(&fields, &mut pairs)?;
+    if let Some(s) = o_str(&opts, "sender") {
+        pairs.push((49, s));
+    }
+    if let Some(s) = o_str(&opts, "target") {
+        pairs.push((56, s));
+    }
+    if let Some(s) = o_str(&opts, "seq") {
+        pairs.push((34, s));
+    }
+    if !pairs.iter().any(|p| p.0 == 52) {
+        pairs.push((52, now_fix()));
+    }
+    let begin = o_str(&opts, "begin").unwrap_or_else(|| "FIX.4.4".into());
+    let msg = encode(&begin, &type_code(msg_type), &pairs);
+    Ok(match o_str(&opts, "sep") {
+        Some(sep) => msg.replace('\u{1}', &sep),
+        None => msg,
+    })
+}
+
+/// Reads a FIX message (SOH or `|` between fields): `{ begin, msg_type, name, seq, sender, target, valid, problems, fields, meanings }`, fields under their names, groups as lists; BodyLength and CheckSum checked; an ExecutionReport also gets `order` (status, quantities, prices). `groups` adds repeating groups: `{ "1234": [first tag, other tags...] }`.
+pub fn fix_parse(text: &str, groups: serde_json::Value) -> Result<Value, String> {
+    parse_msg(text, &groups)
+}
+
+/// A tag's number and name, from either: `fix_tag("ClOrdID")` and `fix_tag("11")` both give `{ tag: 11, name: "ClOrdID" }`.
+pub fn fix_tag(tag: &str) -> Result<Value, String> {
+    let n = tag_number(tag).ok_or(format!("{} is not a tag this plugin knows", tag))?;
+    Ok(json!({ "tag": n, "name": tag_name(n) }))
+}
+
+/// Opens a FIX session called `name` to `host` (host:port) and logs on. Options: `sender` and `target` (CompIDs, required), `begin` ("FIX.4.4" or "FIX.4.2"), `heartbeat` (30 s), `reset` (true: sequence numbers start again at 1, 141=Y), `username`, `password`, `store` (a file that keeps sequence numbers across restarts), `buffer` (10000 messages kept for fix_receive, the oldest dropped past it), `tls`, `ca`, `insecure`, `timeout_ms`. Heartbeats, test requests and resend requests are answered on a thread; a dropped connection logs on again.
+pub fn fix_connect(name: &str, host: &str, opts: serde_json::Value) -> Result<Value, String> {
+    let sender = o_str(&opts, "sender").ok_or("give `sender`, our SenderCompID")?;
+    let target = o_str(&opts, "target").ok_or("give `target`, the counterparty's TargetCompID")?;
+    if let Ok(old) = session(name) {
+        let st = lock(&old).state.clone();
+        if st == "logged on" || st == "reconnecting" {
+            return fix_status(name);
+        }
+    }
+    let mut cfg = opts.clone();
+    cfg["host"] = json!(host);
+    let (mut seq_out, mut seq_in) = (1, 1);
+    if let Some(path) = o_str(&opts, "store") {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                seq_out = v["seq_out"].as_i64().unwrap_or(1);
+                seq_in = v["seq_in"].as_i64().unwrap_or(1);
+            }
+        }
+    }
+    let s = Arc::new(Session {
+        begin: o_str(&opts, "begin").unwrap_or_else(|| "FIX.4.4".into()),
+        sender,
+        target,
+        heartbeat: o_i64(&opts, "heartbeat", 30).clamp(1, 3600),
+        capacity: o_i64(&opts, "buffer", 10_000).clamp(1, 1_000_000) as usize,
+        cfg,
+        shared: Mutex::new(Shared { state: "connecting".into(), seq_out, seq_in, queue: VecDeque::new(), dropped: 0, last_error: None, outbox: VecDeque::new(), stop: false }),
+        ready: Condvar::new(),
+    });
+    let (st, rest) = logon(&s, o_bool(&opts, "reset", true))?;
+    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(name.to_string(), s.clone());
+    let sc = s.clone();
+    std::thread::spawn(move || run(sc, st, rest));
+    fix_status(name)
+}
+
+/// Sends a message on session `name`: `msg_type` ("D", "F", ... or a name) and `fields` as for fix_build; the header and sequence number are the session's. Gives `{ seq, text }`.
+pub fn fix_send(name: &str, msg_type: &str, fields: serde_json::Value) -> Result<Value, String> {
+    let s = session(name)?;
+    let mut pairs = vec![];
+    flatten(&fields, &mut pairs)?;
+    let mut sh = lock(&s);
+    if sh.state != "logged on" {
+        return Err(format!("session {} is {}: {}", name, sh.state, sh.last_error.clone().unwrap_or_else(|| "call fix_connect again".into())));
+    }
+    let (seq, text) = queue_msg(&s, &mut sh, &type_code(msg_type), pairs);
+    Ok(json!({ "seq": seq, "text": shown(&text) }))
+}
+
+/// Sends a NewOrderSingle: `order` is `{ symbol, side ("buy", "sell", "short"), qty, type ("market", "limit", "stop", "stop_limit"), price, stop_price, tif ("day", "gtc", "ioc", "fok"), account, currency, cl_ord_id }` (a ClOrdID is made when none is given). Gives `{ cl_ord_id, seq }`.
+pub fn fix_order(name: &str, order: serde_json::Value) -> Result<Value, String> {
+    let s = session(name)?;
+    let symbol = o_str(&order, "symbol").ok_or("the order needs a symbol")?;
+    let side = match o_str(&order, "side").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "buy" | "1" => "1",
+        "sell" | "2" => "2",
+        "short" | "sell_short" | "5" => "5",
+        x => return Err(format!("side {:?}: buy, sell or short", x)),
+    };
+    let qty = o_str(&order, "qty").ok_or("the order needs a qty")?;
+    if qty.parse::<f64>().map_or(true, |q| q <= 0.0) {
+        return Err(format!("qty {} is not a positive number", qty));
+    }
+    let kind = o_str(&order, "type").unwrap_or_else(|| if order.get("price").is_some() { "limit".into() } else { "market".into() });
+    let ord_type = match kind.to_ascii_lowercase().as_str() {
+        "market" | "1" => "1",
+        "limit" | "2" => "2",
+        "stop" | "3" => "3",
+        "stop_limit" | "stop limit" | "4" => "4",
+        x => return Err(format!("type {:?}: market, limit, stop or stop_limit", x)),
+    };
+    if (ord_type == "2" || ord_type == "4") && order.get("price").is_none() {
+        return Err("a limit order needs a price".into());
+    }
+    let tif = match o_str(&order, "tif").unwrap_or_else(|| "day".into()).to_ascii_lowercase().as_str() {
+        "day" | "0" => "0",
+        "gtc" | "1" => "1",
+        "ioc" | "3" => "3",
+        "fok" | "4" => "4",
+        x => return Err(format!("tif {:?}: day, gtc, ioc or fok", x)),
+    };
+    let cl = o_str(&order, "cl_ord_id").unwrap_or_else(|| format!("Q{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()), lock(&s).seq_out));
+    let mut pairs = vec![(11, cl.clone())];
+    if let Some(a) = o_str(&order, "account") {
+        pairs.push((1, a));
+    }
+    pairs.push((21, "1".into()));
+    if let Some(c) = o_str(&order, "currency") {
+        pairs.push((15, c));
+    }
+    pairs.push((55, symbol));
+    pairs.push((54, side.into()));
+    pairs.push((60, now_fix()));
+    pairs.push((38, qty));
+    pairs.push((40, ord_type.into()));
+    if let Some(p) = o_str(&order, "price") {
+        pairs.push((44, p));
+    }
+    if let Some(p) = o_str(&order, "stop_price") {
+        pairs.push((99, p));
+    }
+    pairs.push((59, tif.into()));
+    let mut sh = lock(&s);
+    if sh.state != "logged on" {
+        return Err(format!("session {} is {}: {}", name, sh.state, sh.last_error.clone().unwrap_or_else(|| "call fix_connect again".into())));
+    }
+    let (seq, _) = queue_msg(&s, &mut sh, "D", pairs);
+    Ok(json!({ "cl_ord_id": cl, "seq": seq }))
+}
+
+/// Up to `max` messages the counterparty sent on session `name` (execution reports, rejects, anything but the session's own), waiting up to `wait_ms` for the first; each parsed as by fix_parse, with its `text`.
+pub fn fix_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let s = session(name)?;
+    let until = Instant::now() + Duration::from_millis(wait_ms.clamp(0, 600_000) as u64);
+    let mut sh = lock(&s);
+    while sh.queue.is_empty() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || sh.state == "logged out" {
+            break;
+        }
+        sh = s.ready.wait_timeout(sh, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let n = (max.max(1) as usize).min(sh.queue.len());
+    Ok(sh.queue.drain(..n).collect())
+}
+
+/// How session `name` is: `{ state ("logged on", "reconnecting", "logged out"), seq_out, seq_in, buffered, dropped, last_error }`.
+pub fn fix_status(name: &str) -> Result<Value, String> {
+    let s = session(name)?;
+    let sh = lock(&s);
+    Ok(json!({ "name": name, "state": sh.state, "begin": s.begin, "sender": s.sender, "target": s.target, "heartbeat": s.heartbeat, "seq_out": sh.seq_out, "seq_in": sh.seq_in, "buffered": sh.queue.len(), "dropped": sh.dropped, "last_error": sh.last_error }))
+}
+
+/// Logs session `name` out (with `text`, may be empty), waits for the counterparty's Logout up to the session's timeout, and closes it.
+pub fn fix_logout(name: &str, text: &str) -> Result<Value, String> {
+    let s = session(name)?;
+    {
+        let mut sh = lock(&s);
+        if sh.state == "logged on" {
+            let pairs = if text.is_empty() { vec![] } else { vec![(58, text.to_string())] };
+            queue_msg(&s, &mut sh, "5", pairs);
+            sh.state = "logging out".into();
+        }
+        sh.stop = true;
+    }
+    let until = Instant::now() + timeout_of(&s.cfg);
+    let mut sh = lock(&s);
+    while sh.state != "logged out" && Instant::now() < until {
+        let left = until.saturating_duration_since(Instant::now());
+        sh = s.ready.wait_timeout(sh, left.min(Duration::from_millis(100))).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let clean = sh.state == "logged out";
+    sh.state = "logged out".into();
+    drop(sh);
+    let out = fix_status(name)?;
+    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(name);
+    let mut out = out;
+    out["answered"] = json!(clean);
+    Ok(out)
+}
