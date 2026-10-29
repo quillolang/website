@@ -64,9 +64,11 @@ database per host, see [Many tenants](/docs/structure/#many-tenants).
 
 ### Header checks as middleware
 
-There is no hook that runs before every route. A check is a function that gives the
-request back or ends it with `reply`, used as a pipeline stage in each route that needs
-it. `reply` ends the request from anywhere, a helper included.
+A check is a function that gives the request back or ends it with `reply`. It goes
+in a route as a pipeline stage, or before a whole set of routes as the middleware of a
+`routes` group, which also gives them a shared prefix (see [Route
+groups](/docs/routes/#route-groups)). `reply` ends the request from anywhere, a helper
+included.
 
 ```quillo
 let api = {
@@ -82,6 +84,17 @@ let api = {
 
 route GET /api/private = request | api.key | (r) => { ok: true, from: r.ip }
 route POST /api/items = request | api.key | api.json | (r) => add_item(r.json)
+```
+
+The same checks once, for every route under `/api`:
+
+```quillo
+routes /api | api.key {
+    route GET /private = { ok: true, from: request.ip }
+    routes /items | api.json {                       // groups nest: one more check for these
+        route POST / = add_item(request.json)
+    }
+}
 ```
 
 For a page rather than an API, the check redirects instead: a `reply` with a status and
