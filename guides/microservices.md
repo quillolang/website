@@ -80,6 +80,200 @@ route POST /buy {
 }
 ```
 
+### The payload
+
+A call sends its arguments and gets a value back. What goes each way, exactly:
+
+- **Arguments** go as a JSON array, in the order of the parameters. An optional argument
+  left out is not sent, so the service's own default applies, whichever version of the
+  service answers.
+- **A record** (a `type`) goes as the map of its fields. The service's parameter type
+  checks it on arrival, as it checks a page's call, and fills the defaults the type
+  declares: `billing.invoice({ customer: "Zed", cents: 5 })` arrives with `note: ""`
+  when `Order` says so. The same record type is declared in both files, since each is a
+  program of its own; a `use`d file can hold it for both.
+- **Numbers** keep their kind: an int stays an int, a float a float (`2.0` is not
+  turned into `2`), a decimal a decimal with its scale (`12.50`). Strings, booleans,
+  lists, maps and `null` go as they are.
+- **A function cannot go.** Across the network it arrives as `null`. Send what the
+  function would have computed, or a name the service understands.
+- **The result** is the function's value, or its error: `?` and `??` work on it as on
+  any call. A wrong argument (a `str` for an `int`) is refused by the service before the
+  function runs, with the same message `quillo check` would have given.
+
+```quillo
+// billing.qwe
+type Order = { customer: str, cents: int, note: str = "" }
+
+server fn invoice(o: Order) -> map ! str {
+    if trim(o.customer) == "" { return err("An invoice is for someone") }
+    ...
+}
+
+// shop.qwe, calling it
+type Order = { customer: str, cents: int, note: str = "" }
+
+route POST /buy { json: Order } {
+    let inv = billing.invoice(Order(request.json)) ?? reply 400 "Billing refused the order"
+    { invoice: inv }
+}
+```
+
+What this is on the wire, for a balancer's rules, a log, or a service written in
+another language: `POST <service>/_quillo/service/<fn>` with the arguments as the JSON
+body and these headers:
+
+| Header | Carries |
+|---|---|
+| `x-quillo-service` | `t=<unix seconds>,sig=<hex>`: the time and the signature |
+| `x-quillo-to` | the service's name, as the caller knows it |
+| `x-quillo-call` | the call's id, up to 64 letters and digits, remembered by the service |
+| `x-quillo-caller` | the calling program's name |
+| `x-quillo-deadline` | milliseconds the caller still waits |
+| `x-quillo-contract` | the function's contract as the caller's copy declares it |
+| `x-quillo-tenant` | the tenant, when there is one |
+| `x-request-id` | the request's id, passed down the chain |
+
+The signature is HMAC-SHA256 under `QUILLO_SERVICE_SECRET` of the text
+`quillo-service-2`, the time, the service, the function, the tenant and the call id,
+each followed by a line break, then the body. The time must be within five minutes.
+The answer is `{"ok": value}` or `{"err": payload}`, with `"published": [...]` when the
+call published topics. Otherwise: 400 for an argument of the wrong type, 401 for a bad
+or old signature or a call meant for another service, 404 for no such function, 409
+when the contracts differ (the answer says both), 503 while the same call is still
+running. A call sent twice with the same id gets the same answer and runs once.
+
+### A chain of calls
+
+Services may use one another: the app calls the shop, the shop calls billing, billing
+posts to a ledger. Each link is an ordinary call, so the chain is written as three
+functions calling each other:
+
+```quillo
+// shop.qwe
+service billing = "billing.qwe" { timeout: "2s", retries: 1 }
+
+route POST /buy { json: Order } {
+    let inv = billing.invoice(Order(request.json))?
+    { invoice: inv }
+}
+
+// billing.qwe
+service ledger = "ledger.qwe"
+
+server fn invoice(o: Order) -> map ! str {
+    if trim(o.customer) == "" { return err("An invoice is for someone") }
+    let inv = { id: len(invoices) + 1, customer: trim(o.customer), cents: o.cents, note: o.note }
+    invoices = invoices + [inv]
+    ledger.post(`inv-${inv.id}`, inv.cents)?        // the ledger's error is the invoice's
+    inv
+}
+
+// ledger.qwe
+let posted = {}
+
+server fn post(ref: str, cents: int) -> int ! str {
+    if cents <= 0 { return err("nothing to post") }
+    if has(posted, ref) { return posted[ref] }      // a step done already is not done twice
+    posted = set(posted, ref, cents)
+    cents
+}
+```
+
+What holds across the links:
+
+- **Errors come back up.** `ledger.post` refusing `cents: 0` makes `billing.invoice`
+  an error (`?` passes it on), which the shop's `?` turns into its answer: the caller
+  three links up sees `nothing to post`. Replace it where it is yours to handle
+  (`?? reply 400 ...`) and pass it on where it is not.
+- **Each link commits by itself.** There is no transaction across services: billing's
+  invoice is written whether or not the ledger takes the posting. So each step takes a
+  reference the caller makes up (`inv-7`) and keeps what it did, as `post` does above:
+  a request sent again goes on from where it stopped instead of posting twice.
+- **The chain gives up together.** Each call carries the time its caller still waits
+  (`x-quillo-deadline`), and the calls made below wait no longer than that, or their own
+  `timeout` when shorter. When the shop's two seconds are up, billing's call to the
+  ledger stops waiting too, and a call with no time left is not made. What a service is
+  already doing runs to its end.
+- **One id all the way down.** The request's `x-request-id` (or the one made for it)
+  goes with every call. With `--log json` the caller logs each call as a line of its
+  own, beside the request's:
+
+```json
+{"time":"2026-10-29T03:30:43.727Z","service":"ledger","fn":"total","url":"http://127.0.0.1:56782","status":200,"ms":0.18,"tries":1,"rid":"req-44"}
+{"time":"2026-10-29T03:30:43.727Z","method":"GET","path":"/","status":200,"ms":0.26,"ip":"127.0.0.1","rid":"req-44"}
+```
+
+- **A call runs once.** A retry sends the same call id, and a service remembers the ids
+  it answered, so a link that was answered but not heard is not run again; the chain
+  below it is not run again either.
+- **Only `server fn`s are reachable.** A service's routes, globals and plain functions
+  are its own. What the next link needs, it gets as an argument.
+- **In one process it is all function calls**, with nothing on the network, no
+  timeouts and no retries; the same code, split, gets all of the above.
+
+### Querying the API: `quillo docs` and `--describe`
+
+A program's API is written from its source, as OpenAPI 3, so a gateway, a client
+generator or a reviewer can read what a service takes without running it:
+
+```sh
+quillo docs app.qwe                 # to stdout
+quillo run app.qwe --describe       # the same at GET /_quillo/describe
+```
+
+Each route is a path with its method; a query pattern becomes `parameters`, a `json:`
+pattern a `requestBody` schema, and `x-quillo-at` says where in the source the route is:
+
+```json
+"/payments": {
+  "post": {
+    "requestBody": {
+      "required": true,
+      "content": { "application/json": { "schema": {
+        "type": "object",
+        "properties": { "to": { "type": "string" }, "amount": { "type": "string", "format": "decimal" } },
+        "required": ["to", "amount"]
+      } } }
+    },
+    "x-quillo-at": "app.qwe:6"
+  }
+}
+```
+
+A record type in a pattern or a parameter is named rather than expanded
+(`"schema": { "x-quillo-type": "Order" }`). Each `server fn` is under
+`x-quillo-server-fns` with its contract, its parameters and what it returns or fails
+with:
+
+```json
+"invoice": {
+  "contract": "invoice(o: Order) -> map ! str",
+  "params": [{ "name": "o", "schema": { "x-quillo-type": "Order" }, "required": true }],
+  "returns": { "type": "object" },
+  "error": { "type": "string" }
+}
+```
+
+Run on the app, the document holds the routes of the services served under their
+prefixes (`/shop/buy`, `/billing`) and their `server fn`s keyed by prefix and name
+(`"/billing invoice"`); a service declared without a path, only called, is described
+by running `quillo docs` on its own file.
+
+The `contract` line is what a call carries in `x-quillo-contract`, and what a service
+checks it against. A service deployed apart whose own differs refuses the call with
+409 and says both sides:
+
+```
+service ledger: 409 `total` here is `total() -> int`; the caller's copy of this service says `total() -> str`
+```
+
+So a caller's `.qwe` copy of a service is its client stub: keep the `server fn`
+signatures in it in step with the service, and `quillo check` plus the contract check
+catch the rest. For a service written in another language, that copy is what
+`quillo check` reads, and the server must answer `/_quillo/service/<fn>` as
+[The payload](#the-payload) describes and `GET /_quillo/ready`.
+
 ### Checked before it runs
 
 `quillo check` checks each call against the service's `server fn`s: their names, the
@@ -187,8 +381,7 @@ as it checks the call itself.
   being delivered) reaches only the service's pages when it runs apart.
 
 [Services](/docs/routes/#services) in the reference has the rest: `--scale`, `--join`,
-`/_quillo/ready`, contracts between versions, `quillo docs`, deadlines that pass down a
-chain, and the calls on the wire, for a service written in another language.
+`/_quillo/ready`, live data across services, and copies behind a balancer.
 
 ### Security
 
