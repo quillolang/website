@@ -38,7 +38,7 @@ print(math.degrees(math.inf), math.degrees(math.nan))
 ```output
 720.0 -45.0
 0.0
-90.0 29.999999999999996
+90.0 30.000000000000004
 inf NaN
 ```
 

@@ -27,7 +27,7 @@ print(http.post("not a url", { name: "Ada" }))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/users: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/users: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -47,8 +47,8 @@ print(http.post("http://127.0.0.1:9/ping", "hello", {}, { public_only: true }))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 61)")
-err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 111)")
+err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: http://127.0.0.1:9/ping: refused by public_only: 127.0.0.1 is not on the public internet")
 ```
 
@@ -65,7 +65,7 @@ print(http.post("http://127.0.0.1:9/users", {}) ?? "queued for later")
 ```
 
 ```output
-true http: http://127.0.0.1:9/users: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/users: Connection Failed: Connect error: Connection refused (os error 111)
 queued for later
 ```
 

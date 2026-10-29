@@ -26,7 +26,7 @@ print(http.request("PROPFIND", "not a url"))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -45,8 +45,8 @@ print(http.request("GET", "http://127.0.0.1:9/", null, null, { cache: 60 }))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 61)")
-err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/items/1: Connection Failed: Connect error: Connection refused (os error 111)")
+err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 111)")
 ```
 
 ### Errors
@@ -60,7 +60,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 111)
 ```
 
 ```quillo error

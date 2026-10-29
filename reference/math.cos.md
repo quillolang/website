@@ -74,7 +74,7 @@ print(0.5 | math.acos | math.degrees)
 ```output
 0.5
 [1.0, 0.5, -1.0]
-59.99999999999999
+60.00000000000001
 ```
 
 ### See also

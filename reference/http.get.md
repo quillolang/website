@@ -30,7 +30,7 @@ print(http.get("not a url"))
 ```
 
 ```output
-err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 61)")
+err("http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: not an http(s) URL: not a url")
 ```
 
@@ -77,7 +77,7 @@ print(http.get("http://127.0.0.1:9/") ?? "no rates today")
 ```
 
 ```output
-true http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 61)
+true http: http://127.0.0.1:9/: Connection Failed: Connect error: Connection refused (os error 111)
 no rates today
 ```
 
