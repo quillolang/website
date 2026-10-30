@@ -11,19 +11,20 @@ runs on the server, as `env` does, so a page asks through a `server fn`.
 | Field | Says |
 |---|---|
 | `os` | `"ios"`, `"android"`, `"macos"`, `"linux"`, `"windows"`, `"freebsd"` |
-| `os_name`, `os_version` | the system's own name and version: `"iOS"` and `"27.0"`, `"macOS"` and `"15.5"`, `"Ubuntu"` and `"24.04"` |
+| `os_name`, `os_version` | the system's own name and version: `"iOS"` and `"27.0"`, `"Android"` and `"15"`, `"macOS"` and `"15.5"`, `"Ubuntu"` and `"24.04"` |
 | `kernel` | the kernel's release |
-| `device` | `"phone"` (`"tablet"` on an iPad), `"desktop"` (in `quillo app`) or `"server"` |
-| `model` | the hardware model: `"iPhone19,2"`, `"Mac15,6"`; null when the system does not say |
+| `device` | `"phone"` (`"tablet"` on an iPad or a large Android device), `"desktop"` (in `quillo app`) or `"server"` |
+| `model` | the hardware model: `"iPhone19,2"`, `"Pixel 9"`, `"Mac15,6"`; null when the system does not say |
 | `arch`, `cpus` | the processor (`"aarch64"`, `"x86_64"`) and how many cores the program may use |
-| `simulator` | `true` in the iOS simulator |
+| `simulator` | `true` in the iOS simulator and an Android emulator |
 | `runtime` | how the program runs: `"mobile"` in a phone app, `"app"` in `quillo app`, `"server"` |
 | `locale`, `time_zone` | `"en-SG"`, `"Asia/Singapore"`; null when unknown |
 | `screen` | in a phone app, `{ width, height, scale }` in points; null elsewhere |
 | `app` | in a phone app, `{ name, id, version, build }`; null elsewhere |
 | `quillo` | Quillo's version, as `quillo --version` says it |
 
-A phone app's launcher may add fields of its own (`memory`, `model_family`).
+A phone app's launcher may add fields of its own: `memory` and `model_family` (the
+maker on Android), and `sdk` (the API level) on Android.
 
 ### Examples
 
