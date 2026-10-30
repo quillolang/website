@@ -45,14 +45,19 @@ component Share(link: str) {
   `insertAdjacentHTML`, `document.write` and the like (`` `js` does not call eval: it
   runs text as code ``), and ways around the checks such as `Object.assign` or
   `Reflect.apply`. A name with spaces or empty parts is not a dotted name. `quillo
-  check` does not see these: the program's load does.
+  check` refuses a name in a variable and one that is not dotted; the names refused by
+  what they are (`eval` and the rest), the program's load refuses.
 - A name the page lacks (a library's `<script>` left out) gives the error value `js:
   L.map is not defined on this page`; a value that is `undefined` reads as `null`.
 - A class called without `new` (`js("Chart", el)`) stops with `Chart is a class: make
   one with Chart.new(...) (or js_new("Chart", ...))`.
 - A function that gives a Promise (`fetch`, `navigator.mediaDevices.getUserMedia`) is
-  waited for in an event handler, in `@mount` and in a `state` initializer; elsewhere
-  it stays a promise, with `.then(...)`.
+  waited for in an event handler, in `@mount`, in a `state` initializer and in a
+  component's `let` functions that its markup does not call (`let locate = () => {...}`
+  used as `@click={locate}`); elsewhere it stays a promise, with `.then(...)`.
+- A `state` initializer that reads the page (`state dark = js("localStorage.getItem",
+  "theme") == "dark"`) gives `null` from `js` while the server renders the component,
+  and runs again in the browser once the component is on the page, which sets the state.
 - What comes back from the page keeps its properties and methods: `el.value`,
   `chart.update()`, and its fields can be set (`el.scrollTop += 100`). `innerHTML`,
   `on...` handlers and `javascript:` URLs are not set.
