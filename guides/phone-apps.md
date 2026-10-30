@@ -10,9 +10,10 @@ Phone apps are in preview. What works today, and what does not yet:
 
 | | |
 |---|---|
+| **A real iPhone** | Works: Fieldbook on an iPhone 17 Pro Max (iOS 26.7.1), with real GPS, compass, camera and microphone, and no change to the program |
 | **iOS simulator** | Works: built with one script, run end to end (pages, forms, uploads, SQLite, jobs, a background and foreground cycle, a relaunch with its data) |
-| **Android emulator** | Works: a debug APK built with one script, run end to end on Android 15, the system's permission prompts answered both ways |
-| **Store builds** | Not yet: a signed iOS build for devices and the App Store, a signed Android release for the Play Store |
+| **Android emulator** | Works: built with one script, run end to end on Android 15, the system's permission prompts answered both ways. Not yet tried on a real Android phone |
+| **Store builds** | Built, not yet uploaded: an iOS archive ready to sign, and a signed Android App Bundle targeting Android 16, as Google Play requires |
 | **HarmonyOS NEXT** | Planned (HarmonyOS 2 to 4 run the Android app as it is) |
 | **`.qwer` plugins** | Not yet: a phone has no compiler, and linking plugins into the app ahead of time is still to be built |
 
@@ -37,6 +38,22 @@ The runtime is the same code on both systems; only the app around it differs:
 | The web view | WKWebView (Safari's engine) | WebView (Chrome's engine) |
 | The runtime | a static library with a C entry | a shared library with a JNI entry |
 | The program | in the app bundle | in the APK's assets, unpacked at launch |
+
+### Naming your app: `app.toml`
+
+A program says what its app is called in an `app.toml` beside its main.qwe, read by both
+build scripts:
+
+```toml
+name = "Fieldbook"                  # under the icon
+id = "org.quillolang.fieldbook"     # bundle id / application id; never changed once published
+version = "1.0.0"                   # what people see in the store
+build = 1                           # a whole number, higher for each upload
+icon = "icon.png"                   # 1024 x 1024 PNG without transparency; Quillo's when left out
+```
+
+A bad value stops the build and says what is wrong. The icon becomes an asset catalog on
+iOS, and launcher and adaptive icons at every density on Android.
 
 ### Building it
 
@@ -78,7 +95,41 @@ adb shell am start -n org.quillolang.app/.MainActivity \
 
 An Android emulator can also be tapped (`adb shell input tap x y`), so a test can answer
 the system's permission prompts; the iOS simulator's prompts cannot be answered from the
-command line.
+command line. Android takes these scripts in debug builds only, since other apps on a phone
+could otherwise start the app with a script of their own.
+
+### On your own iPhone
+
+No paid account is needed to run on your own phone, but the app stops launching after 7
+days until it is installed again:
+
+1. Turn on Developer Mode on the phone (Settings, Privacy & Security), and connect it.
+2. Make a small Xcode project with the app's id, choose your Personal Team under Signing &
+   Capabilities, and run it on the phone once. Xcode makes the certificate and a profile.
+3. Build with them. The phone must be unlocked:
+
+```sh
+QUILLO_IOS_IDENTITY="Apple Development: Your Name (ABCDE12345)" \
+QUILLO_IOS_PROFILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/<uuid>.mobileprovision" \
+mobile/ios/build.sh path/to/program --device --run
+```
+
+4. The first launch needs your developer profile trusted, once: Settings, General, VPN &
+   Device Management.
+
+### Builds for the stores
+
+```sh
+mobile/ios/build.sh path/to/program --archive       # an .ipa for App Store Connect
+mobile/android/build.sh path/to/program --release   # a signed APK and an App Bundle for Google Play
+```
+
+The iOS archive has what App Store Connect looks for: arm64, the icon, a privacy manifest
+and the build keys Xcode writes. It is signed when given a certificate and a provisioning
+profile from an Apple Developer account, and unsigned, ready to sign, without them. The
+Android release targets Android 16 and runs from Android 8; without a key given, an upload
+key is made once for the app's id in `~/.quillo/android/`. Keep that key backed up: Google
+Play knows the app by it.
 
 ### Where the program runs: `platform()`
 
@@ -152,18 +203,19 @@ component Spot() {
 }
 ```
 
-Where the two web views differ, as a page in each found:
+Where the two web views differ, as a page in each found. The iOS column is a real iPhone; a
+simulator refuses more than a phone does, so test on one:
 
 | | iOS | Android |
 |---|---|---|
 | `navigator.geolocation` | asks again, in the name of `127.0.0.1`: use the app's location | granted with the app's location permission |
 | `capture` on a file input | the camera | the camera (the app opens it), else the photo picker |
-| Motion and orientation | only after a tap of the person's own | events without asking |
+| Motion and orientation | after a tap of the person's own, then real events and the compass | events without asking |
 | `navigator.vibrate`, `getBattery`, `connection` | not there (the app's calls stand in) | there; vibration only after a tap |
-| `navigator.wakeLock` | refused (the app's `keepAwake` works) | there |
+| `navigator.wakeLock` | there, from a tap | there |
 | `speechSynthesis` | there | not in the web view |
 | Bluetooth, USB, Serial, HID | not there | not there |
-| The clipboard | only from a tap | only from a tap, in a focused page |
+| The clipboard | writing from a tap; reading is refused | only from a tap, in a focused page |
 
 ### When the app leaves the screen
 
@@ -195,5 +247,6 @@ field notebook built to try all of this on a phone: a note with the place from t
 the compass, a photo with a thumbnail made on the phone by `image.convert`, a voice memo,
 and the weather at that place from a web API; a page that tries 35 things a phone can do
 and keeps the answers; a page of what `platform()` says; a job every minute; a CSV
-export. It runs unchanged on iOS and Android. What it found on iOS is written up in
+export. It runs unchanged on an iPhone, the iOS simulator and Android: the probe on a real iPhone
+gave 37 answers, 26 of them working, with no errors. What it found is written up in
 [FEEDBACK18.md](https://github.com/quillolang/quillo/blob/main/feedback/reports/FEEDBACK18.md).
