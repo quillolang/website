@@ -99,6 +99,7 @@ print(db.transaction(() => db.atomic([db], () => 1)))
 
 ```output
 line 2: `db.atomic` cannot begin inside a transaction already open on one of its databases
+  in a function, called at main.qwe:2
 ```
 
 ### Chaining

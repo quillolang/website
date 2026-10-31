@@ -110,6 +110,7 @@ print(db.transaction(() => db.transaction({ isolation: "serializable" }, () => 1
 
 ```output
 line 3: a transaction inside another cannot change its isolation: give it to the outermost one
+  in a function, called at main.qwe:3
 ```
 
 ```quillo error

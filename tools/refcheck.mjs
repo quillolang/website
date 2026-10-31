@@ -41,7 +41,9 @@ function run(code) {
   runs++;
   // The file's path is noise in a message: `quillo: /tmp/x/main.qwe:3: ...` -> `line 3: ...`
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
-  const err = (r.stderr || "").replace(new RegExp("(?:" + esc(real) + "|" + esc(file) + "):(\\d+):", "g"), "line $1:").replace(/^quillo: /gm, "").trim();
+  const err = (r.stderr || "").replace(new RegExp("(?:" + esc(real) + "|" + esc(file) + "):(\\d+):", "g"), "line $1:").replace(/^quillo: /gm, "").trim()
+    // A call chain names the file too, where this run keeps it.
+    .replace(new RegExp("(?:" + esc(real) + "|" + esc(file) + ")", "g"), "main.qwe");
   return { status: r.status, out: (r.stdout || "").replace(/\n$/, ""), err };
 }
 

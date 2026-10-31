@@ -89,6 +89,7 @@ print(parallel(() => 1, () => upper(42)))
 
 ```output
 line 1: `upper` expects a str as argument 1, got int
+  in a function, called at main.qwe:1
 ```
 
 ### Chaining

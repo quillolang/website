@@ -72,6 +72,7 @@ print(filter([1, "a"], (x) => x > 0))
 
 ```output
 line 1: cannot compare str with int
+  in a function, called at main.qwe:1
 ```
 
 ### Chaining

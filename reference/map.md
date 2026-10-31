@@ -79,6 +79,7 @@ print(map([1, "x"], (x) => x * 2))
 
 ```output
 line 1: cannot multiply str and int
+  in a function, called at main.qwe:1
 ```
 
 ### Chaining
