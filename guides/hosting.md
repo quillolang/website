@@ -253,5 +253,5 @@ writes them to a folder that is uploaded as it is.
 - a service manager that restarts it, and waits 15 seconds when stopping it
 - `/_quillo/health` for the load balancer, `/_quillo/ready` for readiness;
   `/_quillo/metrics` kept private
-- limits of your own where you need them: Quillo has no rate limiting and no time limit
-  on a route
+- `--max-compute 2s`, so one request that computes for ever cannot hold an instance, and
+  limits of your own where you need them: Quillo has no rate limiting

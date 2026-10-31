@@ -375,7 +375,8 @@ db.open("data/{tenant}.db")         // a SQLite file per tenant
 db.migrate()                        // run for each tenant's database when it is made
 
 route POST /signup { form: { name: str } } {
-    with_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
+    let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
+    if is_err(made) { reply 409 "That name is taken" }
     redirect(`https://${name}.example.com/`)
 }
 ```
@@ -388,9 +389,14 @@ route POST /signup { form: { name: str } } {
 | `mysql://host/app_{tenant}` | MySQL or MariaDB database |
 | a function of the tenant's name | whatever it gives, or `null` for no such tenant |
 
-- A tenant's database is made, and migrated, the first time `with_tenant(name, ...)`
-  runs for it, as when it signs up. Requests only open databases that exist: a made-up
-  host gets an error from `db`, and no file or schema is made for it.
+- `new_tenant(name, f)` makes a tenant's database, migrates it and runs `f` for it, or
+  gives an error when that tenant exists, in one step on the database, so a second
+  signup for a name cannot land in a customer's data. `with_tenant(name, f)` runs code for
+  a tenant, making its database if there is none: for scripts and jobs.
+- Requests only open databases that exist, and no file or schema is made for a made-up
+  host. Where a route needs its database, it answers 404, unless the route answers for
+  itself; a route that needs no database answers as usual, so `www.example.com` can be a
+  page of its own.
 - `db.tenant_exists(name)` says whether a tenant has a database, without making one.
   `db.tenants()` lists the tenants whose databases exist, for a SQLite, PostgreSQL schema
   or MySQL template; where a function says where tenants are, keep the list yourself.
