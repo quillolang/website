@@ -17,16 +17,19 @@ already there. There is nothing to write or set up: it is on for every page.
 - **Chrome and Edge** are given the link as a speculation rule, and keep the page for the
   navigation themselves.
 - **Other browsers** fetch it in the background with `x-quillo-prefetch: 1`. The server
-  answers with `cache-control: private, max-age=30`, so the click is answered from the
-  browser's cache for the next 30 seconds.
+  answers with `cache-control: private, max-age=30` and `Vary: Cookie`, so the click is
+  answered from the browser's cache for the next 30 seconds, and not once someone has
+  logged in or out.
+- **Links a page's components follow** are fetched the same way, for the state of the
+  components on the page they lead to, so those start with their data and no `null` first.
+  It is kept for 30 seconds, until a `server fn` is called, and only for components not
+  already on the page; the others ask as usual.
 
 These links are left alone:
 
 - links to other sites, and links with `target` or `download`;
 - links to the page itself (`#section`);
 - links inside an element with `data-no-prefetch`;
-- links a page's components follow themselves (see
-  [Single-page apps](/docs/components/#single-page-apps));
 - every link, on a connection that is saving data or on 2G.
 
 ### Prefetching changes nothing
@@ -53,7 +56,22 @@ route GET /logout {
 Pointing at a link to either does nothing: `/count` counts only when it is followed, and
 pointing at "Log out" logs no one out. The same holds for prefetches the browser makes on
 its own (`Sec-Purpose: prefetch`, from `<link rel="prefetch">` or speculation rules a page
-writes itself).
+writes itself). A page prerendered runs none of its components, `server fn`s or live updates
+until someone opens it.
+
+### Keeping up with changes
+
+A request that changes something, or logs someone in or out, answers with `Clear-Site-Data:
+"prefetchCache", "prerenderCache"`, so a page kept for a click is not shown out of date. Chrome
+obeys it from version 138. A `GET` does not send it, nor a `POST` that only reads, so a page
+that counts its visits keeps its prefetches. Elsewhere, a change that is not a login can be up
+to 30 seconds old on the click.
+
+### When the server is busy
+
+A prefetch is work nobody has asked for yet. If anyone is waiting, it is answered "not
+prefetched" before it runs, and the page is made if the link is followed. So prefetches never
+go ahead of a visitor.
 
 ### Turning it off
 
@@ -81,6 +99,13 @@ writes itself).
 - **Check the page's part.** After pointing at a link, in the console,
   `document.querySelectorAll('script[type=speculationrules]').length` is 1 or more in
   Chrome: the page has asked, and anything missing is the browser's choice.
+
+### Seeing what it does
+
+The request log marks a prefetch: `GET /docs -> 200 (0.4ms) prefetch`, and `"prefetch": true`
+under `--log json`, so what counts the log does not count pages nobody saw. With `--metrics`,
+`quillo_prefetches_total` counts those `answered`, `refused`, and `used` by a click, which a
+page reports when it was landed on from a prefetch (in Chrome and Edge).
 
 ### Behind a CDN or on a static host
 
