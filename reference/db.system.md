@@ -5,8 +5,9 @@ group: Database
 ### What it does
 
 Names the system database: where Quillo keeps its own tables, the scheduled jobs
-(`_quillo_jobs`), calls made later (`_quillo_later`), the decisions of `db.atomic`
-(`_quillo_atomic`) and the calls a service answered. Without it they go to the
+(`_quillo_jobs`), the decisions of `db.atomic` (`_quillo_atomic`) and the calls a
+service answered. Calls made later stay with the work, in the program's database or
+the tenant's, and only go here when there is neither. Without it they go to the
 program's database, or, when that is one per tenant, to `$QUILLO_SYSTEM_DB` or a
 SQLite file `quillo-system.db` next to the program. Several servers of one program
 share one system database, so give them a server URL. It gives `null` when the

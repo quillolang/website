@@ -141,7 +141,8 @@ The answer is `{"ok": value}` or `{"err": payload}`, with `"published": [...]` w
 call published topics. Otherwise: 400 for an argument of the wrong type, 401 for a bad
 or old signature or a call meant for another service, 404 for no such function, 409
 when the contracts differ (the answer says both), 503 while the same call is still
-running. A call sent twice with the same id gets the same answer and runs once.
+running. A call sent twice with the same id gets the same answer and runs once while
+the service stays up. Only an answer of 200 is remembered.
 
 ### A chain of calls
 
@@ -206,7 +207,8 @@ What holds across the links:
 
 - **A call runs once.** A retry sends the same call id, and a service remembers the ids
   it answered, so a link that was answered but not heard is not run again; the chain
-  below it is not run again either.
+  below it is not run again either. A service that dies in the middle of one is the
+  exception: see [Calls that hold up](#calls-that-hold-up).
 - **Only `server fn`s are reachable.** A service's routes, globals and plain functions
   are its own. What the next link needs, it gets as an argument.
 - **In one process it is all function calls**, with nothing on the network, no
@@ -304,8 +306,16 @@ A call that got no connection, or a server answering 502, 503 or 504, is tried a
 next address, a little later each time. A call sent but not answered in time is tried
 again at the same address, with the same call id. The service remembers the calls it
 answered for eleven minutes (in its database too, `_quillo_calls`, when it has one, so
-copies sharing it remember together) and gives the same answer again, so the function
-runs once however often the call is sent. A call still running there is waited for.
+copies sharing it remember together) and gives the same answer again, so while the
+service stays up the function runs once however often the call is sent. A call still
+running there is waited for.
+
+Across a crash a call runs at least once. A service stopped in the middle of a function
+cannot say how far it got, so the call is refused as still running for eleven minutes,
+as long as a signature lasts, and then runs again, though its first run may have
+committed. A function that must not do its work twice keeps its own record: a reference
+the caller makes up, or `idempotent`, which needs no header in a service: its key is the
+call's own id, `request.call`, the same for each try, and it commits with the work.
 
 #### Failing servers left alone
 
@@ -358,18 +368,55 @@ route POST /orders/:id(int)/paid {
 ```
 
 The call is tried every second, then a little later each time (up to five minutes apart),
-until it gets through; since the service remembers call ids, it runs once. Calls kept for
-later are stored in the program's database when it has one (the `_quillo_later` table),
-so they outlive a restart, and servers sharing the database make each call once; without
-a database, in a `quillo-system.db` file next to the program. `quillo check` checks them
-as it checks the call itself.
+until it gets through; since the service remembers call ids, it runs once while it stays
+up. `quillo check` checks it as it checks the call itself.
+
+**It goes with the transaction.** A call is kept in the database the work is in, the
+program's or the tenant's (the `_quillo_later` table), so inside `db.transaction` it
+commits or rolls back with the work, on every database. It outlives a restart, and servers
+sharing the database make each call once. Without a database, it goes in a
+`quillo-system.db` file next to the program.
+
+**What finishes it.** A value, or an error value the function gave. Any other answer does
+not: a 401, 404 or 409 from a deploy gone wrong, or a 500, is tried again for about a day,
+and a service that does not answer at all is waited for however long it takes. A 400,
+arguments the service refuses, cannot work and is given up on at once. A call given up on
+stays in `_quillo_later` with `tries` -1 and why in `error`, is counted in
+`quillo_later_total` with `--metrics`, and goes again with `update _quillo_later set at =
+0, tries = 0 where tries < 0`.
+
+**Asking after one.** [`later.status(id)`](/docs/reference/later.status/) says whether the
+call is waiting, done, with what the function gave, or failed.
+
+**Who delivers them.** The same thread for each program in the process, the app and the
+services it runs, however the program runs. It takes 50 calls a go from each database,
+each second, and the next go at once after a full one. A call that has to wait does not
+hold up the next, so order is not kept.
+
+### Sagas
+
+A saga is an operation spread over services that share no transaction. Each service commits
+its own part, and if a later part cannot happen, the earlier parts are undone by
+compensating steps you write. Quillo has no `saga` word: one is a table, a job that moves
+each row a step at a time, and ordinary calls. [Routes](/docs/routes/#sagas) has
+a working one. Five rules carry it:
+
+1. **The reference is the key.** The caller makes it up, and a step keyed on it changes
+   nothing the second time.
+2. **A "no" is an answer, not an error.** A step gives `{ ok: false, why }`. An error value
+   means no answer came and the step may have run.
+3. **An undo works on what never happened, and leaves a mark.** A refund with no charge
+   writes `refunded`, so a charge that arrives late is refused.
+4. **A step with no answer is undone too.** It may have run, and rule 3 makes that safe.
+5. **An undo never gives up.** It waits for the service, so a saga long in `undoing` is what
+   to alert on.
 
 ### What it does not do
 
 - **No transaction across services.** Each service's `db.transaction` is its own, so a
   chain of calls commits step by step. Give each step a reference the caller makes up,
   and keep what was done, so a request sent again goes on from where it stopped instead
-  of doing a step twice.
+  of doing a step twice. To undo the steps before one that fails, see [Sagas](#sagas).
 - **No discovery.** Each caller is told where a service runs (`--service-url` or
   `QUILLO_SERVICE_<NAME>`), and `QUILLO_SERVICE_SECRET` is set on every machine by hand.
   A copy can join a running app with `--join`, but it is recorded at the address it

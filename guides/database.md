@@ -353,16 +353,19 @@ fn pay(from: int, n: int) =
 ### Quillo's own tables
 
 Quillo keeps a few tables of its own in the program's database: scheduled jobs
-(`_quillo_jobs`, each run once, whichever server it is due on), calls made later
-(`_quillo_later`, see [Microservices](/docs/microservices/#calls-made-later)), the
-decisions of `db.atomic` (`_quillo_atomic`) and the migrations applied
-(`_quillo_migrations`).
+(`_quillo_jobs`, each run once, whichever server it is due on), the decisions of
+`db.atomic` (`_quillo_atomic`) and the migrations applied (`_quillo_migrations`).
 
 With a database per tenant there is no one program database to keep them in, so the
-first three go to a system database: `db.system(target)` (one every server of the program
+first two go to a system database: `db.system(target)` (one every server of the program
 shares, when there are several), else `$QUILLO_SYSTEM_DB`, else a SQLite file
 `quillo-system.db` next to the program. `db.system` also keeps them out of the program's
 own tables when there is one database.
+
+Calls made later (`_quillo_later`, see
+[Microservices](/docs/microservices/#calls-made-later)) stay with the work wherever the
+others go, in the program's database or the tenant's, so they commit or roll back with it.
+With a database per tenant, the system database only notes which tenants have some.
 
 ### A database per tenant
 
