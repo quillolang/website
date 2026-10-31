@@ -30,6 +30,8 @@ use memcache_get as memo_get from memory_cache.qwer
 use csv_parse, csv_write from csv
 ```
 
+*Since then the file comes first: `import redis use cache_get as redis_get`. This spelling still works, with a warning, and `quillo fix` turns it around. See [What a file sees](/docs/structure/#what-a-file-sees) for why.*
+
 A name a plugin does not have is an error that names the nearest it does, and two plugins exporting one name are now warned of, with the `as` that keeps both.
 
 ### quillo install

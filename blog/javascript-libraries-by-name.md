@@ -22,6 +22,8 @@ component Sales(points: list) {
 }
 ```
 
+*Since then the file comes first, and the first word says it runs in the browser: `client "https://..." use Chart`, with `preload` or `preconnect` in its place. This spelling still works, with a warning, and `quillo fix` turns it around. See [What a file sees](/docs/structure/#what-a-file-sees) for why.*
+
 ### Which name
 
 The name after `use` is what the script defines on the page: `Chart` for Chart.js, `L` for Leaflet, `confetti`, `dayjs`. It is the name the library's README uses in its plain-`<script>` example, in its case. One script can give several (`use L, LeafletDraw from /assets/leaflet.js`), and `as` gives one a name of your own.

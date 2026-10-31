@@ -11,8 +11,8 @@ its result. With no arguments and a name that is not a function, it reads the va
 server renders the component it gives `null`. A name the page does not have is an
 error value, not a runtime error.
 
-A library named with `use` is called the same way, as JavaScript reads it:
-`use L from /assets/leaflet.js`, then `L.map(el)` is `js("L.map", el)` and
+A library named on a `client` line is called the same way, as JavaScript reads it:
+`client /assets/leaflet.js use L`, then `L.map(el)` is `js("L.map", el)` and
 `L.version` reads a value, and the page loads the script itself (see
 [JavaScript libraries](/docs/components/#javascript-libraries)).
 

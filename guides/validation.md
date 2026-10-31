@@ -197,13 +197,3 @@ fn check_email(s: map) = when(ends_with(s.email ?? "", ".con"), warning("email",
 
 Show every problem as a hint, and decide on `errors(problems)`, in the browser and on the
 server alike.
-
-### A larger example
-
-The [CRM](https://github.com/quillolang/apps/tree/main/crm) in quillolang/apps is
-built this way. Each plugin brings rules for the kinds of records it cares about
-(contacts, deals, products, campaigns, public forms); `validate(kind, record, ctx)` in
-`lib/rules.qwe` runs those of the plugins a workspace has on. Its editors call it as you
-type, and the `server fn`s that save call it again with a context built from the
-database, so a rule written once checks a contact in the editor, in a CSV import and in a
-public sign-up form.
