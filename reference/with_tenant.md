@@ -5,20 +5,16 @@ group: Tenants
 ### What it does
 
 Runs the function for a tenant, with its database and its live updates, and gives what
-the function gives. For signing a tenant up (its database is made and migrated the
-first time code runs for it), and for code outside a request: a script, a scheduled
-job that loops over the tenants. The name must be a valid tenant's name: lowercase
+the function gives. For code outside a request: a script, a scheduled job that loops
+over the tenants. Its database is made and migrated if there is none, so to sign a
+tenant up use [new_tenant](/docs/reference/new_tenant/), which refuses a name that is
+taken. The name must be a valid tenant's name: lowercase
 letters, digits, `-` and `_`, at most 63, starting with a letter or a digit. See
 [Many tenants](/docs/structure/#many-tenants).
 
 ### Examples
 
 ```quillo noexec
-route POST /signup { form: { name: str } } {
-    with_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
-    redirect(`https://${name}.example.com/`)
-}
-
 schedule("@daily", () => {
     for t in db.tenants() { with_tenant(t, () => db.exec("delete from tokens where expires < ?", now())) }
 })

@@ -25,8 +25,8 @@ print(int(dec("12.50")), int(true), int(false))
 
 - Text with a decimal point is not an int: `int("3.0")` is an error; convert with
   `float` first when that is wanted.
-- A float past what an int holds (about 9.2 × 10¹⁸) is clamped to the largest or
-  smallest int, not an error; `NaN` is an error.
+- A float past what an int holds (about 9.2 × 10¹⁸) is an error value, as `NaN` is, and
+  as a decimal that large is.
 - `null` is an error, not 0: give the default yourself with `??`.
 - Digits in other scripts are not read; only ASCII `0` to `9`.
 
@@ -39,7 +39,7 @@ print(int(null) ?? 0)
 
 ```output
 err("not an int: \"3.0\"") 3
-9223372036854775807 -9223372036854775808 err("cannot convert float to int")
+err("1000000000000000000000000000000 is too large for an int") err("-1000000000000000000000000000000 is too large for an int") err("cannot convert float to int")
 err("cannot convert null to int")
 0
 ```

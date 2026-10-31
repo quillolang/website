@@ -30,22 +30,18 @@ print(math.fsum([1, 2, 3]), type_of(math.fsum([1, 2, 3])))
 - An empty list, or `null`, gives `0.0`.
 - Ints are summed as floats, so the result is a float even for ints, and ints past
   2⁵³ lose precision; use `sum` for an exact int total.
-- Infinity sums to infinity, and infinity with minus infinity is NaN, as in Python.
-- A sum whose partials overflow the largest float gives `0.0` rather than an error:
-  `math.fsum([1e308, 1e308])` is `0.0`, where Python raises `OverflowError` and `sum`
-  gives `inf`.
+- Infinity sums to infinity. Infinity with minus infinity has no sum, and neither has a
+  sum past the largest float, so `math.fsum([1e308, 1e308])` stops the code, as Python
+  raises `OverflowError`; `sum` gives `inf`.
 
 ```quillo
 print(math.fsum([]), math.fsum(null), math.fsum([9007199254740993]))
-let inf = float("inf")
-print(math.fsum([inf, 1]), math.fsum([inf, -inf]))
-print(math.fsum([1e308, 1e308]), sum([1e308, 1e308]))
+print(math.fsum([float("inf"), 1]), sum([1e308, 1e308]))
 ```
 
 ```output
 0.0 0.0 9007199254740992.0
-inf NaN
-0.0 inf
+inf inf
 ```
 
 ### Errors

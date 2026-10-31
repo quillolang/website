@@ -26,7 +26,7 @@ print(stats.mean([0.1, 0.2, 0.3]), (0.1 + 0.2 + 0.3) / 3)
 - One number gives that number, as a float.
 - The list is read into floats first: an int past 2⁵³ (about 9 × 10¹⁵) loses its
   last digits, where Python keeps them exact.
-- Floats whose sum overflows give `inf`, not the mean Python gets through fractions.
+- Floats whose sum overflows the largest float still give their mean, as in Python.
 - Decimals are not accepted; convert them with `float`.
 
 ```quillo
@@ -39,7 +39,7 @@ print(stats.mean([dec("1.5"), dec("2.5")] | map(float)))
 ```output
 5.0 0.0
 9007199254740992.0
-inf
+100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 2.0
 ```
 

@@ -27,8 +27,7 @@ print(math.dist([1], [4]), math.dist([1.5, 2], [1, 2]))
 - In one dimension it is the absolute difference.
 - Two empty points are `0.0` apart, and `null` counts as an empty point.
 - `1e200` apart does not overflow; an infinite coordinate gives `inf`. A `NaN`
-  coordinate gives `NaN` when another coordinate differs, and `0.0` when none does
-  (Python gives `NaN` there).
+  coordinate gives `NaN`, as in Python.
 
 ```quillo
 print(math.dist([3, 4], [0, 0]), math.dist([3, 4], [3, 4]))
@@ -43,7 +42,7 @@ print(math.dist([math.nan, 1], [0, 0]), math.dist([math.nan], [0]))
 3.0
 0.0 0.0
 true inf
-NaN 0.0
+NaN NaN
 ```
 
 ### Errors

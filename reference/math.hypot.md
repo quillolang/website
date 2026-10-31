@@ -27,9 +27,8 @@ print(math.hypot(1, 2, 2), math.hypot(3, 4, 12))
 - Signs do not matter; one number gives its absolute value, and no numbers give `0.0`.
 - `math.sqrt(x * x + y * y)` overflows for `1e200`; `math.hypot` does not, and
   `1e-200` does not vanish either.
-- An infinity gives `inf`, even next to a `NaN`. A `NaN` next to a number other than
-  zero gives `NaN`; a `NaN` on its own, or next to zeros only, gives `0.0` (Python
-  gives `NaN` there).
+- An infinity gives `inf`, even next to a `NaN`. Otherwise a `NaN` gives `NaN`, as in
+  Python.
 - The numbers are separate arguments, not a list: for a list use
   [vec.norm](/docs/reference/vec.norm/), and for two points
   [math.dist](/docs/reference/math.dist/).
@@ -44,7 +43,7 @@ print(vec.norm([3, 4]), math.dist([0, 0], [3, 4]))
 ```output
 5.0 5.0 0.0
 true true
-inf NaN 0.0
+inf NaN NaN
 5.0 5.0
 ```
 
