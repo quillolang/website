@@ -1,5 +1,5 @@
 # live
-live(fn, any...) -> any
+live(any, any...) -> any
 group: Browser
 
 ### What it does
@@ -10,6 +10,10 @@ shows the state, whenever something it read changes (a table it queried, a globa
 used, a topic it `watch`ed), for anyone, not only this page. The arguments after the
 function are followed too: `live(load, id)` loads again when `id` changes. It is
 written only as a `state` initializer, with a `server fn` by its name.
+
+`live({ every: "2s" }, load)` puts a gap of at least that long between a page's refreshes,
+given as `500`, `"500ms"`, `"2s"` or `"1m"`, written here as it is. Whatever changes
+meanwhile comes with the next refresh.
 
 ### Examples
 

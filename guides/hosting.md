@@ -121,9 +121,10 @@ server {
 }
 ```
 
-- **The visitor's address.** Behind a proxy, `request.ip` is the proxy's. The visitor's
-  is in the header the proxy adds, `request.headers["x-forwarded-for"]`. Trust it only
-  when Quillo can be reached through the proxy alone: keep `--host 127.0.0.1`.
+- **The visitor's address.** Behind a proxy, `request.ip` is the proxy's, and every
+  visitor counts as one: only 256 pages then get live updates. `--trust-proxy 127.0.0.1`
+  names the proxy, and `request.ip` and each client's limits are the visitor's, from the
+  `X-Forwarded-For` it adds. It is read from no other address, as a client can write it.
 - **WebTransport** (channels over HTTP/3) goes over UDP, which these proxies do not pass.
   Open the UDP port, the HTTP port's number unless `--wt-port` says another, to the
   server itself: Quillo presents a certificate of its own, which pages take by its hash,
@@ -230,7 +231,7 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 - `--log json` writes a JSON line per request (time, method, path with its query, status,
   ms, ip, tenant, and `rid`, the request's id) on stderr, where systemd's journal or the
   container's log collects it. Errors stay plain text lines (`quillo: ...`). `ip` is the
-  proxy's, behind one: Quillo never reads `X-Forwarded-For`.
+  proxy's, behind one, unless `--trust-proxy` names it.
 - `--metrics` answers `GET /_quillo/metrics` in Prometheus's text format. Anyone who can
   reach it can read it, so keep it from the public at the proxy: in nginx,
   `location /_quillo/metrics { deny all; }`; in Caddy, `respond /_quillo/metrics 403`.

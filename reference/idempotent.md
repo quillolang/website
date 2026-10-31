@@ -63,6 +63,8 @@ paid
 - `{ required: true }` answers 400 to a request without the header. `{ transaction:
   false }` runs the function without a transaction and keeps every answer, failures
   too, for work that is mostly outside the database (a call to a payment provider).
+- `<form method="post" idempotent>` carries a key of its own, for a form with no script
+  to send a header. Two clicks run the work once, the second getting the first's answer.
 - In a function a service answers with, the key is the call's own id, `request.call`, the
   same for each try, so no header is needed, the function's value is what is kept, and
   it holds across a crash of the service.
