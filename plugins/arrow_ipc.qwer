@@ -1,0 +1,632 @@
+//! Apache Arrow IPC stream and file formats read and written: schemas, record batches, and columns turned to and from rows, nested types and nulls included.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! arrow-array = { version = "=60.1.0", default-features = false, features = ["chrono-tz"] }
+//! arrow-buffer = { version = "=60.1.0", default-features = false }
+//! arrow-cast = { version = "=60.1.0", default-features = false }
+//! arrow-ipc = { version = "=60.1.0", default-features = false, features = ["lz4"] }
+//! arrow-schema = { version = "=60.1.0", default-features = false }
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use arrow_array::builder::{BooleanBuilder, PrimitiveBuilder};
+use arrow_array::cast::AsArray;
+use arrow_array::types::*;
+use arrow_array::{new_null_array, Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray, StructArray};
+use arrow_buffer::{NullBuffer, OffsetBuffer};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
+use arrow_cast::{cast_with_options, CastOptions};
+use arrow_ipc::reader::{FileReader, StreamReader};
+use arrow_ipc::writer::{FileWriter, IpcWriteOptions, StreamWriter};
+use arrow_ipc::CompressionType;
+use arrow_schema::{DataType, Field, Fields, Metadata, Schema, TimeUnit};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
+
+const MAGIC: &[u8] = b"ARROW1\0\0";
+const MAX_DEPTH: usize = 64;
+
+// Types by name: int8..int64, uint8..uint64, float32, float64, bool, utf8, large_utf8, binary, date32,
+// date64, timestamp[ms], timestamp[us, UTC], time64[us], decimal128(10,2), list<int32>,
+// struct<a:int32,b:utf8>, dictionary<int32,utf8>.
+
+fn type_name(t: &DataType) -> String {
+    match t {
+        DataType::Null => "null".into(),
+        DataType::Boolean => "bool".into(),
+        DataType::Int8 => "int8".into(),
+        DataType::Int16 => "int16".into(),
+        DataType::Int32 => "int32".into(),
+        DataType::Int64 => "int64".into(),
+        DataType::UInt8 => "uint8".into(),
+        DataType::UInt16 => "uint16".into(),
+        DataType::UInt32 => "uint32".into(),
+        DataType::UInt64 => "uint64".into(),
+        DataType::Float16 => "float16".into(),
+        DataType::Float32 => "float32".into(),
+        DataType::Float64 => "float64".into(),
+        DataType::Utf8 => "utf8".into(),
+        DataType::LargeUtf8 => "large_utf8".into(),
+        DataType::Binary => "binary".into(),
+        DataType::LargeBinary => "large_binary".into(),
+        DataType::Date32 => "date32".into(),
+        DataType::Date64 => "date64".into(),
+        DataType::Timestamp(u, tz) => match tz {
+            Some(z) => format!("timestamp[{}, {}]", unit(u), z),
+            None => format!("timestamp[{}]", unit(u)),
+        },
+        DataType::Time32(u) => format!("time32[{}]", unit(u)),
+        DataType::Time64(u) => format!("time64[{}]", unit(u)),
+        DataType::Decimal128(p, s) => format!("decimal128({},{})", p, s),
+        DataType::Decimal256(p, s) => format!("decimal256({},{})", p, s),
+        DataType::List(f) => format!("list<{}>", type_name(f.data_type())),
+        DataType::LargeList(f) => format!("large_list<{}>", type_name(f.data_type())),
+        DataType::Struct(fs) => format!("struct<{}>", fs.iter().map(|f| format!("{}:{}", f.name(), type_name(f.data_type()))).collect::<Vec<_>>().join(",")),
+        DataType::Dictionary(k, v) => format!("dictionary<{},{}>", type_name(k), type_name(v)),
+        o => format!("{:?}", o).to_lowercase(),
+    }
+}
+
+fn unit(u: &TimeUnit) -> &'static str {
+    match u {
+        TimeUnit::Second => "s",
+        TimeUnit::Millisecond => "ms",
+        TimeUnit::Microsecond => "us",
+        TimeUnit::Nanosecond => "ns",
+    }
+}
+
+fn unit_of(s: &str) -> Result<TimeUnit, String> {
+    Ok(match s.trim() {
+        "s" => TimeUnit::Second,
+        "ms" => TimeUnit::Millisecond,
+        "us" => TimeUnit::Microsecond,
+        "ns" => TimeUnit::Nanosecond,
+        o => return Err(format!("`{}` is not a time unit: s, ms, us or ns", o)),
+    })
+}
+
+/// Splits `a:int32,b:list<int8>` at top-level commas.
+fn top_split(s: &str) -> Vec<&str> {
+    let (mut d, mut from) = (0i32, 0);
+    let mut out = vec![];
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => d += 1,
+            '>' | ')' | ']' => d -= 1,
+            ',' if d == 0 => {
+                out.push(&s[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !s[from..].trim().is_empty() {
+        out.push(&s[from..]);
+    }
+    out
+}
+
+fn parse_type(s: &str, depth: usize) -> Result<DataType, String> {
+    if depth > MAX_DEPTH {
+        return Err("types are nested too deep".to_string());
+    }
+    let t = s.trim();
+    let inner = |pre: &str, close: char| t.strip_prefix(pre).and_then(|x| x.strip_suffix(close));
+    Ok(match t {
+        "null" => DataType::Null,
+        "bool" | "boolean" => DataType::Boolean,
+        "int8" => DataType::Int8,
+        "int16" => DataType::Int16,
+        "int32" | "int" => DataType::Int32,
+        "int64" | "long" => DataType::Int64,
+        "uint8" => DataType::UInt8,
+        "uint16" => DataType::UInt16,
+        "uint32" => DataType::UInt32,
+        "uint64" => DataType::UInt64,
+        "float32" | "float" => DataType::Float32,
+        "float64" | "double" => DataType::Float64,
+        "utf8" | "string" => DataType::Utf8,
+        "large_utf8" => DataType::LargeUtf8,
+        "binary" => DataType::Binary,
+        "large_binary" => DataType::LargeBinary,
+        "date32" => DataType::Date32,
+        "date64" => DataType::Date64,
+        _ => {
+            if let Some(i) = inner("timestamp[", ']') {
+                let (u, z) = i.split_once(',').map_or((i, None), |(a, b)| (a, Some(b.trim())));
+                DataType::Timestamp(unit_of(u)?, z.map(Arc::from))
+            } else if let Some(i) = inner("time32[", ']') {
+                DataType::Time32(unit_of(i)?)
+            } else if let Some(i) = inner("time64[", ']') {
+                DataType::Time64(unit_of(i)?)
+            } else if let Some(i) = inner("decimal128(", ')') {
+                let (p, s) = i.split_once(',').ok_or(format!("`{}` needs precision and scale", t))?;
+                DataType::Decimal128(p.trim().parse().map_err(|_| format!("`{}` is not a precision", p))?, s.trim().parse().map_err(|_| format!("`{}` is not a scale", s))?)
+            } else if let Some(i) = inner("list<", '>') {
+                DataType::List(Arc::new(Field::new("item", parse_type(i, depth + 1)?, true)))
+            } else if let Some(i) = inner("struct<", '>') {
+                let mut fs = vec![];
+                for p in top_split(i) {
+                    let (n, ty) = p.split_once(':').ok_or(format!("`{}` must be name:type", p))?;
+                    fs.push(Field::new(n.trim(), parse_type(ty, depth + 1)?, true));
+                }
+                DataType::Struct(Fields::from(fs))
+            } else if let Some(i) = inner("dictionary<", '>') {
+                let p = top_split(i);
+                if p.len() != 2 {
+                    return Err(format!("`{}` needs a key and a value type", t));
+                }
+                DataType::Dictionary(Box::new(parse_type(p[0], depth + 1)?), Box::new(parse_type(p[1], depth + 1)?))
+            } else {
+                return Err(format!("`{}` is not a type", t));
+            }
+        }
+    })
+}
+
+fn schema_from(v: &Value) -> Result<Schema, String> {
+    let mut fields = vec![];
+    match v {
+        Value::Object(m) => {
+            for (k, t) in m {
+                fields.push(Field::new(k, parse_type(t.as_str().ok_or(format!("the type of {} must be text", k))?, 0)?, true));
+            }
+        }
+        Value::Array(a) => {
+            for f in a {
+                let name = f.get("name").and_then(Value::as_str).ok_or("a field needs a `name`")?;
+                let ty = parse_type(f.get("type").and_then(Value::as_str).ok_or(format!("{} needs a `type`", name))?, 0)?;
+                fields.push(Field::new(name, ty, f.get("nullable").and_then(Value::as_bool).unwrap_or(true)));
+            }
+        }
+        _ => return Err("a schema is a map of name to type, or a list of { name, type, nullable }".to_string()),
+    }
+    Ok(Schema::new(fields))
+}
+
+fn meta(m: &Metadata) -> Value {
+    Value::Object(m.iter().map(|(k, v)| (k.to_string(), json!(v.to_string()))).collect())
+}
+
+fn schema_json(s: &Schema) -> Value {
+    json!({
+        "fields": s.fields().iter().map(|f| {
+            let mut m = Map::new();
+            m.insert("name".into(), json!(f.name()));
+            m.insert("type".into(), json!(type_name(f.data_type())));
+            m.insert("nullable".into(), json!(f.is_nullable()));
+            if !f.metadata().is_empty() { m.insert("metadata".into(), meta(f.metadata())); }
+            Value::Object(m)
+        }).collect::<Vec<_>>(),
+        "metadata": meta(s.metadata()),
+    })
+}
+
+fn infer(v: &Value, depth: usize) -> Option<DataType> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    match v {
+        Value::Null => None,
+        Value::Bool(_) => Some(DataType::Boolean),
+        Value::Number(n) if n.is_f64() => Some(DataType::Float64),
+        Value::Number(_) => Some(DataType::Int64),
+        Value::String(_) => Some(DataType::Utf8),
+        Value::Array(a) => {
+            let mut t = None;
+            for x in a {
+                t = join(t, infer(x, depth + 1));
+            }
+            Some(DataType::List(Arc::new(Field::new("item", t.unwrap_or(DataType::Utf8), true))))
+        }
+        Value::Object(m) => {
+            let fs: Vec<Field> = m.iter().map(|(k, x)| Field::new(k, infer(x, depth + 1).unwrap_or(DataType::Utf8), true)).collect();
+            Some(DataType::Struct(Fields::from(fs)))
+        }
+    }
+}
+
+/// Two types for one column: int and float make float, struct keys add up, anything else is text.
+fn join(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) if x == y => Some(x),
+        (Some(DataType::Int64), Some(DataType::Float64)) | (Some(DataType::Float64), Some(DataType::Int64)) => Some(DataType::Float64),
+        (Some(DataType::List(x)), Some(DataType::List(y))) => {
+            let t = join(Some(x.data_type().clone()), Some(y.data_type().clone())).unwrap_or(DataType::Utf8);
+            Some(DataType::List(Arc::new(Field::new("item", t, true))))
+        }
+        (Some(DataType::Struct(x)), Some(DataType::Struct(y))) => {
+            let mut fs: Vec<Field> = x.iter().map(|f| f.as_ref().clone()).collect();
+            for f in y.iter() {
+                match fs.iter_mut().find(|g| g.name() == f.name()) {
+                    Some(g) => *g = Field::new(g.name(), join(Some(g.data_type().clone()), Some(f.data_type().clone())).unwrap_or(DataType::Utf8), true),
+                    None => fs.push(f.as_ref().clone()),
+                }
+            }
+            Some(DataType::Struct(Fields::from(fs)))
+        }
+        _ => Some(DataType::Utf8),
+    }
+}
+
+fn infer_schema(rows: &[Value]) -> Result<Schema, String> {
+    let mut names: Vec<(String, Option<DataType>)> = vec![];
+    for (i, r) in rows.iter().enumerate() {
+        let m = r.as_object().ok_or(format!("row {} is not a map", i))?;
+        for (k, v) in m {
+            let t = infer(v, 0);
+            match names.iter_mut().find(|n| n.0 == *k) {
+                Some(n) => n.1 = join(n.1.take(), t),
+                None => names.push((k.clone(), t)),
+            }
+        }
+    }
+    Ok(Schema::new(names.into_iter().map(|(k, t)| Field::new(k, t.unwrap_or(DataType::Utf8), true)).collect::<Vec<_>>()))
+}
+
+/// The schema rows would get: ints as int64, floats as float64, a column of both as float64, maps as structs.
+pub fn arrow_ipc_infer(rows: Vec<serde_json::Value>) -> Result<Value, String> {
+    Ok(schema_json(&infer_schema(&rows)?))
+}
+
+fn build_int<T: ArrowPrimitiveType>(vals: &[&Value], name: &str, conv: impl Fn(i128) -> Option<T::Native>) -> Result<ArrayRef, String> {
+    let mut b = PrimitiveBuilder::<T>::with_capacity(vals.len());
+    for (i, v) in vals.iter().enumerate() {
+        let n: Option<i128> = match v {
+            Value::Null => None,
+            Value::Number(x) if x.is_i64() => x.as_i64().map(|y| y as i128),
+            Value::Number(x) if x.is_u64() => x.as_u64().map(|y| y as i128),
+            Value::Number(x) if x.as_f64().map_or(false, |f| f.fract() == 0.0) => x.as_f64().map(|f| f as i128),
+            Value::String(s) => Some(s.parse::<i128>().map_err(|_| format!("row {}: {}: `{}` is not a whole number", i, name, s))?),
+            o => return Err(format!("row {}: {}: {} is not a whole number", i, name, o)),
+        };
+        match n {
+            None => b.append_null(),
+            Some(x) => b.append_value(conv(x).ok_or(format!("row {}: {}: {} does not fit in {}", i, name, x, type_name(&T::DATA_TYPE)))?),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+fn build_float<T: ArrowPrimitiveType>(vals: &[&Value], name: &str, conv: impl Fn(f64) -> T::Native) -> Result<ArrayRef, String> {
+    let mut b = PrimitiveBuilder::<T>::with_capacity(vals.len());
+    for (i, v) in vals.iter().enumerate() {
+        match v {
+            Value::Null => b.append_null(),
+            Value::Number(x) => b.append_value(conv(x.as_f64().unwrap_or(0.0))),
+            Value::String(s) if matches!(s.as_str(), "NaN" | "nan" | "inf" | "-inf" | "Infinity" | "-Infinity") => b.append_value(conv(s.replace("Infinity", "inf").parse::<f64>().unwrap_or(f64::NAN))),
+            o => return Err(format!("row {}: {}: {} is not a number", i, name, o)),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+fn build(vals: &[&Value], ty: &DataType, name: &str, depth: usize) -> Result<ArrayRef, String> {
+    if depth > MAX_DEPTH {
+        return Err("values are nested too deep".to_string());
+    }
+    let range = |lo: i128, hi: i128| move |x: i128| -> Option<i128> { (x >= lo && x <= hi).then_some(x) };
+    Ok(match ty {
+        DataType::Null => new_null_array(ty, vals.len()),
+        DataType::Boolean => {
+            let mut b = BooleanBuilder::with_capacity(vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    Value::Null => b.append_null(),
+                    Value::Bool(x) => b.append_value(*x),
+                    o => return Err(format!("row {}: {}: {} is not true or false", i, name, o)),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Int8 => build_int::<Int8Type>(vals, name, |x| i8::try_from(x).ok())?,
+        DataType::Int16 => build_int::<Int16Type>(vals, name, |x| i16::try_from(x).ok())?,
+        DataType::Int32 => build_int::<Int32Type>(vals, name, |x| i32::try_from(x).ok())?,
+        DataType::Int64 => build_int::<Int64Type>(vals, name, |x| i64::try_from(x).ok())?,
+        DataType::UInt8 => build_int::<UInt8Type>(vals, name, |x| u8::try_from(x).ok())?,
+        DataType::UInt16 => build_int::<UInt16Type>(vals, name, |x| u16::try_from(x).ok())?,
+        DataType::UInt32 => build_int::<UInt32Type>(vals, name, |x| u32::try_from(x).ok())?,
+        DataType::UInt64 => build_int::<UInt64Type>(vals, name, |x| range(0, u64::MAX as i128)(x).map(|y| y as u64))?,
+        DataType::Float32 => build_float::<Float32Type>(vals, name, |x| x as f32)?,
+        DataType::Float64 => build_float::<Float64Type>(vals, name, |x| x)?,
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let text: Vec<Option<String>> = vals.iter().map(|v| match v {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                o => Some(o.to_string()),
+            }).collect();
+            if *ty == DataType::Utf8 { Arc::new(StringArray::from(text)) } else { Arc::new(LargeStringArray::from(text)) }
+        }
+        DataType::Binary | DataType::LargeBinary => {
+            let mut bytes: Vec<Option<Vec<u8>>> = vec![];
+            for (i, v) in vals.iter().enumerate() {
+                bytes.push(match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(STANDARD.decode(s).map_err(|e| format!("row {}: {}: not base64: {}", i, name, e))?),
+                    o => return Err(format!("row {}: {}: {} is not base64 text", i, name, o)),
+                });
+            }
+            let refs: Vec<Option<&[u8]>> = bytes.iter().map(|b| b.as_deref()).collect();
+            if *ty == DataType::Binary { Arc::new(BinaryArray::from(refs)) } else { Arc::new(LargeBinaryArray::from(refs)) }
+        }
+        DataType::List(f) => {
+            let mut lens = Vec::with_capacity(vals.len());
+            let mut inner: Vec<&Value> = vec![];
+            let mut valid = Vec::with_capacity(vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    Value::Null => {
+                        lens.push(0usize);
+                        valid.push(false);
+                    }
+                    Value::Array(a) => {
+                        lens.push(a.len());
+                        valid.push(true);
+                        inner.extend(a.iter());
+                    }
+                    o => return Err(format!("row {}: {}: {} is not a list", i, name, o)),
+                }
+            }
+            let child = build(&inner, f.data_type(), name, depth + 1)?;
+            Arc::new(ListArray::try_new(f.clone(), OffsetBuffer::from_lengths(lens), child, Some(NullBuffer::from(valid))).map_err(|e| format!("{}: {}", name, e))?)
+        }
+        DataType::Struct(fs) => {
+            let mut cols = vec![];
+            let null = Value::Null;
+            for f in fs.iter() {
+                let inner: Vec<&Value> = vals.iter().map(|v| v.get(f.name().as_str()).unwrap_or(&null)).collect();
+                cols.push(build(&inner, f.data_type(), &format!("{}.{}", name, f.name()), depth + 1)?);
+            }
+            for (i, v) in vals.iter().enumerate() {
+                if !v.is_object() && !v.is_null() {
+                    return Err(format!("row {}: {}: {} is not a map", i, name, v));
+                }
+            }
+            let valid: Vec<bool> = vals.iter().map(|v| !v.is_null()).collect();
+            Arc::new(StructArray::try_new(fs.clone(), cols, Some(NullBuffer::from(valid))).map_err(|e| format!("{}: {}", name, e))?)
+        }
+        // Dates, times, decimals and dictionaries all come from text.
+        other => {
+            let text: Vec<Option<String>> = vals.iter().map(|v| match v {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                o => Some(o.to_string()),
+            }).collect();
+            let strings = StringArray::from(text);
+            let opts = CastOptions { safe: false, ..Default::default() };
+            cast_with_options(&strings, other, &opts).map_err(|e| format!("{}: {}", name, e))?
+        }
+    })
+}
+
+fn batch_of(rows: &[Value], schema: &Arc<Schema>) -> Result<RecordBatch, String> {
+    let null = Value::Null;
+    let mut cols = vec![];
+    for f in schema.fields() {
+        let vals: Vec<&Value> = rows.iter().map(|r| r.get(f.name().as_str()).unwrap_or(&null)).collect();
+        if !f.is_nullable() {
+            if let Some(i) = vals.iter().position(|v| v.is_null()) {
+                return Err(format!("row {}: {} may not be null", i, f.name()));
+            }
+        }
+        cols.push(build(&vals, f.data_type(), f.name(), 0)?);
+    }
+    RecordBatch::try_new(schema.clone(), cols).map_err(|e| e.to_string())
+}
+
+fn encode(rows: &[Value], schema: &Value, options: &Value) -> Result<(Vec<u8>, usize), String> {
+    for (i, r) in rows.iter().enumerate() {
+        if !r.is_object() {
+            return Err(format!("row {} is not a map", i));
+        }
+    }
+    let s = Arc::new(if schema.is_null() { infer_schema(rows)? } else { schema_from(schema)? });
+    if s.fields().is_empty() {
+        return Err("no columns: give a schema, or rows with fields".to_string());
+    }
+    let size = options.get("batch_size").and_then(Value::as_i64).unwrap_or(65536);
+    if size <= 0 {
+        return Err("`batch_size` must be above 0".to_string());
+    }
+    let mut write_opts = IpcWriteOptions::default();
+    match options.get("compression").and_then(Value::as_str) {
+        None | Some("none") => {}
+        Some("lz4") => write_opts = write_opts.try_with_compression(Some(CompressionType::LZ4_FRAME)).map_err(|e| e.to_string())?,
+        Some(o) => return Err(format!("`{}` is not a compression here: lz4 or none (zstd needs C)", o)),
+    }
+    // One big batch cut into slices, not one built for each: a file allows a dictionary only once.
+    let whole = batch_of(rows, &s)?;
+    let mut batches = vec![];
+    let mut at = 0;
+    while at < whole.num_rows() {
+        let n = (size as usize).min(whole.num_rows() - at);
+        batches.push(whole.slice(at, n));
+        at += n;
+    }
+    if batches.is_empty() {
+        batches.push(whole);
+    }
+    let n = batches.len();
+    let mut out = vec![];
+    match options.get("format").and_then(Value::as_str).unwrap_or("file") {
+        "file" => {
+            let mut w = FileWriter::try_new_with_options(&mut out, &s, write_opts).map_err(|e| e.to_string())?;
+            for b in &batches {
+                w.write(b).map_err(|e| e.to_string())?;
+            }
+            w.finish().map_err(|e| e.to_string())?;
+        }
+        "stream" => {
+            let mut w = StreamWriter::try_new_with_options(&mut out, &s, write_opts).map_err(|e| e.to_string())?;
+            for b in &batches {
+                w.write(b).map_err(|e| e.to_string())?;
+            }
+            w.finish().map_err(|e| e.to_string())?;
+        }
+        o => return Err(format!("`{}` is not a format: file or stream", o)),
+    }
+    Ok((out, n))
+}
+
+/// Writes rows to a file. `schema` is null to infer, a map of name to type, or a list of `{ name, type, nullable }`. `options`: `format` (`file` or `stream`), `batch_size`, `compression` (`lz4`). Gives `{ rows, batches, bytes }`.
+pub fn arrow_ipc_write(path: &str, rows: Vec<serde_json::Value>, schema: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (b, n) = encode(&rows, &schema, &options)?;
+    std::fs::write(path, &b).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    Ok(json!({ "rows": rows.len(), "batches": n, "bytes": b.len() }))
+}
+
+/// The same, giving the bytes as base64 text.
+pub fn arrow_ipc_encode(rows: Vec<serde_json::Value>, schema: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    Ok(STANDARD.encode(encode(&rows, &schema, &options)?.0))
+}
+
+fn cell(a: &dyn Array, i: usize, depth: usize) -> Result<Value, String> {
+    if a.is_null(i) {
+        return Ok(Value::Null);
+    }
+    if depth > MAX_DEPTH {
+        return Err("values are nested too deep".to_string());
+    }
+    macro_rules! prim {
+        ($t:ty) => { json!(a.as_primitive::<$t>().value(i)) };
+    }
+    let float = |f: f64| if f.is_finite() { json!(f) } else { json!(f.to_string()) };
+    Ok(match a.data_type() {
+        DataType::Null => Value::Null,
+        DataType::Boolean => json!(a.as_boolean().value(i)),
+        DataType::Int8 => prim!(Int8Type),
+        DataType::Int16 => prim!(Int16Type),
+        DataType::Int32 => prim!(Int32Type),
+        DataType::Int64 => prim!(Int64Type),
+        DataType::UInt8 => prim!(UInt8Type),
+        DataType::UInt16 => prim!(UInt16Type),
+        DataType::UInt32 => prim!(UInt32Type),
+        DataType::UInt64 => {
+            let x = a.as_primitive::<UInt64Type>().value(i);
+            if x > i64::MAX as u64 { json!(x.to_string()) } else { json!(x) }
+        }
+        DataType::Float32 => float(a.as_primitive::<Float32Type>().value(i) as f64),
+        DataType::Float64 => float(a.as_primitive::<Float64Type>().value(i)),
+        DataType::Utf8 => json!(a.as_string::<i32>().value(i)),
+        DataType::LargeUtf8 => json!(a.as_string::<i64>().value(i)),
+        DataType::Binary => json!(STANDARD.encode(a.as_binary::<i32>().value(i))),
+        DataType::LargeBinary => json!(STANDARD.encode(a.as_binary::<i64>().value(i))),
+        DataType::List(_) => {
+            let v = a.as_list::<i32>().value(i);
+            json!((0..v.len()).map(|k| cell(v.as_ref(), k, depth + 1)).collect::<Result<Vec<_>, _>>()?)
+        }
+        DataType::LargeList(_) => {
+            let v = a.as_list::<i64>().value(i);
+            json!((0..v.len()).map(|k| cell(v.as_ref(), k, depth + 1)).collect::<Result<Vec<_>, _>>()?)
+        }
+        DataType::Struct(fs) => {
+            let s = a.as_struct();
+            let mut m = Map::new();
+            for (k, f) in fs.iter().enumerate() {
+                m.insert(f.name().clone(), cell(s.column(k).as_ref(), i, depth + 1)?);
+            }
+            Value::Object(m)
+        }
+        // Dates, times, decimals, dictionaries and the rest print as Arrow prints them.
+        _ => {
+            let o = FormatOptions::default();
+            let f = ArrayFormatter::try_new(a, &o).map_err(|e| e.to_string())?;
+            json!(f.value(i).to_string())
+        }
+    })
+}
+
+fn rows_of(b: &RecordBatch, out: &mut Vec<Value>, limit: usize) -> Result<(), String> {
+    let s = b.schema();
+    for i in 0..b.num_rows() {
+        if out.len() >= limit {
+            return Ok(());
+        }
+        let mut m = Map::new();
+        for (k, f) in s.fields().iter().enumerate() {
+            m.insert(f.name().clone(), cell(b.column(k).as_ref(), i, 0)?);
+        }
+        out.push(Value::Object(m));
+    }
+    Ok(())
+}
+
+struct Read {
+    format: &'static str,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+}
+
+fn decode(bytes: Vec<u8>) -> Result<Read, String> {
+    if bytes.len() < 8 {
+        return Err(format!("{} bytes is too short for Arrow IPC", bytes.len()));
+    }
+    let file = bytes.starts_with(MAGIC);
+    // Bad bytes can reach an assertion in the crate: turn that into an error.
+    let run = catch_unwind(AssertUnwindSafe(|| -> Result<Read, String> {
+        if file {
+            if !bytes.ends_with(b"ARROW1") {
+                return Err("the file has lost its closing ARROW1: it was cut short".to_string());
+            }
+            let r = FileReader::try_new(Cursor::new(&bytes), None).map_err(|e| format!("not a readable Arrow file: {}", e))?;
+            let schema = r.schema();
+            let batches = r.collect::<Result<Vec<_>, _>>().map_err(|e| format!("a batch cannot be read: {}", e))?;
+            Ok(Read { format: "file", schema, batches })
+        } else {
+            let r = StreamReader::try_new(Cursor::new(&bytes), None).map_err(|e| format!("not an Arrow stream: {}", e))?;
+            let schema = r.schema();
+            let batches = r.collect::<Result<Vec<_>, _>>().map_err(|e| format!("a batch cannot be read: {}", e))?;
+            Ok(Read { format: "stream", schema, batches })
+        }
+    }));
+    run.unwrap_or_else(|_| Err("the data is damaged".to_string()))
+}
+
+fn report(r: Read, limit: i64) -> Result<Value, String> {
+    let lim = if limit <= 0 { usize::MAX } else { limit as usize };
+    let mut rows = vec![];
+    for b in &r.batches {
+        rows_of(b, &mut rows, lim)?;
+    }
+    let total: usize = r.batches.iter().map(|b| b.num_rows()).sum();
+    Ok(json!({ "format": r.format, "schema": schema_json(&r.schema), "batches": r.batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), "total_rows": total, "rows": rows }))
+}
+
+/// Reads a file in either format, told apart by its magic: `{ format, schema, batches, total_rows, rows }`. `limit` of 0 gives every row. Dates, times and decimals come as text, binary as base64.
+pub fn arrow_ipc_read(path: &str, limit: i64) -> Result<Value, String> {
+    report(decode(std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?)?, limit)
+}
+
+/// The same from base64 text.
+pub fn arrow_ipc_decode(text: &str, limit: i64) -> Result<Value, String> {
+    report(decode(STANDARD.decode(text.trim()).map_err(|e| format!("bad base64: {}", e))?)?, limit)
+}
+
+/// Only what a file holds: its format, schema and batch sizes, the rows not converted.
+pub fn arrow_ipc_schema(path: &str) -> Result<Value, String> {
+    let mut v = report(decode(std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?)?, 1)?;
+    if let Some(m) = v.as_object_mut() {
+        m.remove("rows");
+    }
+    Ok(v)
+}
+
+/// One column's values, nulls included, by its name.
+pub fn arrow_ipc_column(path: &str, name: &str) -> Result<Vec<Value>, String> {
+    let r = decode(std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?)?;
+    let at = r.schema.index_of(name).map_err(|_| format!("{} has no column {}", path, name))?;
+    let mut out = vec![];
+    for b in &r.batches {
+        let c = b.column(at);
+        for i in 0..c.len() {
+            out.push(cell(c.as_ref(), i, 0)?);
+        }
+    }
+    Ok(out)
+}

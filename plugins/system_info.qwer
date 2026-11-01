@@ -1,0 +1,269 @@
+//! The machine a program runs on (`sysinfo`): CPU usage per core, memory and swap, disks with free space, network totals and rates, load average, uptime, and processes sorted by CPU or memory, for status pages and health checks.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sysinfo = { version = "=0.37.2", default-features = false, features = ["disk", "network", "system", "user"] }
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+use sysinfo::{DiskKind, Disks, Networks, Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users, MINIMUM_CPU_UPDATE_INTERVAL};
+
+struct Keep {
+    sys: System,
+    cpu_at: Option<Instant>,
+    processes_at: Option<Instant>,
+    net: Networks,
+    net_at: Option<Instant>,
+}
+
+fn keep() -> &'static Mutex<Keep> {
+    static K: OnceLock<Mutex<Keep>> = OnceLock::new();
+    K.get_or_init(|| Mutex::new(Keep { sys: System::new(), cpu_at: None, processes_at: None, net: Networks::new_with_refreshed_list(), net_at: None }))
+}
+
+fn percent(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+fn gib(b: u64) -> f64 {
+    (b as f64 / (1u64 << 30) as f64 * 100.0).round() / 100.0
+}
+
+// CPU usage is the change between two readings, so the first ever waits for a second one, and
+// readings closer than the system's interval are the same reading.
+fn refresh_cpu(k: &mut Keep) {
+    match k.cpu_at {
+        None => {
+            k.sys.refresh_cpu_usage();
+            std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+            k.sys.refresh_cpu_usage();
+            k.cpu_at = Some(Instant::now());
+        }
+        Some(t) if t.elapsed() >= MINIMUM_CPU_UPDATE_INTERVAL => {
+            k.sys.refresh_cpu_usage();
+            k.cpu_at = Some(Instant::now());
+        }
+        _ => {}
+    }
+}
+
+/// The CPUs: `{ brand, arch, logical, physical, usage_percent, frequency_mhz, per_core }`. The first call takes 200 ms to measure; later ones report since the one before.
+pub fn system_info_cpu() -> Result<Value, String> {
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    k.sys.refresh_cpu_all();
+    refresh_cpu(&mut k);
+    let cpus = k.sys.cpus();
+    Ok(json!({
+        "brand": cpus.first().map(|c| c.brand().trim().to_string()),
+        "arch": System::cpu_arch(),
+        "logical": cpus.len(),
+        "physical": System::physical_core_count(),
+        "usage_percent": percent(k.sys.global_cpu_usage() as f64),
+        "frequency_mhz": cpus.first().map(|c| c.frequency()),
+        "per_core": cpus.iter().map(|c| percent(c.cpu_usage() as f64)).collect::<Vec<_>>(),
+    }))
+}
+
+/// Memory and swap in bytes, with `used_percent` and sizes in GiB, and the container's limits under Linux cgroups in `cgroup`.
+pub fn system_info_memory() -> Result<Value, String> {
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    k.sys.refresh_memory();
+    let (total, used, avail) = (k.sys.total_memory(), k.sys.used_memory(), k.sys.available_memory());
+    let mut m = json!({
+        "total": total, "used": used, "free": k.sys.free_memory(), "available": avail,
+        "used_percent": if total == 0 { 0.0 } else { percent(used as f64 * 100.0 / total as f64) },
+        "total_gib": gib(total), "available_gib": gib(avail),
+        "swap_total": k.sys.total_swap(), "swap_used": k.sys.used_swap(),
+    });
+    if let Some(c) = k.sys.cgroup_limits() {
+        m["cgroup"] = json!({ "total": c.total_memory, "free": c.free_memory, "rss": c.rss });
+    }
+    Ok(m)
+}
+
+/// The mounted disks: `{ name, mount, file_system, kind, total, available, used_percent, removable, read_only }`, largest first. `options.real_only` leaves out pseudo file systems and read-only snapshots.
+pub fn system_info_disks(options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let real = options.get("real_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let disks = Disks::new_with_refreshed_list();
+    let mut l: Vec<_> = disks.list().iter().filter(|d| d.total_space() > 0).filter(|d| !real || (!d.is_read_only() && !matches!(d.file_system().to_string_lossy().as_ref(), "devfs" | "tmpfs" | "overlay" | "squashfs"))).collect();
+    l.sort_by_key(|d| std::cmp::Reverse(d.total_space()));
+    Ok(l.into_iter().map(|d| {
+        let (t, a) = (d.total_space(), d.available_space());
+        json!({
+            "name": d.name().to_string_lossy(), "mount": d.mount_point().display().to_string(), "file_system": d.file_system().to_string_lossy(),
+            "kind": match d.kind() { DiskKind::HDD => "hdd".to_string(), DiskKind::SSD => "ssd".to_string(), DiskKind::Unknown(_) => "unknown".to_string() },
+            "total": t, "available": a, "total_gib": gib(t), "available_gib": gib(a),
+            "used_percent": percent(t.saturating_sub(a) as f64 * 100.0 / t as f64),
+            "removable": d.is_removable(), "read_only": d.is_read_only(),
+        })
+    }).collect())
+}
+
+/// The disk holding a path, the longest mount that contains it, with its free space: what a "disk almost full" check wants.
+pub fn system_info_disk_for(path: &str) -> Result<Value, String> {
+    let p = std::fs::canonicalize(path).map_err(|e| format!("{}: {}", path, e))?;
+    let disks = Disks::new_with_refreshed_list();
+    let d = disks.list().iter().filter(|d| p.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).ok_or(format!("no mounted disk holds {}", path))?;
+    let (t, a) = (d.total_space(), d.available_space());
+    Ok(json!({ "mount": d.mount_point().display().to_string(), "total": t, "available": a, "available_gib": gib(a), "used_percent": if t == 0 { 0.0 } else { percent(t.saturating_sub(a) as f64 * 100.0 / t as f64) } }))
+}
+
+/// Network interfaces since boot, sorted by traffic: `{ name, received, transmitted, packets_received, packets_transmitted, errors, mac, addresses }`, and `rate_in` and `rate_out` in bytes a second since the last call (null the first time).
+pub fn system_info_network() -> Result<Vec<Value>, String> {
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    let since = k.net_at.map(|t| t.elapsed().as_secs_f64());
+    k.net.refresh(true);
+    k.net_at = Some(Instant::now());
+    let mut l: Vec<_> = k.net.list().iter().collect();
+    l.sort_by(|a, b| (b.1.total_received() + b.1.total_transmitted()).cmp(&(a.1.total_received() + a.1.total_transmitted())).then(a.0.cmp(b.0)));
+    Ok(l.into_iter().map(|(n, d)| {
+        let rate = |x: u64| since.filter(|s| *s > 0.0).map(|s| (x as f64 / s).round());
+        json!({
+            "name": n, "received": d.total_received(), "transmitted": d.total_transmitted(),
+            "packets_received": d.total_packets_received(), "packets_transmitted": d.total_packets_transmitted(),
+            "errors": d.total_errors_on_received() + d.total_errors_on_transmitted(),
+            "rate_in": rate(d.received()), "rate_out": rate(d.transmitted()),
+            "mac": d.mac_address().to_string(),
+            "addresses": d.ip_networks().iter().map(|i| format!("{}/{}", i.addr, i.prefix)).collect::<Vec<_>>(),
+        })
+    }).collect())
+}
+
+/// Load averages over 1, 5 and 15 minutes, with `per_core`, the first divided by the logical CPUs: over 1 means work is waiting.
+pub fn system_info_load() -> Result<Value, String> {
+    let l = System::load_average();
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    if k.sys.cpus().is_empty() {
+        k.sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+    }
+    let n = k.sys.cpus().len().max(1);
+    Ok(json!({ "one": l.one, "five": l.five, "fifteen": l.fifteen, "per_core": (l.one / n as f64 * 100.0).round() / 100.0 }))
+}
+
+/// How long the machine has been up: `{ seconds, boot_time, text }`, `text` like "3 days, 4:05".
+pub fn system_info_uptime() -> Value {
+    let s = System::uptime();
+    let (d, h, m) = (s / 86400, s % 86400 / 3600, s % 3600 / 60);
+    let text = if d > 0 { format!("{} day{}, {}:{:02}", d, if d == 1 { "" } else { "s" }, h, m) } else { format!("{}:{:02}", h, m) };
+    json!({ "seconds": s, "boot_time": System::boot_time(), "text": text })
+}
+
+/// The operating system and host: `{ name, version, long_version, kernel, host, arch }`, for an about page.
+pub fn system_info_os() -> Value {
+    json!({ "name": System::name(), "version": System::os_version(), "long_version": System::long_os_version(), "kernel": System::kernel_version(), "host": System::host_name(), "arch": System::cpu_arch() })
+}
+
+/// All at once, for a status page: `{ os, cpu, memory, disks, load, uptime }`.
+pub fn system_info_summary() -> Result<Value, String> {
+    Ok(json!({ "os": system_info_os(), "cpu": system_info_cpu()?, "memory": system_info_memory()?, "disks": system_info_disks(json!({ "real_only": true }))?, "load": system_info_load()?, "uptime": system_info_uptime() }))
+}
+
+fn users() -> &'static Mutex<Users> {
+    static U: OnceLock<Mutex<Users>> = OnceLock::new();
+    U.get_or_init(|| Mutex::new(Users::new_with_refreshed_list()))
+}
+
+fn process_map(p: &Process, u: &Users) -> Value {
+    json!({
+        "pid": p.pid().as_u32(),
+        "parent": p.parent().map(|x| x.as_u32()),
+        "name": p.name().to_string_lossy(),
+        "cpu_percent": percent(p.cpu_usage() as f64),
+        "memory": p.memory(),
+        "memory_mib": (p.memory() as f64 / (1u64 << 20) as f64 * 10.0).round() / 10.0,
+        "status": p.status().to_string(),
+        "run_seconds": p.run_time(),
+        "user": p.user_id().and_then(|i| u.get_user_by_id(i)).map(|x| x.name().to_string()),
+        "command": p.cmd().iter().map(|c| c.to_string_lossy().to_string()).collect::<Vec<_>>().join(" "),
+    })
+}
+
+fn refresh_processes(k: &mut Keep) {
+    let kind = ProcessRefreshKind::nothing().with_cpu().with_memory().with_user(UpdateKind::OnlyIfNotSet).with_cmd(UpdateKind::OnlyIfNotSet);
+    // Like the CPUs, a process's CPU share is the change between two looks.
+    let first = k.processes_at.is_none();
+    if first {
+        k.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+    }
+    k.sys.refresh_cpu_usage();
+    k.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    k.processes_at = Some(Instant::now());
+}
+
+/// Processes, heaviest first: options `sort` ("cpu", "memory", "name" or "pid"), `limit` (20), and `name`, part of a name to look for. Each has `pid`, `parent`, `name`, `cpu_percent`, `memory`, `status`, `run_seconds`, `user` and `command`. What a process's command line says is its own business: it may hold secrets.
+pub fn system_info_processes(options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let sort = options.get("sort").and_then(|v| v.as_str()).unwrap_or("cpu");
+    if !["cpu", "memory", "name", "pid"].contains(&sort) {
+        return Err(format!("`{}` is not a sort: cpu, memory, name or pid", sort));
+    }
+    let limit = options.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let want = options.get("name").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    refresh_processes(&mut k);
+    let mut l: Vec<&Process> = k.sys.processes().values().filter(|p| p.thread_kind().is_none()).filter(|p| want.as_ref().map_or(true, |w| p.name().to_string_lossy().to_lowercase().contains(w))).collect();
+    match sort {
+        "cpu" => l.sort_by(|a, b| b.cpu_usage().total_cmp(&a.cpu_usage()).then(b.memory().cmp(&a.memory()))),
+        "memory" => l.sort_by_key(|p| std::cmp::Reverse(p.memory())),
+        "name" => l.sort_by_key(|p| p.name().to_string_lossy().to_lowercase()),
+        _ => l.sort_by_key(|p| p.pid()),
+    }
+    let u = users().lock().map_err(|_| "lock")?;
+    Ok(l.into_iter().take(limit).map(|p| process_map(p, &u)).collect())
+}
+
+/// One process by its pid, null when it has gone.
+pub fn system_info_process(pid: i64) -> Result<Option<Value>, String> {
+    let n = u32::try_from(pid).map_err(|_| format!("{} is not a pid", pid))?;
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    refresh_processes(&mut k);
+    let u = users().lock().map_err(|_| "lock")?;
+    Ok(k.sys.process(Pid::from_u32(n)).map(|p| process_map(p, &u)))
+}
+
+/// This program's own process: pid, memory, CPU and run time.
+pub fn system_info_self() -> Result<Option<Value>, String> {
+    system_info_process(std::process::id() as i64)
+}
+
+/// How many processes there are, and how many in each state.
+pub fn system_info_process_counts() -> Result<Value, String> {
+    let mut k = keep().lock().map_err(|_| "lock")?;
+    refresh_processes(&mut k);
+    let mut by = std::collections::BTreeMap::new();
+    let mut total = 0;
+    for p in k.sys.processes().values().filter(|p| p.thread_kind().is_none()) {
+        total += 1;
+        *by.entry(p.status().to_string()).or_insert(0u64) += 1;
+    }
+    Ok(json!({ "total": total, "by_status": by }))
+}
+
+/// Warnings for a health check: `{ ok, warnings }`, from `limits` such as `{ memory_percent: 90, disk_percent: 90, load_per_core: 2.0 }`. The disks looked at are the real ones.
+pub fn system_info_health(limits: serde_json::Value) -> Result<Value, String> {
+    let n = |k: &str| limits.get(k).and_then(|v| v.as_f64());
+    let mut warn = vec![];
+    if let Some(l) = n("memory_percent") {
+        let u = system_info_memory()?["used_percent"].as_f64().unwrap_or(0.0);
+        if u >= l {
+            warn.push(format!("memory is {}% used", u));
+        }
+    }
+    if let Some(l) = n("disk_percent") {
+        for d in system_info_disks(json!({ "real_only": true }))? {
+            let u = d["used_percent"].as_f64().unwrap_or(0.0);
+            if u >= l {
+                warn.push(format!("{} is {}% full", d["mount"].as_str().unwrap_or("?"), u));
+            }
+        }
+    }
+    if let Some(l) = n("load_per_core") {
+        let u = system_info_load()?["per_core"].as_f64().unwrap_or(0.0);
+        if u >= l {
+            warn.push(format!("load is {} per core", u));
+        }
+    }
+    Ok(json!({ "ok": warn.is_empty(), "warnings": warn }))
+}

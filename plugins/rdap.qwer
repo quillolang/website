@@ -1,0 +1,413 @@
+//! RDAP, the JSON successor to WHOIS: domains, IP addresses and AS numbers looked up through IANA's bootstrap files, the right registry found by longest match, redirects and 429s handled, the registrar's own record followed, and events, entities and vCards flattened into plain fields. HTTP errors become usable errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! idna = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const BOOTSTRAP: &str = "https://data.iana.org/rdap";
+const MAX_RETRY_WAIT_MS: u64 = 5000;
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
+}
+
+fn agent(o: &Value) -> ureq::Agent {
+    let t = Duration::from_millis(opt_u64(o, "timeout_ms", 10000));
+    ureq::AgentBuilder::new().timeout_connect(t).timeout(t).redirects(5).user_agent("quillo-rdap/1.0").build()
+}
+
+enum Got {
+    Doc(Value),
+    Missing(Value),
+}
+
+// One GET, with 429s waited out as far as Retry-After allows. A 404 is an answer, not a failure.
+fn fetch(url: &str, o: &Value) -> Result<Got, String> {
+    let a = agent(o);
+    let mut tries = opt_u64(o, "retries", 2);
+    loop {
+        match a.get(url).set("Accept", "application/rdap+json, application/json").call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| format!("{}: {}", url, e))?;
+                return serde_json::from_str(&t).map(Got::Doc).map_err(|_| format!("{} did not answer JSON", url));
+            }
+            Err(ureq::Error::Status(429, r)) if tries > 0 => {
+                let wait = r.header("retry-after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1) * 1000;
+                if wait > opt_u64(o, "max_wait_ms", MAX_RETRY_WAIT_MS) {
+                    return Err(format!("{} is rate-limiting: try again in {} s", host_of(url), wait / 1000));
+                }
+                std::thread::sleep(Duration::from_millis(wait));
+                tries -= 1;
+            }
+            Err(ureq::Error::Status(404, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Ok(Got::Missing(serde_json::from_str(&body).unwrap_or(Value::Null)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Err(problem(c, &body, url));
+            }
+            Err(ureq::Error::Transport(t)) => return Err(format!("cannot reach {}: {}", host_of(url), t)),
+        }
+    }
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url).to_string()
+}
+
+// RDAP's error shape: errorCode, title, description (a list of lines).
+fn problem(code: u16, body: &str, url: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let lines: Vec<&str> = v.get("description").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|l| l.as_str()).collect()).unwrap_or_default();
+        if !title.is_empty() || !lines.is_empty() {
+            let mut m = format!("{} answered {}: {}", host_of(url), code, title);
+            if !lines.is_empty() {
+                m.push_str(if title.is_empty() { "" } else { ": " });
+                m.push_str(&lines.join(" "));
+            }
+            return m;
+        }
+    }
+    format!("{} answered {}", host_of(url), code)
+}
+
+fn bootstrap_base() -> String {
+    std::env::var("RDAP_BOOTSTRAP_URL").ok().filter(|s| !s.is_empty()).unwrap_or(BOOTSTRAP.to_string()).trim_end_matches('/').to_string()
+}
+
+// Bootstrap files change rarely: kept 6 hours, as asked of clients.
+fn file(name: &str, o: &Value) -> Result<Vec<(Vec<String>, Vec<String>)>, String> {
+    static C: OnceLock<Mutex<HashMap<String, (Instant, Vec<(Vec<String>, Vec<String>)>)>>> = OnceLock::new();
+    let c = C.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{}/{}.json", bootstrap_base(), name);
+    if let Some((at, v)) = c.lock().map_err(|_| "lock")?.get(&key) {
+        if at.elapsed() < Duration::from_secs(6 * 3600) {
+            return Ok(v.clone());
+        }
+    }
+    let doc = match fetch(&key, o)? {
+        Got::Doc(d) => d,
+        Got::Missing(_) => return Err(format!("no bootstrap file at {}", key)),
+    };
+    let mut list = vec![];
+    for s in doc.get("services").and_then(|v| v.as_array()).ok_or(format!("{} has no services", key))? {
+        let words = |i: usize| -> Vec<String> { s.get(i).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
+        list.push((words(0), words(1)));
+    }
+    c.lock().map_err(|_| "lock")?.insert(key, (Instant::now(), list.clone()));
+    Ok(list)
+}
+
+// The https one when a service lists both.
+fn best_url(urls: &[String]) -> Option<String> {
+    urls.iter().find(|u| u.starts_with("https://")).or(urls.first()).map(|u| if u.ends_with('/') { u.clone() } else { format!("{}/", u) })
+}
+
+fn ascii_domain(name: &str) -> Result<String, String> {
+    let t = name.trim().trim_end_matches('.').to_lowercase();
+    if t.is_empty() || !t.contains('.') && t.len() < 2 {
+        return Err(format!("`{}` is not a domain", name));
+    }
+    idna::domain_to_ascii(&t).map_err(|_| format!("`{}` is not a domain", name))
+}
+
+fn domain_server(ascii: &str, o: &Value) -> Result<String, String> {
+    let labels: Vec<&str> = ascii.split('.').collect();
+    let list = file("dns", o)?;
+    // The longest suffix wins: `co.uk` over `uk`.
+    for n in 0..labels.len() {
+        let suffix = labels[n..].join(".");
+        if let Some((_, urls)) = list.iter().find(|(tlds, _)| tlds.iter().any(|t| t.eq_ignore_ascii_case(&suffix))) {
+            return best_url(urls).ok_or(format!("the entry for `{}` has no URL", suffix));
+        }
+    }
+    Err(format!("no RDAP server is listed for .{}", labels.last().unwrap_or(&"")))
+}
+
+fn prefix_bits(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(a) => (u32::from(a) as u128) << 96,
+        IpAddr::V6(a) => u128::from(a),
+    }
+}
+
+fn in_net(ip: IpAddr, cidr: &str) -> Option<u32> {
+    let (a, l) = cidr.split_once('/')?;
+    let net: IpAddr = a.parse().or_else(|_| format!("{}.0.0", a.trim_end_matches(".0")).parse()).ok()?;
+    let len: u32 = l.parse().ok()?;
+    if ip.is_ipv4() != net.is_ipv4() {
+        return None;
+    }
+    let mask = if len == 0 { 0 } else { u128::MAX << (128 - len) };
+    if prefix_bits(ip) & mask == prefix_bits(net) & mask {
+        Some(len)
+    } else {
+        None
+    }
+}
+
+fn ip_server(ip: IpAddr, o: &Value) -> Result<String, String> {
+    let list = file(if ip.is_ipv4() { "ipv4" } else { "ipv6" }, o)?;
+    let mut best: Option<(u32, &Vec<String>)> = None;
+    for (nets, urls) in &list {
+        for n in nets {
+            if let Some(l) = in_net(ip, n) {
+                if best.map_or(true, |b| l > b.0) {
+                    best = Some((l, urls));
+                }
+            }
+        }
+    }
+    best.and_then(|b| best_url(b.1)).ok_or(format!("no RDAP server is listed for {}: private or unallocated", ip))
+}
+
+fn asn_server(n: u64, o: &Value) -> Result<String, String> {
+    for (ranges, urls) in file("asn", o)? {
+        for r in &ranges {
+            let (a, b) = r.split_once('-').unwrap_or((r, r));
+            if let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>()) {
+                if (a..=b).contains(&n) {
+                    return best_url(&urls).ok_or(format!("the entry for AS{} has no URL", n));
+                }
+            }
+        }
+    }
+    Err(format!("no RDAP server is listed for AS{}: private or unallocated", n))
+}
+
+/// The base URL the bootstrap files give for a domain, an IP address or an AS number ("AS15169"), without asking it anything.
+pub fn rdap_server(query: &str, options: serde_json::Value) -> Result<String, String> {
+    match kind_of(query)? {
+        Query::Domain(d) => domain_server(&d, &options),
+        Query::Ip(ip, _) => ip_server(ip, &options),
+        Query::Asn(n) => asn_server(n, &options),
+    }
+}
+
+enum Query {
+    Domain(String),
+    Ip(IpAddr, String),
+    Asn(u64),
+}
+
+fn kind_of(q: &str) -> Result<Query, String> {
+    let t = q.trim();
+    if let Ok(ip) = t.parse::<IpAddr>() {
+        return Ok(Query::Ip(ip, ip.to_string()));
+    }
+    if let Some((a, l)) = t.split_once('/') {
+        let ip: IpAddr = a.parse().map_err(|_| format!("`{}` is not an address", t))?;
+        let bits: u32 = l.parse().ok().filter(|n| *n <= if ip.is_ipv4() { 32 } else { 128 }).ok_or(format!("`{}` is not an address", t))?;
+        return Ok(Query::Ip(ip, format!("{}/{}", ip, bits)));
+    }
+    if t.len() > 2 && t.get(..2).map_or(false, |a| a.eq_ignore_ascii_case("as")) && t[2..].bytes().all(|c| c.is_ascii_digit()) {
+        return t[2..].parse().map(Query::Asn).map_err(|_| format!("`{}` is not an AS number", t));
+    }
+    if !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()) {
+        return t.parse().map(Query::Asn).map_err(|_| format!("`{}` is not an AS number", t));
+    }
+    Ok(Query::Domain(ascii_domain(t)?))
+}
+
+fn vcard(e: &Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    let Some(list) = e.get("vcardArray").and_then(|v| v.get(1)).and_then(|v| v.as_array()) else { return m };
+    for item in list {
+        let Some(a) = item.as_array() else { continue };
+        let name = a.first().and_then(|v| v.as_str()).unwrap_or("");
+        let text = a.get(3).and_then(|v| v.as_str()).unwrap_or("");
+        match name {
+            "fn" if !text.is_empty() => {
+                m.insert("name".into(), json!(text));
+            }
+            "org" if !text.is_empty() => {
+                m.insert("org".into(), json!(text));
+            }
+            "email" if !text.is_empty() => {
+                m.insert("email".into(), json!(text.trim_start_matches("mailto:")));
+            }
+            "tel" if !text.is_empty() => {
+                let kind = a.get(1).and_then(|p| p.get("type")).map(|t| t.to_string()).unwrap_or_default();
+                if !kind.contains("fax") {
+                    m.insert("phone".into(), json!(text.trim_start_matches("tel:")));
+                }
+            }
+            "adr" => {
+                if let Some(label) = a.get(1).and_then(|p| p.get("label")).and_then(|l| l.as_str()) {
+                    m.insert("address".into(), json!(label.replace('\n', ", ")));
+                } else if let Some(parts) = a.get(3).and_then(|v| v.as_array()) {
+                    let t: Vec<&str> = parts.iter().filter_map(|x| x.as_str()).filter(|x| !x.is_empty()).collect();
+                    if !t.is_empty() {
+                        m.insert("address".into(), json!(t.join(", ")));
+                    }
+                    if let Some(c) = parts.get(6).and_then(|x| x.as_str()).filter(|x| !x.is_empty()) {
+                        m.insert("country".into(), json!(c));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+// Every entity, the nested ones too, as one flat list with its roles.
+fn entities(doc: &Value, out: &mut Vec<Value>, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    for e in doc.get("entities").and_then(|v| v.as_array()).into_iter().flatten() {
+        let mut m = vcard(e);
+        m.insert("roles".into(), e.get("roles").cloned().unwrap_or(json!([])));
+        if let Some(h) = e.get("handle").filter(|h| h.is_string()) {
+            m.insert("handle".into(), h.clone());
+        }
+        for id in e.get("publicIds").and_then(|v| v.as_array()).into_iter().flatten() {
+            if id.get("type").and_then(|t| t.as_str()) == Some("IANA Registrar ID") {
+                m.insert("iana_id".into(), id.get("identifier").cloned().unwrap_or(Value::Null));
+            }
+        }
+        out.push(Value::Object(m));
+        entities(e, out, depth + 1);
+    }
+}
+
+fn with_role<'a>(list: &'a [Value], role: &str) -> Option<&'a Value> {
+    list.iter().find(|e| e["roles"].as_array().map_or(false, |r| r.iter().any(|x| x == role)))
+}
+
+/// Flattens an RDAP answer: `events` as a map of action to date, every entity with its roles and vCard as plain fields, `registrar`, `abuse_email`, `nameservers`, `status`, `notices`. Works on any answer you fetched yourself.
+pub fn rdap_flatten(doc: serde_json::Value) -> Value {
+    let class = doc.get("objectClassName").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = json!({ "kind": class, "handle": doc.get("handle") });
+    let copy = |k: &str, to: &str, out: &mut Value| {
+        if let Some(v) = doc.get(k).filter(|v| !v.is_null()) {
+            out[to] = v.clone();
+        }
+    };
+    match class {
+        "domain" => {
+            copy("ldhName", "name", &mut out);
+            copy("unicodeName", "unicode_name", &mut out);
+        }
+        "ip network" => {
+            copy("name", "name", &mut out);
+            copy("startAddress", "start", &mut out);
+            copy("endAddress", "end", &mut out);
+            copy("ipVersion", "version", &mut out);
+            copy("type", "type", &mut out);
+            copy("country", "country", &mut out);
+            copy("parentHandle", "parent", &mut out);
+            if let Some(c) = doc.get("cidr0_cidrs").and_then(|v| v.as_array()) {
+                let list: Vec<String> = c.iter().filter_map(|x| Some(format!("{}/{}", x.get("v4prefix").or(x.get("v6prefix"))?.as_str()?, x.get("length")?))).collect();
+                out["cidrs"] = json!(list);
+            }
+        }
+        "autnum" => {
+            copy("name", "name", &mut out);
+            copy("startAutnum", "start", &mut out);
+            copy("endAutnum", "end", &mut out);
+            copy("type", "type", &mut out);
+            copy("country", "country", &mut out);
+        }
+        _ => {}
+    }
+    copy("status", "status", &mut out);
+    let mut events = Map::new();
+    for e in doc.get("events").and_then(|v| v.as_array()).into_iter().flatten() {
+        if let (Some(a), Some(d)) = (e.get("eventAction").and_then(|v| v.as_str()), e.get("eventDate")) {
+            events.entry(a.to_string()).or_insert(d.clone());
+        }
+    }
+    out["events"] = Value::Object(events);
+    if let Some(n) = doc.get("nameservers").and_then(|v| v.as_array()) {
+        out["nameservers"] = json!(n.iter().filter_map(|x| x.get("ldhName").and_then(|v| v.as_str()).map(|s| s.to_lowercase())).collect::<Vec<_>>());
+    }
+    if let Some(d) = doc.get("secureDNS") {
+        out["dnssec"] = d.get("delegationSigned").cloned().unwrap_or(json!(false));
+    }
+    let mut list = vec![];
+    entities(&doc, &mut list, 0);
+    if let Some(r) = with_role(&list, "registrar") {
+        out["registrar"] = r.get("name").or(r.get("org")).cloned().unwrap_or(Value::Null);
+        if let Some(id) = r.get("iana_id") {
+            out["registrar_iana_id"] = id.clone();
+        }
+    }
+    if let Some(a) = with_role(&list, "abuse").and_then(|a| a.get("email")) {
+        out["abuse_email"] = a.clone();
+    }
+    if let Some(r) = with_role(&list, "registrant") {
+        out["registrant"] = r.get("org").or(r.get("name")).cloned().unwrap_or(Value::Null);
+    }
+    out["entities"] = json!(list);
+    let notes: Vec<Value> = doc.get("notices").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|n| n.get("title").cloned()).collect();
+    if !notes.is_empty() {
+        out["notices"] = json!(notes);
+    }
+    out
+}
+
+fn related(doc: &Value) -> Option<String> {
+    doc.get("links")?.as_array()?.iter().find(|l| l.get("rel").and_then(|v| v.as_str()) == Some("related") && l.get("type").and_then(|v| v.as_str()).map_or(true, |t| t.contains("rdap")) && l.get("href").and_then(|v| v.as_str()).map_or(false, |h| h.contains("/domain/"))).and_then(|l| l.get("href")?.as_str().map(String::from))
+}
+
+/// Looks up a domain, an IP address or network ("8.8.8.0/24"), or an AS number ("AS15169"): the server found from IANA's bootstrap files, and for a domain the registrar's own record followed when the registry links it (a failure there is noted, not fatal). Answers the flattened record with `found` and `server`; a name that does not exist is `found: false`. Options: `server` (a base URL, skipping the bootstrap), `follow`, `timeout_ms`, `retries`.
+pub fn rdap_lookup(query: &str, options: serde_json::Value) -> Result<Value, String> {
+    let q = kind_of(query)?;
+    let fixed = options.get("server").and_then(|v| v.as_str()).map(|s| if s.ends_with('/') { s.to_string() } else { format!("{}/", s) });
+    let (base, path, key) = match &q {
+        Query::Domain(d) => (match &fixed { Some(s) => s.clone(), None => domain_server(d, &options)? }, format!("domain/{}", d), d.clone()),
+        Query::Ip(ip, text) => (match &fixed { Some(s) => s.clone(), None => ip_server(*ip, &options)? }, format!("ip/{}", text), text.clone()),
+        Query::Asn(n) => (match &fixed { Some(s) => s.clone(), None => asn_server(*n, &options)? }, format!("autnum/{}", n), format!("AS{}", n)),
+    };
+    let url = format!("{}{}", base, path);
+    let doc = match fetch(&url, &options)? {
+        Got::Doc(d) => d,
+        Got::Missing(_) => return Ok(json!({ "found": false, "query": key, "server": base })),
+    };
+    let mut out = rdap_flatten(doc.clone());
+    out["found"] = json!(true);
+    out["server"] = json!(base);
+    let follow = options.get("follow").and_then(|v| v.as_bool()).unwrap_or(true);
+    if let (true, Query::Domain(_), Some(link)) = (follow, &q, related(&doc)) {
+        match fetch(&link, &options) {
+            Ok(Got::Doc(d)) => {
+                let more = rdap_flatten(d);
+                if let (Some(a), Some(b)) = (out["entities"].as_array().cloned(), more["entities"].as_array()) {
+                    let mut all = a;
+                    all.extend(b.iter().cloned());
+                    out["entities"] = json!(all);
+                }
+                for k in ["registrant", "abuse_email", "registrar"] {
+                    if out.get(k).map_or(true, |v| v.is_null()) && !more[k].is_null() {
+                        out[k] = more[k].clone();
+                    }
+                }
+                out["related"] = json!(link);
+            }
+            Ok(Got::Missing(_)) => out["related_failed"] = json!(format!("{} has no such record", host_of(&link))),
+            Err(e) => out["related_failed"] = json!(e),
+        }
+    }
+    Ok(out)
+}
+
+/// What a server asked for: `rdap_raw("https://rdap.org/", "domain/example.com")` answers its JSON unflattened, null for a 404.
+pub fn rdap_raw(server: &str, path: &str, options: serde_json::Value) -> Result<Value, String> {
+    let base = if server.ends_with('/') { server.to_string() } else { format!("{}/", server) };
+    Ok(match fetch(&format!("{}{}", base, path.trim_start_matches('/')), &options)? {
+        Got::Doc(d) => d,
+        Got::Missing(_) => Value::Null,
+    })
+}

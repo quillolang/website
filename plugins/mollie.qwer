@@ -1,0 +1,261 @@
+//! Mollie's Payments API without an SDK: payments with the exact decimals Mollie insists on, refunds, customers, mandates and recurring charges, lists followed through their next links, Mollie's problem answers read, and webhooks handled as Mollie means them: only an id comes in, and the payment is fetched back to learn what happened.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// MOLLIE_API_KEY is a test_ or live_ key (or an access_ token); MOLLIE_API_URL the API
+// (https://api.mollie.com/v2 when not set).
+
+const ZERO: &[&str] = &["JPY", "ISK"];
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("MOLLIE_API_URL").unwrap_or_else(|| "https://api.mollie.com/v2".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn token() -> Result<String, String> {
+    let t = setting("MOLLIE_API_KEY").ok_or("MOLLIE_API_KEY is not set")?;
+    if !(t.starts_with("test_") || t.starts_with("live_") || t.starts_with("access_")) {
+        return Err("a Mollie key starts with test_ or live_, a token with access_".into());
+    }
+    Ok(t)
+}
+
+fn problem(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let mut t = format!("Mollie {}", status);
+    if let Some(title) = v["title"].as_str() {
+        t.push_str(&format!(" {}", title));
+    }
+    match v["detail"].as_str() {
+        Some(d) => t.push_str(&format!(": {}", d)),
+        None => t.push_str(&format!(": {}", text.trim().chars().take(300).collect::<String>())),
+    }
+    if let Some(f) = v["field"].as_str() {
+        t.push_str(&format!(" (field {})", f));
+    }
+    t
+}
+
+// `url` is whole, as a next link is. A write without a key is not repeated.
+fn fetch(method: &str, url: &str, body: Option<&Value>, idempotency: &str) -> Result<Value, String> {
+    let t = token()?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let tries = if method == "GET" || !idempotency.is_empty() { 4u32 } else { 1 };
+    for attempt in 0..tries {
+        let mut req = agent.request(method, url).set("Authorization", &format!("Bearer {}", t)).set("Accept", "application/hal+json");
+        if !idempotency.is_empty() {
+            req = req.set("Idempotency-Key", idempotency);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let text = r.into_string().map_err(|e| e.to_string())?;
+                return if text.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&text).map_err(|_| format!("Mollie's answer is not JSON: {}", text.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(429 | 502 | 503 | 504, r)) if attempt + 1 < tries => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(300u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(problem(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Mollie at {}: {}", api(), e)),
+        }
+    }
+    Err("Mollie stayed busy through four tries".into())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    fetch(method, &format!("{}{}", api(), path), body, "")
+}
+
+// A list's items are in _embedded under its own name, and the next page is a whole link.
+fn walk(path: &str, field: &str, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut url = format!("{}{}{}limit=250", api(), path, if path.contains('?') { "&" } else { "?" });
+    loop {
+        let v = fetch("GET", &url, None, "")?;
+        out.extend(v["_embedded"][field].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["_links"]["next"]["href"].as_str() {
+            Some(n) => url = n.to_string(),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// An amount as Mollie wants it, a string with exactly the currency's decimals: `mollie_amount("10", "EUR")` is `{ currency: "EUR", value: "10.00" }`, `("1000", "JPY")` keeps none. More decimals than that are an error.
+pub fn mollie_amount(amount: &str, currency: &str) -> Result<serde_json::Value, String> {
+    let c = currency.to_uppercase();
+    if c.len() != 3 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("`{}` is not a three-letter currency code", currency));
+    }
+    let places = if ZERO.contains(&c.as_str()) { 0 } else { 2 };
+    let a = amount.trim();
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > places {
+        return Err(format!("{} has {} decimals; {} has {} at Mollie", amount, frac.len(), c, places));
+    }
+    let value = if places == 0 { whole.to_string() } else { format!("{}.{}{}", whole, frac, "0".repeat(places - frac.len())) };
+    Ok(json!({ "currency": c, "value": value }))
+}
+
+fn take_key(b: &mut Value) -> String {
+    b.as_object_mut().and_then(|m| m.remove("idempotency_key")).and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+fn create(path: &str, mut b: Value) -> Result<Value, String> {
+    let idem = take_key(&mut b);
+    fetch("POST", &format!("{}{}", api(), path), Some(&b), &idem)
+}
+
+fn summary(p: Value) -> Value {
+    let checkout = p["_links"]["checkout"]["href"].clone();
+    let mut p = p;
+    p["checkout_url"] = checkout;
+    p
+}
+
+/// Makes a payment: `amount` from mollie_amount, `redirect_url` where the customer comes back. `params` adds `webhookUrl`, `method`, `metadata`, `locale`, `idempotency_key`... Gives the payment with `checkout_url`: send the customer there.
+pub fn mollie_payment_create(amount: serde_json::Value, description: &str, redirect_url: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !amount["value"].is_string() {
+        return Err("the amount must be { currency, value } with a text value: see mollie_amount".into());
+    }
+    if description.is_empty() {
+        return Err("a payment needs a description".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["amount"] = amount;
+    b["description"] = json!(description);
+    if !redirect_url.is_empty() {
+        b["redirectUrl"] = json!(redirect_url);
+    }
+    Ok(summary(create("/payments", b)?))
+}
+
+/// One payment by id (tr_...), with `checkout_url`.
+pub fn mollie_payment(id: &str) -> Result<serde_json::Value, String> {
+    Ok(summary(call("GET", &format!("/payments/{}", enc(id)), None)?))
+}
+
+/// Cancels a payment whose `isCancelable` is true.
+pub fn mollie_payment_cancel(id: &str) -> Result<serde_json::Value, String> {
+    call("DELETE", &format!("/payments/{}", enc(id)), None)
+}
+
+/// Payments, newest first, through every page; `max_items` caps them (0: all).
+pub fn mollie_payments(max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/payments", "payments", max_items)
+}
+
+/// Refunds `amount` of a payment. `description` may be "". Gives the refund; Mollie refuses more than is left.
+pub fn mollie_refund(payment_id: &str, amount: serde_json::Value, description: &str) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "amount": amount });
+    if !description.is_empty() {
+        b["description"] = json!(description);
+    }
+    call("POST", &format!("/payments/{}/refunds", enc(payment_id)), Some(&b))
+}
+
+/// A payment's refunds.
+pub fn mollie_refunds(payment_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/payments/{}/refunds", enc(payment_id)), "refunds", 0)
+}
+
+/// Cancels a refund still `queued` or `pending`.
+pub fn mollie_refund_cancel(payment_id: &str, refund_id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/payments/{}/refunds/{}", enc(payment_id), enc(refund_id)), None)?;
+    Ok(true)
+}
+
+/// Makes a customer: `fields` are `name`, `email`, `locale`, `metadata`.
+pub fn mollie_customer_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    create("/customers", fields)
+}
+
+/// One customer by id (cst_...).
+pub fn mollie_customer(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/customers/{}", enc(id)), None)
+}
+
+/// Customers through every page; `max_items` caps them (0: all).
+pub fn mollie_customers(max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/customers", "customers", max_items)
+}
+
+/// The first payment of a recurring customer: the customer pays once by hand and Mollie makes a mandate of it. Otherwise as mollie_payment_create.
+pub fn mollie_first_payment(customer_id: &str, amount: serde_json::Value, description: &str, redirect_url: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut p = if params.is_object() { params } else { json!({}) };
+    p["customerId"] = json!(customer_id);
+    p["sequenceType"] = json!("first");
+    mollie_payment_create(amount, description, redirect_url, p)
+}
+
+/// A charge on a customer's mandate, with no one present: give `mandate_id`, or "" to let Mollie pick a valid one. It starts `pending` and ends by webhook. Give `params.idempotency_key` so a retry cannot charge twice.
+pub fn mollie_charge(customer_id: &str, amount: serde_json::Value, description: &str, mandate_id: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut p = if params.is_object() { params } else { json!({}) };
+    p["customerId"] = json!(customer_id);
+    p["sequenceType"] = json!("recurring");
+    if !mandate_id.is_empty() {
+        p["mandateId"] = json!(mandate_id);
+    }
+    mollie_payment_create(amount, description, "", p)
+}
+
+/// Makes a mandate directly: `fields` as Mollie documents them (`method`: "directdebit", `consumerName`, `consumerAccount`).
+pub fn mollie_mandate_create(customer_id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("POST", &format!("/customers/{}/mandates", enc(customer_id)), Some(&fields))
+}
+
+/// A customer's mandates, each with a `status` of valid, pending or invalid.
+pub fn mollie_mandates(customer_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/customers/{}/mandates", enc(customer_id)), "mandates", 0)
+}
+
+/// The first mandate that can be charged now, or null.
+pub fn mollie_valid_mandate(customer_id: &str) -> Result<serde_json::Value, String> {
+    Ok(mollie_mandates(customer_id)?.into_iter().find(|m| m["status"] == "valid").unwrap_or(Value::Null))
+}
+
+/// Revokes a mandate.
+pub fn mollie_mandate_revoke(customer_id: &str, mandate_id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/customers/{}/mandates/{}", enc(customer_id), enc(mandate_id)), None)?;
+    Ok(true)
+}
+
+/// Handles a webhook's raw form `body` (`id=tr_...`). Nothing in it can be believed, so the payment is fetched back by id. Gives { known, id, status, paid, payment }; an unknown id is `known: false`, not an error: Mollie's advice is to answer 200 either way, so a stranger learns nothing.
+pub fn mollie_webhook(body: &str) -> Result<serde_json::Value, String> {
+    let id = body.split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").to_string();
+    if id.is_empty() {
+        return Ok(json!({ "known": false, "id": Value::Null, "status": Value::Null, "paid": false, "payment": Value::Null }));
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Ok(json!({ "known": false, "id": Value::Null, "status": Value::Null, "paid": false, "payment": Value::Null }));
+    }
+    match mollie_payment(&id) {
+        Ok(p) => Ok(json!({ "known": true, "id": id, "status": p["status"], "paid": p["paidAt"].is_string() || p["status"] == "paid", "payment": p })),
+        Err(e) if e.starts_with("Mollie 404") => Ok(json!({ "known": false, "id": id, "status": Value::Null, "paid": false, "payment": Value::Null })),
+        Err(e) => Err(e),
+    }
+}

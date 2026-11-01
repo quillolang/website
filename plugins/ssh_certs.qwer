@@ -1,0 +1,438 @@
+//! OpenSSH certificates: read with their principals, validity, critical options and CA, checked as sshd checks them (signature, trusted CA, type, time, principal, unknown critical options), and made and signed with a CA key, for short-lived access.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "ed25519", "rsa", "ecdsa", "p256", "p384", "encryption", "getrandom", "rand_core"] }
+//! signature = "2"
+//! rsa = "0.9"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use signature::{Signer, Verifier};
+use ssh_key::rand_core::OsRng;
+use ssh_key::{Algorithm, EcdsaCurve, Fingerprint, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const FOREVER: u64 = u64::MAX;
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn iso(secs: u64) -> String {
+    let secs = secs as i64;
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+// ---- The certificate format, by hand: ssh-key 0.6 cannot hold a `forever` validity ----
+
+struct Wire<'a>(&'a [u8]);
+
+impl<'a> Wire<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.0.len() < n {
+            return Err("the certificate is cut short".into());
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        let b = self.take(8)?;
+        Ok(u64::from_be_bytes(b.try_into().unwrap_or_default()))
+    }
+    fn string(&mut self) -> Result<&'a [u8], String> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+    fn text(&mut self) -> Result<String, String> {
+        String::from_utf8(self.string()?.to_vec()).map_err(|_| "a field that is not UTF-8".to_string())
+    }
+}
+
+fn put(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend((b.len() as u32).to_be_bytes());
+    out.extend(b);
+}
+
+struct Cert {
+    algorithm: String,
+    key_blob: Vec<u8>,
+    serial: u64,
+    host: bool,
+    key_id: String,
+    principals: Vec<String>,
+    after: u64,
+    before: u64,
+    critical: Vec<(String, String)>,
+    extensions: Vec<(String, String)>,
+    ca_blob: Vec<u8>,
+    signature: Vec<u8>,
+    tbs: Vec<u8>,
+    comment: String,
+}
+
+/// How many length-prefixed fields a public key of this kind has after its name.
+fn key_fields(kind: &str) -> Result<usize, String> {
+    Ok(match kind {
+        "ssh-ed25519" => 1,
+        "ssh-rsa" => 2,
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => 2,
+        "sk-ssh-ed25519@openssh.com" => 2,
+        "sk-ecdsa-sha2-nistp256@openssh.com" => 3,
+        other => return Err(format!("`{}` is not a key type this reads", other)),
+    })
+}
+
+fn option_list(b: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let mut r = Wire(b);
+    let mut out: Vec<(String, String)> = vec![];
+    while !r.0.is_empty() {
+        let name = r.text()?;
+        let data = r.string()?;
+        let value = if data.is_empty() { String::new() } else { Wire(data).text()? };
+        if out.last().is_some_and(|(p, _)| *p >= name) {
+            return Err("the certificate's options are out of order or doubled, which OpenSSH refuses".into());
+        }
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
+fn parse(text: &str) -> Result<Cert, String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).ok_or("no certificate given")?;
+    let mut words = line.split_whitespace();
+    let name = words.next().unwrap_or("");
+    let plain = name.strip_suffix("-cert-v01@openssh.com").ok_or("this is not an OpenSSH certificate: its first word should end in -cert-v01@openssh.com")?;
+    let blob = B64.decode(words.next().ok_or("the certificate has no body")?).map_err(|_| "the certificate's body is not base64".to_string())?;
+    let comment = words.collect::<Vec<_>>().join(" ");
+    let mut r = Wire(&blob);
+    if r.string()? != name.as_bytes() {
+        return Err("the certificate's type does not match its name".into());
+    }
+    r.string()?; // the nonce
+    let start = blob.len() - r.0.len();
+    for _ in 0..key_fields(plain)? {
+        r.string()?;
+    }
+    let mut key_blob = vec![];
+    put(&mut key_blob, plain.as_bytes());
+    key_blob.extend(&blob[start..blob.len() - r.0.len()]);
+    let serial = r.u64()?;
+    let host = match r.u32()? {
+        1 => false,
+        2 => true,
+        x => return Err(format!("certificate type {} is neither user nor host", x)),
+    };
+    let key_id = r.text()?;
+    let list = r.string()?;
+    let mut p = Wire(list);
+    let mut principals = vec![];
+    while !p.0.is_empty() {
+        principals.push(p.text()?);
+    }
+    let (after, before) = (r.u64()?, r.u64()?);
+    let critical = option_list(r.string()?)?;
+    let extensions = option_list(r.string()?)?;
+    r.string()?; // reserved
+    let ca_blob = r.string()?.to_vec();
+    let tbs = blob[..blob.len() - r.0.len()].to_vec();
+    let signature = r.string()?.to_vec();
+    if !r.0.is_empty() {
+        return Err("the certificate has bytes after its signature".into());
+    }
+    Ok(Cert { algorithm: plain.to_string(), key_blob, serial, host, key_id, principals, after, before, critical, extensions, ca_blob, signature, tbs, comment })
+}
+
+fn fp(blob: &[u8]) -> Result<Fingerprint, String> {
+    Ok(PublicKey::from_bytes(blob).map_err(|e| format!("a key that cannot be read: {}", e))?.fingerprint(HashAlg::Sha256))
+}
+
+fn options(m: &[(String, String)]) -> Value {
+    Value::Object(m.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<String, Value>>())
+}
+
+fn opt<'a>(m: &'a [(String, String)], k: &str) -> Option<&'a String> {
+    m.iter().find(|(n, _)| n == k).map(|(_, v)| v)
+}
+
+fn describe(c: &Cert) -> Result<Value, String> {
+    let forever = c.before == FOREVER;
+    let ca = PublicKey::from_bytes(&c.ca_blob).map_err(|e| format!("the CA key cannot be read: {}", e))?;
+    Ok(json!({
+        "type": if c.host { "host" } else { "user" },
+        "algorithm": c.algorithm,
+        "key_id": c.key_id,
+        "serial": c.serial,
+        "principals": c.principals,
+        "valid_after": c.after,
+        "valid_before": if forever { Value::Null } else { json!(c.before) },
+        "from": iso(c.after),
+        "until": if forever { json!("forever") } else { json!(iso(c.before)) },
+        "critical_options": options(&c.critical),
+        "extensions": options(&c.extensions),
+        "key_fingerprint": fp(&c.key_blob)?.to_string(),
+        "ca_fingerprint": ca.fingerprint(HashAlg::Sha256).to_string(),
+        "ca_algorithm": ca.algorithm().as_str(),
+        "comment": c.comment,
+    }))
+}
+
+/// Reads a certificate's line, or a `-cert.pub` file's text: { type, algorithm, key_id, serial, principals, from, until ("forever"), valid_after, valid_before, critical_options, extensions, key_fingerprint, ca_fingerprint, ca_algorithm, comment }. Nothing is checked yet.
+pub fn ssh_cert_read(text: &str) -> Result<serde_json::Value, String> {
+    describe(&parse(text)?)
+}
+
+/// An OpenSSH SHA256 fingerprint for a public key's line, or a fingerprint as it is.
+fn ca_print(s: &str) -> Result<Fingerprint, String> {
+    if s.starts_with("SHA256:") {
+        return s.trim().parse::<Fingerprint>().map_err(|e| format!("`{}`: {}", s, e));
+    }
+    Ok(PublicKey::from_openssh(s.trim()).map_err(|e| format!("the CA key cannot be read: {}", e))?.fingerprint(HashAlg::Sha256))
+}
+
+fn ip_of(s: &str) -> Option<Vec<u8>> {
+    s.parse::<std::net::IpAddr>().ok().map(|a| match a {
+        std::net::IpAddr::V4(x) => x.octets().to_vec(),
+        std::net::IpAddr::V6(x) => x.to_canonical().to_string().parse::<std::net::IpAddr>().map_or(x.octets().to_vec(), |c| match c {
+            std::net::IpAddr::V4(y) => y.octets().to_vec(),
+            std::net::IpAddr::V6(y) => y.octets().to_vec(),
+        }),
+    })
+}
+
+fn in_cidr(ip: &[u8], cidr: &str) -> bool {
+    let (net, bits) = cidr.split_once('/').map_or((cidr, None), |(a, b)| (a, b.parse::<usize>().ok()));
+    let Some(n) = ip_of(net) else { return false };
+    if n.len() != ip.len() {
+        return false;
+    }
+    let bits = bits.unwrap_or(n.len() * 8);
+    (0..bits.min(n.len() * 8)).all(|i| (n[i / 8] >> (7 - i % 8)) & 1 == (ip[i / 8] >> (7 - i % 8)) & 1)
+}
+
+/// Decides as sshd would: the signature, the CA among `ca` (a list of public-key lines or SHA256 fingerprints), `type` (user by default), the time (option now), `principal` if given, `source_address` against any source-address option, and any critical option sshd would not know, which refuses it. Gives { ok: true, ... what `ssh_cert_read` gives, with force_command } or an error value saying what failed. An empty principal list is refused when a principal is asked for.
+pub fn ssh_cert_check(text: &str, options_in: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = parse(text)?;
+    let list = options_in.get("ca").and_then(|a| a.as_array()).filter(|a| !a.is_empty()).ok_or("say which CAs to trust: the option `ca`, a list of public keys or fingerprints")?;
+    let cas = list.iter().map(|x| ca_print(x.as_str().unwrap_or(""))).collect::<Result<Vec<_>, _>>()?;
+    let t = options_in.get("now").and_then(|n| n.as_u64()).unwrap_or_else(now);
+    let ca = PublicKey::from_bytes(&c.ca_blob).map_err(|e| format!("the CA key cannot be read: {}", e))?;
+    let sig = Signature::try_from(c.signature.as_slice()).map_err(|_| "the certificate's signature cannot be read".to_string())?;
+    if !matches!(sig.algorithm(), Algorithm::Rsa { hash: None }) {
+        Verifier::verify(ca.key_data(), &c.tbs, &sig).map_err(|_| "the certificate's signature does not match: it was changed, or forged".to_string())?;
+    }
+    let own = ca.fingerprint(HashAlg::Sha256);
+    if !cas.contains(&own) {
+        return Err(format!("signed by a CA not trusted here: {}", own));
+    }
+    if matches!(sig.algorithm(), Algorithm::Rsa { hash: None }) {
+        return Err("signed with SHA-1 (ssh-rsa), which OpenSSH no longer takes".into());
+    }
+    let want = options_in.get("type").and_then(|x| x.as_str()).unwrap_or("user");
+    let is_host = c.host;
+    if want != "user" && want != "host" {
+        return Err(format!("`{}` is not a type: user or host", want));
+    }
+    if (want == "host") != is_host {
+        return Err(format!("this is a {} certificate, not a {} one", if is_host { "host" } else { "user" }, want));
+    }
+    if t < c.after {
+        return Err(format!("not valid yet: from {}", iso(c.after)));
+    }
+    if t >= c.before {
+        return Err(format!("expired on {}", iso(c.before)));
+    }
+    if let Some(p) = options_in.get("principal").and_then(|x| x.as_str()) {
+        if c.principals.is_empty() {
+            return Err("the certificate has no principals: it would hold for anyone, and is refused".into());
+        }
+        if !c.principals.iter().any(|x| x == p) {
+            return Err(format!("`{}` is not among its principals: {}", p, c.principals.join(", ")));
+        }
+    }
+    // Critical options are the ones a reader must understand or refuse.
+    for (k, _) in &c.critical {
+        if !is_host && !["force-command", "source-address", "verify-required"].contains(&k.as_str()) {
+            return Err(format!("the critical option `{}` is unknown, so the certificate is refused", k));
+        }
+        if is_host {
+            return Err(format!("a host certificate has the critical option `{}`, and OpenSSH defines none", k));
+        }
+    }
+    if let Some(list) = opt(&c.critical, "source-address") {
+        let Some(from) = options_in.get("source_address").and_then(|x| x.as_str()) else {
+            return Err(format!("the certificate is limited to {}: give `source_address`", list));
+        };
+        let ip = ip_of(from).ok_or(format!("`{}` is not an address", from))?;
+        if !list.split(',').any(|n| in_cidr(&ip, n.trim())) {
+            return Err(format!("{} is not within source-address {}", from, list));
+        }
+    }
+    let mut v = describe(&c)?;
+    v["ok"] = json!(true);
+    v["force_command"] = json!(opt(&c.critical, "force-command"));
+    Ok(v)
+}
+
+fn time_of(v: &Value) -> Result<u64, String> {
+    match v {
+        Value::Number(n) => n.as_u64().ok_or(format!("{} is not a time", n)),
+        Value::String(s) => {
+            let b = s.as_bytes();
+            let num = |a: usize, z: usize| s.get(a..z).and_then(|x| x.parse::<i64>().ok()).ok_or(format!("`{}` is not a time: Unix seconds, or 2026-11-01T09:00:00Z", s));
+            if b.len() < 19 {
+                return Err(format!("`{}` is not a time: Unix seconds, or 2026-11-01T09:00:00Z", s));
+            }
+            let (y, mo, d, h, mi, se) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
+            let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+            let era = yy.div_euclid(400);
+            let yoe = yy - era * 400;
+            Ok(((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + se) as u64)
+        }
+        _ => Err(format!("{} is not a time", v)),
+    }
+}
+
+/// rsa-sha2-512. ssh-key 0.6.7 builds an RSA key from `p` twice, so its own signing fails.
+fn rsa_sign(k: &ssh_key::private::RsaKeypair, msg: &[u8]) -> Result<Signature, String> {
+    let n = |m: &ssh_key::Mpint| m.as_positive_bytes().map(rsa::BigUint::from_bytes_be).ok_or("an RSA key with a bad number".to_string());
+    let key = rsa::RsaPrivateKey::from_components(n(&k.public.n)?, n(&k.public.e)?, n(&k.private.d)?, vec![n(&k.private.p)?, n(&k.private.q)?]).map_err(|e| format!("the RSA key is not valid: {}", e))?;
+    let data = rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(key).try_sign(msg).map_err(|e| format!("signing failed: {}", e))?;
+    let bytes: Box<[u8]> = data.into();
+    Signature::new(Algorithm::Rsa { hash: Some(HashAlg::Sha512) }, bytes.to_vec()).map_err(|e| e.to_string())
+}
+
+fn ca_key(text: &str, o: &Value) -> Result<PrivateKey, String> {
+    let k = PrivateKey::from_openssh(text.trim()).map_err(|e| format!("the CA key cannot be read: {}", e))?;
+    if !k.is_encrypted() {
+        return Ok(k);
+    }
+    let pass = o.get("passphrase").and_then(|p| p.as_str()).ok_or("the CA key is encrypted: give `passphrase`")?;
+    k.decrypt(pass).map_err(|_| "wrong passphrase for the CA key".to_string())
+}
+
+/// Signs a public key (its line) with a CA's private key (OpenSSH format). `spec` is { type (user), key_id, principals, serial, valid_for (seconds from now) or valid_after and valid_before, forever: true, critical_options, extensions, comment, passphrase }. A user certificate gets ssh-keygen's usual permit-* extensions unless `extensions` is given. A skew of a minute goes before the start. Gives the certificate's line.
+pub fn ssh_cert_sign(public_key: &str, ca_private: &str, spec: serde_json::Value) -> Result<String, String> {
+    let ca = ca_key(ca_private, &spec)?;
+    let subject = PublicKey::from_openssh(public_key.trim()).map_err(|e| format!("the public key cannot be read: {}", e))?;
+    let t = now();
+    let after = match spec.get("valid_after") {
+        Some(v) => time_of(v)?,
+        None => t.saturating_sub(60),
+    };
+    let before = if spec.get("forever") == Some(&Value::Bool(true)) {
+        FOREVER
+    } else if let Some(v) = spec.get("valid_before") {
+        time_of(v)?
+    } else if let Some(s) = spec.get("valid_for").and_then(|s| s.as_u64()) {
+        t + s
+    } else {
+        return Err("say how long: `valid_for` (seconds), `valid_before`, or `forever: true`".into());
+    };
+    if before <= after {
+        return Err("the certificate would end before it starts".into());
+    }
+    let host = match spec.get("type").and_then(|x| x.as_str()).unwrap_or("user") {
+        "user" => false,
+        "host" => true,
+        other => return Err(format!("`{}` is not a type: user or host", other)),
+    };
+    let key_id = spec.get("key_id").and_then(|k| k.as_str()).ok_or("the certificate needs a `key_id`, which sshd writes to its log")?;
+    let principals = spec.get("principals").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    if principals.is_empty() && spec.get("any_principal") != Some(&Value::Bool(true)) {
+        return Err("no principals: such a certificate holds for anyone. Say `any_principal: true` if that is meant".into());
+    }
+    let mut names = vec![];
+    for p in &principals {
+        put(&mut names, p.as_str().ok_or("principals are text")?.as_bytes());
+    }
+    let pairs = |o: Option<&Value>, defaults: &[&str]| -> Vec<(String, String)> {
+        let mut l: Vec<(String, String)> = match o.and_then(|x| x.as_object()) {
+            Some(m) => m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+            None => defaults.iter().map(|k| (k.to_string(), String::new())).collect(),
+        };
+        l.sort();
+        l
+    };
+    let critical = pairs(spec.get("critical_options"), &[]);
+    if host && !critical.is_empty() {
+        return Err("host certificates take no critical options".into());
+    }
+    let extensions = pairs(spec.get("extensions"), if host { &[] } else { &["permit-X11-forwarding", "permit-agent-forwarding", "permit-port-forwarding", "permit-pty", "permit-user-rc"] });
+    let encode = |l: &[(String, String)]| {
+        let mut out = vec![];
+        for (k, v) in l {
+            put(&mut out, k.as_bytes());
+            let mut inner = vec![];
+            if !v.is_empty() {
+                put(&mut inner, v.as_bytes());
+            }
+            put(&mut out, &inner);
+        }
+        out
+    };
+    let plain = subject.to_bytes().map_err(|e| e.to_string())?;
+    let mut r = Wire(&plain);
+    let kind = String::from_utf8_lossy(r.string()?).to_string();
+    key_fields(&kind)?;
+    let name = format!("{}-cert-v01@openssh.com", kind);
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
+    let mut tbs = vec![];
+    put(&mut tbs, name.as_bytes());
+    put(&mut tbs, &nonce);
+    tbs.extend(r.0);
+    tbs.extend(spec.get("serial").and_then(|s| s.as_u64()).unwrap_or(0).to_be_bytes());
+    tbs.extend((if host { 2u32 } else { 1u32 }).to_be_bytes());
+    put(&mut tbs, key_id.as_bytes());
+    put(&mut tbs, &names);
+    tbs.extend(after.to_be_bytes());
+    tbs.extend(before.to_be_bytes());
+    put(&mut tbs, &encode(&critical));
+    put(&mut tbs, &encode(&extensions));
+    put(&mut tbs, &[]);
+    put(&mut tbs, &ca.public_key().to_bytes().map_err(|e| e.to_string())?);
+    let sig: Signature = match ca.key_data().rsa() {
+        Some(k) => rsa_sign(k, &tbs)?,
+        None => ca.try_sign(&tbs).map_err(|e| format!("signing failed: {}", e))?,
+    };
+    let sig_bytes: Vec<u8> = sig.try_into().map_err(|e: ssh_key::Error| e.to_string())?;
+    let mut blob = tbs;
+    put(&mut blob, &sig_bytes);
+    let comment = spec.get("comment").and_then(|x| x.as_str()).unwrap_or("");
+    Ok(format!("{} {} {}", name, B64.encode(&blob), comment).trim_end().to_string())
+}
+
+/// A new key pair, for a CA or a test: `kind` is ed25519, ecdsa-p256, ecdsa-p384 or rsa. Gives { private_key, public_key, fingerprint }. Keep a CA's private key out of the program's reach: in `env`, or better on a machine of its own.
+pub fn ssh_ca_keygen(kind: &str, comment: &str) -> Result<serde_json::Value, String> {
+    let alg = match kind {
+        "ed25519" => Algorithm::Ed25519,
+        "ecdsa-p256" => Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 },
+        "ecdsa-p384" => Algorithm::Ecdsa { curve: EcdsaCurve::NistP384 },
+        "rsa" => Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+        other => return Err(format!("`{}` is not a key type: ed25519, ecdsa-p256, ecdsa-p384 or rsa", other)),
+    };
+    let mut k = PrivateKey::random(&mut OsRng, alg).map_err(|e| e.to_string())?;
+    k.set_comment(comment);
+    let private = k.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
+    Ok(json!({ "private_key": private.as_str(), "public_key": k.public_key().to_openssh().map_err(|e| e.to_string())?, "fingerprint": k.fingerprint(HashAlg::Sha256).to_string() }))
+}

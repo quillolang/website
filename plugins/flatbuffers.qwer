@@ -1,0 +1,755 @@
+//! FlatBuffers read and written from a schema given as data: vtables, tables, vectors, strings, structs, unions and scalars by field id, with bad offsets refused rather than followed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, VecDeque};
+
+// A schema, the data form of a .fbs file:
+// {
+//   root: "Monster", file_identifier: "MONS",
+//   enums: { Color: { type: "byte", values: { Red: 0, Green: 1 } } },
+//   structs: { Vec3: [{ name: "x", type: "float" }] },
+//   unions: { Equip: ["Weapon"] },
+//   tables: { Monster: [{ name: "pos", type: "Vec3" }, { name: "hp", type: "short", default: 100 }, { name: "tags", type: "[string]" }, { name: "kind", type: "Equip" }] },
+// }
+// A field's id is its place in the list, or its `id`. A union takes two ids, the type's then the value's.
+
+const MAX_DEPTH: usize = 64;
+const MAX_TABLES: usize = 1_000_000;
+const MAX_SIZE: usize = 2_147_483_647;
+// Offsets may overlap, so a small buffer can claim a huge value: what is read is counted.
+const MAX_APPARENT: usize = 1 << 30;
+
+fn scalar_size(t: &str) -> Option<usize> {
+    Some(match t {
+        "bool" | "byte" | "ubyte" | "int8" | "uint8" => 1,
+        "short" | "ushort" | "int16" | "uint16" => 2,
+        "int" | "uint" | "float" | "int32" | "uint32" | "float32" => 4,
+        "long" | "ulong" | "double" | "int64" | "uint64" | "float64" => 8,
+        _ => return None,
+    })
+}
+
+#[derive(Clone)]
+struct Field {
+    name: String,
+    ty: String,
+    id: usize,
+    default: Value,
+    required: bool,
+}
+
+struct Enum {
+    ty: String,
+    names: HashMap<i64, String>,
+    values: HashMap<String, i64>,
+}
+
+struct Schema {
+    root: String,
+    ident: Option<String>,
+    tables: HashMap<String, Vec<Field>>,
+    structs: HashMap<String, Vec<(String, String, usize)>>,
+    sizes: HashMap<String, (usize, usize)>,
+    enums: HashMap<String, Enum>,
+    unions: HashMap<String, Vec<String>>,
+}
+
+fn struct_layout(name: &str, src: &Map<String, Value>, sizes: &mut HashMap<String, (usize, usize)>, out: &mut HashMap<String, Vec<(String, String, usize)>>, enums: &HashMap<String, Enum>, depth: usize) -> Result<(usize, usize), String> {
+    if let Some(s) = sizes.get(name) {
+        return Ok(*s);
+    }
+    if depth > MAX_DEPTH {
+        return Err(format!("struct {} contains itself", name));
+    }
+    let fields = src.get(name).and_then(Value::as_array).ok_or(format!("{} is not a struct", name))?;
+    let (mut size, mut align) = (0usize, 1usize);
+    let mut list = vec![];
+    for f in fields {
+        let fname = f.get("name").and_then(Value::as_str).ok_or(format!("struct {}: a field needs a `name`", name))?;
+        let ty = f.get("type").and_then(Value::as_str).ok_or(format!("struct {}: {} needs a `type`", name, fname))?;
+        let (s, a) = if let Some(s) = scalar_size(ty) {
+            (s, s)
+        } else if let Some(e) = enums.get(ty) {
+            let s = scalar_size(&e.ty).unwrap_or(1);
+            (s, s)
+        } else if src.contains_key(ty) {
+            struct_layout(ty, src, sizes, out, enums, depth + 1)?
+        } else {
+            return Err(format!("struct {}: {} has the type {}, and a struct holds only scalars and structs", name, fname, ty));
+        };
+        size = (size + a - 1) & !(a - 1);
+        list.push((fname.to_string(), ty.to_string(), size));
+        size += s;
+        align = align.max(a);
+    }
+    size = (size + align - 1) & !(align - 1);
+    sizes.insert(name.to_string(), (size, align));
+    out.insert(name.to_string(), list);
+    Ok((size, align))
+}
+
+fn schema_of(v: &Value) -> Result<Schema, String> {
+    let root = v.get("root").and_then(Value::as_str).ok_or("a schema needs a `root` table")?.to_string();
+    let ident = v.get("file_identifier").and_then(Value::as_str).map(str::to_string);
+    if let Some(i) = &ident {
+        if i.len() != 4 {
+            return Err(format!("the file identifier `{}` must be 4 bytes", i));
+        }
+    }
+    let mut enums = HashMap::new();
+    for (k, e) in v.get("enums").and_then(Value::as_object).into_iter().flatten() {
+        let ty = e.get("type").and_then(Value::as_str).unwrap_or("byte").to_string();
+        if scalar_size(&ty).is_none() || ty == "float" || ty == "double" {
+            return Err(format!("enum {}: {} is not an integer type", k, ty));
+        }
+        let (mut names, mut values) = (HashMap::new(), HashMap::new());
+        for (n, x) in e.get("values").and_then(Value::as_object).into_iter().flatten() {
+            let x = x.as_i64().ok_or(format!("enum {}: {} must be a number", k, n))?;
+            names.insert(x, n.clone());
+            values.insert(n.clone(), x);
+        }
+        enums.insert(k.clone(), Enum { ty, names, values });
+    }
+    let mut structs = HashMap::new();
+    let mut sizes = HashMap::new();
+    let empty = Map::new();
+    let src = v.get("structs").and_then(Value::as_object).unwrap_or(&empty);
+    for k in src.keys() {
+        struct_layout(k, src, &mut sizes, &mut structs, &enums, 0)?;
+    }
+    let mut unions = HashMap::new();
+    for (k, u) in v.get("unions").and_then(Value::as_object).into_iter().flatten() {
+        unions.insert(k.clone(), u.as_array().ok_or(format!("union {} must list its tables", k))?.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>());
+    }
+    let mut tables = HashMap::new();
+    let tsrc = v.get("tables").and_then(Value::as_object).ok_or("a schema needs `tables`")?;
+    for (k, fields) in tsrc {
+        let mut list = vec![];
+        let mut next = 0;
+        for f in fields.as_array().ok_or(format!("table {} must list its fields", k))? {
+            let name = f.get("name").and_then(Value::as_str).ok_or(format!("table {}: a field needs a `name`", k))?.to_string();
+            let ty = f.get("type").and_then(Value::as_str).ok_or(format!("table {}: {} needs a `type`", k, name))?.to_string();
+            let inner = ty.trim_start_matches('[').trim_end_matches(']');
+            let known = scalar_size(inner).is_some() || inner == "string" || enums.contains_key(inner) || sizes.contains_key(inner) || tsrc.contains_key(inner) || unions.contains_key(inner);
+            if !known {
+                return Err(format!("table {}: {} has the unknown type {}", k, name, ty));
+            }
+            let is_union = unions.contains_key(&ty);
+            let mut id = f.get("id").and_then(Value::as_u64).map_or(next, |i| i as usize);
+            // An explicit id on a union names the value's slot; the type sits just before it.
+            if is_union && f.get("id").is_some() {
+                id = id.saturating_sub(1);
+            }
+            next = id + if is_union { 2 } else { 1 };
+            list.push(Field { name, ty, id, default: f.get("default").cloned().unwrap_or(Value::Null), required: f.get("required") == Some(&json!(true)) });
+        }
+        tables.insert(k.clone(), list);
+    }
+    if !tables.contains_key(&root) {
+        return Err(format!("the root {} is not a table", root));
+    }
+    Ok(Schema { root, ident, tables, structs, sizes, enums, unions })
+}
+
+fn base_scalar<'a>(s: &'a Schema, ty: &'a str) -> &'a str {
+    s.enums.get(ty).map_or(ty, |e| e.ty.as_str())
+}
+
+// Reading. Every offset is checked before it is used.
+
+struct R<'a> {
+    b: &'a [u8],
+    s: &'a Schema,
+    tables: usize,
+    bytes: usize,
+}
+
+impl<'a> R<'a> {
+    fn need(&self, at: usize, n: usize, what: &str) -> Result<(), String> {
+        match at.checked_add(n) {
+            Some(e) if e <= self.b.len() => Ok(()),
+            _ => Err(format!("{} at {} runs past the end of the {} byte buffer", what, at, self.b.len())),
+        }
+    }
+    fn aligned(&self, at: usize, n: usize, what: &str) -> Result<(), String> {
+        if at % n != 0 {
+            return Err(format!("{} at {} is not aligned to {}", what, at, n));
+        }
+        Ok(())
+    }
+    fn u16(&self, at: usize, what: &str) -> Result<usize, String> {
+        self.need(at, 2, what)?;
+        Ok(u16::from_le_bytes([self.b[at], self.b[at + 1]]) as usize)
+    }
+    fn u32(&self, at: usize, what: &str) -> Result<usize, String> {
+        self.need(at, 4, what)?;
+        Ok(u32::from_le_bytes([self.b[at], self.b[at + 1], self.b[at + 2], self.b[at + 3]]) as usize)
+    }
+    fn i32(&self, at: usize, what: &str) -> Result<i64, String> {
+        self.need(at, 4, what)?;
+        Ok(i32::from_le_bytes([self.b[at], self.b[at + 1], self.b[at + 2], self.b[at + 3]]) as i64)
+    }
+    /// A uoffset goes forward from where it sits, never to itself.
+    fn follow(&self, at: usize, what: &str) -> Result<usize, String> {
+        self.aligned(at, 4, what)?;
+        let off = self.u32(at, what)?;
+        if off == 0 {
+            return Err(format!("{} at {} is a zero offset", what, at));
+        }
+        let to = at.checked_add(off).ok_or(format!("{} at {} overflows", what, at))?;
+        self.need(to, 0, what)?;
+        Ok(to)
+    }
+    fn scalar(&self, at: usize, ty: &str) -> Result<Value, String> {
+        let n = scalar_size(ty).ok_or(format!("{} is not a scalar", ty))?;
+        self.need(at, n, ty)?;
+        let d = &self.b[at..at + n];
+        Ok(match ty {
+            "bool" => json!(d[0] != 0),
+            "byte" | "int8" => json!(d[0] as i8),
+            "ubyte" | "uint8" => json!(d[0]),
+            "short" | "int16" => json!(i16::from_le_bytes([d[0], d[1]])),
+            "ushort" | "uint16" => json!(u16::from_le_bytes([d[0], d[1]])),
+            "int" | "int32" => json!(i32::from_le_bytes([d[0], d[1], d[2], d[3]])),
+            "uint" | "uint32" => json!(u32::from_le_bytes([d[0], d[1], d[2], d[3]])),
+            "float" | "float32" => float(f32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64),
+            "long" | "int64" => json!(i64::from_le_bytes(d.try_into().unwrap())),
+            "ulong" | "uint64" => {
+                let x = u64::from_le_bytes(d.try_into().unwrap());
+                // Past i64 a Quillo int cannot hold it: it comes as text.
+                if x > i64::MAX as u64 { json!(x.to_string()) } else { json!(x) }
+            }
+            _ => float(f64::from_le_bytes(d.try_into().unwrap())),
+        })
+    }
+    fn count(&mut self, n: usize) -> Result<(), String> {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > MAX_APPARENT {
+            return Err("offsets overlap until the value passes 1 GB".to_string());
+        }
+        Ok(())
+    }
+    fn string(&mut self, at: usize) -> Result<Value, String> {
+        self.aligned(at, 4, "a string")?;
+        let n = self.u32(at, "a string's length")?;
+        let start = at + 4;
+        self.need(start, n + 1, "a string")?;
+        self.count(n)?;
+        if self.b[start + n] != 0 {
+            return Err(format!("the string at {} has no terminating zero", at));
+        }
+        match std::str::from_utf8(&self.b[start..start + n]) {
+            Ok(t) => Ok(json!(t)),
+            Err(_) => Err(format!("the string at {} is not UTF-8", at)),
+        }
+    }
+    fn struct_at(&self, at: usize, name: &str) -> Result<Value, String> {
+        let (size, align) = self.s.sizes[name];
+        self.need(at, size, "a struct")?;
+        self.aligned(at, align, "a struct")?;
+        let mut m = Map::new();
+        for (fname, ty, off) in &self.s.structs[name] {
+            let v = if self.s.structs.contains_key(ty) { self.struct_at(at + off, ty)? } else { self.typed_scalar(at + off, ty)? };
+            m.insert(fname.clone(), v);
+        }
+        Ok(Value::Object(m))
+    }
+    fn typed_scalar(&self, at: usize, ty: &str) -> Result<Value, String> {
+        let raw = self.scalar(at, base_scalar(self.s, ty))?;
+        Ok(enum_name(self.s, ty, raw))
+    }
+    fn vector(&mut self, at: usize, ty: &str, depth: usize) -> Result<Value, String> {
+        self.aligned(at, 4, "a vector")?;
+        let n = self.u32(at, "a vector's length")?;
+        let start = at + 4;
+        let elem = if let Some(s) = self.s.sizes.get(ty) { s.0 } else { scalar_size(base_scalar(self.s, ty)).unwrap_or(4) };
+        let bytes = n.checked_mul(elem).ok_or(format!("the vector at {} is too long", at))?;
+        self.need(start, bytes, "a vector")?;
+        self.count(bytes)?;
+        let mut out = Vec::with_capacity(n.min(1 << 20));
+        for i in 0..n {
+            let p = start + i * elem;
+            out.push(if self.s.sizes.contains_key(ty) {
+                self.struct_at(p, ty)?
+            } else if ty == "string" {
+                let to = self.follow(p, "a string offset")?;
+                self.string(to)?
+            } else if self.s.tables.contains_key(ty) {
+                let to = self.follow(p, "a table offset")?;
+                self.table(to, ty, depth + 1)?
+            } else {
+                self.typed_scalar(p, ty)?
+            });
+        }
+        Ok(Value::Array(out))
+    }
+    fn table(&mut self, at: usize, name: &str, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!("tables are nested deeper than {}: a cycle?", MAX_DEPTH));
+        }
+        self.tables += 1;
+        if self.tables > MAX_TABLES {
+            return Err("more tables than a buffer this size should hold".to_string());
+        }
+        self.aligned(at, 4, "a table")?;
+        let so = self.i32(at, "a table's vtable offset")?;
+        let vt = (at as i64).checked_sub(so).filter(|x| *x >= 0).ok_or(format!("the table at {} points before the buffer", at))? as usize;
+        self.aligned(vt, 2, "a vtable")?;
+        let vsize = self.u16(vt, "a vtable's size")?;
+        let tsize = self.u16(vt + 2, "a vtable's size")?;
+        if vsize < 4 || vsize % 2 != 0 {
+            return Err(format!("the vtable at {} has a bad size of {}", vt, vsize));
+        }
+        self.need(vt, vsize, "a vtable")?;
+        self.need(at, tsize, "a table")?;
+        if tsize < 4 {
+            return Err(format!("the table at {} says it is {} bytes", at, tsize));
+        }
+        let fields = self.s.tables[name].clone();
+        let mut m = Map::new();
+        for f in &fields {
+            let slot = 4 + f.id * 2;
+            let union = self.s.unions.contains_key(&f.ty);
+            let off = if slot + 2 <= vsize { self.u16(vt + slot, "a vtable entry")? } else { 0 };
+            if off != 0 && off >= tsize {
+                return Err(format!("field {} of {} lies outside its table", f.name, name));
+            }
+            if union {
+                let slot2 = slot + 2;
+                let voff = if slot2 + 2 <= vsize { self.u16(vt + slot2, "a vtable entry")? } else { 0 };
+                let tag = if off != 0 { self.b[at + off] as usize } else { 0 };
+                m.insert(format!("{}_type", f.name), match tag {
+                    0 => json!("NONE"),
+                    t => json!(self.s.unions[&f.ty].get(t - 1).cloned().ok_or(format!("union {}: there is no member {}", f.ty, t))?),
+                });
+                if tag != 0 && voff != 0 {
+                    if voff >= tsize {
+                        return Err(format!("field {} of {} lies outside its table", f.name, name));
+                    }
+                    let member = self.s.unions[&f.ty][tag - 1].clone();
+                    let to = self.follow(at + voff, "a table offset")?;
+                    m.insert(f.name.clone(), self.table(to, &member, depth + 1)?);
+                } else {
+                    m.insert(f.name.clone(), Value::Null);
+                }
+                continue;
+            }
+            let v = if off == 0 {
+                if f.required {
+                    return Err(format!("the required field {} of {} is missing", f.name, name));
+                }
+                self.absent(f)
+            } else if let Some(inner) = f.ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+                let to = self.follow(at + off, "a vector offset")?;
+                self.vector(to, inner, depth)?
+            } else if f.ty == "string" {
+                let to = self.follow(at + off, "a string offset")?;
+                self.string(to)?
+            } else if self.s.sizes.contains_key(&f.ty) {
+                self.struct_at(at + off, &f.ty)?
+            } else if self.s.tables.contains_key(&f.ty) {
+                let to = self.follow(at + off, "a table offset")?;
+                self.table(to, &f.ty, depth + 1)?
+            } else {
+                self.typed_scalar(at + off, &f.ty)?
+            };
+            m.insert(f.name.clone(), v);
+        }
+        Ok(Value::Object(m))
+    }
+    fn absent(&self, f: &Field) -> Value {
+        if !f.default.is_null() {
+            return f.default.clone();
+        }
+        let b = base_scalar(self.s, &f.ty);
+        match b {
+            "bool" => json!(false),
+            "float" | "double" | "float32" | "float64" => json!(0.0),
+            _ if scalar_size(b).is_some() => enum_name(self.s, &f.ty, json!(0)),
+            _ => Value::Null,
+        }
+    }
+}
+
+fn float(f: f64) -> Value {
+    if f.is_finite() { json!(f) } else { json!(f.to_string()) }
+}
+
+fn enum_name(s: &Schema, ty: &str, raw: Value) -> Value {
+    match (s.enums.get(ty), raw.as_i64()) {
+        (Some(e), Some(i)) => e.names.get(&i).map(|n| json!(n)).unwrap_or(raw),
+        _ => raw,
+    }
+}
+
+fn unhex(t: &str) -> Result<Vec<u8>, String> {
+    let c: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if c.len() % 2 != 0 || !c.is_ascii() {
+        return Err("hex must have two digits to a byte".to_string());
+    }
+    (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).map_err(|_| format!("`{}` is not hex", &c[i..i + 2]))).collect()
+}
+
+fn read(b: &[u8], schema: &Schema, table: &str) -> Result<Value, String> {
+    if b.len() > MAX_SIZE {
+        return Err("a FlatBuffer stops at 2 GB".to_string());
+    }
+    if b.len() < 8 {
+        return Err(format!("{} bytes is too short for a FlatBuffer", b.len()));
+    }
+    if let Some(i) = &schema.ident {
+        if &b[4..8] != i.as_bytes() {
+            return Err(format!("the file identifier is `{}`, and the schema says `{}`", String::from_utf8_lossy(&b[4..8]).escape_default(), i));
+        }
+    }
+    let mut r = R { b, s: schema, tables: 0, bytes: 0 };
+    let root = r.follow(0, "the root offset")?;
+    r.table(root, table, 0)
+}
+
+/// Reads a buffer given as hex, by a schema given as data: the root table as a map, enums by name, absent fields at their defaults. A bad offset, length or vtable is an error naming where, never a crash.
+pub fn flatbuffers_read(hex: &str, schema: serde_json::Value) -> Result<Value, String> {
+    let s = schema_of(&schema)?;
+    read(&unhex(hex)?, &s, &s.root)
+}
+
+/// The same from base64 text.
+pub fn flatbuffers_read_base64(text: &str, schema: serde_json::Value) -> Result<Value, String> {
+    let s = schema_of(&schema)?;
+    let b = STANDARD.decode(text.trim()).map_err(|e| format!("bad base64: {}", e))?;
+    read(&b, &s, &s.root)
+}
+
+/// The same from a file.
+pub fn flatbuffers_read_file(path: &str, schema: serde_json::Value) -> Result<Value, String> {
+    let s = schema_of(&schema)?;
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    read(&b, &s, &s.root)
+}
+
+/// One field by id with no schema at all: `{ present, offset, hex }`, reading `size` bytes where a table's vtable says. For looking into a buffer whose schema is lost.
+pub fn flatbuffers_field(hex: &str, id: i64, size: i64) -> Result<Value, String> {
+    let b = unhex(hex)?;
+    let empty = Schema { root: String::new(), ident: None, tables: HashMap::new(), structs: HashMap::new(), sizes: HashMap::new(), enums: HashMap::new(), unions: HashMap::new() };
+    let r = R { b: &b, s: &empty, tables: 0, bytes: 0 };
+    let id = usize::try_from(id).map_err(|_| "a field id cannot be negative".to_string())?;
+    let n = usize::try_from(size).map_err(|_| "a size cannot be negative".to_string())?;
+    let root = r.follow(0, "the root offset")?;
+    let so = r.i32(root, "a table's vtable offset")?;
+    let vt = (root as i64).checked_sub(so).filter(|x| *x >= 0).ok_or("the root table points before the buffer")? as usize;
+    let vsize = r.u16(vt, "a vtable's size")?;
+    let tsize = r.u16(vt + 2, "a vtable's size")?;
+    let slot = 4 + id * 2;
+    let off = if slot + 2 <= vsize { r.u16(vt + slot, "a vtable entry")? } else { 0 };
+    if off == 0 {
+        return Ok(json!({ "present": false, "offset": null, "hex": null, "fields": (vsize.saturating_sub(4)) / 2, "table_size": tsize }));
+    }
+    r.need(root + off, n, "the field")?;
+    let h: String = b[root + off..root + off + n].iter().map(|x| format!("{:02x}", x)).collect();
+    Ok(json!({ "present": true, "offset": root + off, "hex": h, "fields": (vsize.saturating_sub(4)) / 2, "table_size": tsize }))
+}
+
+// Writing, back to front as the official builders do: an offset is counted from the buffer's end.
+
+struct B {
+    d: VecDeque<u8>,
+    minalign: usize,
+}
+
+impl B {
+    fn used(&self) -> usize {
+        self.d.len()
+    }
+    fn push(&mut self, b: &[u8]) {
+        for x in b.iter().rev() {
+            self.d.push_front(*x);
+        }
+    }
+    /// Pads so that `size`-aligned data can go in after `extra` more bytes.
+    fn prep(&mut self, size: usize, extra: usize) {
+        self.minalign = self.minalign.max(size);
+        while (self.used() + extra) % size != 0 {
+            self.d.push_front(0);
+        }
+    }
+    fn offset_to(&mut self, target: usize) {
+        self.prep(4, 0);
+        let v = (self.used() + 4 - target) as u32;
+        self.push(&v.to_le_bytes());
+    }
+    fn string(&mut self, t: &str) -> usize {
+        self.prep(4, t.len() + 1);
+        self.d.push_front(0);
+        self.push(t.as_bytes());
+        self.push(&(t.len() as u32).to_le_bytes());
+        self.used()
+    }
+}
+
+fn bytes_of(s: &Schema, ty: &str, v: &Value, field: &str) -> Result<Vec<u8>, String> {
+    let (base, val): (&str, Value) = match s.enums.get(ty) {
+        Some(e) => {
+            let raw = match v {
+                Value::String(n) => json!(e.values.get(n).ok_or(format!("{}: {} is not in {}", field, n, ty))?),
+                x => x.clone(),
+            };
+            (e.ty.as_str(), raw)
+        }
+        None => (ty, v.clone()),
+    };
+    let int = || -> Result<i128, String> {
+        match &val {
+            Value::Number(n) if n.is_i64() => Ok(n.as_i64().unwrap() as i128),
+            Value::Number(n) if n.is_u64() => Ok(n.as_u64().unwrap() as i128),
+            Value::String(t) => t.parse::<i128>().map_err(|_| format!("{}: `{}` is not a number", field, t)),
+            Value::Bool(b) => Ok(*b as i128),
+            x => Err(format!("{}: {} is not a whole number", field, x)),
+        }
+    };
+    let fit = |lo: i128, hi: i128| -> Result<i128, String> {
+        let x = int()?;
+        if x < lo || x > hi {
+            return Err(format!("{}: {} does not fit in {}", field, x, ty));
+        }
+        Ok(x)
+    };
+    Ok(match base {
+        "bool" => vec![(val == json!(true) || val.as_i64().map_or(false, |x| x != 0)) as u8],
+        "byte" | "int8" => vec![fit(-128, 127)? as i8 as u8],
+        "ubyte" | "uint8" => vec![fit(0, 255)? as u8],
+        "short" | "int16" => (fit(-32768, 32767)? as i16).to_le_bytes().to_vec(),
+        "ushort" | "uint16" => (fit(0, 65535)? as u16).to_le_bytes().to_vec(),
+        "int" | "int32" => (fit(i32::MIN as i128, i32::MAX as i128)? as i32).to_le_bytes().to_vec(),
+        "uint" | "uint32" => (fit(0, u32::MAX as i128)? as u32).to_le_bytes().to_vec(),
+        "long" | "int64" => (fit(i64::MIN as i128, i64::MAX as i128)? as i64).to_le_bytes().to_vec(),
+        "ulong" | "uint64" => (fit(0, u64::MAX as i128)? as u64).to_le_bytes().to_vec(),
+        "float" | "float32" => (val.as_f64().ok_or(format!("{}: {} is not a number", field, val))? as f32).to_le_bytes().to_vec(),
+        "double" | "float64" => val.as_f64().ok_or(format!("{}: {} is not a number", field, val))?.to_le_bytes().to_vec(),
+        o => return Err(format!("{}: {} is not a scalar", field, o)),
+    })
+}
+
+fn struct_bytes(s: &Schema, name: &str, v: &Value, field: &str) -> Result<Vec<u8>, String> {
+    let (size, _) = s.sizes[name];
+    let mut out = vec![0u8; size];
+    let m = v.as_object().ok_or(format!("{}: a {} must be a map", field, name))?;
+    for (fname, ty, off) in &s.structs[name] {
+        let x = m.get(fname).ok_or(format!("{}: the struct {} needs all its fields, and {} is missing", field, name, fname))?;
+        let b = if s.structs.contains_key(ty) { struct_bytes(s, ty, x, field)? } else { bytes_of(s, ty, x, field)? };
+        out[*off..*off + b.len()].copy_from_slice(&b);
+    }
+    Ok(out)
+}
+
+fn is_default(s: &Schema, f: &Field, v: &Value) -> bool {
+    let d = if f.default.is_null() {
+        match base_scalar(s, &f.ty) {
+            "bool" => json!(false),
+            b if scalar_size(b).is_some() => json!(0),
+            _ => return false,
+        }
+    } else {
+        f.default.clone()
+    };
+    if d == *v {
+        return true;
+    }
+    match (d.as_f64(), v.as_f64()) {
+        (Some(a), Some(b)) => a == b,
+        _ => s.enums.get(&f.ty).map_or(false, |e| match (v.as_str(), d.as_i64()) {
+            (Some(n), Some(x)) => e.values.get(n) == Some(&x),
+            _ => false,
+        }),
+    }
+}
+
+/// Things written before their table: strings, vectors, nested tables. Gives each field's offset.
+fn write_vector(b: &mut B, s: &Schema, inner: &str, list: &[Value], path: &str, depth: usize) -> Result<usize, String> {
+    let n = list.len();
+    if s.sizes.contains_key(inner) {
+        let (size, align) = s.sizes[inner];
+        b.prep(4, n * size);
+        b.prep(align, n * size);
+        for x in list.iter().rev() {
+            b.push(&struct_bytes(s, inner, x, path)?);
+        }
+    } else if inner == "string" || s.tables.contains_key(inner) {
+        let mut offs = Vec::with_capacity(n);
+        for (i, x) in list.iter().enumerate() {
+            let p = format!("{}[{}]", path, i);
+            offs.push(if inner == "string" {
+                b.string(x.as_str().ok_or(format!("{}: must be text", p))?)
+            } else {
+                write_table(b, s, inner, x, &p, depth + 1)?
+            });
+        }
+        b.prep(4, n * 4);
+        for o in offs.into_iter().rev() {
+            b.offset_to(o);
+        }
+    } else {
+        let size = scalar_size(base_scalar(s, inner)).ok_or(format!("{}: {} cannot be in a vector", path, inner))?;
+        b.prep(4, n * size);
+        b.prep(size, n * size);
+        for x in list.iter().rev() {
+            b.push(&bytes_of(s, inner, x, path)?);
+        }
+    }
+    b.push(&(n as u32).to_le_bytes());
+    Ok(b.used())
+}
+
+enum Slot {
+    Offset(usize, usize),
+    Inline(usize, Vec<u8>, usize),
+}
+
+fn write_table(b: &mut B, s: &Schema, name: &str, v: &Value, path: &str, depth: usize) -> Result<usize, String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("{}: nested deeper than {}", path, MAX_DEPTH));
+    }
+    let m = v.as_object().ok_or(format!("{}: a {} must be a map", path, name))?;
+    let fields = s.tables[name].clone();
+    for k in m.keys() {
+        if !fields.iter().any(|f| f.name == *k || format!("{}_type", f.name) == *k) {
+            return Err(format!("{}{} has no field {}", if path.is_empty() { String::new() } else { format!("{}: ", path) }, name, k));
+        }
+    }
+    let mut slots: Vec<Slot> = vec![];
+    for f in &fields {
+        let val = m.get(&f.name).filter(|x| !x.is_null());
+        let p = if path.is_empty() { f.name.clone() } else { format!("{}.{}", path, f.name) };
+        if let Some(members) = s.unions.get(&f.ty) {
+            let kind = m.get(&format!("{}_type", f.name)).and_then(Value::as_str);
+            match (kind, val) {
+                (None, None) | (Some("NONE"), None) => continue,
+                (Some(k), Some(x)) => {
+                    let at = members.iter().position(|t| t == k).ok_or(format!("{}: {} is not in the union {}", p, k, f.ty))?;
+                    let o = write_table(b, s, k, x, &p, depth + 1)?;
+                    slots.push(Slot::Inline(f.id, vec![at as u8 + 1], 1));
+                    slots.push(Slot::Offset(f.id + 1, o));
+                }
+                _ => return Err(format!("{}: a union needs both {}_type and {}", p, f.name, f.name)),
+            }
+            continue;
+        }
+        let Some(x) = val else {
+            if f.required {
+                return Err(format!("{}: this field is required", p));
+            }
+            continue;
+        };
+        if let Some(inner) = f.ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+            let list = x.as_array().ok_or(format!("{}: must be a list", p))?;
+            slots.push(Slot::Offset(f.id, write_vector(b, s, inner, list, &p, depth)?));
+        } else if f.ty == "string" {
+            slots.push(Slot::Offset(f.id, b.string(x.as_str().ok_or(format!("{}: must be text", p))?)));
+        } else if s.sizes.contains_key(&f.ty) {
+            let (_, align) = s.sizes[&f.ty];
+            slots.push(Slot::Inline(f.id, struct_bytes(s, &f.ty, x, &p)?, align));
+        } else if s.tables.contains_key(&f.ty) {
+            slots.push(Slot::Offset(f.id, write_table(b, s, &f.ty, x, &p, depth + 1)?));
+        } else {
+            if is_default(s, f, x) {
+                let _ = bytes_of(s, &f.ty, x, &p)?;
+                continue;
+            }
+            let bytes = bytes_of(s, &f.ty, x, &p)?;
+            let a = bytes.len();
+            slots.push(Slot::Inline(f.id, bytes, a));
+        }
+    }
+    // The table body: its fields, largest alignment nearest the start.
+    let start = b.used();
+    let mut placed: Vec<(usize, usize)> = vec![];
+    slots.sort_by_key(|x| match x {
+        Slot::Inline(_, _, a) => *a,
+        Slot::Offset(..) => 4,
+    });
+    for sl in &slots {
+        match sl {
+            Slot::Offset(id, o) => {
+                b.offset_to(*o);
+                placed.push((*id, b.used()));
+            }
+            Slot::Inline(id, bytes, a) => {
+                b.prep(*a, bytes.len());
+                b.push(bytes);
+                placed.push((*id, b.used()));
+            }
+        }
+    }
+    b.prep(4, 0);
+    b.push(&[0, 0, 0, 0]);
+    let table = b.used();
+    let top = placed.iter().map(|p| p.0 + 1).max().unwrap_or(0);
+    let tsize = table - start;
+    let vsize = 4 + top * 2;
+    if tsize > 65535 {
+        return Err(format!("{}: a table's own fields stop at 64 KB", path));
+    }
+    let mut vt: Vec<u8> = vec![];
+    vt.extend_from_slice(&(vsize as u16).to_le_bytes());
+    vt.extend_from_slice(&(tsize as u16).to_le_bytes());
+    for i in 0..top {
+        let off = placed.iter().find(|p| p.0 == i).map_or(0, |p| table - p.1);
+        vt.extend_from_slice(&(off as u16).to_le_bytes());
+    }
+    b.prep(2, vt.len());
+    b.push(&vt);
+    let vtable = b.used();
+    let so = (vtable - table) as i32;
+    let at = b.used() - table;
+    for (i, x) in so.to_le_bytes().iter().enumerate() {
+        b.d[at + i] = *x;
+    }
+    Ok(table)
+}
+
+fn write(value: &Value, s: &Schema) -> Result<Vec<u8>, String> {
+    let mut b = B { d: VecDeque::new(), minalign: 1 };
+    let root = write_table(&mut b, s, &s.root, value, "", 0)?;
+    let extra = 4 + if s.ident.is_some() { 4 } else { 0 };
+    b.prep(b.minalign.max(4), extra);
+    if let Some(i) = &s.ident {
+        b.push(i.as_bytes());
+    }
+    b.offset_to_root(root);
+    if b.used() > MAX_SIZE {
+        return Err("a FlatBuffer stops at 2 GB".to_string());
+    }
+    Ok(b.d.into_iter().collect())
+}
+
+impl B {
+    fn offset_to_root(&mut self, target: usize) {
+        let v = (self.used() + 4 - target) as u32;
+        self.push(&v.to_le_bytes());
+    }
+}
+
+/// Builds a buffer from a map by a schema given as data, and gives it as hex. Scalars at their default are left out, as builders do. Unknown fields, numbers that do not fit and missing required fields are errors.
+pub fn flatbuffers_write(value: serde_json::Value, schema: serde_json::Value) -> Result<String, String> {
+    let s = schema_of(&schema)?;
+    Ok(write(&value, &s)?.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// The same as base64 text.
+pub fn flatbuffers_write_base64(value: serde_json::Value, schema: serde_json::Value) -> Result<String, String> {
+    let s = schema_of(&schema)?;
+    Ok(STANDARD.encode(write(&value, &s)?))
+}
+
+/// The same to a file; gives the size.
+pub fn flatbuffers_write_file(path: &str, value: serde_json::Value, schema: serde_json::Value) -> Result<i64, String> {
+    let s = schema_of(&schema)?;
+    let b = write(&value, &s)?;
+    std::fs::write(path, &b).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    Ok(b.len() as i64)
+}

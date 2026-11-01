@@ -1,0 +1,548 @@
+//! ffmpeg and ffprobe driven through argument lists, never a shell: a file probed to a map, thumbnails, trims, transcodes and HLS segments, values checked before they reach the command line, paths kept from being read as URLs or options, and progress read from `-progress`, in the call or for a job in the background.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! libc = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const DEFAULT_TIMEOUT: u64 = 600_000;
+const OPTIONS: [&str; 21] = [
+    "overwrite", "timeout_ms", "at", "start", "end", "duration", "copy", "width", "height", "fps", "video_codec", "audio_codec", "crf", "preset",
+    "video_bitrate", "audio_bitrate", "no_audio", "no_video", "pixel_format", "faststart", "segment_seconds",
+];
+
+fn ffmpeg() -> String {
+    std::env::var("FFMPEG_BIN").ok().filter(|s| !s.is_empty()).unwrap_or("ffmpeg".to_string())
+}
+
+fn ffprobe() -> String {
+    std::env::var("FFPROBE_BIN").ok().filter(|s| !s.is_empty()).unwrap_or("ffprobe".to_string())
+}
+
+fn check_options(o: &Value) -> Result<(), String> {
+    for k in o.as_object().into_iter().flat_map(|m| m.keys()) {
+        if !OPTIONS.contains(&k.as_str()) {
+            return Err(format!("no option `{}`; there are {}", k, OPTIONS.join(", ")));
+        }
+    }
+    Ok(())
+}
+
+// `file:` makes ffmpeg read this as a path, whatever it looks like: `concat:a|b`, `http://x`,
+// `-y`, `subfile,,start,...`. ffmpeg's own protocols never see a caller's text.
+fn input_arg(path: &str) -> Result<String, String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err("no input named".into());
+    }
+    if !Path::new(path).is_file() {
+        return Err(format!("{}: no such file", path));
+    }
+    Ok(format!("file:{}", path))
+}
+
+fn output_arg(path: &str, o: &Value) -> Result<String, String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err("no output named".into());
+    }
+    if Path::new(path).extension().is_none() {
+        return Err(format!("{}: an output needs an extension, which picks the format", path));
+    }
+    if Path::new(path).exists() && !flag(o, "overwrite") {
+        return Err(format!("{} already exists: give `overwrite: true`", path));
+    }
+    if let Some(d) = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", d.display(), e))?;
+    }
+    Ok(format!("file:{}", path))
+}
+
+fn flag(o: &Value, k: &str) -> bool {
+    o.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn word(o: &Value, k: &str) -> Result<Option<String>, String> {
+    match o.get(k).and_then(|v| v.as_str()) {
+        None => Ok(None),
+        Some(w) if !w.is_empty() && !w.starts_with('-') && w.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') => Ok(Some(w.to_string())),
+        Some(w) => Err(format!("`{}` is not a {}", w, k.replace('_', " "))),
+    }
+}
+
+// "1.5", 90, "00:01:30", "00:01:30.250": as ffmpeg takes a time.
+fn time(o: &Value, k: &str) -> Result<Option<String>, String> {
+    let t = match o.get(k) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.as_f64().filter(|x| *x >= 0.0).map(|x| x.to_string()).ok_or(format!("`{}` cannot be negative", k))?,
+        Some(Value::String(s)) => s.clone(),
+        Some(x) => return Err(format!("{} is not a time", x)),
+    };
+    if t.is_empty() || !t.bytes().all(|c| c.is_ascii_digit() || c == b':' || c == b'.') {
+        return Err(format!("`{}` is not a time: seconds, or HH:MM:SS.mmm", t));
+    }
+    Ok(Some(t))
+}
+
+fn seconds_of(t: &str) -> f64 {
+    t.split(':').fold(0.0, |a, x| a * 60.0 + x.parse::<f64>().unwrap_or(0.0))
+}
+
+fn even_size(o: &Value, k: &str) -> Result<Option<u64>, String> {
+    match o.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().filter(|n| (2..=16384).contains(n)).map(Some).ok_or(format!("{} {} is not a size", k, v)),
+    }
+}
+
+fn scale_filter(o: &Value) -> Result<Option<String>, String> {
+    let (w, h) = (even_size(o, "width")?, even_size(o, "height")?);
+    // -2 keeps the aspect ratio with an even size, which H.264 needs.
+    Ok(match (w, h) {
+        (None, None) => None,
+        (Some(a), None) => Some(format!("scale={}:-2", a)),
+        (None, Some(b)) => Some(format!("scale=-2:{}", b)),
+        (Some(a), Some(b)) => Some(format!("scale={}:{}", a, b)),
+    })
+}
+
+fn base(o: &Value) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "error", "-progress", "pipe:1"].iter().map(|s| s.to_string()).collect();
+    a.push(if flag(o, "overwrite") { "-y".into() } else { "-n".into() });
+    a
+}
+
+fn encoder_args(a: &mut Vec<String>, o: &Value) -> Result<(), String> {
+    if flag(o, "no_video") {
+        a.push("-vn".into());
+    } else {
+        if let Some(c) = word(o, "video_codec")? {
+            a.extend(["-c:v".into(), c]);
+        }
+        if let Some(n) = o.get("crf") {
+            let c = n.as_u64().filter(|x| *x <= 63).ok_or(format!("crf {} is not 0 to 63", n))?;
+            a.extend(["-crf".into(), c.to_string()]);
+        }
+        if let Some(p) = word(o, "preset")? {
+            a.extend(["-preset".into(), p]);
+        }
+        if let Some(b) = word(o, "video_bitrate")? {
+            a.extend(["-b:v".into(), b]);
+        }
+        if let Some(f) = scale_filter(o)? {
+            a.extend(["-vf".into(), f]);
+        }
+        if let Some(n) = o.get("fps") {
+            let f = n.as_f64().filter(|x| *x > 0.0 && *x <= 480.0).ok_or(format!("fps {} is not a frame rate", n))?;
+            a.extend(["-r".into(), f.to_string()]);
+        }
+        if let Some(p) = word(o, "pixel_format")? {
+            a.extend(["-pix_fmt".into(), p]);
+        }
+    }
+    if flag(o, "no_audio") {
+        a.push("-an".into());
+    } else {
+        if let Some(c) = word(o, "audio_codec")? {
+            a.extend(["-c:a".into(), c]);
+        }
+        if let Some(b) = word(o, "audio_bitrate")? {
+            a.extend(["-b:a".into(), b]);
+        }
+    }
+    if flag(o, "faststart") {
+        a.extend(["-movflags".into(), "+faststart".into()]);
+    }
+    Ok(())
+}
+
+fn tail_of(e: &str) -> String {
+    // ffmpeg starts a line with `[vost#0:0 @ 0x7f...]`, an address that means nothing to a reader.
+    let bare = |l: &'_ str| -> String { if l.starts_with('[') { l.split_once("] ").map_or(l, |x| x.1).to_string() } else { l.to_string() } };
+    let lines: Vec<String> = e.lines().map(|l| bare(l.trim())).filter(|l| !l.is_empty()).collect();
+    // The first line says what went wrong; the last what came of it.
+    match lines.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, .., last] => format!("{}; {}", first, last),
+    }
+}
+
+#[derive(Default)]
+struct Progress {
+    frame: u64,
+    fps: f64,
+    out_ms: u64,
+    speed: f64,
+    size: u64,
+    finished: bool,
+}
+
+fn progress_line(p: &mut Progress, l: &str) {
+    let Some((k, v)) = l.split_once('=') else { return };
+    let v = v.trim();
+    match k {
+        "frame" => p.frame = v.parse().unwrap_or(p.frame),
+        "fps" => p.fps = v.parse().unwrap_or(p.fps),
+        "out_time_us" | "out_time_ms" => {
+            // ffmpeg writes microseconds under both names.
+            if let Ok(n) = v.parse::<u64>() {
+                p.out_ms = n / 1000;
+            }
+        }
+        "total_size" => p.size = v.parse().unwrap_or(p.size),
+        "speed" => p.speed = v.trim_end_matches('x').trim().parse().unwrap_or(p.speed),
+        "progress" => p.finished = v == "end",
+        _ => {}
+    }
+}
+
+fn progress_map(p: &Progress, duration_ms: Option<u64>) -> Value {
+    let percent = duration_ms.filter(|d| *d > 0).map(|d| ((p.out_ms as f64 / d as f64 * 1000.0).round() / 10.0).min(100.0));
+    json!({ "frame": p.frame, "fps": p.fps, "out_ms": p.out_ms, "speed": p.speed, "size": p.size, "percent": if p.finished { json!(100.0) } else { json!(percent) }, "finished": p.finished })
+}
+
+struct Job {
+    child: Mutex<Child>,
+    pid: i32,
+    progress: Arc<Mutex<Progress>>,
+    errors: Arc<Mutex<String>>,
+    readers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    duration_ms: Option<u64>,
+    started: Instant,
+    output: String,
+}
+
+fn spawn(args: &[String], duration_ms: Option<u64>, output: &str) -> Result<Job, String> {
+    let mut c = Command::new(ffmpeg());
+    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let mut child = c.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "ffmpeg is not installed, or not on PATH (FFMPEG_BIN names it)".to_string(),
+        _ => format!("cannot run ffmpeg: {}", e),
+    })?;
+    let progress = Arc::new(Mutex::new(Progress::default()));
+    let errors = Arc::new(Mutex::new(String::new()));
+    let (so, mut se) = (child.stdout.take().ok_or("no stdout")?, child.stderr.take().ok_or("no stderr")?);
+    let (p2, e2) = (progress.clone(), errors.clone());
+    let a = std::thread::spawn(move || {
+        for l in BufReader::new(so).lines().map_while(Result::ok) {
+            progress_line(&mut p2.lock().unwrap(), &l);
+        }
+    });
+    let b = std::thread::spawn(move || {
+        let mut t = [0u8; 4096];
+        while let Ok(n) = se.read(&mut t) {
+            if n == 0 {
+                break;
+            }
+            let mut g = e2.lock().unwrap();
+            if g.len() < 1 << 16 {
+                g.push_str(&String::from_utf8_lossy(&t[..n]));
+            }
+        }
+    });
+    let pid = child.id() as i32;
+    Ok(Job { child: Mutex::new(child), pid, progress, errors, readers: Mutex::new(vec![a, b]), duration_ms, started: Instant::now(), output: output.to_string() })
+}
+
+fn kill_group(pid: i32) {
+    // SAFETY: kill(2) with a negative pid signals a group; nothing is touched in memory.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+fn finish(j: &Job, code: Option<i32>) -> Result<Value, String> {
+    for r in j.readers.lock().map_err(|_| "lock")?.drain(..) {
+        let _ = r.join();
+    }
+    let err = j.errors.lock().map_err(|_| "lock")?.clone();
+    if code != Some(0) {
+        let _ = std::fs::remove_file(&j.output);
+        let t = tail_of(&err);
+        return Err(if t.is_empty() { format!("ffmpeg stopped with status {:?}", code) } else { format!("ffmpeg: {}", t) });
+    }
+    let p = j.progress.lock().map_err(|_| "lock")?;
+    let bytes = std::fs::metadata(&j.output).map(|m| m.len()).unwrap_or(0);
+    Ok(json!({ "output": j.output, "bytes": bytes, "seconds": j.started.elapsed().as_secs_f64(), "frames": p.frame, "speed": p.speed, "out_ms": p.out_ms }))
+}
+
+fn run(args: &[String], output: &str, o: &Value) -> Result<Value, String> {
+    let j = spawn(args, None, output)?;
+    let limit = Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT));
+    let end = Instant::now() + limit;
+    let code = loop {
+        if let Some(s) = j.child.lock().map_err(|_| "lock")?.try_wait().map_err(|e| e.to_string())? {
+            break s.code();
+        }
+        if Instant::now() >= end {
+            kill_group(j.pid);
+            let _ = j.child.lock().map_err(|_| "lock")?.wait();
+            let _ = std::fs::remove_file(output);
+            return Err(format!("ffmpeg took longer than {} ms and was stopped", limit.as_millis()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    finish(&j, code)
+}
+
+fn first_of<'a>(streams: &'a [Value], kind: &str) -> Option<&'a Value> {
+    streams.iter().find(|s| s["codec_type"] == kind)
+}
+
+fn num(v: &Value) -> Value {
+    match v.as_str().and_then(|s| s.parse::<f64>().ok()) {
+        Some(x) if x.fract() == 0.0 => json!(x as i64),
+        Some(x) => json!(x),
+        None => v.clone(),
+    }
+}
+
+fn rate(v: &Value) -> Value {
+    let t = v.as_str().unwrap_or("0/0");
+    match t.split_once('/').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))) {
+        Some((a, b)) if b != 0.0 => json!((a / b * 1000.0).round() / 1000.0),
+        _ => Value::Null,
+    }
+}
+
+/// Reads a media file with ffprobe: `{ format, format_name, duration, size, bit_rate, tags, video: { codec, profile, width, height, pixel_format, fps, frames, rotation, bit_rate }, audio: { codec, sample_rate, channels, layout, bit_rate }, streams, subtitles, chapters }`. A file that is not media is an error saying so.
+pub fn ffmpeg_probe(path: &str) -> Result<Value, String> {
+    let input = input_arg(path)?;
+    let out = Command::new(ffprobe()).args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-show_chapters", &input]).stdin(Stdio::null()).output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "ffprobe is not installed, or not on PATH (FFPROBE_BIN names it)".to_string(),
+        _ => format!("cannot run ffprobe: {}", e),
+    })?;
+    if !out.status.success() {
+        return Err(format!("{} cannot be read as media: {}", path, tail_of(&String::from_utf8_lossy(&out.stderr))));
+    }
+    let doc: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe's answer: {}", e))?;
+    let streams = doc["streams"].as_array().cloned().unwrap_or_default();
+    let f = &doc["format"];
+    let mut m = json!({
+        "format": f["format_name"], "format_name": f["format_long_name"], "duration": num(&f["duration"]), "size": num(&f["size"]),
+        "bit_rate": num(&f["bit_rate"]), "tags": f.get("tags").cloned().unwrap_or(json!({})),
+    });
+    if let Some(v) = first_of(&streams, "video") {
+        let mut rotation = Value::Null;
+        for d in v["side_data_list"].as_array().into_iter().flatten() {
+            if let Some(r) = d.get("rotation") {
+                rotation = r.clone();
+            }
+        }
+        m["video"] = json!({
+            "codec": v["codec_name"], "profile": v["profile"], "width": v["width"], "height": v["height"], "pixel_format": v["pix_fmt"],
+            "fps": rate(&v["avg_frame_rate"]), "frames": num(&v["nb_frames"]), "rotation": rotation, "bit_rate": num(&v["bit_rate"]),
+        });
+    }
+    if let Some(a) = first_of(&streams, "audio") {
+        m["audio"] = json!({ "codec": a["codec_name"], "sample_rate": num(&a["sample_rate"]), "channels": a["channels"], "layout": a["channel_layout"], "bit_rate": num(&a["bit_rate"]) });
+    }
+    m["streams"] = json!(streams.iter().map(|s| json!({ "index": s["index"], "type": s["codec_type"], "codec": s["codec_name"], "language": s["tags"]["language"] })).collect::<Vec<_>>());
+    m["subtitles"] = json!(streams.iter().filter(|s| s["codec_type"] == "subtitle").count());
+    m["chapters"] = json!(doc["chapters"].as_array().map_or(0, |c| c.len()));
+    Ok(m)
+}
+
+fn thumbnail_args(input: &str, output: &str, o: &Value) -> Result<Vec<String>, String> {
+    check_options(o)?;
+    let mut a = base(o);
+    let at = time(o, "at")?.unwrap_or("0".to_string());
+    // Before -i, so the seek is by keyframe and fast.
+    a.extend(["-ss".into(), at, "-i".into(), input_arg(input)?, "-frames:v".into(), "1".into(), "-update".into(), "1".into()]);
+    if let Some(f) = scale_filter(o)? {
+        a.extend(["-vf".into(), f]);
+    }
+    a.push(output_arg(output, o)?);
+    Ok(a)
+}
+
+/// One frame as an image: `at` (a time), `width` or `height` (the other keeps the aspect ratio), `overwrite`. The extension picks JPEG, PNG or WebP.
+pub fn ffmpeg_thumbnail(input: &str, output: &str, options: serde_json::Value) -> Result<Value, String> {
+    run(&thumbnail_args(input, output, &options)?, output, &options)
+}
+
+fn trim_args(input: &str, output: &str, o: &Value) -> Result<Vec<String>, String> {
+    check_options(o)?;
+    let (start, end, length) = (time(o, "start")?, time(o, "end")?, time(o, "duration")?);
+    if end.is_some() && length.is_some() {
+        return Err("give `end` or `duration`, not both".into());
+    }
+    if let (Some(s), Some(e)) = (&start, &end) {
+        if seconds_of(e) <= seconds_of(s) {
+            return Err(format!("`end` ({}) is not after `start` ({})", e, s));
+        }
+    }
+    let mut a = base(o);
+    if let Some(s) = &start {
+        a.extend(["-ss".into(), s.clone()]);
+    }
+    a.extend(["-i".into(), input_arg(input)?]);
+    let span = match (&end, &length) {
+        (Some(e), _) => Some((seconds_of(e) - start.as_deref().map_or(0.0, seconds_of)).to_string()),
+        (_, Some(l)) => Some(l.clone()),
+        _ => None,
+    };
+    if let Some(t) = span {
+        a.extend(["-t".into(), t]);
+    }
+    // By default streams are copied: fast, and cut at keyframes. `copy: false` re-encodes to the frame.
+    if o.get("copy").and_then(|v| v.as_bool()).unwrap_or(true) {
+        a.extend(["-c".into(), "copy".into(), "-avoid_negative_ts".into(), "make_zero".into()]);
+    } else {
+        encoder_args(&mut a, o)?;
+    }
+    a.push(output_arg(output, o)?);
+    Ok(a)
+}
+
+/// Cuts a piece: `start`, and `end` or `duration`. Streams are copied unless `copy: false`, which re-encodes, cutting exactly.
+pub fn ffmpeg_trim(input: &str, output: &str, options: serde_json::Value) -> Result<Value, String> {
+    run(&trim_args(input, output, &options)?, output, &options)
+}
+
+fn transcode_args(input: &str, output: &str, o: &Value) -> Result<Vec<String>, String> {
+    check_options(o)?;
+    let mut a = base(o);
+    a.extend(["-i".into(), input_arg(input)?]);
+    encoder_args(&mut a, o)?;
+    a.push(output_arg(output, o)?);
+    Ok(a)
+}
+
+/// Transcodes: `video_codec`, `audio_codec`, `crf`, `preset`, `video_bitrate`, `audio_bitrate`, `width`, `height`, `fps`, `pixel_format`, `no_audio`, `no_video`, `faststart`, `overwrite`, `timeout_ms`.
+pub fn ffmpeg_transcode(input: &str, output: &str, options: serde_json::Value) -> Result<Value, String> {
+    run(&transcode_args(input, output, &options)?, output, &options)
+}
+
+/// The arguments a transcode would run with, as a list: for logging, or a test. Nothing runs.
+pub fn ffmpeg_transcode_args(input: &str, output: &str, options: serde_json::Value) -> Result<Vec<String>, String> {
+    transcode_args(input, output, &options)
+}
+
+/// Cuts a video into HLS: `index.m3u8` and `seg_00000.ts` files in `folder`, each about `segment_seconds` (6) long, with the options of a transcode (streams copied unless a codec is given). Answers `{ playlist, segments: [{ file, duration }], target_duration, bytes }`, read from the playlist.
+pub fn ffmpeg_hls(input: &str, folder: &str, options: serde_json::Value) -> Result<Value, String> {
+    check_options(&options)?;
+    let secs = options.get("segment_seconds").and_then(|v| v.as_f64()).filter(|x| *x > 0.0 && *x <= 3600.0).unwrap_or(6.0);
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {}", folder, e))?;
+    let playlist = format!("{}/index.m3u8", folder.trim_end_matches('/'));
+    if Path::new(&playlist).exists() && !flag(&options, "overwrite") {
+        return Err(format!("{} already exists: give `overwrite: true`", playlist));
+    }
+    let mut a = base(&options);
+    a.extend(["-i".into(), input_arg(input)?]);
+    let mut o = options.clone();
+    let chose = options.get("video_codec").is_some() || options.get("width").is_some() || options.get("height").is_some();
+    if !chose {
+        a.extend(["-c".into(), "copy".into()]);
+        if let Some(m) = o.as_object_mut() {
+            m.remove("audio_codec");
+        }
+    } else {
+        encoder_args(&mut a, &o)?;
+    }
+    a.extend(["-f".into(), "hls".into(), "-hls_time".into(), secs.to_string(), "-hls_playlist_type".into(), "vod".into(), "-hls_segment_type".into(), "mpegts".into(), "-hls_flags".into(), "independent_segments".into()]);
+    a.extend(["-hls_segment_filename".into(), format!("{}/seg_%05d.ts", folder.trim_end_matches('/')), playlist.clone()]);
+    run(&a, &playlist, &options)?;
+    let text = std::fs::read_to_string(&playlist).map_err(|e| format!("{}: {}", playlist, e))?;
+    let mut segments = vec![];
+    let mut target = Value::Null;
+    let mut last = 0.0;
+    let mut bytes = 0;
+    for l in text.lines() {
+        if let Some(t) = l.strip_prefix("#EXT-X-TARGETDURATION:") {
+            target = json!(t.parse::<u64>().ok());
+        } else if let Some(t) = l.strip_prefix("#EXTINF:") {
+            last = t.trim_end_matches(',').parse().unwrap_or(0.0);
+        } else if !l.starts_with('#') && !l.is_empty() {
+            bytes += std::fs::metadata(format!("{}/{}", folder.trim_end_matches('/'), l)).map(|m| m.len()).unwrap_or(0);
+            segments.push(json!({ "file": l, "duration": last }));
+        }
+    }
+    Ok(json!({ "playlist": playlist, "segments": segments, "target_duration": target, "ended": text.contains("#EXT-X-ENDLIST"), "bytes": bytes }))
+}
+
+/// A test video from ffmpeg's own lavfi source, colour bars and a tone: `seconds` (2), `width` (320), `height` (240), `fps` (25), `audio` (true). For tests and demos: no sample to ship.
+pub fn ffmpeg_generate(output: &str, options: serde_json::Value) -> Result<Value, String> {
+    let n = |k: &str, d: f64| options.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    let (secs, w, h, fps) = (n("seconds", 2.0), n("width", 320.0) as u64, n("height", 240.0) as u64, n("fps", 25.0) as u64);
+    if !(0.0..=3600.0).contains(&secs) || !(2..=4096).contains(&w) || !(2..=4096).contains(&h) || !(1..=120).contains(&fps) {
+        return Err("seconds, width, height or fps is out of range".into());
+    }
+    let audio = options.get("audio").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut o = options.clone();
+    if let Some(m) = o.as_object_mut() {
+        m.retain(|k, _| k == "overwrite" || k == "timeout_ms");
+    }
+    let mut a = base(&o);
+    a.extend(["-f".into(), "lavfi".into(), "-i".into(), format!("testsrc2=size={}x{}:rate={}:duration={}", w, h, fps, secs)]);
+    if audio {
+        a.extend(["-f".into(), "lavfi".into(), "-i".into(), format!("sine=frequency=440:sample_rate=48000:duration={}", secs)]);
+    }
+    a.extend(["-pix_fmt".into(), "yuv420p".into(), "-g".into(), fps.to_string()]);
+    a.push(output_arg(output, &o)?);
+    run(&a, output, &o)
+}
+
+fn jobs() -> &'static Mutex<HashMap<String, Arc<Job>>> {
+    static J: OnceLock<Mutex<HashMap<String, Arc<Job>>>> = OnceLock::new();
+    J.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Starts a transcode in the background under `name` and answers at once; `ffmpeg_progress` follows it, with `percent` worked out from the input's length.
+pub fn ffmpeg_start(name: &str, input: &str, output: &str, options: serde_json::Value) -> Result<bool, String> {
+    if jobs().lock().map_err(|_| "lock")?.contains_key(name) {
+        return Err(format!("`{}` is already running", name));
+    }
+    let args = transcode_args(input, output, &options)?;
+    let duration = ffmpeg_probe(input).ok().and_then(|p| p["duration"].as_f64()).map(|d| (d * 1000.0) as u64);
+    let j = spawn(&args, duration, output)?;
+    jobs().lock().map_err(|_| "lock")?.insert(name.to_string(), Arc::new(j));
+    Ok(true)
+}
+
+/// Where a background job is: `{ running, percent, frame, fps, speed, out_ms, size, finished }`; once it has ended, its `result`, or `error`. Its name is free after that.
+pub fn ffmpeg_progress(name: &str) -> Result<Value, String> {
+    let j = jobs().lock().map_err(|_| "lock")?.get(name).cloned().ok_or(format!("no job `{}`", name))?;
+    let done = j.child.lock().map_err(|_| "lock")?.try_wait().map_err(|e| e.to_string())?;
+    let mut m = progress_map(&*j.progress.lock().map_err(|_| "lock")?, j.duration_ms);
+    m["running"] = json!(done.is_none());
+    if let Some(s) = done {
+        match finish(&j, s.code()) {
+            Ok(r) => m["result"] = r,
+            Err(e) => m["error"] = json!(e),
+        }
+        m["running"] = json!(false);
+        jobs().lock().map_err(|_| "lock")?.remove(name);
+    }
+    Ok(m)
+}
+
+/// Stops a background job and removes its partial output; true when there was one.
+pub fn ffmpeg_cancel(name: &str) -> Result<bool, String> {
+    let Some(j) = jobs().lock().map_err(|_| "lock")?.remove(name) else { return Ok(false) };
+    kill_group(j.pid);
+    let _ = j.child.lock().map_err(|_| "lock")?.wait();
+    let _ = std::fs::remove_file(&j.output);
+    Ok(true)
+}
+
+/// Which ffmpeg this is: its version line, and what it can encode among the usual codecs.
+pub fn ffmpeg_version() -> Result<Value, String> {
+    let o = Command::new(ffmpeg()).args(["-hide_banner", "-encoders"]).stdin(Stdio::null()).output().map_err(|_| "ffmpeg is not installed, or not on PATH (FFMPEG_BIN names it)")?;
+    let v = Command::new(ffmpeg()).arg("-version").stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    let list = String::from_utf8_lossy(&o.stdout).to_string();
+    let mut m = Map::new();
+    m.insert("version".into(), json!(String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or("").split_whitespace().nth(2)));
+    for c in ["libx264", "libx265", "libvpx-vp9", "libsvtav1", "aac", "libopus", "libmp3lame"] {
+        m.insert(c.replace('-', "_"), json!(list.lines().any(|l| l.split_whitespace().nth(1) == Some(c))));
+    }
+    Ok(Value::Object(m))
+}

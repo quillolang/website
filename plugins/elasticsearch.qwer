@@ -1,0 +1,399 @@
+//! Elasticsearch and OpenSearch over their REST API: documents indexed, read and updated with optimistic locks, bulk writes as NDJSON with each item's error read and rejected items sent again, searches with hits flattened, search_after paging, whole result sets walked under a point in time on either product, and error bodies turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// ELASTICSEARCH_API_URL is the cluster (http://localhost:9200 when not set). ELASTICSEARCH_API_KEY
+// sends `Authorization: ApiKey`; ELASTICSEARCH_USERNAME with ELASTICSEARCH_PASSWORD basic auth,
+// which is what OpenSearch uses.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("ELASTICSEARCH_API_URL").unwrap_or_else(|| "http://localhost:9200".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// Index names may be a list or hold `*`; a comma and a star stay as they are in the path.
+fn enc_index(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("no index given".into());
+    }
+    Ok(s.split(',').map(|p| p.split('*').map(enc).collect::<Vec<_>>().join("*")).collect::<Vec<_>>().join(","))
+}
+
+fn query_text(q: &[(&str, String)]) -> String {
+    let t = q.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect::<Vec<_>>().join("&");
+    if t.is_empty() { t } else { format!("?{}", t) }
+}
+
+fn opt(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// `caused_by` is where the useful sentence often is.
+fn error_text(status: u16, v: &Value, text: &str) -> String {
+    let e = &v["error"];
+    if e.is_object() {
+        let mut m = format!("{}: {}", e["type"].as_str().unwrap_or("error"), e["reason"].as_str().unwrap_or(""));
+        if let Some(c) = e["caused_by"]["reason"].as_str() {
+            m.push_str(&format!(" (caused by {}: {})", e["caused_by"]["type"].as_str().unwrap_or("error"), c));
+        }
+        return format!("Elasticsearch answered {}: {}", status, m);
+    }
+    if let Some(s) = e.as_str() {
+        return format!("Elasticsearch answered {}: {}", status, s);
+    }
+    format!("Elasticsearch answered {}: {}", status, text.chars().take(300).collect::<String>())
+}
+
+struct Reply {
+    status: u16,
+    body: Value,
+    text: String,
+}
+
+fn send(method: &str, path: &str, body: Option<(&str, String)>) -> Result<Reply, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let url = format!("{}{}", base(), path);
+    for attempt in 0..4 {
+        let mut req = agent.request(method, &url).set("Accept", "application/json");
+        if let Some(k) = env("ELASTICSEARCH_API_KEY") {
+            req = req.set("Authorization", &format!("ApiKey {}", k));
+        } else if let (Some(u), Some(p)) = (env("ELASTICSEARCH_USERNAME"), env("ELASTICSEARCH_PASSWORD")) {
+            req = req.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+        }
+        let res = match &body {
+            Some((kind, b)) => req.set("Content-Type", kind).send_string(b),
+            None => req.call(),
+        };
+        let (status, text) = match res {
+            Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(c, r)) => {
+                if (c == 429 || c == 503) && attempt < 3 {
+                    let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1 << attempt);
+                    std::thread::sleep(Duration::from_secs(wait.min(30)));
+                    continue;
+                }
+                (c, r.into_string().unwrap_or_default())
+            }
+            Err(e) => return Err(format!("cannot reach Elasticsearch at {}: {}", base(), e)),
+        };
+        let v = serde_json::from_str(&text).unwrap_or(Value::Null);
+        return Ok(Reply { status, body: v, text });
+    }
+    Err("Elasticsearch stayed busy (429) through four tries".into())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let r = send(method, path, body.map(|b| ("application/json", b.to_string())))?;
+    if r.status >= 300 {
+        return Err(error_text(r.status, &r.body, &r.text));
+    }
+    Ok(r.body)
+}
+
+fn hit(h: &Value) -> Value {
+    let mut o = Map::new();
+    o.insert("_id".into(), h["_id"].clone());
+    o.insert("_index".into(), h["_index"].clone());
+    if !h["_score"].is_null() {
+        o.insert("_score".into(), h["_score"].clone());
+    }
+    if let Some(s) = h.get("sort") {
+        o.insert("_sort".into(), s.clone());
+    }
+    if let Some(s) = h.get("highlight") {
+        o.insert("_highlight".into(), s.clone());
+    }
+    for (k, v) in h["_source"].as_object().into_iter().flatten() {
+        o.insert(k.clone(), v.clone());
+    }
+    Value::Object(o)
+}
+
+fn page(r: &Value) -> Value {
+    let hits: Vec<Value> = r["hits"]["hits"].as_array().into_iter().flatten().map(hit).collect();
+    // Before version 7 `total` was a number.
+    let (total, exact) = match &r["hits"]["total"] {
+        Value::Object(t) => (t.get("value").cloned().unwrap_or(json!(0)), t.get("relation") != Some(&json!("gte"))),
+        n => (n.clone(), true),
+    };
+    let mut o = json!({ "total": total, "total_exact": exact, "took": r["took"], "hits": hits });
+    if r["timed_out"] == true {
+        o["timed_out"] = json!(true);
+    }
+    if r["_shards"]["failed"].as_i64().unwrap_or(0) > 0 {
+        o["shards_failed"] = r["_shards"]["failed"].clone();
+    }
+    if let Some(a) = r.get("aggregations") {
+        o["aggregations"] = a.clone();
+    }
+    o
+}
+
+/// Which server this is: `{ product, version, cluster }`, `product` being "elasticsearch" or "opensearch".
+pub fn elastic_info() -> Result<Value, String> {
+    let r = call("GET", "/", None)?;
+    let product = if r["version"]["distribution"] == "opensearch" { "opensearch" } else { "elasticsearch" };
+    Ok(json!({ "product": product, "version": r["version"]["number"], "cluster": r["cluster_name"] }))
+}
+
+/// Makes an index; `definition` is `{ settings, mappings, aliases }` or null. True when made, false when it was there already.
+pub fn elastic_create_index(index: &str, definition: serde_json::Value) -> Result<bool, String> {
+    let body = if definition.is_null() { json!({}) } else { definition };
+    let r = send("PUT", &format!("/{}", enc_index(index)?), Some(("application/json", body.to_string())))?;
+    if r.status == 400 && r.body["error"]["type"] == "resource_already_exists_exception" {
+        return Ok(false);
+    }
+    if r.status >= 300 {
+        return Err(error_text(r.status, &r.body, &r.text));
+    }
+    Ok(true)
+}
+
+/// Deletes an index; true when it was there.
+pub fn elastic_delete_index(index: &str) -> Result<bool, String> {
+    let r = send("DELETE", &format!("/{}", enc_index(index)?), None)?;
+    if r.status == 404 {
+        return Ok(false);
+    }
+    if r.status >= 300 {
+        return Err(error_text(r.status, &r.body, &r.text));
+    }
+    Ok(true)
+}
+
+/// Writes a document under `id` ("" lets the server choose one). `options`: `refresh` (true, "wait_for"), `routing`, `op_type` ("create" refuses an id in use), and `if_seq_no` with `if_primary_term` for an optimistic lock. Gives `{ id, result, version, seq_no, primary_term }`.
+pub fn elastic_index(index: &str, id: &str, doc: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let mut q = vec![];
+    for k in ["refresh", "routing", "op_type", "if_seq_no", "if_primary_term", "pipeline"] {
+        if let Some(v) = opt(&options, k) {
+            q.push((k, v));
+        }
+    }
+    let i = enc_index(index)?;
+    let r = if id.is_empty() { call("POST", &format!("/{}/_doc{}", i, query_text(&q)), Some(&doc))? } else { call("PUT", &format!("/{}/_doc/{}{}", i, enc(id), query_text(&q)), Some(&doc))? };
+    Ok(json!({ "id": r["_id"], "result": r["result"], "version": r["_version"], "seq_no": r["_seq_no"], "primary_term": r["_primary_term"] }))
+}
+
+/// Reads a document: its fields with `_id`, `_seq_no` and `_primary_term`, or null when there is none.
+pub fn elastic_get(index: &str, id: &str) -> Result<Value, String> {
+    let r = send("GET", &format!("/{}/_doc/{}", enc_index(index)?, enc(id)), None)?;
+    if r.status == 404 && r.body["error"].is_null() {
+        return Ok(Value::Null);
+    }
+    if r.status >= 300 {
+        return Err(error_text(r.status, &r.body, &r.text));
+    }
+    let mut o = Map::new();
+    o.insert("_id".into(), r.body["_id"].clone());
+    o.insert("_seq_no".into(), r.body["_seq_no"].clone());
+    o.insert("_primary_term".into(), r.body["_primary_term"].clone());
+    for (k, v) in r.body["_source"].as_object().into_iter().flatten() {
+        o.insert(k.clone(), v.clone());
+    }
+    Ok(Value::Object(o))
+}
+
+/// Changes some fields of a document (`doc` holds only those). `options`: `refresh`, `retry_on_conflict`, `upsert` true to make it when missing.
+pub fn elastic_update(index: &str, id: &str, doc: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let mut q = vec![];
+    for k in ["refresh", "retry_on_conflict", "routing"] {
+        if let Some(v) = opt(&options, k) {
+            q.push((k, v));
+        }
+    }
+    let body = json!({ "doc": doc, "doc_as_upsert": options["upsert"] == true });
+    let r = call("POST", &format!("/{}/_update/{}{}", enc_index(index)?, enc(id), query_text(&q)), Some(&body))?;
+    Ok(json!({ "id": r["_id"], "result": r["result"], "version": r["_version"] }))
+}
+
+/// Deletes a document; true when it was there.
+pub fn elastic_delete(index: &str, id: &str) -> Result<bool, String> {
+    let r = send("DELETE", &format!("/{}/_doc/{}", enc_index(index)?, enc(id)), None)?;
+    if r.status == 404 && r.body["error"].is_null() {
+        return Ok(false);
+    }
+    if r.status >= 300 {
+        return Err(error_text(r.status, &r.body, &r.text));
+    }
+    Ok(true)
+}
+
+fn bulk_line(a: &Value, out: &mut String) -> Result<String, String> {
+    let op = a["op"].as_str().unwrap_or("index");
+    if !["index", "create", "update", "delete"].contains(&op) {
+        return Err(format!("{:?} is not a bulk operation: use index, create, update or delete", op));
+    }
+    let mut head = Map::new();
+    if let Some(i) = a.get("index") {
+        head.insert("_index".into(), i.clone());
+    }
+    if let Some(i) = a.get("id") {
+        head.insert("_id".into(), match i { Value::Number(n) => json!(n.to_string()), o => o.clone() });
+    }
+    if let Some(r) = a.get("routing") {
+        head.insert("routing".into(), r.clone());
+    }
+    if op != "index" && op != "create" && a.get("id").is_none() {
+        return Err(format!("a bulk {} needs an id", op));
+    }
+    out.push_str(&json!({ op: head }).to_string());
+    out.push('\n');
+    if op != "delete" {
+        let doc = a.get("doc").ok_or(format!("a bulk {} needs a doc", op))?;
+        // A document is one line: serde_json writes no line breaks of its own.
+        let line = if op == "update" { json!({ "doc": doc }).to_string() } else { doc.to_string() };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(op.to_string())
+}
+
+/// Many writes in one request, sent as NDJSON. Each action is `{ op, index, id, doc }`, `op` "index" (the default), "create", "update" or "delete". The answer is read item by item: `{ ok, failed: [{ position, op, id, status, type, reason }], took }`. Items refused with 429 are sent again, up to three times, and a failed item never fails the others. `refresh` is "" or as for `elastic_index`.
+pub fn elastic_bulk(actions: Vec<serde_json::Value>, refresh: &str) -> Result<Value, String> {
+    if actions.is_empty() {
+        return Ok(json!({ "ok": 0, "failed": [], "took": 0 }));
+    }
+    let path = format!("/_bulk{}", query_text(&if refresh.is_empty() { vec![] } else { vec![("refresh", refresh.to_string())] }));
+    let mut pending: Vec<(usize, Value)> = actions.into_iter().enumerate().collect();
+    let (mut ok, mut failed, mut took) = (0i64, vec![], 0i64);
+    for round in 0..4 {
+        let mut body = String::new();
+        for (_, a) in &pending {
+            bulk_line(a, &mut body)?;
+        }
+        let r = send("POST", &path, Some(("application/x-ndjson", body)))?;
+        if r.status >= 300 {
+            return Err(error_text(r.status, &r.body, &r.text));
+        }
+        took += r.body["took"].as_i64().unwrap_or(0);
+        let items = r.body["items"].as_array().cloned().unwrap_or_default();
+        if items.len() != pending.len() {
+            return Err(format!("the bulk answer has {} items for {} actions", items.len(), pending.len()));
+        }
+        let mut again = vec![];
+        for ((position, action), item) in pending.into_iter().zip(items) {
+            let (op, res) = item.as_object().and_then(|m| m.iter().next()).map(|(k, v)| (k.clone(), v.clone())).unwrap_or_default();
+            let status = res["status"].as_i64().unwrap_or(0);
+            if res["error"].is_null() && status < 300 {
+                ok += 1;
+            } else if op == "delete" && status == 404 {
+                ok += 1;
+            } else if status == 429 && round < 3 {
+                again.push((position, action));
+            } else {
+                failed.push(json!({ "position": position, "op": op, "id": res["_id"], "status": status, "type": res["error"]["type"], "reason": res["error"]["reason"] }));
+            }
+        }
+        if again.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200 << round));
+        pending = again;
+    }
+    failed.sort_by_key(|f: &Value| f["position"].as_i64());
+    Ok(json!({ "ok": ok, "failed": failed, "took": took }))
+}
+
+/// A search: `body` is the Query DSL (`query`, `sort`, `size`, `from`, `aggs`, `highlight`). Gives `{ total, total_exact, took, hits, aggregations }`, each hit its fields beside `_id`, `_score`, `_sort`. `total_exact` is false when the total stopped counting (at 10000, unless `track_total_hits` says otherwise).
+pub fn elastic_search(index: &str, body: serde_json::Value) -> Result<Value, String> {
+    Ok(page(&call("POST", &format!("/{}/_search", enc_index(index)?), Some(&body))?))
+}
+
+/// One page past any depth by `search_after`: `body` must have a `sort` ending in a field unique to each document, and `size`. `after` is null for the first page, then the `next` of the page before. Gives what `elastic_search` gives, plus `next`, null on the last page.
+pub fn elastic_search_after(index: &str, body: serde_json::Value, after: serde_json::Value) -> Result<Value, String> {
+    if body.get("sort").map_or(true, |s| s.as_array().map_or(false, |a| a.is_empty())) {
+        return Err("search_after needs a `sort`, ending in a field unique to each document".into());
+    }
+    let mut b = body;
+    if !after.is_null() {
+        b["search_after"] = after;
+    }
+    let size = b["size"].as_i64().unwrap_or(10);
+    let mut p = elastic_search(index, b)?;
+    let hits = p["hits"].as_array().cloned().unwrap_or_default();
+    p["next"] = if (hits.len() as i64) < size { Value::Null } else { hits.last().map_or(Value::Null, |h| h["_sort"].clone()) };
+    Ok(p)
+}
+
+/// Every hit of a search, up to `max`, read in pages under a point in time so that writes meanwhile do not move them: `_pit` on Elasticsearch, `_search/point_in_time` on OpenSearch, chosen by asking the server, and closed afterwards. `body` needs a `sort`; `_shard_doc` is added as the tiebreak. Gives `{ hits, complete, pit }`.
+pub fn elastic_search_all(index: &str, body: serde_json::Value, max: i64) -> Result<Value, String> {
+    let info = elastic_info()?;
+    let open_search = info["product"] == "opensearch";
+    let i = enc_index(index)?;
+    let opened = if open_search { call("POST", &format!("/{}/_search/point_in_time?keep_alive=1m", i), None)? } else { call("POST", &format!("/{}/_pit?keep_alive=1m", i), None)? };
+    let id = opened[if open_search { "pit_id" } else { "id" }].as_str().ok_or("the server gave no point in time")?.to_string();
+    let walked = walk(&id, body, max);
+    let closed = if open_search { call("DELETE", "/_search/point_in_time", Some(&json!({ "pit_id": [id.as_str()] }))) } else { call("DELETE", "/_pit", Some(&json!({ "id": id }))) };
+    let (hits, complete) = walked?;
+    closed?;
+    Ok(json!({ "hits": hits, "complete": complete, "pit": info["product"] }))
+}
+
+fn walk(id: &str, body: Value, max: i64) -> Result<(Vec<Value>, bool), String> {
+    let mut b = body;
+    let size = b["size"].as_i64().unwrap_or(1000).clamp(1, 10_000);
+    b["size"] = json!(size);
+    b["pit"] = json!({ "id": id, "keep_alive": "1m" });
+    let mut sort = b["sort"].as_array().cloned().ok_or("elastic_search_all needs a `sort` list")?;
+    sort.push(json!({ "_shard_doc": "asc" }));
+    b["sort"] = Value::Array(sort);
+    let mut out: Vec<Value> = vec![];
+    loop {
+        let r = call("POST", "/_search", Some(&b))?;
+        let p = page(&r);
+        let hits = p["hits"].as_array().cloned().unwrap_or_default();
+        let n = hits.len() as i64;
+        let last = hits.last().map(|h| h["_sort"].clone());
+        out.extend(hits);
+        if out.len() as i64 >= max {
+            out.truncate(max.max(0) as usize);
+            return Ok((out, n < size));
+        }
+        if n < size {
+            return Ok((out, true));
+        }
+        b["search_after"] = last.ok_or("a page came back without sort values")?;
+    }
+}
+
+/// How many documents match `query` (null for all).
+pub fn elastic_count(index: &str, query: serde_json::Value) -> Result<i64, String> {
+    let body = if query.is_null() { json!({}) } else { json!({ "query": query }) };
+    let r = call("POST", &format!("/{}/_count", enc_index(index)?), Some(&body))?;
+    r["count"].as_i64().ok_or("the count answer has no count".to_string())
+}
+
+/// A visitor's text made safe for a `query_string` query: its reserved characters backslashed, and `<` and `>`, which cannot be escaped, removed.
+pub fn elastic_escape(text: &str) -> String {
+    let mut o = String::new();
+    for c in text.chars() {
+        if c == '<' || c == '>' {
+            continue;
+        }
+        if "+-=&|!(){}[]^\"~*?:\\/".contains(c) {
+            o.push('\\');
+        }
+        o.push(c);
+    }
+    o
+}

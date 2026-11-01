@@ -1,0 +1,275 @@
+//! Spotify's Web API without an SDK: client-credentials tokens kept until they run out, PKCE sign-in with its verifier, challenge, address and code exchange, search, tracks in fifties, playlists read through `next`, made and added to in hundreds, 429s waited out by their Retry-After, and ids taken from any link or URI.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// SPOTIFY_CLIENT_ID is the app's id, SPOTIFY_CLIENT_SECRET its secret (client credentials only; PKCE
+// needs none). SPOTIFY_API_URL is the API (https://api.spotify.com/v1), SPOTIFY_ACCOUNTS_URL the
+// sign-in (https://accounts.spotify.com). Pass a signed-in user's token as `user_token` on calls that
+// act for them; "" uses the app's own token, which cannot touch a user's library.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("SPOTIFY_API_URL").unwrap_or_else(|| "https://api.spotify.com/v1".into()).trim_end_matches('/').to_string()
+}
+
+fn accounts() -> String {
+    setting("SPOTIFY_ACCOUNTS_URL").unwrap_or_else(|| "https://accounts.spotify.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn token_post(form: &[(&str, &str)], basic: bool) -> Result<Value, String> {
+    let mut req = ureq::post(&format!("{}/api/token", accounts())).timeout(Duration::from_secs(20));
+    if basic {
+        let id = setting("SPOTIFY_CLIENT_ID").ok_or("SPOTIFY_CLIENT_ID is not set")?;
+        let secret = setting("SPOTIFY_CLIENT_SECRET").ok_or("SPOTIFY_CLIENT_SECRET is not set")?;
+        req = req.set("Authorization", &format!("Basic {}", STANDARD.encode(format!("{}:{}", id, secret))));
+    }
+    match req.send_form(form) {
+        Ok(r) => serde_json::from_str(&r.into_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            Err(format!("Spotify refused the token, {}: {} {}", c, v["error"].as_str().unwrap_or(&b), v["error_description"].as_str().unwrap_or("")))
+        }
+        Err(e) => Err(format!("cannot reach Spotify's accounts service: {}", e)),
+    }
+}
+
+static APP_TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn app_token(force: bool) -> Result<String, String> {
+    let mut g = APP_TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let (false, Some((t, until))) = (force, g.as_ref()) {
+        if *until > now() + 60 {
+            return Ok(t.clone());
+        }
+    }
+    let v = token_post(&[("grant_type", "client_credentials")], true)?;
+    let t = v["access_token"].as_str().ok_or("Spotify gave no access_token")?.to_string();
+    *g = Some((t.clone(), now() + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(t)
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let m = v["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| text.trim().chars().take(300).collect());
+    let hint = match status {
+        401 => " (the token is wrong or expired)",
+        403 => " (the app or user may not do this: check the token's scopes)",
+        _ => "",
+    };
+    format!("Spotify {}: {}{}", status, m, hint)
+}
+
+// `url` is whole, as `next` is.
+fn fetch(method: &str, url: &str, body: Option<&Value>, user_token: &str) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut renewed = false;
+    let mut waited = 0;
+    loop {
+        let t = if user_token.is_empty() { app_token(false)? } else { user_token.to_string() };
+        let req = agent.request(method, url).set("Authorization", &format!("Bearer {}", t)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let text = r.into_string().map_err(|e| e.to_string())?;
+                return if text.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&text).map_err(|_| format!("Spotify's answer is not JSON: {}", text.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed && user_token.is_empty() => {
+                renewed = true;
+                app_token(true)?;
+            }
+            Err(ureq::Error::Status(429, r)) if waited < 5 => {
+                let secs = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+                if secs > 60 {
+                    return Err(format!("Spotify says to wait {} s, longer than a request should", secs));
+                }
+                waited += 1;
+                std::thread::sleep(Duration::from_secs(secs));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Spotify at {}: {}", api(), e)),
+        }
+    }
+}
+
+fn get(path: &str, user_token: &str) -> Result<Value, String> {
+    fetch("GET", &format!("{}{}", api(), path), None, user_token)
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn random_text() -> String {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let a = Sha256::digest(format!("{}:{}:{}:{:?}", t, n, std::process::id(), std::collections::hash_map::RandomState::new()));
+    let b = Sha256::digest(format!("{:?}:{:?}", a, std::collections::hash_map::RandomState::new()));
+    URL_SAFE_NO_PAD.encode([a.as_slice(), b.as_slice()].concat())
+}
+
+/// The S256 challenge of a verifier: the unpadded base64url of its SHA-256.
+pub fn spotify_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// A new PKCE pair: { verifier, challenge, state }. Keep `verifier` and `state` in the visitor's session until they come back.
+pub fn spotify_pkce() -> serde_json::Value {
+    let verifier = random_text();
+    json!({ "challenge": spotify_challenge(&verifier), "verifier": verifier, "state": random_text()[..24] })
+}
+
+/// The address to send a visitor to, for PKCE sign-in: `scopes` a list like ["playlist-modify-private"].
+pub fn spotify_authorize_url(redirect_uri: &str, scopes: Vec<String>, state: &str, challenge: &str) -> Result<String, String> {
+    let id = setting("SPOTIFY_CLIENT_ID").ok_or("SPOTIFY_CLIENT_ID is not set")?;
+    Ok(format!("{}/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge_method=S256&code_challenge={}", accounts(), enc(&id), enc(redirect_uri), enc(&scopes.join(" ")), enc(state), enc(challenge)))
+}
+
+/// Trades the `code` from the redirect for tokens: { access_token, refresh_token, expires_in, scope }. Needs the same `redirect_uri`, and the `verifier` that made the challenge.
+pub fn spotify_exchange_code(code: &str, redirect_uri: &str, verifier: &str) -> Result<serde_json::Value, String> {
+    let id = setting("SPOTIFY_CLIENT_ID").ok_or("SPOTIFY_CLIENT_ID is not set")?;
+    if verifier.len() < 43 || verifier.len() > 128 {
+        return Err(format!("a PKCE verifier is 43 to 128 characters, not {}", verifier.len()));
+    }
+    token_post(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect_uri), ("client_id", &id), ("code_verifier", verifier)], false)
+}
+
+/// A new access token from a user's refresh token. Under PKCE the answer may hold a new refresh_token: keep that one if it does.
+pub fn spotify_refresh(refresh_token: &str) -> Result<serde_json::Value, String> {
+    let id = setting("SPOTIFY_CLIENT_ID").ok_or("SPOTIFY_CLIENT_ID is not set")?;
+    token_post(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", &id)], false)
+}
+
+/// The id in a link or URI: "https://open.spotify.com/track/ID?si=x", "spotify:track:ID", or an id already.
+pub fn spotify_id(link: &str) -> Result<String, String> {
+    let t = link.trim();
+    let id = if let Some(rest) = t.strip_prefix("spotify:") {
+        rest.rsplit(':').next().unwrap_or("")
+    } else if t.contains("open.spotify.com/") {
+        t.split(|c| c == '?' || c == '#').next().unwrap_or("").trim_end_matches('/').rsplit('/').next().unwrap_or("")
+    } else {
+        t
+    };
+    if id.len() != 22 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("no Spotify id in `{}`: an id is 22 letters and digits", link));
+    }
+    Ok(id.to_string())
+}
+
+/// Searches: `types` a list from "track", "album", "artist", "playlist"; `params` adds `market`; `max_items` is the most of each type. Spotify stops at 1000 results, and `q` may use its filters (`artist:"Nina Simone" year:1965`). Gives { track: { total, items }, ... }.
+pub fn spotify_search(q: &str, types: Vec<String>, params: serde_json::Value, max_items: i64) -> Result<serde_json::Value, String> {
+    if q.trim().is_empty() || types.is_empty() {
+        return Err("a search needs a query and at least one type".into());
+    }
+    let cap = if max_items > 0 { max_items.min(1000) } else { 1000 };
+    let extra: String = params.as_object().map_or(String::new(), |m| m.iter().map(|(k, v)| format!("&{}={}", enc(k), enc(v.as_str().unwrap_or("")))).collect());
+    let mut out = serde_json::Map::new();
+    for ty in &types {
+        let mut items = vec![];
+        let mut total = Value::Null;
+        let mut offset = 0;
+        loop {
+            let limit = (cap - offset).min(50);
+            let v = get(&format!("/search?q={}&type={}&limit={}&offset={}{}", enc(q), enc(ty), limit, offset, extra), "")?;
+            let page = &v[format!("{}s", ty)];
+            total = page["total"].clone();
+            let got = page["items"].as_array().cloned().unwrap_or_default();
+            let n = got.len() as i64;
+            items.extend(got);
+            offset += n;
+            if n == 0 || offset >= cap || page["next"].is_null() {
+                break;
+            }
+        }
+        out.insert(ty.clone(), json!({ "total": total, "items": items }));
+    }
+    Ok(Value::Object(out))
+}
+
+/// One track, by id, link or URI.
+pub fn spotify_track(id: &str) -> Result<serde_json::Value, String> {
+    get(&format!("/tracks/{}", spotify_id(id)?), "")
+}
+
+/// Tracks by id, link or URI, as many as you like, asked for in fifties. An id Spotify does not know is left out.
+pub fn spotify_tracks(ids: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
+    let clean: Vec<String> = ids.iter().map(|i| spotify_id(i)).collect::<Result<_, _>>()?;
+    let mut out = vec![];
+    for chunk in clean.chunks(50) {
+        let v = get(&format!("/tracks?ids={}", chunk.join(",")), "")?;
+        out.extend(v["tracks"].as_array().cloned().unwrap_or_default().into_iter().filter(|t| !t.is_null()));
+    }
+    Ok(out)
+}
+
+/// A playlist's details, with `user_token` for a private one ("" for none). `tracks` is left to spotify_playlist_tracks.
+pub fn spotify_playlist(id: &str, user_token: &str) -> Result<serde_json::Value, String> {
+    get(&format!("/playlists/{}?fields=id,name,description,public,owner(id),tracks(total),snapshot_id", spotify_id(id)?), user_token)
+}
+
+/// A playlist's items through every `next`: each { added_at, track }, with removed tracks' null left out; `max_items` caps them (0: all).
+pub fn spotify_playlist_tracks(id: &str, user_token: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let mut url = format!("{}/playlists/{}/tracks?limit=100", api(), spotify_id(id)?);
+    let mut out = vec![];
+    loop {
+        let v = fetch("GET", &url, None, user_token)?;
+        out.extend(v["items"].as_array().cloned().unwrap_or_default().into_iter().filter(|i| !i["track"].is_null()));
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["next"].as_str() {
+            Some(n) => url = n.to_string(),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Makes a playlist for the signed-in user: `params` adds `description`, `public`. Needs a `user_token` with playlist-modify scopes.
+pub fn spotify_playlist_create(user_id: &str, name: &str, params: serde_json::Value, user_token: &str) -> Result<serde_json::Value, String> {
+    if user_token.is_empty() {
+        return Err("making a playlist needs a user's token: an app's own cannot".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["name"] = json!(name);
+    fetch("POST", &format!("{}/users/{}/playlists", api(), enc(user_id)), Some(&b), user_token)
+}
+
+/// Adds tracks to a playlist, by link, URI or id, in hundreds as Spotify wants, in order. Gives the last snapshot_id.
+pub fn spotify_playlist_add(id: &str, tracks: Vec<String>, user_token: &str) -> Result<String, String> {
+    if user_token.is_empty() {
+        return Err("changing a playlist needs a user's token: an app's own cannot".into());
+    }
+    let uris: Vec<String> = tracks.iter().map(|t| spotify_id(t).map(|i| format!("spotify:track:{}", i))).collect::<Result<_, _>>()?;
+    let mut last = String::new();
+    let url = format!("{}/playlists/{}/tracks", api(), spotify_id(id)?);
+    for chunk in uris.chunks(100) {
+        let v = fetch("POST", &url, Some(&json!({ "uris": chunk })), user_token)?;
+        last = v["snapshot_id"].as_str().unwrap_or("").to_string();
+    }
+    Ok(last)
+}

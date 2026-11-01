@@ -1,0 +1,159 @@
+//! An IP address's country, city and ASN from MaxMind-format .mmdb files, in pure Rust: lookups through a kept reader, names in a chosen language, address kinds told apart, and metadata.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! maxminddb = "=0.32.0"
+
+use maxminddb::Reader;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+type Db = Arc<Reader<Vec<u8>>>;
+
+/// Files by path, read once, and read again when they change on disk: the databases are replaced each week.
+static DBS: Mutex<Option<HashMap<String, (SystemTime, Db)>>> = Mutex::new(None);
+
+fn open(path: &str) -> Result<Db, String> {
+    let stamp = std::fs::metadata(path).and_then(|m| m.modified()).map_err(|e| format!("{}: {}", path, e))?;
+    if let Some((t, d)) = DBS.lock().unwrap().as_ref().and_then(|m| m.get(path)) {
+        if *t == stamp {
+            return Ok(d.clone());
+        }
+    }
+    let r: Db = Arc::new(Reader::open_readfile(path).map_err(|e| format!("{}: {}", path, e))?);
+    DBS.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_string(), (stamp, r.clone()));
+    Ok(r)
+}
+
+fn parse_ip(ip: &str) -> Result<IpAddr, String> {
+    ip.trim().parse().map_err(|_| format!("`{}` is not an IP address", ip))
+}
+
+fn kind_v4(a: Ipv4Addr) -> &'static str {
+    let o = a.octets();
+    if a.is_private() { "private" }
+    else if a.is_loopback() { "loopback" }
+    else if a.is_link_local() { "link-local" }
+    else if a.is_multicast() { "multicast" }
+    else if a.is_broadcast() { "broadcast" }
+    else if a.is_unspecified() { "unspecified" }
+    else if o[0] == 100 && (64..128).contains(&o[1]) { "carrier-grade nat" }
+    else if matches!(o, [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]) { "documentation" }
+    else if o[0] == 198 && (o[1] == 18 || o[1] == 19) { "benchmarking" }
+    else if o[0] >= 240 { "reserved" }
+    else { "public" }
+}
+
+fn kind_v6(a: Ipv6Addr) -> &'static str {
+    let s = a.segments();
+    if let Some(v4) = a.to_ipv4_mapped() { return kind_v4(v4); }
+    if a.is_loopback() { "loopback" }
+    else if a.is_unspecified() { "unspecified" }
+    else if a.is_multicast() { "multicast" }
+    else if s[0] & 0xfe00 == 0xfc00 { "private" }
+    else if s[0] & 0xffc0 == 0xfe80 { "link-local" }
+    else if s[0] == 0x2001 && s[1] == 0x0db8 { "documentation" }
+    else { "public" }
+}
+
+/// What kind of address this is: `{ ip, version, kind, public }`, `kind` being public, private, loopback, link-local, multicast, carrier-grade nat, documentation and so on. Private ones are in no database, so check before you look.
+pub fn ip_location_kind(ip: &str) -> Result<Value, String> {
+    let a = parse_ip(ip)?;
+    let (version, kind) = match a {
+        IpAddr::V4(x) => (4, kind_v4(x)),
+        IpAddr::V6(x) => (6, kind_v6(x)),
+    };
+    Ok(json!({ "ip": a.to_string(), "version": version, "kind": kind, "public": kind == "public" }))
+}
+
+/// The record at an address, as the file has it, or null, with its `network`: for fields this plugin does not lift out.
+pub fn ip_location_raw(db: &str, ip: &str) -> Result<Value, String> {
+    let (rec, net) = find(db, ip)?;
+    Ok(json!({ "record": rec, "network": net }))
+}
+
+fn find(db: &str, ip: &str) -> Result<(Value, Value), String> {
+    let r = open(db)?;
+    let a = parse_ip(ip)?;
+    let hit = r.lookup(a).map_err(|e| format!("{}: {}", db, e))?;
+    if !hit.has_data() {
+        return Ok((Value::Null, Value::Null));
+    }
+    let net = hit.network().map(|n| json!(n.to_string())).unwrap_or(Value::Null);
+    let rec: Option<Value> = hit.decode().map_err(|e| format!("{}: {}", db, e))?;
+    Ok((rec.unwrap_or(Value::Null), net))
+}
+
+fn name(v: &Value, lang: &str) -> Value {
+    let n = &v["names"];
+    if n[lang].is_string() { n[lang].clone() } else { n["en"].clone() }
+}
+
+fn lift(rec: &Value, lang: &str) -> Value {
+    let region: Vec<Value> = rec["subdivisions"].as_array().into_iter().flatten().map(|s| json!({ "code": s["iso_code"], "name": name(s, lang) })).collect();
+    json!({
+        "country": rec["country"]["iso_code"], "country_name": name(&rec["country"], lang),
+        "continent": rec["continent"]["code"], "continent_name": name(&rec["continent"], lang),
+        "region": region.first().cloned().unwrap_or(Value::Null), "regions": region,
+        "city": name(&rec["city"], lang), "postal": rec["postal"]["code"],
+        "latitude": rec["location"]["latitude"], "longitude": rec["location"]["longitude"], "time_zone": rec["location"]["time_zone"], "accuracy_km": rec["location"]["accuracy_radius"],
+        "eu": rec["country"]["is_in_european_union"], "registered_country": rec["registered_country"]["iso_code"],
+    })
+}
+
+/// Where an address is, from a City or Country database: `{ found, ip, network, country, country_name, continent, region, city, postal, latitude, longitude, time_zone, accuracy_km }`. Names come in `lang`, English when the file lacks it. An address the file has nothing on gives `found: false`.
+pub fn ip_location_city(db: &str, ip: &str, lang: &str) -> Result<Value, String> {
+    let (rec, net) = find(db, ip)?;
+    if rec.is_null() {
+        return Ok(json!({ "found": false, "ip": ip.trim() }));
+    }
+    let mut v = lift(&rec, if lang.is_empty() { "en" } else { lang });
+    v["found"] = json!(true);
+    v["ip"] = json!(ip.trim());
+    v["network"] = net;
+    Ok(v)
+}
+
+/// Who an address belongs to, from an ASN database: `{ found, ip, network, asn, organization }`.
+pub fn ip_location_asn(db: &str, ip: &str) -> Result<Value, String> {
+    let (rec, net) = find(db, ip)?;
+    if rec.is_null() {
+        return Ok(json!({ "found": false, "ip": ip.trim() }));
+    }
+    Ok(json!({ "found": true, "ip": ip.trim(), "network": net, "asn": rec["autonomous_system_number"], "organization": rec["autonomous_system_organization"] }))
+}
+
+/// City and ASN at once, from `IP_LOCATION_CITY_DB` and `IP_LOCATION_ASN_DB`, and the kind of address: what a log line or a sign-in check wants. A private address looks up nothing.
+pub fn ip_location_lookup(ip: &str, lang: &str) -> Result<Value, String> {
+    let kind = ip_location_kind(ip)?;
+    let var = |k: &str| std::env::var(k).ok().filter(|x| !x.is_empty());
+    let city = match var("IP_LOCATION_CITY_DB") {
+        Some(p) => ip_location_city(&p, ip, lang)?,
+        None => return Err("IP_LOCATION_CITY_DB is not set".into()),
+    };
+    let asn = match var("IP_LOCATION_ASN_DB") {
+        Some(p) => ip_location_asn(&p, ip)?,
+        None => Value::Null,
+    };
+    Ok(json!({ "ip": kind["ip"], "kind": kind["kind"], "found": city["found"], "country": city["country"], "city": city["city"], "time_zone": city["time_zone"], "asn": asn["asn"], "organization": asn["organization"] }))
+}
+
+/// What a file is: `{ type, description, built, ip_version, languages, nodes, record_size, format }`, `built` in seconds since 1970. Check its age: stale data gives wrong answers.
+pub fn ip_location_info(db: &str) -> Result<Value, String> {
+    let r = open(db)?;
+    let m = r.metadata();
+    Ok(json!({
+        "type": m.database_type, "description": m.description.get("en"), "built": m.build_epoch, "ip_version": m.ip_version, "languages": m.languages,
+        "nodes": m.node_count, "record_size": m.record_size, "format": format!("{}.{}", m.binary_format_major_version, m.binary_format_minor_version),
+    }))
+}
+
+/// Checks a whole file against the format: search tree, data and metadata. Null when sound, or the reason.
+pub fn ip_location_verify(db: &str) -> Result<Option<String>, String> {
+    let r = open(db)?;
+    Ok(r.verify().err().map(|e| e.to_string()))
+}

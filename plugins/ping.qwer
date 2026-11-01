@@ -1,0 +1,276 @@
+//! Is that host up, and how far away? ICMP echo with an unprivileged datagram socket, IPv4 and IPv6, with round-trip times, loss and a summary, and a TCP-connect ping as the fallback where ICMP is denied (Linux needs `net.ipv4.ping_group_range`). Several hosts pinged at once.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! socket2 = "0.5"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+const ECHO_V4: u8 = 8;
+const REPLY_V4: u8 = 0;
+const ECHO_V6: u8 = 128;
+const REPLY_V6: u8 = 129;
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
+}
+
+fn resolve(host: &str) -> Result<IpAddr, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+    let mut list = (host, 0u16).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?;
+    list.next().map(|a| a.ip()).ok_or(format!("{}: no address", host))
+}
+
+fn checksum(b: &[u8]) -> u16 {
+    let mut s = 0u32;
+    for c in b.chunks(2) {
+        s += if c.len() == 2 { u16::from_be_bytes([c[0], c[1]]) as u32 } else { (c[0] as u32) << 8 };
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
+}
+
+// A datagram ICMP socket, wearing UdpSocket's clothes for its timeouts and connected send.
+fn icmp_socket(ip: IpAddr) -> Result<UdpSocket, std::io::Error> {
+    let (domain, proto) = if ip.is_ipv4() { (Domain::IPV4, Protocol::ICMPV4) } else { (Domain::IPV6, Protocol::ICMPV6) };
+    let s = Socket::new(domain, Type::DGRAM, Some(proto))?;
+    s.connect(&SocketAddr::new(ip, 0).into())?;
+    Ok(s.into())
+}
+
+fn denied(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::Unsupported) || matches!(e.raw_os_error(), Some(1) | Some(13) | Some(43) | Some(93) | Some(97))
+}
+
+// The ICMP header in what came back: macOS leaves the IP header on for IPv4, Linux does not.
+fn icmp_part(b: &[u8], v4: bool) -> Option<(&[u8], Option<u8>)> {
+    if v4 && b.len() >= 20 && b[0] >> 4 == 4 {
+        let ihl = ((b[0] & 15) as usize) * 4;
+        return b.get(ihl..).map(|x| (x, Some(b[8])));
+    }
+    Some((b, None))
+}
+
+struct Shot {
+    ms: Option<f64>,
+    ttl: Option<u8>,
+    error: Option<String>,
+}
+
+fn echo(sock: &UdpSocket, ip: IpAddr, id: u16, seq: u16, tag: &[u8], size: usize, timeout: Duration) -> Result<Shot, String> {
+    let v4 = ip.is_ipv4();
+    let mut p = vec![if v4 { ECHO_V4 } else { ECHO_V6 }, 0, 0, 0];
+    p.extend(id.to_be_bytes());
+    p.extend(seq.to_be_bytes());
+    let mut body = tag.to_vec();
+    body.resize(size.max(tag.len()), 0x61);
+    p.extend(&body);
+    if v4 {
+        let c = checksum(&p);
+        p[2..4].copy_from_slice(&c.to_be_bytes());
+    }
+    let start = Instant::now();
+    sock.send(&p).map_err(|e| format!("cannot send to {}: {}", ip, e))?;
+    let end = start + timeout;
+    let mut buf = vec![0u8; size + 128];
+    let want = if v4 { REPLY_V4 } else { REPLY_V6 };
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Shot { ms: None, ttl: None, error: None });
+        }
+        sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        match sock.recv(&mut buf) {
+            Ok(n) => {
+                let Some((icmp, ttl)) = icmp_part(&buf[..n], v4) else { continue };
+                if icmp.len() < 8 {
+                    continue;
+                }
+                // The kernel may rewrite the id, so the sequence and the payload's tag decide.
+                let s = u16::from_be_bytes([icmp[6], icmp[7]]);
+                if icmp[0] == want && s == seq && icmp[8..].starts_with(tag) {
+                    return Ok(Shot { ms: Some(start.elapsed().as_secs_f64() * 1000.0), ttl, error: None });
+                }
+                // Destination unreachable (v4 type 3, v6 type 1) and time exceeded (11, 3).
+                if (v4 && (icmp[0] == 3 || icmp[0] == 11)) || (!v4 && (icmp[0] == 1 || icmp[0] == 3)) {
+                    let what = if (v4 && icmp[0] == 3) || (!v4 && icmp[0] == 1) { "unreachable" } else { "time exceeded" };
+                    return Ok(Shot { ms: None, ttl: None, error: Some(what.to_string()) });
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(Shot { ms: None, ttl: None, error: None }),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => return Ok(Shot { ms: None, ttl: None, error: Some("unreachable".into()) }),
+            Err(e) if e.raw_os_error() == Some(65) || e.raw_os_error() == Some(113) || e.raw_os_error() == Some(101) => return Ok(Shot { ms: None, ttl: None, error: Some("unreachable".into()) }),
+            Err(e) => return Err(format!("{}: {}", ip, e)),
+        }
+    }
+}
+
+fn round(x: f64) -> f64 {
+    (x * 1000.0).round() / 1000.0
+}
+
+fn report(host: &str, ip: IpAddr, method: &str, port: Option<u16>, sent: u64, times: &[Option<f64>], ttl: Option<u8>, errors: Vec<String>, note: Option<String>) -> Value {
+    let got: Vec<f64> = times.iter().filter_map(|x| *x).collect();
+    let received = got.len() as u64;
+    let mut m = json!({
+        "host": host, "address": ip.to_string(), "method": method, "sent": sent, "received": received,
+        "alive": received > 0,
+        "loss_percent": if sent == 0 { 0.0 } else { round((sent - received) as f64 * 100.0 / sent as f64) },
+        "times_ms": times.iter().map(|x| x.map(round)).collect::<Vec<_>>(),
+    });
+    if let Some(p) = port {
+        m["port"] = json!(p);
+    }
+    if !got.is_empty() {
+        let (min, max) = got.iter().fold((f64::MAX, 0f64), |(a, b), x| (a.min(*x), b.max(*x)));
+        let avg = got.iter().sum::<f64>() / got.len() as f64;
+        let dev = (got.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / got.len() as f64).sqrt();
+        m["min_ms"] = json!(round(min));
+        m["avg_ms"] = json!(round(avg));
+        m["max_ms"] = json!(round(max));
+        m["stddev_ms"] = json!(round(dev));
+    }
+    if let Some(t) = ttl {
+        m["ttl"] = json!(t);
+    }
+    if !errors.is_empty() {
+        m["errors"] = json!(errors);
+    }
+    if let Some(n) = note {
+        m["note"] = json!(n);
+    }
+    m
+}
+
+fn icmp_run(host: &str, ip: IpAddr, sock: UdpSocket, o: &Value) -> Result<Value, String> {
+    let count = opt_u64(o, "count", 4).clamp(1, 1000);
+    let interval = Duration::from_millis(opt_u64(o, "interval_ms", 1000));
+    let timeout = Duration::from_millis(opt_u64(o, "timeout_ms", 1000));
+    let size = opt_u64(o, "size", 56).min(65000) as usize;
+    let mut tag = [0u8; 8];
+    getrandom::getrandom(&mut tag).map_err(|e| e.to_string())?;
+    let id = u16::from_be_bytes([tag[0], tag[1]]);
+    let mut times = vec![];
+    let mut ttl = None;
+    let mut errors = vec![];
+    for n in 0..count {
+        let start = Instant::now();
+        let s = echo(&sock, ip, id, n as u16 + 1, &tag, size, timeout)?;
+        times.push(s.ms);
+        if s.ttl.is_some() {
+            ttl = s.ttl;
+        }
+        if let Some(e) = s.error {
+            if !errors.contains(&e) {
+                errors.push(e);
+            }
+        }
+        if n + 1 < count {
+            if let Some(w) = interval.checked_sub(start.elapsed()) {
+                std::thread::sleep(w);
+            }
+        }
+    }
+    Ok(report(host, ip, "icmp", None, count, &times, ttl, errors, None))
+}
+
+fn tcp_run(host: &str, ip: IpAddr, port: u16, o: &Value, note: Option<String>) -> Result<Value, String> {
+    let count = opt_u64(o, "count", 4).clamp(1, 1000);
+    let interval = Duration::from_millis(opt_u64(o, "interval_ms", 1000));
+    let timeout = Duration::from_millis(opt_u64(o, "timeout_ms", 1000));
+    let addr = SocketAddr::new(ip, port);
+    let mut times = vec![];
+    let mut refused = 0;
+    let mut errors = vec![];
+    for n in 0..count {
+        let start = Instant::now();
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(_) => times.push(Some(start.elapsed().as_secs_f64() * 1000.0)),
+            // A refusal comes from the host itself: it is up, with nothing on that port.
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                refused += 1;
+                times.push(Some(start.elapsed().as_secs_f64() * 1000.0));
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => times.push(None),
+            Err(e) => {
+                times.push(None);
+                let t = e.to_string();
+                if !errors.contains(&t) {
+                    errors.push(t);
+                }
+            }
+        }
+        if n + 1 < count {
+            if let Some(w) = interval.checked_sub(start.elapsed()) {
+                std::thread::sleep(w);
+            }
+        }
+    }
+    let mut m = report(host, ip, "tcp", Some(port), count, &times, None, errors, note);
+    m["port_open"] = json!(refused == 0 && m["received"].as_u64().unwrap_or(0) > 0);
+    Ok(m)
+}
+
+/// Pings a host with ICMP echo, falling back on a TCP connect to `options.port` (443) when the system denies ICMP. Options: `count` (4), `interval_ms` (1000), `timeout_ms` (1000), `size` (56), `method` ("auto", "icmp" or "tcp"). Answers `{ host, address, method, sent, received, alive, loss_percent, times_ms, min_ms, avg_ms, max_ms, stddev_ms }`, a lost probe being null in `times_ms`.
+pub fn ping_host(host: &str, options: serde_json::Value) -> Result<Value, String> {
+    let ip = resolve(host)?;
+    let method = options.get("method").and_then(|v| v.as_str()).unwrap_or("auto");
+    let port = opt_u64(&options, "port", 443) as u16;
+    match method {
+        "tcp" => tcp_run(host, ip, port, &options, None),
+        "icmp" | "auto" => match icmp_socket(ip) {
+            Ok(s) => icmp_run(host, ip, s, &options),
+            Err(e) if denied(&e) && method == "auto" => tcp_run(host, ip, port, &options, Some(format!("ICMP is denied here ({}); on Linux, widen net.ipv4.ping_group_range", e))),
+            Err(e) if denied(&e) => Err(format!("ICMP is denied here ({}); on Linux, set net.ipv4.ping_group_range to include this user's group", e)),
+            Err(e) => Err(format!("{}: {}", host, e)),
+        },
+        m => Err(format!("`{}` is not a method: auto, icmp or tcp", m)),
+    }
+}
+
+/// A TCP-connect ping to one port: a connection or a refusal both show the host is up, and `port_open` says which. Options as for `ping_host`.
+pub fn ping_tcp(host: &str, port: i64, options: serde_json::Value) -> Result<Value, String> {
+    let p = u16::try_from(port).ok().filter(|x| *x != 0).ok_or(format!("{} is not a port", port))?;
+    tcp_run(host, resolve(host)?, p, &options, None)
+}
+
+/// Pings several hosts at once, each on its own thread, and answers in the order given; a host that cannot be pinged has `{ host, alive: false, error }`.
+pub fn ping_many(hosts: Vec<String>, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    if hosts.len() > 256 {
+        return Err("at most 256 hosts at once".into());
+    }
+    let handles: Vec<_> = hosts.into_iter().map(|h| {
+        let o = options.clone();
+        std::thread::spawn(move || ping_host(&h, o).unwrap_or_else(|e| json!({ "host": h, "alive": false, "error": e })))
+    }).collect();
+    Ok(handles.into_iter().map(|t| t.join().unwrap_or(json!({ "alive": false, "error": "the thread failed" }))).collect())
+}
+
+/// Whether this process may send ICMP without privileges: `{ ipv4, ipv6, reason }`.
+pub fn ping_allowed() -> Value {
+    let v4 = icmp_socket("127.0.0.1".parse().unwrap());
+    let v6 = icmp_socket("::1".parse().unwrap());
+    json!({ "ipv4": v4.is_ok(), "ipv6": v6.is_ok(), "reason": v4.err().map(|e| e.to_string()) })
+}
+
+/// The classic last lines of `ping`, from a result: "4 packets transmitted, 4 received, 0% packet loss" and the times.
+pub fn ping_summary(result: serde_json::Value) -> Result<String, String> {
+    let n = |k: &str| result.get(k).and_then(|v| v.as_f64());
+    let sent = n("sent").ok_or("that is not a ping result")?;
+    let mut t = format!("{} packets transmitted, {} received, {}% packet loss", sent, n("received").unwrap_or(0.0), n("loss_percent").unwrap_or(0.0));
+    if let (Some(a), Some(b), Some(c), Some(d)) = (n("min_ms"), n("avg_ms"), n("max_ms"), n("stddev_ms")) {
+        t.push_str(&format!("\nrtt min/avg/max/stddev = {:.3}/{:.3}/{:.3}/{:.3} ms", a, b, c, d));
+    }
+    Ok(t)
+}

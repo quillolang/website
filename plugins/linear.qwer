@@ -1,0 +1,236 @@
+//! Linear's GraphQL API: issues and comments made, read and moved between workflow states, lists walked by cursor, rate limits waited out, and webhook signatures and timestamps checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ISSUE: &str = "id identifier title description priority url createdAt updatedAt state { id name type } assignee { id name } team { id key } labels { nodes { name } }";
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+// A personal key goes in the header bare; an OAuth token takes `Bearer`.
+fn auth(o: &Value) -> Result<String, String> {
+    if let Some(t) = opt(o, "access_token", "LINEAR_ACCESS_TOKEN") {
+        return Ok(format!("Bearer {}", t));
+    }
+    opt(o, "api_key", "LINEAR_API_KEY").ok_or("no key: set LINEAR_API_KEY, or give the option api_key".to_string())
+}
+
+fn messages(errors: &Value) -> String {
+    errors.as_array().map(|l| l.iter().map(|e| {
+        let more = e.pointer("/extensions/userPresentableMessage").and_then(|m| m.as_str());
+        match more {
+            Some(m) => m.to_string(),
+            None => e["message"].as_str().unwrap_or("error").to_string(),
+        }
+    }).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+}
+
+fn is_limited(v: &Value) -> bool {
+    v["errors"].as_array().map(|l| l.iter().any(|e| e.pointer("/extensions/code").and_then(|c| c.as_str()) == Some("RATELIMITED"))).unwrap_or(false)
+}
+
+/// Runs a query or mutation. Options: api_key (else LINEAR_API_KEY), access_token (else LINEAR_ACCESS_TOKEN), base_url (else LINEAR_API_URL). Gives `data`; a rate limit is waited out, up to a minute, and other errors are error values.
+pub fn linear_graphql(query: &str, variables: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let url = opt(&options, "base_url", "LINEAR_API_URL").unwrap_or_else(|| "https://api.linear.app/graphql".into());
+    let header = auth(&options)?;
+    let mut body = json!({ "query": query });
+    if !variables.is_null() {
+        body["variables"] = variables;
+    }
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let res = agent.post(&url).set("Authorization", &header).set("Content-Type", "application/json").set("User-Agent", "quillo-linear/1.0").send_string(&body.to_string());
+        let (status, reset, text) = match res {
+            Ok(r) => (r.status(), None, r.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(c, r)) => {
+                let reset = r.header("x-ratelimit-requests-reset").and_then(|h| h.trim().parse::<u64>().ok());
+                (c, reset, r.into_string().unwrap_or_default())
+            }
+            Err(e) => return Err(format!("cannot reach Linear at {}: {}", url, e)),
+        };
+        let v: Value = serde_json::from_str(&text).map_err(|_| format!("Linear {}: {:?}", status, text.chars().take(200).collect::<String>()))?;
+        // A rate limit is an HTTP 400 with a code; the header says when it lifts, in ms since 1970.
+        if is_limited(&v) {
+            let wait = reset.map(|r| r.saturating_sub(now_ms())).unwrap_or(1000);
+            if tries >= 2 || wait > 60_000 {
+                return Err(format!("Linear's rate limit: {} (lifts in {} s)", messages(&v["errors"]), wait / 1000));
+            }
+            std::thread::sleep(Duration::from_millis(wait));
+            tries += 1;
+            continue;
+        }
+        if status == 401 {
+            return Err(format!("Linear 401: {} (check LINEAR_API_KEY)", messages(&v["errors"])));
+        }
+        if v.get("errors").map(|e| !e.is_null()).unwrap_or(false) {
+            return Err(format!("Linear: {}", messages(&v["errors"])));
+        }
+        return Ok(v["data"].clone());
+    }
+}
+
+fn flatten(i: Value) -> Value {
+    let mut out = i;
+    if let Some(l) = out.pointer("/labels/nodes").and_then(|n| n.as_array()) {
+        let names: Vec<Value> = l.iter().map(|x| x["name"].clone()).collect();
+        out["labels"] = json!(names);
+    }
+    if out["state"].is_object() {
+        let s = out["state"]["name"].clone();
+        out["state_id"] = out["state"]["id"].clone();
+        out["state"] = s;
+    }
+    out
+}
+
+fn result(data: &Value, field: &str) -> Result<Value, String> {
+    if data[field]["success"] != true {
+        return Err(format!("{} did not succeed", field));
+    }
+    Ok(data[field].clone())
+}
+
+/// Opens an issue: `input` holds teamId and title (needed), description (Markdown), priority (0 none, 1 urgent, 2 high, 3 medium, 4 low), assigneeId, stateId, labelIds, parentId, projectId. Gives the issue: { id, identifier, title, url, state, ... }.
+pub fn linear_issue_create(input: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["teamId", "title"] {
+        if input.get(k).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+            return Err(format!("an issue needs `{}`", k));
+        }
+    }
+    let q = format!("mutation ($input: IssueCreateInput!) {{ issueCreate(input: $input) {{ success issue {{ {} }} }} }}", ISSUE);
+    let d = linear_graphql(&q, json!({ "input": input }), options)?;
+    Ok(flatten(result(&d, "issueCreate")?["issue"].clone()))
+}
+
+/// One issue by id or identifier, like ENG-12.
+pub fn linear_issue(id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = format!("query ($id: String!) {{ issue(id: $id) {{ {} }} }}", ISSUE);
+    Ok(flatten(linear_graphql(&q, json!({ "id": id }), options)?["issue"].clone()))
+}
+
+/// Changes an issue: `input` holds title, description, priority, assigneeId, stateId, labelIds, and so on.
+pub fn linear_issue_update(id: &str, input: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = format!("mutation ($id: String!, $input: IssueUpdateInput!) {{ issueUpdate(id: $id, input: $input) {{ success issue {{ {} }} }} }}", ISSUE);
+    let d = linear_graphql(&q, json!({ "id": id, "input": input }), options)?;
+    Ok(flatten(result(&d, "issueUpdate")?["issue"].clone()))
+}
+
+/// Every issue matching a `filter` ({ team: { key: { eq: "ENG" } }, state: { type: { eq: "started" } } }, or null), walked by cursor. Options add max_items.
+pub fn linear_issues(filter: serde_json::Value, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let q = format!("query ($filter: IssueFilter, $after: String) {{ issues(first: 100, after: $after, filter: $filter) {{ nodes {{ {} }} pageInfo {{ hasNextPage endCursor }} }} }}", ISSUE);
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut vars = json!({ "filter": filter });
+    let mut out = vec![];
+    loop {
+        let d = linear_graphql(&q, vars.clone(), options.clone())?;
+        out.extend(d["issues"]["nodes"].as_array().cloned().unwrap_or_default().into_iter().map(flatten));
+        let pi = &d["issues"]["pageInfo"];
+        if pi["hasNextPage"] != true || out.len() >= max {
+            break;
+        }
+        vars["after"] = pi["endCursor"].clone();
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// Comments on an issue, `body` in Markdown. Options add parent_id, to answer in a thread. Gives the comment.
+pub fn linear_comment(issue_id: &str, body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if body.trim().is_empty() {
+        return Err("a comment needs a body".into());
+    }
+    let mut input = json!({ "issueId": issue_id, "body": body });
+    if let Some(p) = options.get("parent_id") {
+        input["parentId"] = p.clone();
+    }
+    let q = "mutation ($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id body url createdAt } } }";
+    let d = linear_graphql(q, json!({ "input": input }), options)?;
+    Ok(result(&d, "commentCreate")?["comment"].clone())
+}
+
+/// An issue's comments, all pages, each { id, body, createdAt, user }.
+pub fn linear_comments(issue_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let q = "query ($id: String!, $after: String) { issue(id: $id) { comments(first: 100, after: $after) { nodes { id body createdAt user { name } } pageInfo { hasNextPage endCursor } } } }";
+    let mut vars = json!({ "id": issue_id });
+    let mut out = vec![];
+    loop {
+        let d = linear_graphql(q, vars.clone(), options.clone())?;
+        let c = &d["issue"]["comments"];
+        out.extend(c["nodes"].as_array().cloned().unwrap_or_default());
+        if c["pageInfo"]["hasNextPage"] != true {
+            return Ok(out);
+        }
+        vars["after"] = c["pageInfo"]["endCursor"].clone();
+    }
+}
+
+/// The teams: { id, key, name }. An issue needs a team's id.
+pub fn linear_teams(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let d = linear_graphql("{ teams(first: 100) { nodes { id key name } } }", Value::Null, options)?;
+    Ok(d["teams"]["nodes"].as_array().cloned().unwrap_or_default())
+}
+
+/// A team's workflow states, in board order: { id, name, type } (type: backlog, unstarted, started, completed, canceled).
+pub fn linear_states(team_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let q = "query ($id: String!) { team(id: $id) { states { nodes { id name type position } } } }";
+    let d = linear_graphql(q, json!({ "id": team_id }), options)?;
+    let mut l = d["team"]["states"]["nodes"].as_array().cloned().unwrap_or_default();
+    l.sort_by(|a, b| a["position"].as_f64().unwrap_or(0.0).total_cmp(&b["position"].as_f64().unwrap_or(0.0)));
+    Ok(l)
+}
+
+/// Moves an issue to the state named `state` (any case) in its team. An error lists the states there are.
+pub fn linear_move(issue_id: &str, state: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let i = linear_issue(issue_id, options.clone())?;
+    let team = i.pointer("/team/id").and_then(|t| t.as_str()).ok_or("the issue has no team")?.to_string();
+    let states = linear_states(&team, options.clone())?;
+    let Some(s) = states.iter().find(|s| s["name"].as_str().map(|n| n.eq_ignore_ascii_case(state)).unwrap_or(false)) else {
+        return Err(format!("the team has no state {:?}: it has {}", state, states.iter().filter_map(|s| s["name"].as_str()).collect::<Vec<_>>().join(", ")));
+    };
+    linear_issue_update(issue_id, json!({ "stateId": s["id"] }), options)
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A webhook checked and read: the raw `body`, its Linear-Signature header (hex HMAC-SHA256), the webhook's secret ("" for LINEAR_WEBHOOK_SECRET), and `max_age_s` for its webhookTimestamp (0: Linear's advice of 60, -1: no limit). Gives { action, type, data, url, created_at, actor, payload }.
+pub fn linear_webhook(body: &str, signature: &str, secret: &str, max_age_s: i64) -> Result<serde_json::Value, String> {
+    let key = if secret.is_empty() { std::env::var("LINEAR_WEBHOOK_SECRET").unwrap_or_default() } else { secret.to_string() };
+    if key.is_empty() {
+        return Err("no secret: set LINEAR_WEBHOOK_SECRET".into());
+    }
+    let mut m = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    let want = m.finalize().into_bytes();
+    if !hex::decode(signature.trim()).map(|g| same(&g, &want)).unwrap_or(false) {
+        return Err("the webhook's signature does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    let p: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    if max_age_s >= 0 {
+        let limit = if max_age_s == 0 { 60 } else { max_age_s } as u64;
+        let ts = p["webhookTimestamp"].as_u64().ok_or("the webhook has no webhookTimestamp")?;
+        let age = now_ms().abs_diff(ts) / 1000;
+        if age > limit {
+            return Err(format!("the webhook is {} s away from now, over the {} s allowed: a replay?", age, limit));
+        }
+    }
+    Ok(json!({ "action": p["action"], "type": p["type"], "data": p["data"], "url": p["url"], "created_at": p["createdAt"], "actor": p.get("actor").cloned().unwrap_or(Value::Null), "payload": p }))
+}

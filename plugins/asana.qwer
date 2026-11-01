@@ -1,0 +1,262 @@
+//! Asana's API without an SDK: tasks, projects and comments in Asana's data envelope, offset pages walked with their limit and an expired offset named, opt_fields, Retry-After waited out, and webhooks: the handshake's X-Hook-Secret answered and kept, refused once one is held, and each delivery's X-Hook-Signature checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// ASANA_ACCESS_TOKEN is a personal access token; ASANA_API_URL the API
+// (https://app.asana.com/api/1.0 when not set). ASANA_HOOK_SECRETS_FILE keeps webhook secrets across
+// restarts, as one JSON map of names to secrets.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("ASANA_API_URL").unwrap_or_else(|| "https://app.asana.com/api/1.0".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let list: Vec<&str> = v["errors"].as_array().into_iter().flatten().filter_map(|e| e["message"].as_str()).collect();
+    if list.is_empty() {
+        return format!("Asana {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    }
+    let hint = match status {
+        401 => " (check ASANA_ACCESS_TOKEN)",
+        402 => " (this needs a paid Asana plan)",
+        _ => "",
+    };
+    format!("Asana {}: {}{}", status, list.join("; "), hint)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("ASANA_ACCESS_TOKEN").ok_or("ASANA_ACCESS_TOKEN is not set")?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    for attempt in 0..5u32 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Asana's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(429, r)) if attempt < 4 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+                std::thread::sleep(Duration::from_secs(wait.min(60)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                if c == 400 && t.contains("pagination token") {
+                    return Err("Asana's offset has expired: an offset lasts minutes, so start the list again".into());
+                }
+                return Err(error_text(c, &t));
+            }
+            Err(e) => return Err(format!("cannot reach Asana at {}: {}", api(), e)),
+        }
+    }
+    Err("Asana stayed over its limit through five tries".into())
+}
+
+fn data(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let b = body.map(|b| json!({ "data": b }));
+    Ok(call(method, path, b.as_ref())?["data"].clone())
+}
+
+fn opt(fields: &Value) -> String {
+    match fields {
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn query(filter: &Value) -> Vec<String> {
+    filter.as_object().map_or(vec![], |m| m.iter().map(|(k, v)| {
+        let t = if k == "opt_fields" { opt(v) } else { v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()) };
+        format!("{}={}", enc(k), enc(&t))
+    }).collect())
+}
+
+// A list without `limit` is cut off or refused when long, so a limit is always sent.
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut offset: Option<String> = None;
+    loop {
+        let mut parts = query(filter);
+        parts.push("limit=100".into());
+        if let Some(o) = &offset {
+            parts.push(format!("offset={}", enc(o)));
+        }
+        let v = call("GET", &format!("{}?{}", path, parts.join("&")), None)?;
+        out.extend(v["data"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["next_page"]["offset"].as_str() {
+            Some(o) => offset = Some(o.to_string()),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Who the token belongs to, with their `workspaces`.
+pub fn asana_me() -> Result<serde_json::Value, String> {
+    data("GET", "/users/me", None)
+}
+
+/// Projects of a workspace through every page: `filter` adds `archived`, `team`, `opt_fields`; `max_items` caps them (0: all).
+pub fn asana_projects(workspace: &str, filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let mut f = if filter.is_object() { filter } else { json!({}) };
+    f["workspace"] = json!(workspace);
+    walk("/projects", &f, max_items)
+}
+
+/// One project by gid.
+pub fn asana_project(gid: &str) -> Result<serde_json::Value, String> {
+    data("GET", &format!("/projects/{}", enc(gid)), None)
+}
+
+/// Makes a project: `name` and `workspace` or `team`.
+pub fn asana_project_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    data("POST", "/projects", Some(&fields))
+}
+
+/// A project's tasks through every page: `filter` adds `completed_since` ("now" for the unfinished), `opt_fields`; `max_items` caps them (0: all).
+pub fn asana_project_tasks(project: &str, filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/projects/{}/tasks", enc(project)), &filter, max_items)
+}
+
+/// One task by gid; `opt_fields` is a list of fields, or null for the default set.
+pub fn asana_task(gid: &str, opt_fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let f = opt(&opt_fields);
+    let q = if f.is_empty() { String::new() } else { format!("?opt_fields={}", enc(&f)) };
+    data("GET", &format!("/tasks/{}{}", enc(gid), q), None)
+}
+
+/// Makes a task: `name`, and one of `workspace`, `projects` or `parent`, with `notes`, `assignee`, `due_on`...
+pub fn asana_task_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if fields.get("workspace").is_none() && fields.get("projects").is_none() && fields.get("parent").is_none() {
+        return Err("a task needs a workspace, projects or a parent".into());
+    }
+    data("POST", "/tasks", Some(&fields))
+}
+
+/// Changes a task.
+pub fn asana_task_update(gid: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    data("PUT", &format!("/tasks/{}", enc(gid)), Some(&fields))
+}
+
+/// Marks a task done.
+pub fn asana_task_complete(gid: &str) -> Result<serde_json::Value, String> {
+    asana_task_update(gid, json!({ "completed": true }))
+}
+
+/// Deletes a task.
+pub fn asana_task_delete(gid: &str) -> Result<bool, String> {
+    data("DELETE", &format!("/tasks/{}", enc(gid)), None)?;
+    Ok(true)
+}
+
+/// Writes a comment on a task.
+pub fn asana_comment(gid: &str, text: &str) -> Result<serde_json::Value, String> {
+    if text.trim().is_empty() {
+        return Err("a comment needs text".into());
+    }
+    data("POST", &format!("/tasks/{}/stories", enc(gid)), Some(&json!({ "text": text })))
+}
+
+/// A task's comments, without the system's own stories.
+pub fn asana_comments(gid: &str) -> Result<Vec<serde_json::Value>, String> {
+    Ok(walk(&format!("/tasks/{}/stories", enc(gid)), &Value::Null, 0)?.into_iter().filter(|s| s["resource_subtype"] == "comment_added").collect())
+}
+
+static SECRETS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+static MAKING: AtomicI64 = AtomicI64::new(0);
+
+fn secrets<T>(f: impl FnOnce(&mut HashMap<String, String>) -> T) -> T {
+    let mut g = SECRETS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(|| {
+        setting("ASANA_HOOK_SECRETS_FILE").and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    });
+    f(m)
+}
+
+/// Asks Asana for a webhook on `resource`, calling `target` back. Asana calls `target` with the handshake before this returns, so `target`'s route must use asana_webhook_receive with the same `name`, which is how the secret gets kept. `filters` is Asana's list, or null.
+pub fn asana_webhook_create(name: &str, resource: &str, target: &str, filters: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "resource": resource, "target": target });
+    if filters.is_array() {
+        b["filters"] = filters;
+    }
+    secrets(|m| m.remove(name));
+    MAKING.fetch_add(1, Ordering::SeqCst);
+    let r = data("POST", "/webhooks", Some(&b));
+    MAKING.fetch_sub(1, Ordering::SeqCst);
+    r
+}
+
+/// Deletes a webhook.
+pub fn asana_webhook_delete(gid: &str) -> Result<bool, String> {
+    data("DELETE", &format!("/webhooks/{}", enc(gid)), None)?;
+    Ok(true)
+}
+
+fn hex_sig(secret: &str, body: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    m
+}
+
+/// Takes what comes to a webhook's route, for a `name` of yours. The handshake carries X-Hook-Secret: this keeps it and gives { handshake: true, secret }, and the route must answer 200 with that secret in the same header. It is refused when a secret is already kept and no asana_webhook_create is under way, or anyone could replace it. A delivery has X-Hook-Signature: this checks it and gives { handshake: false, events }.
+pub fn asana_webhook_receive(name: &str, headers: std::collections::HashMap<String, serde_json::Value>, body: &str) -> Result<serde_json::Value, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.as_str()).map(str::to_string);
+    if let Some(s) = h("x-hook-secret") {
+        let accepted = secrets(|m| {
+            if m.contains_key(name) && MAKING.load(Ordering::SeqCst) == 0 {
+                return false;
+            }
+            m.insert(name.to_string(), s.clone());
+            if let Some(p) = setting("ASANA_HOOK_SECRETS_FILE") {
+                let _ = std::fs::write(p, json!(m).to_string());
+            }
+            true
+        });
+        if !accepted {
+            return Err("a handshake came for a webhook that already has a secret, with no webhook being made".into());
+        }
+        return Ok(json!({ "handshake": true, "secret": s }));
+    }
+    let sig = h("x-hook-signature").ok_or("no X-Hook-Signature header: this did not come from Asana")?;
+    let secret = secrets(|m| m.get(name).cloned()).ok_or(format!("no secret is kept for webhook `{}`: was its handshake answered here?", name))?;
+    let raw = hex::decode(sig.trim()).map_err(|_| "the X-Hook-Signature header is not hex".to_string())?;
+    if hex_sig(&secret, body).verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match its secret, or the body was changed (use the raw body)".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "handshake": false, "events": v["events"] }))
+}
+
+/// Checks a body against a secret you keep yourself: `signature` the X-Hook-Signature header.
+pub fn asana_signature_valid(body: &str, signature: &str, secret: &str) -> bool {
+    hex::decode(signature.trim()).map_or(false, |raw| hex_sig(secret, body).verify_slice(&raw).is_ok())
+}

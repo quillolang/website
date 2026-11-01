@@ -1,0 +1,219 @@
+//! YouTube's Data API v3 without an SDK: search, videos, channels, playlists and their items, page tokens followed, ids sent in fifties, quota spent counted and quota errors read back with when they reset, statistics strings made numbers, ISO 8601 durations read and written, and video ids taken from any address.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+// YOUTUBE_API_KEY is the key; YOUTUBE_API_URL the API
+// (https://www.googleapis.com/youtube/v3 when not set).
+
+static SPENT: AtomicI64 = AtomicI64::new(0);
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("YOUTUBE_API_URL").unwrap_or_else(|| "https://www.googleapis.com/youtube/v3".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let reason = v["error"]["errors"][0]["reason"].as_str().unwrap_or("");
+    let m = v["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| text.trim().chars().take(300).collect());
+    let hint = match reason {
+        "quotaExceeded" | "dailyLimitExceeded" => ": the day's quota is spent; it comes back at midnight, Pacific time",
+        "rateLimitExceeded" => ": too many requests a second",
+        "keyInvalid" => ": check YOUTUBE_API_KEY",
+        "ipRefererBlocked" => ": the key's restrictions refuse this caller",
+        _ => "",
+    };
+    format!("YouTube {} {}: {}{}", status, reason, m, hint)
+}
+
+fn call(path: &str, params: &[(&str, String)], cost: i64) -> Result<Value, String> {
+    let key = setting("YOUTUBE_API_KEY").ok_or("YOUTUBE_API_KEY is not set")?;
+    let mut q: Vec<String> = params.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect();
+    q.push(format!("key={}", enc(&key)));
+    let url = format!("{}{}?{}", api(), path, q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..4u32 {
+        SPENT.fetch_add(cost, Ordering::Relaxed);
+        match agent.get(&url).set("Accept", "application/json").call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|e| e.to_string());
+            }
+            Err(ureq::Error::Status(c @ (403 | 429 | 500 | 503), r)) if attempt < 3 => {
+                let t = r.into_string().unwrap_or_default();
+                // A burst is worth waiting out; the day's quota is not.
+                if c == 403 && !t.contains("rateLimitExceeded") {
+                    return Err(error_text(c, &t));
+                }
+                std::thread::sleep(Duration::from_millis(500u64 << attempt));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach YouTube at {}: {}", api(), e)),
+        }
+    }
+    Err("YouTube stayed busy through four tries".into())
+}
+
+/// Quota units these calls have cost since the server started (a search is 100, most reads 1), as this plugin counts: not Google's own figure.
+pub fn youtube_quota_spent() -> i64 {
+    SPENT.load(Ordering::Relaxed)
+}
+
+fn walk(path: &str, params: Vec<(&str, String)>, cost: i64, max_items: i64) -> Result<(Vec<Value>, Value), String> {
+    let mut out = vec![];
+    let mut token = String::new();
+    let mut total = Value::Null;
+    loop {
+        let mut p = params.clone();
+        p.push(("maxResults", "50".to_string()));
+        p.push(("pageToken", token.clone()));
+        let v = call(path, &p, cost)?;
+        total = if total.is_null() { v["pageInfo"]["totalResults"].clone() } else { total };
+        out.extend(v["items"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok((out, total));
+        }
+        match v["nextPageToken"].as_str() {
+            Some(t) => token = t.to_string(),
+            None => return Ok((out, total)),
+        }
+    }
+}
+
+fn opts(params: &Value) -> Vec<(String, String)> {
+    params.as_object().map_or(vec![], |m| m.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect())
+}
+
+/// Searches: `params` adds YouTube's `type` ("video", "channel", "playlist"), `order`, `channelId`, `publishedAfter`, `regionCode`, `relevanceLanguage`... Each page costs 100 units of a day's 10000, so `max_items` is required. Gives { total, items: [{ kind, id, title, channel, published, description }] }.
+pub fn youtube_search(q: &str, params: serde_json::Value, max_items: i64) -> Result<serde_json::Value, String> {
+    if max_items <= 0 {
+        return Err("a search needs a max_items: each page costs 100 units of quota".into());
+    }
+    let extra = opts(&params);
+    let mut p: Vec<(&str, String)> = vec![("part", "snippet".to_string()), ("q", q.to_string())];
+    for (k, v) in &extra {
+        p.push((k.as_str(), v.clone()));
+    }
+    let (items, total) = walk("/search", p, 100, max_items)?;
+    let list: Vec<Value> = items
+        .iter()
+        .map(|i| {
+            let id = &i["id"];
+            let (kind, the_id) = if id["videoId"].is_string() { ("video", &id["videoId"]) } else if id["channelId"].is_string() { ("channel", &id["channelId"]) } else { ("playlist", &id["playlistId"]) };
+            let s = &i["snippet"];
+            json!({ "kind": kind, "id": the_id, "title": s["title"], "channel": s["channelTitle"], "published": s["publishedAt"], "description": s["description"] })
+        })
+        .collect();
+    Ok(json!({ "total": total, "items": list }))
+}
+
+fn number(v: &Value) -> Value {
+    v.as_str().and_then(|s| s.parse::<i64>().ok()).map_or(Value::Null, |n| json!(n))
+}
+
+/// Seconds in an ISO 8601 duration: `youtube_duration("PT1H2M3S")` is 3723, "P1DT1S" 86401, "P0D" 0 (a live stream).
+pub fn youtube_duration(iso: &str) -> Result<i64, String> {
+    let bad = || format!("`{}` is not an ISO 8601 duration", iso);
+    let rest = iso.strip_prefix('P').ok_or_else(bad)?;
+    let (date, time) = rest.split_once('T').unwrap_or((rest, ""));
+    let mut total = 0i64;
+    let mut read = |text: &str, units: &[(char, i64)]| -> Result<(), String> {
+        let mut n = String::new();
+        for c in text.chars() {
+            if c.is_ascii_digit() {
+                n.push(c);
+            } else {
+                let scale = units.iter().find(|(u, _)| *u == c).ok_or_else(bad)?.1;
+                total += n.parse::<i64>().map_err(|_| bad())? * scale;
+                n.clear();
+            }
+        }
+        if n.is_empty() { Ok(()) } else { Err(bad()) }
+    };
+    read(date, &[('W', 604800), ('D', 86400)])?;
+    read(time, &[('H', 3600), ('M', 60), ('S', 1)])?;
+    if rest.is_empty() || rest.ends_with('T') {
+        return Err(bad());
+    }
+    Ok(total)
+}
+
+/// Seconds as a clock: `youtube_clock(3723)` is "1:02:03", 63 is "1:03".
+pub fn youtube_clock(seconds: i64) -> String {
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) }
+}
+
+/// The video id in an address: watch?v=, youtu.be/, /shorts/, /embed/ and /live/ links, or an id already.
+pub fn youtube_video_id(link: &str) -> Result<String, String> {
+    let t = link.trim();
+    let id = if let Some((_, rest)) = t.split_once("v=") {
+        rest.split(|c| c == '&' || c == '#').next().unwrap_or("")
+    } else if let Some((_, rest)) = t.split_once("youtu.be/") {
+        rest.split(|c| c == '?' || c == '/' || c == '#').next().unwrap_or("")
+    } else if let Some(i) = ["/shorts/", "/embed/", "/live/"].iter().find_map(|p| t.find(p).map(|i| i + p.len())) {
+        t[i..].split(|c| c == '?' || c == '/' || c == '#').next().unwrap_or("")
+    } else {
+        t
+    };
+    if id.len() != 11 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("no video id in `{}`", link));
+    }
+    Ok(id.to_string())
+}
+
+/// Videos by id, as many as you like, asked for in fifties. Gives each as { id, title, channel, published, seconds, clock, live, views, likes, comments, tags }, where `likes` or `comments` is null if the owner hides them, in the order of `ids`; an id that does not exist is left out.
+pub fn youtube_videos(ids: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
+    let mut found = std::collections::HashMap::new();
+    for chunk in ids.chunks(50) {
+        let v = call("/videos", &[("part", "snippet,contentDetails,statistics".to_string()), ("id", chunk.join(","))], 1)?;
+        for i in v["items"].as_array().into_iter().flatten() {
+            let s = &i["snippet"];
+            let d = i["contentDetails"]["duration"].as_str().unwrap_or("P0D");
+            let secs = youtube_duration(d)?;
+            found.insert(i["id"].as_str().unwrap_or("").to_string(), json!({
+                "id": i["id"], "title": s["title"], "channel": s["channelTitle"], "published": s["publishedAt"], "seconds": secs, "clock": youtube_clock(secs),
+                "live": s["liveBroadcastContent"] == "live", "views": number(&i["statistics"]["viewCount"]), "likes": number(&i["statistics"]["likeCount"]),
+                "comments": number(&i["statistics"]["commentCount"]), "tags": s["tags"].as_array().cloned().unwrap_or_default(),
+            }));
+        }
+    }
+    Ok(ids.iter().filter_map(|i| found.get(i).cloned()).collect())
+}
+
+/// A channel, by id ("UC...") or handle ("@name"). Gives { id, title, handle, subscribers, videos, views, uploads }, `uploads` the playlist of all its videos, and `subscribers` null if hidden; null when there is none.
+pub fn youtube_channel(id_or_handle: &str) -> Result<serde_json::Value, String> {
+    let key = if id_or_handle.starts_with('@') { "forHandle" } else { "id" };
+    let v = call("/channels", &[("part", "snippet,statistics,contentDetails".to_string()), (key, id_or_handle.to_string())], 1)?;
+    let Some(i) = v["items"].get(0) else { return Ok(Value::Null) };
+    let st = &i["statistics"];
+    let subs = if st["hiddenSubscriberCount"] == json!(true) { Value::Null } else { number(&st["subscriberCount"]) };
+    Ok(json!({ "id": i["id"], "title": i["snippet"]["title"], "handle": i["snippet"]["customUrl"], "subscribers": subs, "videos": number(&st["videoCount"]), "views": number(&st["viewCount"]), "uploads": i["contentDetails"]["relatedPlaylists"]["uploads"] }))
+}
+
+/// A channel's playlists through every page; `max_items` caps them (0: all). Gives { id, title, count }.
+pub fn youtube_playlists(channel_id: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let (items, _) = walk("/playlists", vec![("part", "snippet,contentDetails".to_string()), ("channelId", channel_id.to_string())], 1, max_items)?;
+    Ok(items.iter().map(|i| json!({ "id": i["id"], "title": i["snippet"]["title"], "count": i["contentDetails"]["itemCount"] })).collect())
+}
+
+/// The videos in a playlist through every page; `max_items` caps them (0: all). Gives { video, title, position, published }, for a private or deleted one too, as YouTube lists them.
+pub fn youtube_playlist_items(playlist_id: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let (items, _) = walk("/playlistItems", vec![("part", "snippet,contentDetails".to_string()), ("playlistId", playlist_id.to_string())], 1, max_items)?;
+    Ok(items.iter().map(|i| json!({ "video": i["contentDetails"]["videoId"], "title": i["snippet"]["title"], "position": i["snippet"]["position"], "published": i["contentDetails"]["videoPublishedAt"] })).collect())
+}

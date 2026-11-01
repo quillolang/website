@@ -1,0 +1,701 @@
+//! IEC 60870-5-104, the telecontrol protocol of power grids, as a controlling station over TCP: APCI frames in I, S and U formats, STARTDT, TESTFR and STOPDT, sequence numbers with the k and w windows and T1 to T3 timers, ASDUs for measured values with quality and CP56Time2a, interrogation, and single, double and set-point commands with select before execute.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+const STARTDT_ACT: u8 = 0x07;
+const STARTDT_CON: u8 = 0x0b;
+const STOPDT_ACT: u8 = 0x13;
+const STOPDT_CON: u8 = 0x23;
+const TESTFR_ACT: u8 = 0x43;
+const TESTFR_CON: u8 = 0x83;
+const MODULO: u16 = 32768;
+const KEEP: usize = 100_000;
+
+// ---- Causes and qualities ----
+
+fn cause_name(c: u8) -> String {
+    match c {
+        1 => "periodic".into(), 2 => "background".into(), 3 => "spontaneous".into(), 4 => "initialized".into(), 5 => "request".into(), 6 => "activation".into(), 7 => "activation_con".into(),
+        8 => "deactivation".into(), 9 => "deactivation_con".into(), 10 => "activation_term".into(), 11 => "return_remote".into(), 12 => "return_local".into(), 13 => "file".into(),
+        20 => "interrogated".into(), 37 => "counter_request".into(), 44 => "unknown_type".into(), 45 => "unknown_cause".into(), 46 => "unknown_address".into(), 47 => "unknown_object".into(),
+        21..=36 => format!("group_{}", c - 20),
+        38..=41 => format!("counter_group_{}", c - 37),
+        x => format!("cause_{}", x),
+    }
+}
+
+fn cause_code(n: &str) -> Option<u8> {
+    Some(match n {
+        "spontaneous" => 3, "request" => 5, "activation" => 6, "deactivation" => 8, "periodic" => 1, "background" => 2,
+        _ => return None,
+    })
+}
+
+fn quality(q: u8) -> Value {
+    json!({ "good": q & 0xf1 == 0, "invalid": q & 0x80 != 0, "not_topical": q & 0x40 != 0, "substituted": q & 0x20 != 0, "blocked": q & 0x10 != 0, "overflow": q & 1 != 0 })
+}
+
+/// CP56Time2a: milliseconds, minute, hour, day, month, year, in that order. The stations' clocks are local more often than not, so `invalid` and `summer` are kept beside it.
+fn cp56(b: &[u8]) -> Value {
+    let ms = u16::from_le_bytes([b[0], b[1]]) as u32;
+    json!({ "time": format!("20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}", b[6] & 0x7f, b[5] & 0x0f, b[4] & 0x1f, b[3] & 0x1f, b[2] & 0x3f, ms / 1000, ms % 1000), "invalid": b[2] & 0x80 != 0, "summer": b[3] & 0x80 != 0, "weekday": b[4] >> 5 })
+}
+
+fn parse_cp56(t: &str) -> Result<Vec<u8>, String> {
+    let d: Vec<u32> = t.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
+    if d.len() < 6 || d[0] < 2000 {
+        return Err(format!("`{}` is not a time like 2026-11-01T09:30:15.250", t));
+    }
+    let ms = d[5] * 1000 + d.get(6).map_or(0, |f| if t.contains('.') { *f } else { 0 });
+    let m = (ms as u16).to_le_bytes();
+    Ok(vec![m[0], m[1], d[4] as u8, d[3] as u8, d[2] as u8, d[1] as u8, (d[0] - 2000) as u8])
+}
+
+// ---- ASDUs ----
+
+struct Layout {
+    name: &'static str,
+    size: usize,
+}
+
+/// A type's name and its element's size, without the 3-byte object address.
+fn layout(t: u8) -> Option<Layout> {
+    let (name, size) = match t {
+        1 => ("M_SP_NA_1", 1), 2 => ("M_SP_TA_1", 4), 3 => ("M_DP_NA_1", 1), 4 => ("M_DP_TA_1", 4), 5 => ("M_ST_NA_1", 2), 6 => ("M_ST_TA_1", 5), 7 => ("M_BO_NA_1", 5), 8 => ("M_BO_TA_1", 8),
+        9 => ("M_ME_NA_1", 3), 10 => ("M_ME_TA_1", 6), 11 => ("M_ME_NB_1", 3), 12 => ("M_ME_TB_1", 6), 13 => ("M_ME_NC_1", 5), 14 => ("M_ME_TC_1", 8), 15 => ("M_IT_NA_1", 5), 16 => ("M_IT_TA_1", 8),
+        21 => ("M_ME_ND_1", 2), 30 => ("M_SP_TB_1", 8), 31 => ("M_DP_TB_1", 8), 32 => ("M_ST_TB_1", 9), 33 => ("M_BO_TB_1", 12), 34 => ("M_ME_TD_1", 10), 35 => ("M_ME_TE_1", 10), 36 => ("M_ME_TF_1", 12), 37 => ("M_IT_TB_1", 12),
+        45 => ("C_SC_NA_1", 1), 46 => ("C_DC_NA_1", 1), 47 => ("C_RC_NA_1", 1), 48 => ("C_SE_NA_1", 3), 49 => ("C_SE_NB_1", 3), 50 => ("C_SE_NC_1", 5), 51 => ("C_BO_NA_1", 4),
+        58 => ("C_SC_TA_1", 8), 59 => ("C_DC_TA_1", 8), 60 => ("C_RC_TA_1", 8), 61 => ("C_SE_TA_1", 10), 62 => ("C_SE_TB_1", 10), 63 => ("C_SE_TC_1", 12), 64 => ("C_BO_TA_1", 11),
+        70 => ("M_EI_NA_1", 1), 100 => ("C_IC_NA_1", 1), 101 => ("C_CI_NA_1", 1), 102 => ("C_RD_NA_1", 0), 103 => ("C_CS_NA_1", 7), 105 => ("C_RP_NA_1", 1), 107 => ("C_TS_TA_1", 9),
+        _ => return None,
+    };
+    Some(Layout { name, size })
+}
+
+fn nva(b: &[u8]) -> f64 {
+    i16::from_le_bytes([b[0], b[1]]) as f64 / 32768.0
+}
+
+fn dbl_state(s: u8) -> &'static str {
+    match s & 3 {
+        0 => "intermediate",
+        1 => "off",
+        2 => "on",
+        _ => "faulty",
+    }
+}
+
+/// One information element, its address taken off already.
+fn element(t: u8, b: &[u8]) -> Value {
+    let time = |n: usize| if n == 7 { Some(cp56(&b[b.len() - 7..])) } else { None };
+    let mut o = match t {
+        1 | 2 | 30 => json!({ "value": b[0] & 1 != 0, "quality": quality(b[0] & 0xf0) }),
+        3 | 4 | 31 => json!({ "value": dbl_state(b[0]), "quality": quality(b[0] & 0xf0) }),
+        5 | 6 | 32 => json!({ "value": ((b[0] & 0x7f) as i8) << 1 >> 1, "transient": b[0] & 0x80 != 0, "quality": quality(b[1]) }),
+        7 | 8 | 33 => json!({ "value": format!("{:08x}", u32::from_le_bytes([b[0], b[1], b[2], b[3]])), "quality": quality(b[4]) }),
+        9 | 10 | 34 => json!({ "value": nva(b), "quality": quality(b[2]) }),
+        11 | 12 | 35 => json!({ "value": i16::from_le_bytes([b[0], b[1]]), "quality": quality(b[2]) }),
+        13 | 14 | 36 => json!({ "value": f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64, "quality": quality(b[4]) }),
+        15 | 16 | 37 => json!({ "value": i32::from_le_bytes([b[0], b[1], b[2], b[3]]), "sequence": b[4] & 0x1f, "carry": b[4] & 0x20 != 0, "adjusted": b[4] & 0x40 != 0, "invalid": b[4] & 0x80 != 0 }),
+        21 => json!({ "value": nva(b) }),
+        45 | 58 => json!({ "value": b[0] & 1 != 0, "select": b[0] & 0x80 != 0, "qualifier": (b[0] >> 2) & 0x1f }),
+        46 | 59 => json!({ "value": dbl_state(b[0]), "select": b[0] & 0x80 != 0, "qualifier": (b[0] >> 2) & 0x1f }),
+        47 | 60 => json!({ "value": b[0] & 3, "select": b[0] & 0x80 != 0, "qualifier": (b[0] >> 2) & 0x1f }),
+        48 | 61 => json!({ "value": nva(b), "select": b[2] & 0x80 != 0 }),
+        49 | 62 => json!({ "value": i16::from_le_bytes([b[0], b[1]]), "select": b[2] & 0x80 != 0 }),
+        50 | 63 => json!({ "value": f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64, "select": b[4] & 0x80 != 0 }),
+        70 => json!({ "value": b[0] & 0x7f, "changed": b[0] & 0x80 != 0 }),
+        100 | 101 | 105 => json!({ "value": b[0] }),
+        103 => json!({ "value": cp56(b)["time"] }),
+        _ => json!({ "raw": hex::encode(b) }),
+    };
+    let stamped = matches!(t, 30..=37 | 58..=64 | 103);
+    if let Some(v) = time(if stamped && t != 103 { 7 } else { 0 }) {
+        o["time"] = v["time"].clone();
+        o["time_invalid"] = v["invalid"].clone();
+    }
+    o
+}
+
+fn decode_asdu(b: &[u8]) -> Result<Value, String> {
+    if b.len() < 6 {
+        return Err("an ASDU under 6 bytes".into());
+    }
+    let (t, vsq, cot, org) = (b[0], b[1], b[2], b[3]);
+    let ca = u16::from_le_bytes([b[4], b[5]]);
+    let seq = vsq & 0x80 != 0;
+    let n = (vsq & 0x7f) as usize;
+    let mut out = json!({ "type": t, "cause": cause_name(cot & 0x3f), "negative": cot & 0x40 != 0, "test": cot & 0x80 != 0, "originator": org, "ca": ca, "sequence": seq });
+    let Some(l) = layout(t) else {
+        out["type_name"] = json!("unknown");
+        out["raw"] = json!(hex::encode(&b[6..]));
+        return Ok(out);
+    };
+    out["type_name"] = json!(l.name);
+    let body = &b[6..];
+    let want = if seq { 3 + l.size * n } else { (3 + l.size) * n };
+    if body.len() < want {
+        return Err(format!("{} with {} elements is {} bytes, and has {}", l.name, n, want, body.len()));
+    }
+    let ioa = |a: &[u8]| a[0] as u32 | (a[1] as u32) << 8 | (a[2] as u32) << 16;
+    let mut pts = vec![];
+    if seq && n > 0 {
+        let first = ioa(body);
+        for i in 0..n {
+            let mut e = element(t, &body[3 + i * l.size..3 + (i + 1) * l.size]);
+            e["ioa"] = json!(first + i as u32);
+            pts.push(e);
+        }
+    } else {
+        for i in 0..n {
+            let a = i * (3 + l.size);
+            let mut e = element(t, &body[a + 3..a + 3 + l.size]);
+            e["ioa"] = json!(ioa(&body[a..]));
+            pts.push(e);
+        }
+    }
+    out["points"] = json!(pts);
+    Ok(out)
+}
+
+/// Decodes an APDU given as hex: { format ("I", "S", "U"), send_seq, recv_seq, function, asdu }.
+pub fn iec104_decode(hex_text: &str) -> Result<serde_json::Value, String> {
+    let b = hex::decode(hex_text.split_whitespace().collect::<String>()).map_err(|_| "that is not hex".to_string())?;
+    if b.len() < 6 || b[0] != 0x68 {
+        return Err("an APDU starts 0x68, with four control bytes".into());
+    }
+    if b[1] as usize != b.len() - 2 {
+        return Err(format!("the length byte says {}, and {} bytes follow", b[1], b.len() - 2));
+    }
+    if b[2] & 1 == 0 {
+        let ns = u16::from_le_bytes([b[2], b[3]]) >> 1;
+        let nr = u16::from_le_bytes([b[4], b[5]]) >> 1;
+        return Ok(json!({ "format": "I", "send_seq": ns, "recv_seq": nr, "asdu": decode_asdu(&b[6..])? }));
+    }
+    if b[2] & 3 == 1 {
+        return Ok(json!({ "format": "S", "recv_seq": u16::from_le_bytes([b[4], b[5]]) >> 1 }));
+    }
+    let f = match b[2] {
+        STARTDT_ACT => "STARTDT act",
+        STARTDT_CON => "STARTDT con",
+        STOPDT_ACT => "STOPDT act",
+        STOPDT_CON => "STOPDT con",
+        TESTFR_ACT => "TESTFR act",
+        TESTFR_CON => "TESTFR con",
+        _ => return Err(format!("U-format function 0x{:02x} is not one", b[2])),
+    };
+    Ok(json!({ "format": "U", "function": f }))
+}
+
+fn frame_i(ns: u16, nr: u16, asdu: &[u8]) -> Result<Vec<u8>, String> {
+    if asdu.len() > 249 {
+        return Err(format!("an ASDU is at most 249 bytes, this is {}", asdu.len()));
+    }
+    let mut f = vec![0x68, asdu.len() as u8 + 4];
+    f.extend((ns << 1).to_le_bytes());
+    f.extend((nr << 1).to_le_bytes());
+    f.extend(asdu);
+    Ok(f)
+}
+
+fn asdu_head(t: u8, vsq: u8, cot: u8, org: u8, ca: u16) -> Vec<u8> {
+    let c = ca.to_le_bytes();
+    vec![t, vsq, cot, org, c[0], c[1]]
+}
+
+fn ioa3(n: u32) -> [u8; 3] {
+    [n as u8, (n >> 8) as u8, (n >> 16) as u8]
+}
+
+/// Builds an APDU as hex, for a test or a station of your own: `spec` is { format: "U", function } or { format: "S", recv_seq } or { format: "I", send_seq, recv_seq, asdu_hex }.
+pub fn iec104_encode(spec: serde_json::Value) -> Result<String, String> {
+    Ok(hex::encode(match spec["format"].as_str().unwrap_or("") {
+        "U" => {
+            let f = match spec["function"].as_str().unwrap_or("") {
+                "STARTDT act" => STARTDT_ACT, "STARTDT con" => STARTDT_CON, "STOPDT act" => STOPDT_ACT, "STOPDT con" => STOPDT_CON, "TESTFR act" => TESTFR_ACT, "TESTFR con" => TESTFR_CON,
+                x => return Err(format!("`{}` is not a U function", x)),
+            };
+            vec![0x68, 4, f, 0, 0, 0]
+        }
+        "S" => {
+            let r = (spec["recv_seq"].as_u64().unwrap_or(0) as u16 % MODULO) << 1;
+            let n = r.to_le_bytes();
+            vec![0x68, 4, 1, 0, n[0], n[1]]
+        }
+        "I" => frame_i(spec["send_seq"].as_u64().unwrap_or(0) as u16 % MODULO, spec["recv_seq"].as_u64().unwrap_or(0) as u16 % MODULO, &hex::decode(spec["asdu_hex"].as_str().unwrap_or("")).map_err(|_| "asdu_hex is not hex".to_string())?)?,
+        x => return Err(format!("`{}` is not a format: I, S or U", x)),
+    }))
+}
+
+// ---- The connection ----
+
+#[derive(Default)]
+struct State {
+    vs: u16,
+    vr: u16,
+    acked: u16,
+    sent_at: VecDeque<(u16, Instant)>,
+    unacked_recv: u16,
+    last_recv: Option<Instant>,
+    last_any: Option<Instant>,
+    inbox: VecDeque<Value>,
+    started: bool,
+    stopped: bool,
+    tests: u64,
+    dropped: u64,
+    frames: u64,
+    down: Option<String>,
+}
+
+struct Link {
+    sock: Mutex<TcpStream>,
+    state: Mutex<State>,
+    wake: Condvar,
+    ca: u16,
+    originator: u8,
+    k: u16,
+    w: u16,
+    t1: Duration,
+    t2: Duration,
+    t3: Duration,
+    stop: Mutex<bool>,
+}
+
+static LINKS: Mutex<Option<HashMap<String, Arc<Link>>>> = Mutex::new(None);
+
+fn link(name: &str) -> Result<Arc<Link>, String> {
+    LINKS.lock().map_err(|e| e.to_string())?.as_ref().and_then(|m| m.get(name)).cloned().ok_or(format!("no connection called `{}`: call iec104_connect first", name))
+}
+
+fn diff(a: u16, b: u16) -> u16 {
+    (a + MODULO - b) % MODULO
+}
+
+impl Link {
+    fn write(&self, b: &[u8]) -> Result<(), String> {
+        self.sock.lock().map_err(|e| e.to_string())?.write_all(b).map_err(|e| format!("the link broke: {}", e))
+    }
+    fn fail(&self, why: String) {
+        if let Ok(mut s) = self.state.lock() {
+            s.down.get_or_insert(why);
+        }
+        self.wake.notify_all();
+        if let Ok(k) = self.sock.lock() {
+            let _ = k.shutdown(Shutdown::Both);
+        }
+    }
+    fn ack_now(&self, s: &mut State) {
+        let n = (s.vr << 1).to_le_bytes();
+        s.unacked_recv = 0;
+        s.last_recv = None;
+        let _ = self.write(&[0x68, 4, 1, 0, n[0], n[1]]);
+    }
+    /// N(R) from the far side: what it has of ours. Anything outside the window is a broken link.
+    fn acknowledge(&self, s: &mut State, nr: u16) -> Result<(), String> {
+        if diff(nr, s.acked) > diff(s.vs, s.acked) {
+            return Err(format!("N(R) {} acknowledges what was not sent (V(S) {})", nr, s.vs));
+        }
+        s.acked = nr;
+        while s.sent_at.front().is_some_and(|(n, _)| diff(nr, *n) > 0 && diff(nr, *n) <= diff(s.vs, *n)) {
+            s.sent_at.pop_front();
+        }
+        Ok(())
+    }
+    fn on_frame(&self, f: &[u8]) -> Result<(), String> {
+        let mut s = self.state.lock().map_err(|e| e.to_string())?;
+        s.frames += 1;
+        s.last_any = Some(Instant::now());
+        if f[0] & 1 == 0 {
+            let ns = u16::from_le_bytes([f[0], f[1]]) >> 1;
+            let nr = u16::from_le_bytes([f[2], f[3]]) >> 1;
+            if ns != s.vr {
+                return Err(format!("sequence error: I frame N(S) {}, expected {}", ns, s.vr));
+            }
+            s.vr = (s.vr + 1) % MODULO;
+            self.acknowledge(&mut s, nr)?;
+            match decode_asdu(&f[4..]) {
+                Ok(a) => {
+                    if s.inbox.len() >= KEEP {
+                        s.inbox.pop_front();
+                        s.dropped += 1;
+                    }
+                    s.inbox.push_back(a);
+                }
+                Err(e) => s.inbox.push_back(json!({ "error": e, "raw": hex::encode(&f[4..]) })),
+            }
+            s.unacked_recv += 1;
+            if s.last_recv.is_none() {
+                s.last_recv = Some(Instant::now());
+            }
+            if s.unacked_recv >= self.w {
+                self.ack_now(&mut s);
+            }
+            self.wake.notify_all();
+        } else if f[0] & 3 == 1 {
+            let nr = u16::from_le_bytes([f[2], f[3]]) >> 1;
+            self.acknowledge(&mut s, nr)?;
+            self.wake.notify_all();
+        } else {
+            match f[0] {
+                STARTDT_CON => s.started = true,
+                STOPDT_CON => s.stopped = true,
+                TESTFR_ACT => {
+                    s.tests += 1;
+                    drop(s);
+                    self.write(&[0x68, 4, TESTFR_CON, 0, 0, 0])?;
+                    return Ok(());
+                }
+                TESTFR_CON | STARTDT_ACT | STOPDT_ACT => {}
+                x => return Err(format!("U-format function 0x{:02x} is not one", x)),
+            }
+            self.wake.notify_all();
+        }
+        Ok(())
+    }
+    fn timers(&self) -> Result<(), String> {
+        let mut s = self.state.lock().map_err(|e| e.to_string())?;
+        if s.sent_at.front().is_some_and(|(_, at)| at.elapsed() > self.t1) {
+            return Err(format!("T1: an I frame was not acknowledged in {} ms", self.t1.as_millis()));
+        }
+        if s.last_recv.is_some_and(|t| t.elapsed() >= self.t2) && s.unacked_recv > 0 {
+            self.ack_now(&mut s);
+        }
+        if s.last_any.is_some_and(|t| t.elapsed() >= self.t3) {
+            s.last_any = Some(Instant::now());
+            drop(s);
+            self.write(&[0x68, 4, TESTFR_ACT, 0, 0, 0])?;
+        }
+        Ok(())
+    }
+}
+
+fn reader(l: Arc<Link>, mut sock: TcpStream) {
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut buf: Vec<u8> = vec![];
+    let mut tmp = [0u8; 4096];
+    loop {
+        if l.stop.lock().map_or(true, |s| *s) {
+            return;
+        }
+        match sock.read(&mut tmp) {
+            Ok(0) => return l.fail("the station closed the connection".to_string()),
+            Ok(n) => buf.extend(&tmp[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return l.fail(format!("the link broke: {}", e)),
+        }
+        let mut at = 0;
+        while buf.len() >= at + 2 {
+            if buf[at] != 0x68 {
+                return l.fail(format!("a frame not starting 0x68, but 0x{:02x}", buf[at]));
+            }
+            let n = buf[at + 1] as usize;
+            if n < 4 {
+                return l.fail("an APDU length under 4".to_string());
+            }
+            if buf.len() < at + 2 + n {
+                break;
+            }
+            if let Err(e) = l.on_frame(&buf[at + 2..at + 2 + n]) {
+                return l.fail(e);
+            }
+            at += 2 + n;
+        }
+        buf.drain(..at);
+        if let Err(e) = l.timers() {
+            return l.fail(e);
+        }
+    }
+}
+
+fn wait_until(l: &Link, ms: u64, mut f: impl FnMut(&mut State) -> bool, what: &str) -> Result<(), String> {
+    let end = Instant::now() + Duration::from_millis(ms);
+    let mut g = l.state.lock().map_err(|e| e.to_string())?;
+    loop {
+        if f(&mut g) {
+            return Ok(());
+        }
+        if let Some(d) = &g.down {
+            return Err(d.clone());
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("no {} in {} ms", what, ms));
+        }
+        g = l.wake.wait_timeout(g, left).map_err(|e| e.to_string())?.0;
+    }
+}
+
+/// Sends an ASDU in an I frame, waiting while the k window is full.
+fn send_i(l: &Link, asdu: &[u8]) -> Result<(), String> {
+    wait_until(l, l.t1.as_millis() as u64, |s| diff(s.vs, s.acked) < l.k, "room in the k window")?;
+    let mut s = l.state.lock().map_err(|e| e.to_string())?;
+    let f = frame_i(s.vs, s.vr, asdu)?;
+    let ns = s.vs;
+    s.sent_at.push_back((ns, Instant::now()));
+    s.vs = (s.vs + 1) % MODULO;
+    s.unacked_recv = 0;
+    s.last_recv = None;
+    s.last_any = Some(Instant::now());
+    drop(s);
+    l.write(&f)
+}
+
+/// Connects and starts data transfer: `options` is { host (else IEC104_HOST, host:port, 2404 by default), ca (common address, 1), originator (0), k (12), w (8), t1_ms (15000), t2_ms (10000), t3_ms (20000), wait_ms }. A connection that STARTDT does not confirm is an error. Gives true.
+pub fn iec104_connect(name: &str, options: serde_json::Value) -> Result<bool, String> {
+    let host = options.get("host").and_then(|h| h.as_str()).map(str::to_string).or_else(|| std::env::var("IEC104_HOST").ok()).unwrap_or("127.0.0.1:2404".into());
+    let addr = if host.contains(':') { host.clone() } else { format!("{}:2404", host) };
+    let n = |k: &str, d: u64| options.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+    let (k, w) = (n("k", 12) as u16, n("w", 8) as u16);
+    if w == 0 || w > k {
+        return Err("w must be 1 to k: 8 and 12 are the standard's".into());
+    }
+    let t = Duration::from_millis(n("wait_ms", 5000));
+    let sa = addr.to_socket_addrs().map_err(|e| format!("{}: {}", addr, e))?.next().ok_or(format!("{} has no address", addr))?;
+    let sock = TcpStream::connect_timeout(&sa, t).map_err(|e| format!("cannot reach the station at {}: {}", addr, e))?;
+    sock.set_nodelay(true).map_err(|e| e.to_string())?;
+    let rd = sock.try_clone().map_err(|e| e.to_string())?;
+    let l = Arc::new(Link {
+        sock: Mutex::new(sock), state: Mutex::new(State::default()), wake: Condvar::new(), ca: n("ca", 1) as u16, originator: n("originator", 0) as u8, k, w,
+        t1: Duration::from_millis(n("t1_ms", 15000)), t2: Duration::from_millis(n("t2_ms", 10000)), t3: Duration::from_millis(n("t3_ms", 20000)), stop: Mutex::new(false),
+    });
+    let r = l.clone();
+    std::thread::spawn(move || reader(r, rd));
+    l.write(&[0x68, 4, STARTDT_ACT, 0, 0, 0])?;
+    wait_until(&l, t.as_millis() as u64, |s| s.started, "STARTDT confirmation")?;
+    if let Some(old) = LINKS.lock().map_err(|e| e.to_string())?.get_or_insert_with(HashMap::new).insert(name.to_string(), l) {
+        if let Ok(mut st) = old.stop.lock() {
+            *st = true;
+        }
+    }
+    Ok(true)
+}
+
+/// STOPDT, waited for, and the socket closed.
+pub fn iec104_close(name: &str) -> Result<bool, String> {
+    let l = link(name)?;
+    l.write(&[0x68, 4, STOPDT_ACT, 0, 0, 0])?;
+    let stopped = wait_until(&l, 2000, |s| s.stopped, "STOPDT confirmation").is_ok();
+    if let Ok(mut s) = l.stop.lock() {
+        *s = true;
+    }
+    if let Ok(s) = l.sock.lock() {
+        let _ = s.shutdown(Shutdown::Both);
+    }
+    LINKS.lock().map_err(|e| e.to_string())?.as_mut().map(|m| m.remove(name));
+    Ok(stopped)
+}
+
+/// Where the link stands: { connected, send_seq, recv_seq, unacknowledged, queued, tests_answered, frames, dropped, error }.
+pub fn iec104_status(name: &str) -> Result<serde_json::Value, String> {
+    let l = link(name)?;
+    let s = l.state.lock().map_err(|e| e.to_string())?;
+    Ok(json!({ "connected": s.down.is_none(), "send_seq": s.vs, "recv_seq": s.vr, "unacknowledged": diff(s.vs, s.acked), "queued": s.inbox.len(), "tests_answered": s.tests, "frames": s.frames, "dropped": s.dropped, "error": s.down }))
+}
+
+/// Hands over what the station has sent by itself: up to `max` ASDUs, waiting at most `wait_ms` for the first. Each is { type, type_name, cause, negative, test, originator, ca, points: [{ ioa, value, quality, time }] }.
+pub fn iec104_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let l = link(name)?;
+    let _ = wait_until(&l, wait_ms.max(0) as u64, |s| !s.inbox.is_empty(), "data");
+    let mut s = l.state.lock().map_err(|e| e.to_string())?;
+    let n = (max.max(0) as usize).min(s.inbox.len());
+    if n == 0 {
+        if let Some(d) = &s.down {
+            return Err(d.clone());
+        }
+    }
+    Ok(s.inbox.drain(..n).collect())
+}
+
+/// Takes the ASDUs that `pick` wants out of the inbox, and leaves the station's other news there.
+fn take(s: &mut State, pick: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let mut out = vec![];
+    let mut kept = VecDeque::new();
+    while let Some(a) = s.inbox.pop_front() {
+        if pick(&a) { out.push(a) } else { kept.push_back(a) }
+    }
+    s.inbox = kept;
+    out
+}
+
+fn caller_ca(l: &Link, o: &Value) -> u16 {
+    o.get("ca").and_then(|c| c.as_u64()).map_or(l.ca, |c| c as u16)
+}
+
+/// General interrogation, C_IC_NA_1: asks a station for everything it has, and waits for the end. Options: ca, qoi (20, the whole station; 21 to 36 a group), wait_ms (15 s). Gives { points, frames }, points flattened with their ASDU's type and cause. A refused one is an error value.
+pub fn iec104_interrogate(name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let l = link(name)?;
+    let ca = caller_ca(&l, &options);
+    let qoi = options.get("qoi").and_then(|q| q.as_u64()).unwrap_or(20) as u8;
+    let ms = options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(15_000);
+    let mut a = asdu_head(100, 1, 6, l.originator, ca);
+    a.extend([0, 0, 0, qoi]);
+    send_i(&l, &a)?;
+    let mut got: Vec<Value> = vec![];
+    let mut confirmed = false;
+    let end = Instant::now() + Duration::from_millis(ms);
+    loop {
+        let left = end.saturating_duration_since(Instant::now()).as_millis() as u64;
+        let mut items = vec![];
+        wait_until(&l, left, |s| {
+            items = take(s, |x| {
+                let c = x["cause"].as_str().unwrap_or("");
+                x["ca"] == ca && (c == "interrogated" || c.starts_with("group_") || (x["type"] == 100 && matches!(c, "activation_con" | "activation_term" | "unknown_type" | "unknown_cause" | "unknown_address" | "unknown_object")))
+            });
+            !items.is_empty()
+        }, "end of interrogation")?;
+        for x in items {
+            if x["type"] != 100 {
+                let (t, c) = (x["type_name"].clone(), x["cause"].clone());
+                for mut p in x["points"].as_array().cloned().unwrap_or_default() {
+                    p["type_name"] = t.clone();
+                    p["cause"] = c.clone();
+                    got.push(p);
+                }
+                continue;
+            }
+            match x["cause"].as_str().unwrap_or("") {
+                "activation_con" if x["negative"] == true => return Err(format!("the station refused the interrogation of address {}", ca)),
+                "activation_con" => confirmed = true,
+                "activation_term" => return Ok(json!({ "confirmed": confirmed, "points": got })),
+                other => return Err(format!("the station answered {} to the interrogation of address {}", other, ca)),
+            }
+        }
+    }
+}
+
+fn wait_answer(l: &Link, type_id: u8, ioa: u32, cause: &str, ca: u16, ms: u64) -> Result<Value, String> {
+    let mut hit = None;
+    wait_until(l, ms, |s| {
+        let list = take(s, |x| x["type"] == type_id && x["ca"] == ca && (x["cause"].as_str().unwrap_or("").starts_with("unknown") || x["cause"] == cause) && x["points"].get(0).is_none_or(|p| p["ioa"] == ioa));
+        hit = list.into_iter().next();
+        hit.is_some()
+    }, cause)?;
+    Ok(hit.unwrap_or(Value::Null))
+}
+
+fn command_asdu(l: &Link, t: u8, ca: u16, ioa: u32, value: &Value, select: bool, cot: u8, qu: u8) -> Result<Vec<u8>, String> {
+    let s = if select { 0x80u8 } else { 0 };
+    let mut a = asdu_head(t, 1, cot, l.originator, ca);
+    a.extend(ioa3(ioa));
+    match t {
+        45 => a.push(s | qu << 2 | value.as_bool().ok_or("a single command takes true or false")? as u8),
+        46 => a.push(s | qu << 2 | match value.as_str() {
+            Some("on") => 2,
+            Some("off") => 1,
+            _ => return Err("a double command takes \"on\" or \"off\"".into()),
+        }),
+        47 => a.push(s | qu << 2 | match value.as_str() {
+            Some("up") => 2,
+            Some("down") => 1,
+            _ => return Err("a step command takes \"up\" or \"down\"".into()),
+        }),
+        48 => {
+            let v = value.as_f64().ok_or("a normalized set-point takes a number, -1 to almost 1")?;
+            if !(-1.0..1.0).contains(&v) {
+                return Err("a normalized set-point is -1 to almost 1".into());
+            }
+            a.extend(((v * 32768.0).round() as i16).to_le_bytes());
+            a.push(s);
+        }
+        49 => {
+            a.extend(i16::try_from(value.as_i64().ok_or("a scaled set-point takes a whole number")?).map_err(|_| "a scaled set-point fits 16 bits".to_string())?.to_le_bytes());
+            a.push(s);
+        }
+        50 => {
+            a.extend((value.as_f64().ok_or("a float set-point takes a number")? as f32).to_le_bytes());
+            a.push(s);
+        }
+        x => return Err(format!("type {} is no command here", x)),
+    }
+    Ok(a)
+}
+
+/// Sends a command and waits for its confirmation: `kind` is single, double, step, setpoint_normalized, setpoint_scaled or setpoint_float, `value` true/false, "on"/"off", "up"/"down", or a number. Options: select (true: select before execute, as breakers want), ca, qualifier (0; 1 short, 2 long pulse, 3 persistent), wait_ms (10 s), wait_term (true waits for activation_term as well). Gives { confirmed, selected, terminated }. A negative confirmation is an error value, saying at which step.
+pub fn iec104_command(name: &str, kind: &str, ioa: i64, value: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let l = link(name)?;
+    let t = match kind {
+        "single" => 45, "double" => 46, "step" => 47, "setpoint_normalized" => 48, "setpoint_scaled" => 49, "setpoint_float" => 50,
+        x => return Err(format!("`{}` is not a command: single, double, step, setpoint_normalized, setpoint_scaled or setpoint_float", x)),
+    };
+    if !(1..=0xff_ffff).contains(&ioa) {
+        return Err(format!("{} is not an object address", ioa));
+    }
+    let (ioa, ca) = (ioa as u32, caller_ca(&l, &options));
+    let ms = options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(10_000);
+    let qu = options.get("qualifier").and_then(|q| q.as_u64()).unwrap_or(0) as u8;
+    let selecting = options.get("select") == Some(&Value::Bool(true));
+    let mut check = |phase: &str, a: Vec<u8>| -> Result<(), String> {
+        send_i(&l, &a)?;
+        let r = wait_answer(&l, t, ioa, "activation_con", ca, ms)?;
+        let cause = r["cause"].as_str().unwrap_or("");
+        if cause != "activation_con" {
+            return Err(format!("{} of {} {}: the station says {}", phase, kind, ioa, cause));
+        }
+        if r["negative"] == true {
+            return Err(format!("{} of {} {} refused: negative confirmation", phase, kind, ioa));
+        }
+        Ok(())
+    };
+    if selecting {
+        check("select", command_asdu(&l, t, ca, ioa, &value, true, 6, qu)?)?;
+    }
+    check("execute", command_asdu(&l, t, ca, ioa, &value, false, 6, qu)?)?;
+    let mut term = false;
+    if options.get("wait_term") != Some(&Value::Bool(false)) {
+        term = wait_answer(&l, t, ioa, "activation_term", ca, ms).is_ok();
+    }
+    Ok(json!({ "confirmed": true, "selected": selecting, "terminated": term }))
+}
+
+/// Reads one object, C_RD_NA_1: the station answers with its value. Options: ca, wait_ms (5 s). Gives the point.
+pub fn iec104_read(name: &str, ioa: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let l = link(name)?;
+    let ca = caller_ca(&l, &options);
+    let ms = options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(5_000);
+    let mut a = asdu_head(102, 1, 5, l.originator, ca);
+    a.extend(ioa3(ioa as u32));
+    send_i(&l, &a)?;
+    let mut hit = None;
+    wait_until(&l, ms, |s| {
+        let list = take(s, |x| x["ca"] == ca && ((x["cause"] == "request" && x["points"].get(0).is_some_and(|p| p["ioa"] == ioa)) || (x["type"] == 102 && x["cause"].as_str().is_some_and(|c| c.starts_with("unknown")))));
+        hit = list.into_iter().next();
+        hit.is_some()
+    }, "answer to the read")?;
+    let h = hit.unwrap_or(Value::Null);
+    if h["type"] == 102 {
+        return Err(format!("the station answered {} for object {}", h["cause"].as_str().unwrap_or("?"), ioa));
+    }
+    let mut p = h["points"][0].clone();
+    p["type_name"] = h["type_name"].clone();
+    Ok(p)
+}
+
+/// Sets a station's clock, C_CS_NA_1: `time` like 2026-11-01T09:30:15.250, in whatever zone the station keeps. Options: ca, wait_ms.
+pub fn iec104_clock_sync(name: &str, time: &str, options: serde_json::Value) -> Result<bool, String> {
+    let l = link(name)?;
+    let ca = caller_ca(&l, &options);
+    let mut a = asdu_head(103, 1, 6, l.originator, ca);
+    a.extend([0, 0, 0]);
+    a.extend(parse_cp56(time)?);
+    send_i(&l, &a)?;
+    let r = wait_answer(&l, 103, 0, "activation_con", ca, options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(5_000))?;
+    if r["negative"] == true {
+        return Err("the station refused the clock".into());
+    }
+    Ok(true)
+}
+
+/// A cause's name as text, the other way round: `spontaneous` is 3. For building ASDUs of your own.
+pub fn iec104_cause(name: &str) -> Option<i64> {
+    cause_code(name).map(|c| c as i64)
+}

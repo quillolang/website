@@ -1,0 +1,220 @@
+//! Airtable's Web API: records listed through their offsets, created, updated and upserted in the batches of 10 it takes, deleted, formulas quoted, and five requests a second kept to per base.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const BATCH: usize = 10;
+// Airtable's limit is 5 requests a second on each base; over it, every request is refused for 30 s.
+const GAP: Duration = Duration::from_millis(210);
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// Holds a call back until the base's last one is far enough behind.
+fn polite(base: &str) {
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let wait = {
+        let Ok(mut map) = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock() else { return };
+        let now = Instant::now();
+        let at = map.get(base).map(|l| (*l + GAP).max(now)).unwrap_or(now);
+        map.insert(base.to_string(), at);
+        at.saturating_duration_since(now)
+    };
+    std::thread::sleep(wait);
+}
+
+fn call(method: &str, base: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let token = opt(o, "token", "AIRTABLE_TOKEN").ok_or("no token: set AIRTABLE_TOKEN (a personal access token), or give the option token")?;
+    let api = opt(o, "base_url", "AIRTABLE_API_URL").unwrap_or_else(|| "https://api.airtable.com".into());
+    let url = format!("{}/v0/{}{}", api.trim_end_matches('/'), base, path);
+    let retry_ms = o.get("retry_wait_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let text = body.map(|b| b.to_string());
+    let mut tries = 0;
+    loop {
+        polite(base);
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("User-Agent", "quillo-airtable/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Airtable's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()).map(|s| s * 1000).unwrap_or(retry_ms);
+                let t = resp.into_string().unwrap_or_default();
+                if (code == 429 || code == 503) && tries < 2 {
+                    std::thread::sleep(Duration::from_millis(wait));
+                    tries += 1;
+                    continue;
+                }
+                return Err(error_text(code, &t));
+            }
+            Err(e) => return Err(format!("cannot reach Airtable at {}: {}", api, e)),
+        }
+    }
+}
+
+// The error is { error: { type, message } }, or { error: "NOT_FOUND" }.
+fn error_text(code: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let (kind, msg) = match &v["error"] {
+        Value::String(s) => (s.clone(), String::new()),
+        e => (e["type"].as_str().unwrap_or("ERROR").to_string(), e["message"].as_str().unwrap_or(body.trim()).to_string()),
+    };
+    let hint = match (code, kind.as_str()) {
+        (401, _) => " (check AIRTABLE_TOKEN)",
+        (403, _) => " (the token lacks this scope, or this base)",
+        (404, _) => " (check the base and table)",
+        (422, "LIST_RECORDS_ITERATOR_NOT_AVAILABLE") => " (an offset lasts five minutes: start the list again)",
+        _ => "",
+    };
+    format!("Airtable {} {}{}{}", code, kind, if msg.is_empty() { String::new() } else { format!(": {}", msg) }, hint)
+}
+
+fn table_path(table: &str) -> Result<String, String> {
+    if table.is_empty() {
+        return Err("no table: give its name or its tbl... id".into());
+    }
+    Ok(format!("/{}", enc(table)))
+}
+
+fn list_body(o: &Value) -> Value {
+    let mut b = json!({});
+    for (k, key) in [("view", "view"), ("formula", "filterByFormula"), ("sort", "sort"), ("fields", "fields"), ("page_size", "pageSize"), ("max_records", "maxRecords"), ("offset", "offset")] {
+        if let Some(v) = o.get(k) {
+            if !v.is_null() {
+                b[key] = v.clone();
+            }
+        }
+    }
+    b
+}
+
+/// One page of a table: options view, formula, sort ([{ field, direction }]), fields, page_size (at most 100), max_records, offset, token (else AIRTABLE_TOKEN), base_url (else AIRTABLE_API_URL). Gives { records, offset }; no offset means the last page. POSTs the list, as a long formula does not fit in a URL.
+pub fn airtable_list(base: &str, table: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let path = format!("{}/listRecords", table_path(table)?);
+    let r = call("POST", base, &path, Some(&list_body(&options)), &options)?;
+    Ok(json!({ "records": r["records"], "offset": r.get("offset").cloned().unwrap_or(Value::Null) }))
+}
+
+/// Every record of a table, following the offsets. Options as for airtable_list.
+pub fn airtable_all(base: &str, table: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut o = options;
+    let mut out = vec![];
+    loop {
+        let r = airtable_list(base, table, o.clone())?;
+        out.extend(r["records"].as_array().cloned().unwrap_or_default());
+        match r["offset"].as_str() {
+            Some(n) => o["offset"] = json!(n),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Records as plain rows: { id, created, ...fields }. Airtable leaves out a field that is empty, so read a missing one as empty.
+pub fn airtable_rows(records: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    records.into_iter().map(|r| {
+        let mut row = json!({ "id": r["id"], "created": r["createdTime"] });
+        if let Some(f) = r["fields"].as_object() {
+            for (k, v) in f {
+                row[k] = v.clone();
+            }
+        }
+        row
+    }).collect()
+}
+
+/// One record by id.
+pub fn airtable_get(base: &str, table: &str, id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", base, &format!("{}/{}", table_path(table)?, enc(id)), None, &options)
+}
+
+fn as_records(rows: &[Value]) -> Vec<Value> {
+    rows.iter().map(|r| if r.get("fields").is_some() { r.clone() } else { json!({ "fields": r }) }).collect()
+}
+
+/// Creates records, each a map of fields, in requests of 10. Options add typecast (true lets Airtable convert values and make new select options). Gives the records made.
+pub fn airtable_create(base: &str, table: &str, rows: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = table_path(table)?;
+    let mut out = vec![];
+    for chunk in rows.chunks(BATCH) {
+        let mut b = json!({ "records": as_records(chunk) });
+        if let Some(t) = options.get("typecast") { b["typecast"] = t.clone(); }
+        let r = call("POST", base, &path, Some(&b), &options)?;
+        out.extend(r["records"].as_array().cloned().unwrap_or_default());
+    }
+    Ok(out)
+}
+
+/// Updates records, each { id, fields }, in requests of 10: only the fields named change. Options add typecast.
+pub fn airtable_update(base: &str, table: &str, records: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    if let Some(r) = records.iter().find(|r| r["id"].as_str().is_none()) {
+        return Err(format!("a record to update needs an id: {}", r));
+    }
+    let path = table_path(table)?;
+    let mut out = vec![];
+    for chunk in records.chunks(BATCH) {
+        let mut b = json!({ "records": chunk });
+        if let Some(t) = options.get("typecast") { b["typecast"] = t.clone(); }
+        let r = call("PATCH", base, &path, Some(&b), &options)?;
+        out.extend(r["records"].as_array().cloned().unwrap_or_default());
+    }
+    Ok(out)
+}
+
+/// Updates the record that matches on the `merge_on` fields (1 to 3 of them) or creates it, in requests of 10. Each row is a map of fields. Gives { created: [ids], updated: [ids], records }.
+pub fn airtable_upsert(base: &str, table: &str, rows: Vec<serde_json::Value>, merge_on: Vec<String>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if merge_on.is_empty() || merge_on.len() > 3 {
+        return Err(format!("an upsert merges on 1 to 3 fields, not {}", merge_on.len()));
+    }
+    for (i, r) in rows.iter().enumerate() {
+        let f = r.get("fields").unwrap_or(r);
+        if let Some(m) = merge_on.iter().find(|m| f.get(m.as_str()).is_none()) {
+            return Err(format!("row {} has no `{}`, which it merges on", i, m));
+        }
+    }
+    let path = table_path(table)?;
+    let (mut created, mut updated, mut records) = (vec![], vec![], vec![]);
+    for chunk in rows.chunks(BATCH) {
+        let mut b = json!({ "performUpsert": { "fieldsToMergeOn": merge_on }, "records": as_records(chunk) });
+        if let Some(t) = options.get("typecast") { b["typecast"] = t.clone(); }
+        let r = call("PATCH", base, &path, Some(&b), &options)?;
+        created.extend(r["createdRecords"].as_array().cloned().unwrap_or_default());
+        updated.extend(r["updatedRecords"].as_array().cloned().unwrap_or_default());
+        records.extend(r["records"].as_array().cloned().unwrap_or_default());
+    }
+    Ok(json!({ "created": created, "updated": updated, "records": records }))
+}
+
+/// Deletes records by id, in requests of 10. Gives how many went.
+pub fn airtable_delete(base: &str, table: &str, ids: Vec<String>, options: serde_json::Value) -> Result<i64, String> {
+    let path = table_path(table)?;
+    let mut n = 0;
+    for chunk in ids.chunks(BATCH) {
+        let q: Vec<String> = chunk.iter().map(|i| format!("records%5B%5D={}", enc(i))).collect();
+        let r = call("DELETE", base, &format!("{}?{}", path, q.join("&")), None, &options)?;
+        n += r["records"].as_array().map(|l| l.len()).unwrap_or(0) as i64;
+    }
+    Ok(n)
+}
+
+/// A text as a string in a formula, quoted so that a visitor's input cannot change the formula: `{Email} = ` + airtable_quote(email).
+pub fn airtable_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r"))
+}

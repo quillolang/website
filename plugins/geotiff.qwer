@@ -1,0 +1,711 @@
+//! GeoTIFF read in pure Rust for elevation files: tags, tie points or a transformation, bounds and the EPSG code, the value at a coordinate, nearest or interpolated, profiles along a line and statistics, in strips or tiles, classic or BigTIFF, plain, deflate, LZW or PackBits.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! flate2 = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+
+struct Tag {
+    kind: u16,
+    count: u64,
+    at: u64,    // Where the values are in the file.
+}
+
+struct Tiff {
+    f: File,
+    le: bool,
+    tags: HashMap<u16, Tag>,
+    ifds: usize,
+    len: u64,
+}
+
+fn size_of(kind: u16) -> u64 {
+    match kind {
+        1 | 2 | 6 | 7 => 1,
+        3 | 8 => 2,
+        4 | 9 | 11 | 13 => 4,
+        5 | 10 | 12 | 16 | 17 | 18 => 8,
+        _ => 0,
+    }
+}
+
+impl Tiff {
+    fn bytes(&mut self, at: u64, n: u64) -> Result<Vec<u8>, String> {
+        if n > 1 << 31 || at + n > self.len {
+            return Err(format!("the file is cut short: {} bytes wanted at {}, and it has {}", n, at, self.len));
+        }
+        let mut b = vec![0u8; n as usize];
+        self.f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+        self.f.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(b)
+    }
+    fn num(&self, b: &[u8]) -> u64 {
+        if self.le { b.iter().rev().fold(0u64, |a, c| a << 8 | *c as u64) } else { b.iter().fold(0u64, |a, c| a << 8 | *c as u64) }
+    }
+    fn open(path: &str) -> Result<Tiff, String> {
+        let f = File::open(path).map_err(|e| format!("cannot open {}: {}", path, e))?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len();
+        let mut t = Tiff { f, le: true, tags: HashMap::new(), ifds: 0, len };
+        if len < 8 {
+            return Err(format!("{} is not a TIFF file", path));
+        }
+        let h = t.bytes(0, 16.min(len))?;
+        t.le = match &h[..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return Err(format!("{} is not a TIFF file", path)),
+        };
+        let magic = t.num(&h[2..4]);
+        let big = match magic {
+            42 => false,
+            43 => {
+                if t.num(&h[4..6]) != 8 {
+                    return Err(format!("{} is a BigTIFF with odd offsets", path));
+                }
+                true
+            }
+            m => return Err(format!("{} is not a TIFF file: its magic number is {}", path, m)),
+        };
+        let mut ifd = if big { t.num(&h[8..16]) } else { t.num(&h[4..8]) };
+        let mut first = true;
+        let mut guard = 0;
+        while ifd != 0 {
+            guard += 1;
+            if guard > 256 {
+                return Err("the image directories loop".into());
+            }
+            t.ifds += 1;
+            let (cn, entry, inline) = if big { (8, 20, 8) } else { (2, 12, 4) };
+            let c = t.bytes(ifd, cn)?;
+            let n = t.num(&c);
+            if n > 4096 {
+                return Err("an image directory has too many tags".into());
+            }
+            let d = t.bytes(ifd + cn, n * entry + cn.min(8) * 0 + if big { 8 } else { 4 })?;
+            if first {
+                for i in 0..n as usize {
+                    let e = &d[i * entry as usize..(i + 1) * entry as usize];
+                    let (id, kind) = (t.num(&e[..2]) as u16, t.num(&e[2..4]) as u16);
+                    let (count, val) = if big { (t.num(&e[4..12]), 12) } else { (t.num(&e[4..8]), 8) };
+                    let total = count.saturating_mul(size_of(kind));
+                    let at = if total <= inline { ifd + cn + i as u64 * entry + val as u64 } else { t.num(&e[val..val + inline as usize]) };
+                    t.tags.insert(id, Tag { kind, count, at });
+                }
+            }
+            first = false;
+            let tail = &d[n as usize * entry as usize..];
+            ifd = t.num(tail);
+        }
+        if t.tags.is_empty() {
+            return Err(format!("{} has no image", path));
+        }
+        Ok(t)
+    }
+    fn nums(&mut self, id: u16) -> Result<Vec<f64>, String> {
+        let (kind, count, at) = match self.tags.get(&id) {
+            Some(t) => (t.kind, t.count, t.at),
+            None => return Ok(vec![]),
+        };
+        let sz = size_of(kind);
+        if sz == 0 {
+            return Err(format!("tag {} has an unknown type {}", id, kind));
+        }
+        if count > 1 << 26 {
+            return Err(format!("tag {} has too many values", id));
+        }
+        let b = self.bytes(at, count * sz)?;
+        let mut o = Vec::with_capacity(count as usize);
+        for c in b.chunks_exact(sz as usize) {
+            let n = self.num(c);
+            o.push(match kind {
+                1 | 3 | 4 | 16 => n as f64,
+                6 => n as u8 as i8 as f64,
+                8 => n as u16 as i16 as f64,
+                9 => n as u32 as i32 as f64,
+                17 => n as i64 as f64,
+                11 => f32::from_bits(n as u32) as f64,
+                12 => f64::from_bits(n),
+                5 => {
+                    let (a, d) = (self.num(&c[..4]), self.num(&c[4..]));
+                    if d == 0 { 0.0 } else { a as f64 / d as f64 }
+                }
+                10 => {
+                    let (a, d) = (self.num(&c[..4]) as u32 as i32, self.num(&c[4..]) as u32 as i32);
+                    if d == 0 { 0.0 } else { a as f64 / d as f64 }
+                }
+                _ => n as f64,
+            });
+        }
+        Ok(o)
+    }
+    fn big_nums(&mut self, id: u16) -> Result<Vec<u64>, String> {
+        let (kind, count, at) = match self.tags.get(&id) {
+            Some(t) => (t.kind, t.count, t.at),
+            None => return Ok(vec![]),
+        };
+        let sz = size_of(kind);
+        if count > 1 << 26 || sz == 0 {
+            return Err(format!("tag {} is unreadable", id));
+        }
+        let b = self.bytes(at, count * sz)?;
+        Ok(b.chunks_exact(sz as usize).map(|c| self.num(c)).collect())
+    }
+    fn one(&mut self, id: u16) -> Result<Option<f64>, String> {
+        Ok(self.nums(id)?.first().copied())
+    }
+    fn text(&mut self, id: u16) -> Result<Option<String>, String> {
+        let (count, at) = match self.tags.get(&id) {
+            Some(t) => (t.count, t.at),
+            None => return Ok(None),
+        };
+        let b = self.bytes(at, count)?;
+        Ok(Some(String::from_utf8_lossy(&b).trim_end_matches('\0').to_string()))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Sample {
+    U,
+    I,
+    F,
+}
+
+struct Image {
+    t: Tiff,
+    w: usize,
+    h: usize,
+    bands: usize,
+    bits: usize,
+    sample: Sample,
+    compression: u16,
+    predictor: u16,
+    planar: u16,
+    chunk_w: usize,
+    chunk_h: usize,
+    tiled: bool,
+    offsets: Vec<u64>,
+    counts: Vec<u64>,
+    nodata: Option<f64>,
+    // Pixel to model: x = a col + b row + c, y = d col + e row + f.
+    gt: Option<[f64; 6]>,
+    point: bool,
+    keys: HashMap<u16, Value>,
+    cache: Vec<(usize, Vec<u8>)>,
+}
+
+fn open(path: &str) -> Result<Image, String> {
+    let mut t = Tiff::open(path)?;
+    let need = |v: Option<f64>, n: &str| v.ok_or(format!("{} has no {} tag", path, n));
+    let w = need(t.one(256)?, "ImageWidth")? as usize;
+    let h = need(t.one(257)?, "ImageLength")? as usize;
+    if w == 0 || h == 0 {
+        return Err(format!("{} is an empty image", path));
+    }
+    let bands = t.one(277)?.unwrap_or(1.0) as usize;
+    let bits_all = t.nums(258)?;
+    let bits = bits_all.first().copied().unwrap_or(1.0) as usize;
+    if bits_all.iter().any(|b| *b as usize != bits) {
+        return Err("bands of different widths are not read here".into());
+    }
+    let sample = match t.one(339)?.unwrap_or(1.0) as u16 {
+        1 => Sample::U,
+        2 => Sample::I,
+        3 => Sample::F,
+        o => return Err(format!("sample format {} is not read here", o)),
+    };
+    if !matches!((sample, bits), (Sample::U | Sample::I, 8 | 16 | 32) | (Sample::F, 32 | 64)) {
+        return Err(format!("{}-bit samples of this kind are not read here", bits));
+    }
+    let compression = t.one(259)?.unwrap_or(1.0) as u16;
+    if !matches!(compression, 1 | 5 | 8 | 32946 | 32773) {
+        let name = match compression {
+            6 | 7 => "JPEG",
+            34712 => "JPEG 2000",
+            50000 => "ZSTD",
+            50001 => "WebP",
+            34925 => "LZMA",
+            _ => "unknown",
+        };
+        return Err(format!("compression {} ({}) is not read here: none, LZW, deflate and PackBits are", compression, name));
+    }
+    let predictor = t.one(317)?.unwrap_or(1.0) as u16;
+    let planar = t.one(284)?.unwrap_or(1.0) as u16;
+    let tiled = t.tags.contains_key(&324);
+    let (chunk_w, chunk_h, offsets, counts) = if tiled {
+        (need(t.one(322)?, "TileWidth")? as usize, need(t.one(323)?, "TileLength")? as usize, t.big_nums(324)?, t.big_nums(325)?)
+    } else {
+        let rows = t.one(278)?.map(|v| v as usize).filter(|v| *v > 0 && *v < h).unwrap_or(h);
+        (w, rows, t.big_nums(273)?, t.big_nums(279)?)
+    };
+    if offsets.len() != counts.len() || offsets.is_empty() || chunk_w == 0 || chunk_h == 0 {
+        return Err(format!("{} has no usable strips or tiles", path));
+    }
+    let nodata = t.text(42113)?.and_then(|s| s.trim().parse::<f64>().ok());
+    let scale = t.nums(33550)?;
+    let ties = t.nums(33922)?;
+    let matrix = t.nums(34264)?;
+    let gt = if matrix.len() >= 16 {
+        Some([matrix[0], matrix[1], matrix[3], matrix[4], matrix[5], matrix[7]])
+    } else if scale.len() >= 2 && ties.len() >= 6 {
+        Some([scale[0], 0.0, ties[3] - ties[0] * scale[0], 0.0, -scale[1], ties[4] + ties[1] * scale[1]])
+    } else {
+        None
+    };
+    let mut keys = HashMap::new();
+    let dir = t.nums(34735)?;
+    if dir.len() >= 4 {
+        let doubles = t.nums(34736)?;
+        let ascii = t.text(34737)?.unwrap_or_default();
+        for k in dir[4..].chunks_exact(4) {
+            let (id, loc, count, val) = (k[0] as u16, k[1] as u16, k[2] as usize, k[3] as usize);
+            let v = match loc {
+                0 => json!(val),
+                34736 => doubles.get(val).map(|x| json!(x)).unwrap_or(Value::Null),
+                34737 => json!(ascii.get(val..val + count).unwrap_or("").trim_end_matches('|')),
+                _ => Value::Null,
+            };
+            keys.insert(id, v);
+        }
+    }
+    let point = keys.get(&1025).and_then(|v| v.as_i64()) == Some(2);
+    Ok(Image { t, w, h, bands, bits, sample, compression, predictor, planar, chunk_w, chunk_h, tiled, offsets, counts, nodata, gt, point, keys, cache: vec![] })
+}
+
+fn lzw(input: &[u8], want: usize) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::with_capacity(want);
+    // Each code is (where in `out` its string starts, its length); roots are single bytes.
+    let mut table: Vec<(usize, usize)> = Vec::with_capacity(4096);
+    let (mut acc, mut nbits, mut width, mut at) = (0u32, 0u32, 9u32, 0usize);
+    let mut prev: Option<(usize, usize)> = None;
+    let mut next = 258usize;
+    let mut roots = [(0usize, 0usize); 256];
+    let mut first = true;
+    loop {
+        while nbits < width {
+            let Some(b) = input.get(at) else { return Ok(out) };
+            acc = acc << 8 | *b as u32;
+            nbits += 8;
+            at += 1;
+        }
+        nbits -= width;
+        let code = ((acc >> nbits) & ((1 << width) - 1)) as usize;
+        if code == 257 {
+            return Ok(out);
+        }
+        if code == 256 {
+            table.clear();
+            next = 258;
+            width = 9;
+            prev = None;
+            continue;
+        }
+        let start = out.len();
+        if code < 256 {
+            out.push(code as u8);
+            roots[code] = (start, 1);
+            let _ = first;
+            first = false;
+        } else if code < next && code - 258 < table.len() {
+            let (s, l) = table[code - 258];
+            for i in 0..l {
+                out.push(out[s + i]);
+            }
+        } else if code == next {
+            let (s, l) = prev.ok_or("a bad LZW stream")?;
+            for i in 0..l {
+                out.push(out[s + i]);
+            }
+            out.push(out[s]);
+        } else {
+            return Err("a bad LZW stream".into());
+        }
+        let len = out.len() - start;
+        if let Some((s, l)) = prev {
+            // The new entry is the previous string and one more byte, which follows it in `out`.
+            table.push((s, l + 1));
+            next += 1;
+        }
+        prev = Some((start, len));
+        width = match next + 1 {
+            n if n >= 2048 => 12,
+            n if n >= 1024 => 11,
+            n if n >= 512 => 10,
+            _ => 9,
+        };
+        if out.len() > want + 65536 {
+            return Err("an LZW strip runs past its size".into());
+        }
+    }
+}
+
+fn packbits(input: &[u8], want: usize) -> Vec<u8> {
+    let mut o = Vec::with_capacity(want);
+    let mut i = 0;
+    while i < input.len() && o.len() < want {
+        let n = input[i] as i8;
+        i += 1;
+        if n >= 0 {
+            let l = n as usize + 1;
+            o.extend_from_slice(&input[i..(i + l).min(input.len())]);
+            i += l;
+        } else if n != -128 {
+            if let Some(b) = input.get(i) {
+                o.extend(std::iter::repeat(*b).take(1 - n as isize as usize));
+            }
+            i += 1;
+        }
+    }
+    o
+}
+
+impl Image {
+    fn chunk(&mut self, idx: usize) -> Result<usize, String> {
+        if let Some(p) = self.cache.iter().position(|c| c.0 == idx) {
+            return Ok(p);
+        }
+        let (off, n) = (*self.offsets.get(idx).ok_or("past the last strip")?, *self.counts.get(idx).ok_or("past the last strip")?);
+        let across = if self.planar == 2 { 1 } else { self.bands };
+        let bytes = self.bits / 8;
+        // A last strip may be shorter; a sparse tile has no bytes.
+        let want = self.chunk_w * self.chunk_h * across * bytes;
+        let mut d = if off == 0 || n == 0 {
+            vec![0u8; want]
+        } else {
+            let raw = self.t.bytes(off, n)?;
+            match self.compression {
+                1 => raw,
+                5 => lzw(&raw, want)?,
+                8 | 32946 => {
+                    let mut o = Vec::with_capacity(want);
+                    flate2::read::ZlibDecoder::new(&raw[..]).take(want as u64 * 2 + 1024).read_to_end(&mut o).map_err(|e| format!("bad deflate data: {}", e))?;
+                    o
+                }
+                _ => packbits(&raw, want),
+            }
+        };
+        if !self.tiled && d.len() < want {
+            d.resize(want, 0);
+        }
+        if d.len() < want {
+            return Err(format!("tile {} is short: {} bytes for {}", idx, d.len(), want));
+        }
+        let row = self.chunk_w * across * bytes;
+        match self.predictor {
+            1 => {}
+            2 => {
+                for r in d.chunks_exact_mut(row) {
+                    match bytes {
+                        1 => {
+                            for i in across..r.len() {
+                                r[i] = r[i].wrapping_add(r[i - across]);
+                            }
+                        }
+                        2 => {
+                            for i in across..r.len() / 2 {
+                                let a = self.u16_at(r, i - across);
+                                let b = self.u16_at(r, i);
+                                let v = a.wrapping_add(b);
+                                let e = if self.t.le { v.to_le_bytes() } else { v.to_be_bytes() };
+                                r[i * 2..i * 2 + 2].copy_from_slice(&e);
+                            }
+                        }
+                        _ => {
+                            for i in across..r.len() / 4 {
+                                let (a, b) = (self.t.num(&r[(i - across) * 4..(i - across) * 4 + 4]) as u32, self.t.num(&r[i * 4..i * 4 + 4]) as u32);
+                                let v = a.wrapping_add(b);
+                                let e = if self.t.le { v.to_le_bytes() } else { v.to_be_bytes() };
+                                r[i * 4..i * 4 + 4].copy_from_slice(&e);
+                            }
+                        }
+                    }
+                }
+            }
+            3 => {
+                // Floating point: bytes differenced across the row, then split by significance.
+                for r in d.chunks_exact_mut(row) {
+                    for i in across..r.len() {
+                        r[i] = r[i].wrapping_add(r[i - across]);
+                    }
+                    let n = r.len() / bytes;
+                    let t = r.to_vec();
+                    for i in 0..n {
+                        for b in 0..bytes {
+                            let at = if self.t.le { bytes - 1 - b } else { b };
+                            r[i * bytes + at] = t[b * n + i];
+                        }
+                    }
+                }
+            }
+            o => return Err(format!("predictor {} is not known", o)),
+        }
+        if self.cache.len() >= 16 {
+            self.cache.remove(0);
+        }
+        self.cache.push((idx, d));
+        Ok(self.cache.len() - 1)
+    }
+
+    fn u16_at(&self, r: &[u8], i: usize) -> u16 {
+        self.t.num(&r[i * 2..i * 2 + 2]) as u16
+    }
+
+    fn read(&mut self, col: usize, row: usize, band: usize) -> Result<f64, String> {
+        let across = self.w.div_ceil(self.chunk_w);
+        let per_band = if self.tiled { self.h.div_ceil(self.chunk_h) * across } else { self.h.div_ceil(self.chunk_h) };
+        let local = if self.tiled { (row / self.chunk_h) * across + col / self.chunk_w } else { row / self.chunk_h };
+        let idx = if self.planar == 2 { band * per_band + local } else { local };
+        let p = self.chunk(idx)?;
+        let (cx, cy) = (col % self.chunk_w, row % self.chunk_h);
+        let bytes = self.bits / 8;
+        let (at, width) = if self.planar == 2 { (cy * self.chunk_w + cx, 1) } else { ((cy * self.chunk_w + cx) * self.bands + band, self.bands) };
+        let _ = width;
+        let b = self.cache[p].1.get(at * bytes..(at + 1) * bytes).ok_or("a strip is short")?.to_vec();
+        let n = self.t.num(&b);
+        Ok(match (self.sample, self.bits) {
+            (Sample::U, _) => n as f64,
+            (Sample::I, 8) => n as u8 as i8 as f64,
+            (Sample::I, 16) => n as u16 as i16 as f64,
+            (Sample::I, _) => n as u32 as i32 as f64,
+            (Sample::F, 32) => f32::from_bits(n as u32) as f64,
+            (Sample::F, _) => f64::from_bits(n),
+        })
+    }
+
+    fn is_nodata(&self, v: f64) -> bool {
+        v.is_nan() || self.nodata.map(|n| (n - v).abs() < 1e-6 * n.abs().max(1.0)).unwrap_or(false)
+    }
+
+    fn to_pixel(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
+        let g = self.gt.ok_or("this TIFF has no georeferencing: no tie points or transformation")?;
+        let det = g[0] * g[4] - g[1] * g[3];
+        if det == 0.0 {
+            return Err("the georeferencing has no inverse".into());
+        }
+        let (dx, dy) = (x - g[2], y - g[5]);
+        Ok(((g[4] * dx - g[1] * dy) / det, (g[0] * dy - g[3] * dx) / det))
+    }
+
+    fn to_model(&self, col: f64, row: f64) -> Option<(f64, f64)> {
+        self.gt.map(|g| (g[0] * col + g[1] * row + g[2], g[3] * col + g[4] * row + g[5]))
+    }
+
+    // The model's corners of the pixel grid, whatever way it is turned.
+    fn bounds(&self) -> Option<[f64; 4]> {
+        let m = if self.point { -0.5 } else { 0.0 };
+        let (w, h) = (self.w as f64 + m, self.h as f64 + m);
+        let c = [self.to_model(m, m)?, self.to_model(w, m)?, self.to_model(m, h)?, self.to_model(w, h)?];
+        Some([
+            c.iter().map(|p| p.0).fold(f64::MAX, f64::min), c.iter().map(|p| p.1).fold(f64::MAX, f64::min),
+            c.iter().map(|p| p.0).fold(f64::MIN, f64::max), c.iter().map(|p| p.1).fold(f64::MIN, f64::max),
+        ])
+    }
+
+    fn pixel_of(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
+        let (c, r) = self.to_pixel(x, y)?;
+        // In area files a pixel's integer position is its corner, in point files its centre.
+        Ok(if self.point { (c, r) } else { (c - 0.5, r - 0.5) })
+    }
+
+    fn value_at(&mut self, x: f64, y: f64, band: usize, bilinear: bool) -> Result<Value, String> {
+        let (c, r) = self.pixel_of(x, y)?;
+        let (col, row) = (c.round(), r.round());
+        if col < 0.0 || row < 0.0 || col >= self.w as f64 || row >= self.h as f64 {
+            return Ok(json!({ "inside": false, "value": null, "column": null, "row": null, "nodata": false }));
+        }
+        let (col, row) = (col as usize, row as usize);
+        if bilinear {
+            let (x0, y0) = (c.floor().clamp(0.0, self.w as f64 - 1.0), r.floor().clamp(0.0, self.h as f64 - 1.0));
+            let (x1, y1) = ((x0 + 1.0).min(self.w as f64 - 1.0), (y0 + 1.0).min(self.h as f64 - 1.0));
+            let (fx, fy) = ((c - x0).clamp(0.0, 1.0), (r - y0).clamp(0.0, 1.0));
+            let mut total = 0.0;
+            let mut weight = 0.0;
+            for (cx, cy, w) in [(x0, y0, (1.0 - fx) * (1.0 - fy)), (x1, y0, fx * (1.0 - fy)), (x0, y1, (1.0 - fx) * fy), (x1, y1, fx * fy)] {
+                let v = self.read(cx as usize, cy as usize, band)?;
+                if !self.is_nodata(v) && w > 0.0 {
+                    total += v * w;
+                    weight += w;
+                }
+            }
+            if weight == 0.0 {
+                return Ok(json!({ "inside": true, "value": null, "column": col, "row": row, "nodata": true }));
+            }
+            return Ok(json!({ "inside": true, "value": (total / weight * 1e6).round() / 1e6, "column": col, "row": row, "nodata": false }));
+        }
+        let v = self.read(col, row, band)?;
+        let nd = self.is_nodata(v);
+        Ok(json!({ "inside": true, "value": if nd { Value::Null } else { json!(v) }, "column": col, "row": row, "nodata": nd }))
+    }
+}
+
+fn crs(im: &Image) -> Value {
+    let k = |id: u16| im.keys.get(&id).and_then(|v| v.as_i64());
+    let (proj, geo) = (k(3072).filter(|v| *v != 32767 && *v != 0), k(2048).filter(|v| *v != 32767 && *v != 0));
+    let model = match k(1024) {
+        Some(1) => "projected",
+        Some(2) => "geographic",
+        Some(3) => "geocentric",
+        _ => "unknown",
+    };
+    let code = proj.or(geo);
+    let citation = im.keys.get(&1026).or(im.keys.get(&3073)).or(im.keys.get(&2049)).cloned().unwrap_or(Value::Null);
+    let units = match k(3076).or(k(2054)) {
+        Some(9001) => json!("metre"),
+        Some(9002) => json!("foot"),
+        Some(9003) => json!("US survey foot"),
+        Some(9102) => json!("degree"),
+        _ => if code.is_some() && model == "geographic" { json!("degree") } else if model == "projected" { json!("metre") } else { Value::Null },
+    };
+    json!({ "model": model, "epsg": code, "name": code.map(|c| format!("EPSG:{}", c)), "citation": citation, "units": units })
+}
+
+const TAG_NAMES: &[(u16, &str)] = &[
+    (254, "NewSubfileType"), (256, "ImageWidth"), (257, "ImageLength"), (258, "BitsPerSample"), (259, "Compression"), (262, "PhotometricInterpretation"),
+    (270, "ImageDescription"), (273, "StripOffsets"), (277, "SamplesPerPixel"), (278, "RowsPerStrip"), (279, "StripByteCounts"), (284, "PlanarConfiguration"), (305, "Software"), (306, "DateTime"),
+    (317, "Predictor"), (322, "TileWidth"), (323, "TileLength"), (324, "TileOffsets"), (325, "TileByteCounts"), (339, "SampleFormat"),
+    (33550, "ModelPixelScale"), (33922, "ModelTiepoint"), (34264, "ModelTransformation"), (34735, "GeoKeyDirectory"), (34736, "GeoDoubleParams"), (34737, "GeoAsciiParams"),
+    (42112, "GDAL_METADATA"), (42113, "GDAL_NODATA"),
+];
+
+/// A file described: { width, height, bands, bits, sample, compression, layout, byte_order, nodata, crs, pixel_is, scale, tie_point, bounds, center, overviews }. `bounds` is [west, south, east, north] in the file's own units, whatever way the grid is turned.
+pub fn geotiff_info(path: &str) -> Result<Value, String> {
+    let mut im = open(path)?;
+    let scale = im.t.nums(33550)?;
+    let ties = im.t.nums(33922)?;
+    let b = im.bounds();
+    Ok(json!({
+        "width": im.w, "height": im.h, "bands": im.bands, "bits": im.bits,
+        "sample": match im.sample { Sample::U => "unsigned", Sample::I => "signed", Sample::F => "float" },
+        "compression": match im.compression { 1 => "none", 5 => "lzw", 8 | 32946 => "deflate", _ => "packbits" }, "predictor": im.predictor,
+        "layout": if im.tiled { "tiles" } else { "strips" }, "chunk": [im.chunk_w, im.chunk_h], "chunks": im.offsets.len(),
+        "byte_order": if im.t.le { "little" } else { "big" }, "nodata": im.nodata, "crs": crs(&im), "pixel_is": if im.point { "point" } else { "area" },
+        "scale": if scale.is_empty() { Value::Null } else { json!(scale) }, "tie_point": if ties.is_empty() { Value::Null } else { json!(ties) },
+        "bounds": b, "center": b.map(|b| [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0]), "overviews": im.t.ifds - 1,
+    }))
+}
+
+/// Every tag of the first image by name with its value, long lists cut to their length, and the GeoKeys by number: for looking at a file that will not read.
+pub fn geotiff_tags(path: &str) -> Result<Value, String> {
+    let mut t = Tiff::open(path)?;
+    let mut ids: Vec<u16> = t.tags.keys().copied().collect();
+    ids.sort();
+    let mut o = Map::new();
+    for id in ids {
+        let name = TAG_NAMES.iter().find(|n| n.0 == id).map(|n| n.1.to_string()).unwrap_or(format!("tag {}", id));
+        let (kind, count) = (t.tags[&id].kind, t.tags[&id].count);
+        let v = if kind == 2 {
+            json!(t.text(id)?.unwrap_or_default().chars().take(200).collect::<String>())
+        } else if count > 32 {
+            json!(format!("{} values", count))
+        } else {
+            let n = t.nums(id)?;
+            if n.len() == 1 { json!(n[0]) } else { json!(n) }
+        };
+        o.insert(name, v);
+    }
+    Ok(Value::Object(o))
+}
+
+fn band_of(options: &Value, im: &Image) -> Result<usize, String> {
+    let b = options.get("band").and_then(|v| v.as_i64()).unwrap_or(1);
+    if b < 1 || b as usize > im.bands {
+        return Err(format!("band {} does not exist: this file has {}", b, im.bands));
+    }
+    Ok(b as usize - 1)
+}
+
+/// The value at a coordinate in the file's own units: { inside, value, column, row, nodata }. A point off the image is `inside` false and a no-data cell `nodata` true, neither an error. `options`: { band (from 1), method: "nearest" or "bilinear" }. Reprojection is the caller's: a UTM file wants UTM.
+pub fn geotiff_value(path: &str, x: f64, y: f64, options: serde_json::Value) -> Result<Value, String> {
+    let mut im = open(path)?;
+    let band = band_of(&options, &im)?;
+    let method = options.get("method").and_then(|v| v.as_str()).unwrap_or("nearest");
+    if !matches!(method, "nearest" | "bilinear") {
+        return Err(format!("no method `{}`; there are nearest and bilinear", method));
+    }
+    im.value_at(x, y, band, method == "bilinear")
+}
+
+/// One cell by column and row, from 0 at the top left.
+pub fn geotiff_pixel(path: &str, column: i64, row: i64, band: i64) -> Result<Value, String> {
+    let mut im = open(path)?;
+    if column < 0 || row < 0 || column as usize >= im.w || row as usize >= im.h {
+        return Err(format!("({}, {}) is off the {} by {} image", column, row, im.w, im.h));
+    }
+    let b = band_of(&json!({ "band": band }), &im)?;
+    let v = im.read(column as usize, row as usize, b)?;
+    Ok(if im.is_nodata(v) { Value::Null } else { json!(v) })
+}
+
+/// Elevations along a line of [x, y] points at `samples` even steps, for a hike's profile: { points: [{ x, y, value, distance }], min, max, gain, loss }. `distance` is in the file's units, so degrees in a geographic file. No-data cells count in no sum.
+pub fn geotiff_profile(path: &str, line: serde_json::Value, samples: i64) -> Result<Value, String> {
+    let mut im = open(path)?;
+    if !(2..=100_000).contains(&samples) {
+        return Err(format!("samples is 2 to 100000, not {}", samples));
+    }
+    let pts: Vec<(f64, f64)> = line.as_array().ok_or("give the line as a list of [x, y]")?.iter().map(|p| Ok((p.get(0).and_then(|v| v.as_f64()).ok_or("a point is [x, y]")?, p.get(1).and_then(|v| v.as_f64()).ok_or("a point is [x, y]")?))).collect::<Result<_, String>>()?;
+    if pts.len() < 2 {
+        return Err("a line has at least two points".into());
+    }
+    let lens: Vec<f64> = pts.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).collect();
+    let total: f64 = lens.iter().sum();
+    let mut out = vec![];
+    let (mut gain, mut loss) = (0.0, 0.0);
+    let mut last: Option<f64> = None;
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for i in 0..samples {
+        let d = total * i as f64 / (samples - 1) as f64;
+        let (mut rest, mut seg) = (d, 0);
+        while seg + 1 < lens.len() && rest > lens[seg] {
+            rest -= lens[seg];
+            seg += 1;
+        }
+        let f = if lens[seg] > 0.0 { rest / lens[seg] } else { 0.0 };
+        let (x, y) = (pts[seg].0 + (pts[seg + 1].0 - pts[seg].0) * f, pts[seg].1 + (pts[seg + 1].1 - pts[seg].1) * f);
+        let v = im.value_at(x, y, 0, true)?["value"].as_f64();
+        if let Some(v) = v {
+            lo = lo.min(v);
+            hi = hi.max(v);
+            if let Some(l) = last {
+                if v > l { gain += v - l } else { loss += l - v }
+            }
+            last = Some(v);
+        }
+        out.push(json!({ "x": x, "y": y, "value": v, "distance": (d * 1e6).round() / 1e6 }));
+    }
+    let r = |x: f64| (x * 1e3).round() / 1e3;
+    Ok(json!({ "points": out, "min": if lo == f64::MAX { Value::Null } else { json!(lo) }, "max": if hi == f64::MIN { Value::Null } else { json!(hi) }, "gain": r(gain), "loss": r(loss) }))
+}
+
+/// Statistics of a band over every cell: { min, max, mean, stddev, cells, nodata }. It reads the whole image, so it is refused past 400 million cells.
+pub fn geotiff_stats(path: &str, band: i64) -> Result<Value, String> {
+    let mut im = open(path)?;
+    if im.w as u64 * im.h as u64 > 400_000_000 {
+        return Err(format!("{} by {} is too much to read at once", im.w, im.h));
+    }
+    let b = band_of(&json!({ "band": band }), &im)?;
+    let (mut n, mut nd, mut sum, mut sq) = (0u64, 0u64, 0f64, 0f64);
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for r in 0..im.h {
+        for c in 0..im.w {
+            let v = im.read(c, r, b)?;
+            if im.is_nodata(v) {
+                nd += 1;
+            } else {
+                n += 1;
+                sum += v;
+                sq += v * v;
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+    }
+    if n == 0 {
+        return Ok(json!({ "min": null, "max": null, "mean": null, "stddev": null, "cells": 0, "nodata": nd }));
+    }
+    let mean = sum / n as f64;
+    Ok(json!({ "min": lo, "max": hi, "mean": (mean * 1e6).round() / 1e6, "stddev": ((sq / n as f64 - mean * mean).max(0.0).sqrt() * 1e6).round() / 1e6, "cells": n, "nodata": nd }))
+}

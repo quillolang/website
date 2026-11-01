@@ -1,0 +1,312 @@
+//! Prometheus's HTTP API (and Thanos, Mimir and VictoriaMetrics, which answer the same): instant and range queries with vector and matrix results flattened into rows, label names and values, series, targets, alerts and rules, label values escaped for PromQL, and error bodies turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// PROMETHEUS_API_URL is the server (http://localhost:9090 when not set). PROMETHEUS_TOKEN sends a
+// bearer token; PROMETHEUS_USERNAME with PROMETHEUS_PASSWORD sends basic auth.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("PROMETHEUS_API_URL").unwrap_or_else(|| "http://localhost:9090".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn form(params: &[(String, String)]) -> String {
+    params.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+fn authed(req: ureq::Request) -> ureq::Request {
+    if let Some(t) = env("PROMETHEUS_TOKEN") {
+        return req.set("Authorization", &format!("Bearer {}", t));
+    }
+    if let (Some(u), Some(p)) = (env("PROMETHEUS_USERNAME"), env("PROMETHEUS_PASSWORD")) {
+        let b = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
+        return req.set("Authorization", &format!("Basic {}", b));
+    }
+    req
+}
+
+/// One call. Prometheus wraps everything in { status, data, errorType, error, warnings }; a query
+/// goes by POST, so a long one is not cut off by a URL limit, as its API allows.
+fn call(path: &str, params: &[(String, String)], post: bool) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let mut url = format!("{}{}", base(), path);
+    let body = form(params);
+    let res = if post {
+        authed(agent.post(&url)).set("Content-Type", "application/x-www-form-urlencoded").send_string(&body)
+    } else {
+        if !body.is_empty() {
+            url = format!("{}?{}", url, body);
+        }
+        authed(agent.get(&url)).call()
+    };
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach Prometheus at {}: {}", base(), e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|_| match status {
+        401 | 403 => format!("Prometheus answered {}: check PROMETHEUS_TOKEN or the username and password", status),
+        _ => format!("Prometheus answered {} with no JSON: {}", status, text.chars().take(200).collect::<String>()),
+    })?;
+    if v["status"] != "success" {
+        return Err(format!("Prometheus refused this ({}): {}", v["errorType"].as_str().unwrap_or("error"), v["error"].as_str().unwrap_or(&text)));
+    }
+    Ok(v)
+}
+
+/// A sample's text as a number; NaN and the infinities have no JSON form, so those are null and
+/// the row keeps them in `text`.
+fn sample(pair: &Value, labels: &Value, out: &mut Vec<Value>) {
+    let text = pair[1].as_str().unwrap_or("");
+    let value = text.parse::<f64>().ok().filter(|f| f.is_finite());
+    let mut row = Map::new();
+    if let Some(n) = labels.get("__name__") {
+        row.insert("metric".into(), n.clone());
+    }
+    let mut rest = labels.as_object().cloned().unwrap_or_default();
+    rest.remove("__name__");
+    row.insert("labels".into(), Value::Object(rest));
+    row.insert("time".into(), pair[0].clone());
+    row.insert("value".into(), value.map_or(Value::Null, |f| json!(f)));
+    if value.is_none() {
+        row.insert("text".into(), json!(text));
+    }
+    out.push(Value::Object(row));
+}
+
+fn flatten(data: &Value) -> Value {
+    let kind = data["resultType"].as_str().unwrap_or("");
+    let mut rows = vec![];
+    match kind {
+        "vector" => {
+            for s in data["result"].as_array().into_iter().flatten() {
+                if s.get("histogram").is_some() {
+                    rows.push(json!({ "labels": s["metric"], "time": s["histogram"][0], "histogram": s["histogram"][1] }));
+                } else {
+                    sample(&s["value"], &s["metric"], &mut rows);
+                }
+            }
+        }
+        "matrix" => {
+            for s in data["result"].as_array().into_iter().flatten() {
+                for p in s["values"].as_array().into_iter().flatten() {
+                    sample(p, &s["metric"], &mut rows);
+                }
+                for h in s["histograms"].as_array().into_iter().flatten() {
+                    rows.push(json!({ "labels": s["metric"], "time": h[0], "histogram": h[1] }));
+                }
+            }
+        }
+        "scalar" => sample(&data["result"], &json!({}), &mut rows),
+        "string" => rows.push(json!({ "labels": {}, "time": data["result"][0], "value": data["result"][1] })),
+        _ => {}
+    }
+    Value::Array(rows)
+}
+
+fn shaped(v: &Value) -> Value {
+    let series = v["data"]["result"].as_array().map_or(1, |a| a.len());
+    let mut o = json!({ "type": v["data"]["resultType"], "series": series, "rows": flatten(&v["data"]) });
+    if let Some(w) = v.get("warnings") {
+        o["warnings"] = w.clone();
+    }
+    if let Some(w) = v.get("infos") {
+        o["infos"] = w.clone();
+    }
+    o
+}
+
+fn time_text(t: &Value) -> Option<String> {
+    match t {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn add_time(p: &mut Vec<(String, String)>, k: &str, t: &Value) {
+    if let Some(s) = time_text(t) {
+        p.push((k.into(), s));
+    }
+}
+
+/// An instant query at `time` (RFC 3339 text or a Unix time; null for now). Gives `{ type, series, rows, warnings }`, each row `{ metric, labels, time, value }`, a float, or null with `text` for NaN and Inf.
+pub fn prom_query(query: &str, time: serde_json::Value) -> Result<Value, String> {
+    let mut p = vec![("query".to_string(), query.to_string())];
+    add_time(&mut p, "time", &time);
+    Ok(shaped(&call("/api/v1/query", &p, true)?))
+}
+
+/// A range query from `start` to `end` every `step` ("15s", "1m", or seconds): the matrix flattened to one row per sample, as for `prom_query`, with `series` saying how many series there were.
+pub fn prom_range(query: &str, start: serde_json::Value, end: serde_json::Value, step: serde_json::Value) -> Result<Value, String> {
+    let step = time_text(&step).ok_or("a range query needs a step, like \"1m\" or 60")?;
+    let mut p = vec![("query".to_string(), query.to_string())];
+    add_time(&mut p, "start", &start);
+    add_time(&mut p, "end", &end);
+    p.push(("step".to_string(), step));
+    if p.len() < 4 {
+        return Err("a range query needs a start and an end, as RFC 3339 text or Unix times".into());
+    }
+    Ok(shaped(&call("/api/v1/query_range", &p, true)?))
+}
+
+/// One number from an instant query, for a check or a page: an error when the query gives no series or more than one, and when the value is NaN or infinite.
+pub fn prom_value(query: &str) -> Result<f64, String> {
+    let r = prom_query(query, Value::Null)?;
+    let rows = r["rows"].as_array().cloned().unwrap_or_default();
+    match rows.len() {
+        0 => Err(format!("no series for {}", query)),
+        1 => rows[0]["value"].as_f64().ok_or(format!("{} is {}", query, rows[0]["text"].as_str().unwrap_or("not a number"))),
+        n => Err(format!("{} gives {} series, not one: aggregate it, with sum() for example", query, n)),
+    }
+}
+
+fn matchers(matches: &Value) -> Result<Vec<(String, String)>, String> {
+    match matches {
+        Value::Null => Ok(vec![]),
+        Value::String(s) if s.is_empty() => Ok(vec![]),
+        Value::String(s) => Ok(vec![("match[]".to_string(), s.clone())]),
+        Value::Array(a) => a.iter().map(|m| m.as_str().map(|s| ("match[]".to_string(), s.to_string())).ok_or("series selectors are texts".to_string())).collect(),
+        _ => Err("series selectors are a text or a list of texts, like up{job=\"api\"}".into()),
+    }
+}
+
+/// The label names in use, among the series `matches` selects (a selector, a list of them, or null for all).
+pub fn prom_labels(matches: serde_json::Value) -> Result<Value, String> {
+    Ok(call("/api/v1/labels", &matchers(&matches)?, true)?["data"].clone())
+}
+
+/// The values of label `name`, among the series `matches` selects (a selector, a list, or null for all).
+pub fn prom_label_values(name: &str, matches: serde_json::Value) -> Result<Value, String> {
+    if !valid_label(name) {
+        return Err(format!("{:?} is not a label name: letters, digits and _, not starting with a digit", name));
+    }
+    Ok(call(&format!("/api/v1/label/{}/values", name), &matchers(&matches)?, false)?["data"].clone())
+}
+
+/// The series `matches` selects (at least one selector), each a map of its labels, between `start` and `end` (null for the server's default).
+pub fn prom_series(matches: serde_json::Value, start: serde_json::Value, end: serde_json::Value) -> Result<Value, String> {
+    let mut p = matchers(&matches)?;
+    if p.is_empty() {
+        return Err("Prometheus needs at least one selector here, like up{job=\"api\"}".into());
+    }
+    add_time(&mut p, "start", &start);
+    add_time(&mut p, "end", &end);
+    Ok(call("/api/v1/series", &p, true)?["data"].clone())
+}
+
+/// The scrape targets, `state` "active", "dropped", "any" or "": `{ active: [{ job, instance, health, last_error, last_scrape, scrape_url, labels }], dropped, down }`, `down` counting those not "up".
+pub fn prom_targets(state: &str) -> Result<Value, String> {
+    let p = if state.is_empty() { vec![] } else { vec![("state".to_string(), state.to_string())] };
+    let d = call("/api/v1/targets", &p, false)?["data"].take();
+    let active: Vec<Value> = d["activeTargets"].as_array().into_iter().flatten().map(|t| json!({
+        "job": t["labels"]["job"], "instance": t["labels"]["instance"], "health": t["health"], "last_error": t["lastError"],
+        "last_scrape": t["lastScrape"], "scrape_url": t["scrapeUrl"], "labels": t["labels"],
+    })).collect();
+    let down = active.iter().filter(|t| t["health"] != "up").count();
+    Ok(json!({ "active": active, "dropped": d["droppedTargets"].as_array().map_or(0, |a| a.len()), "down": down }))
+}
+
+/// The alerts now pending or firing, `state` "firing", "pending" or "" for both: each `{ name, state, value, labels, annotations, active_at }`, with `value` a number.
+pub fn prom_alerts(state: &str) -> Result<Vec<Value>, String> {
+    let d = call("/api/v1/alerts", &[], false)?;
+    Ok(d["data"]["alerts"].as_array().into_iter().flatten().filter(|a| state.is_empty() || a["state"] == state).map(|a| {
+        let value = a["value"].as_str().and_then(|s| s.parse::<f64>().ok()).filter(|f| f.is_finite());
+        json!({ "name": a["labels"]["alertname"], "state": a["state"], "value": value, "labels": a["labels"], "annotations": a["annotations"], "active_at": a["activeAt"] })
+    }).collect())
+}
+
+/// The recording and alerting rules, `kind` "alert", "record" or "": each `{ group, name, type, state, health, query, last_error }`.
+pub fn prom_rules(kind: &str) -> Result<Vec<Value>, String> {
+    let p = if kind.is_empty() { vec![] } else { vec![("type".to_string(), kind.to_string())] };
+    let d = call("/api/v1/rules", &p, false)?;
+    let mut out = vec![];
+    for g in d["data"]["groups"].as_array().into_iter().flatten() {
+        for r in g["rules"].as_array().into_iter().flatten() {
+            out.push(json!({ "group": g["name"], "name": r["name"], "type": r["type"], "state": r["state"], "health": r["health"], "query": r["query"], "last_error": r["lastError"] }));
+        }
+    }
+    Ok(out)
+}
+
+fn valid_label(l: &str) -> bool {
+    !l.is_empty() && !l.as_bytes()[0].is_ascii_digit() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// A text as a PromQL string, quotes included: backslashes, double quotes and line breaks escaped, so a visitor's value cannot end the string and add to the query.
+pub fn prom_quote(value: &str) -> String {
+    let mut o = String::with_capacity(value.len() + 2);
+    o.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// A text with the regular expression characters escaped, for inside `=~`: "a.b" becomes `a\.b`.
+pub fn prom_regex_escape(value: &str) -> String {
+    let mut o = String::new();
+    for c in value.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            o.push('\\');
+        }
+        o.push(c);
+    }
+    o
+}
+
+/// A selector from a metric name and a map of labels, each value escaped: `prom_selector("http_requests_total", { job: "api", code: ["500", "503"], path: { "!~": "/health.*" } })`. A text means `=`, a list is any of its values (`=~`), and a map of one entry names the operator (`=`, `!=`, `=~`, `!~`).
+pub fn prom_selector(metric: &str, labels: serde_json::Value) -> Result<String, String> {
+    let mut parts = vec![];
+    for (k, v) in labels.as_object().ok_or("labels are a map")? {
+        if !valid_label(k) {
+            return Err(format!("{:?} is not a label name: letters, digits and _, not starting with a digit", k));
+        }
+        match v {
+            Value::String(s) => parts.push(format!("{}={}", k, prom_quote(s))),
+            Value::Number(_) | Value::Bool(_) => parts.push(format!("{}={}", k, prom_quote(&v.to_string()))),
+            Value::Array(a) => {
+                let any: Vec<String> = a.iter().map(|x| prom_regex_escape(&x.as_str().map_or(x.to_string(), str::to_string))).collect();
+                if any.is_empty() {
+                    return Err(format!("label {} has an empty list of values", k));
+                }
+                parts.push(format!("{}=~{}", k, prom_quote(&any.join("|"))));
+            }
+            Value::Object(m) if m.len() == 1 => {
+                let (op, x) = m.iter().next().unwrap();
+                if !["=", "!=", "=~", "!~"].contains(&op.as_str()) {
+                    return Err(format!("{:?} is not a label operator: use =, !=, =~ or !~", op));
+                }
+                parts.push(format!("{}{}{}", k, op, prom_quote(x.as_str().ok_or("a label's value is a text")?)));
+            }
+            _ => return Err(format!("label {} must be a text, a list, or a map of one operator", k)),
+        }
+    }
+    if metric.is_empty() && parts.is_empty() {
+        return Err("a selector needs a metric name or a label".into());
+    }
+    Ok(format!("{}{{{}}}", metric, parts.join(",")))
+}

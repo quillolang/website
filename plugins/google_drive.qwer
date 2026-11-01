@@ -1,0 +1,388 @@
+//! Google Drive's v3 API: files listed with queries and page tokens, uploads by multipart or by a resumable session that recovers from a lost piece, downloads and exports of Google Docs, sharing, folders and deletes, shared drives, retries on rate limits, and sign-in by a service account's RS256 JWT, kept until it expires, acting for a user if told to.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// GOOGLE_DRIVE_API_URL is the API (https://www.googleapis.com when not set).
+// GOOGLE_SERVICE_ACCOUNT_JSON holds the service account's JSON, or GOOGLE_APPLICATION_CREDENTIALS
+// its file. GOOGLE_IMPERSONATE names a user to act as, with domain-wide delegation.
+
+const SCOPE: &str = "https://www.googleapis.com/auth/drive";
+const FIELDS: &str = "id,name,mimeType,size,parents,modifiedTime,md5Checksum,webViewLink";
+const PIECE: usize = 256 * 1024;
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn credentials() -> Result<Value, String> {
+    let text = match (env("GOOGLE_SERVICE_ACCOUNT_JSON"), env("GOOGLE_APPLICATION_CREDENTIALS")) {
+        (Some(t), _) => t,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS".into()),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn token() -> Result<String, String> {
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    let sa = credentials()?;
+    let uri = sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let mut claims = json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": uri, "iat": t, "exp": t + 3600 });
+    if let Some(u) = env("GOOGLE_IMPERSONATE") {
+        claims["sub"] = json!(u);
+    }
+    let jwt = jsonwebtoken::encode(&head, &claims, &key).map_err(|e| e.to_string())?;
+    let res = ureq::post(&uri).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("the token server answered {}: {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach the token server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), t + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(tok)
+}
+
+fn base() -> String {
+    env("GOOGLE_DRIVE_API_URL").unwrap_or_else(|| "https://www.googleapis.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, v: &Value) -> String {
+    let e = &v["error"];
+    format!("Drive answered {} {}: {}", status, e["errors"][0]["reason"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or(""))
+}
+
+enum Sent<'a> {
+    Nothing,
+    Json(&'a Value),
+    Raw(&'a str, &'a [u8]),
+}
+
+/// One request with retries on what Drive says will pass: 429, 5xx, and its 403 rate limits.
+fn raw(method: &str, url: &str, body: Sent) -> Result<Result<ureq::Response, (u16, Value)>, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
+    for attempt in 0..5 {
+        let req = agent.request(method, url).set("Authorization", &format!("Bearer {}", token()?));
+        let res = match &body {
+            Sent::Nothing => req.call(),
+            Sent::Json(v) => req.set("Content-Type", "application/json; charset=UTF-8").send_string(&v.to_string()),
+            Sent::Raw(k, b) => req.set("Content-Type", k).send_bytes(b),
+        };
+        match res {
+            Ok(r) => return Ok(Ok(r)),
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(json!({ "error": { "message": t } }));
+                let reason = v["error"]["errors"][0]["reason"].as_str().unwrap_or("");
+                if attempt < 4 && (c == 429 || c >= 500 || reason == "rateLimitExceeded" || reason == "userRateLimitExceeded") {
+                    std::thread::sleep(Duration::from_millis(300 << attempt));
+                    continue;
+                }
+                return Ok(Err((c, v)));
+            }
+            Err(e) => return Err(format!("cannot reach Drive at {}: {}", base(), e)),
+        }
+    }
+    Err("Drive stayed busy through five tries".into())
+}
+
+fn json_of(r: ureq::Response) -> Result<Value, String> {
+    let t = r.into_string().map_err(|e| e.to_string())?;
+    if t.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&t).map_err(|e| e.to_string())
+}
+
+fn call(method: &str, path: &str, body: Sent) -> Result<Value, String> {
+    match raw(method, &format!("{}{}", base(), path), body)? {
+        Ok(r) => json_of(r),
+        Err((c, v)) => Err(error_text(c, &v)),
+    }
+}
+
+/// A text as a value in a Drive query: quotes around it, `'` and `\` escaped. `gdrive_quote("it's")` gives `'it\'s'`.
+pub fn gdrive_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// The query for what is in a folder and not in the trash, with `name` (or "") as an exact name: `'abc' in parents and trashed = false`.
+pub fn gdrive_in_folder(folder_id: &str, name: &str) -> String {
+    let mut q = format!("{} in parents and trashed = false", gdrive_quote(folder_id));
+    if !name.is_empty() {
+        q.push_str(&format!(" and name = {}", gdrive_quote(name)));
+    }
+    q
+}
+
+/// One page of files. `options`: `q` (Drive's search language; see `gdrive_quote`), `page_size`, `page_token`, `order_by` ("modifiedTime desc"), `fields` (of each file), `drive_id` (a shared drive). Gives `{ files, next }`.
+pub fn gdrive_list(options: serde_json::Value) -> Result<Value, String> {
+    let fields = options["fields"].as_str().unwrap_or(FIELDS);
+    let mut p = format!("/drive/v3/files?pageSize={}&fields={}&supportsAllDrives=true&includeItemsFromAllDrives=true", options["page_size"].as_i64().unwrap_or(100).clamp(1, 1000), enc(&format!("nextPageToken,files({})", fields)));
+    for (k, q) in [("q", "q"), ("page_token", "pageToken"), ("order_by", "orderBy")] {
+        if let Some(v) = options[k].as_str().filter(|s| !s.is_empty()) {
+            p.push_str(&format!("&{}={}", q, enc(v)));
+        }
+    }
+    if let Some(d) = options["drive_id"].as_str() {
+        p.push_str(&format!("&corpora=drive&driveId={}", enc(d)));
+    }
+    let r = call("GET", &p, Sent::Nothing)?;
+    Ok(json!({ "files": r["files"], "next": r["nextPageToken"] }))
+}
+
+/// Every file of a search, page after page, up to `max`: `{ files, complete }`.
+pub fn gdrive_list_all(query: &str, max: i64) -> Result<Value, String> {
+    let mut o = json!({ "q": query });
+    let mut out: Vec<Value> = vec![];
+    loop {
+        let r = gdrive_list(o.clone())?;
+        out.extend(r["files"].as_array().cloned().unwrap_or_default());
+        if out.len() as i64 >= max {
+            let more = r["next"].is_string() || out.len() as i64 > max;
+            out.truncate(max.max(0) as usize);
+            return Ok(json!({ "files": out, "complete": !more }));
+        }
+        match r["next"].as_str() {
+            Some(t) => o["page_token"] = json!(t),
+            None => return Ok(json!({ "files": out, "complete": true })),
+        }
+    }
+}
+
+/// A file's metadata, or null when there is none.
+pub fn gdrive_metadata(id: &str) -> Result<Value, String> {
+    match raw("GET", &format!("{}/drive/v3/files/{}?fields={}&supportsAllDrives=true", base(), enc(id), enc(FIELDS)), Sent::Nothing)? {
+        Ok(r) => json_of(r),
+        Err((404, _)) => Ok(Value::Null),
+        Err((c, v)) => Err(error_text(c, &v)),
+    }
+}
+
+fn metadata(name: &str, mime: &str, options: &Value) -> Value {
+    let mut m = if options["metadata"].is_object() { options["metadata"].clone() } else { json!({}) };
+    m["name"] = json!(name);
+    if !mime.is_empty() {
+        m["mimeType"] = json!(mime);
+    }
+    if let Some(p) = options["parents"].as_array() {
+        m["parents"] = Value::Array(p.clone());
+    }
+    m
+}
+
+/// Uploads text as a file by multipart, for small files. `options`: `parents` (folder ids), `metadata` (any other fields). Gives its metadata.
+pub fn gdrive_upload(name: &str, content: &str, mime: &str, options: serde_json::Value) -> Result<Value, String> {
+    let boundary = format!("quillo_{:x}_{:x}", now(), content.len());
+    let meta = metadata(name, mime, &options);
+    let media = if mime.is_empty() { "application/octet-stream" } else { mime };
+    let mut body = format!("--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{m}\r\n--{b}\r\nContent-Type: {t}\r\n\r\n", b = boundary, m = meta, t = media).into_bytes();
+    body.extend_from_slice(content.as_bytes());
+    body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+    let kind = format!("multipart/related; boundary={}", boundary);
+    call("POST", &format!("/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields={}", enc(FIELDS)), Sent::Raw(&kind, &body))
+}
+
+trait Source: Read + Seek {}
+impl<T: Read + Seek> Source for T {}
+
+/// The session's own address goes with each piece; after a lost piece Drive is asked how far it got.
+fn resumable(name: &str, mime: &str, source: &mut dyn Source, size: u64, options: &Value) -> Result<Value, String> {
+    let chunk = options["chunk_kb"].as_i64().unwrap_or(0).max(0) as usize * 1024;
+    let chunk = if chunk == 0 { 16 * PIECE } else { chunk };
+    if chunk % PIECE != 0 {
+        return Err("chunk_kb must be a multiple of 256: Drive takes pieces of 256 KiB and multiples of it".into());
+    }
+    let media = if mime.is_empty() { "application/octet-stream" } else { mime };
+    let start = format!("{}/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields={}", base(), enc(FIELDS));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).redirects(0).build();
+    let meta = metadata(name, mime, options);
+    let res = agent.post(&start).set("Authorization", &format!("Bearer {}", token()?)).set("X-Upload-Content-Type", media).set("X-Upload-Content-Length", &size.to_string()).set("Content-Type", "application/json; charset=UTF-8").send_string(&meta.to_string());
+    let session = match res {
+        Ok(r) => r.header("Location").map(str::to_string).ok_or("Drive gave no upload session")?,
+        Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(Value::Null))),
+        Err(e) => return Err(format!("cannot reach Drive at {}: {}", base(), e)),
+    };
+    let mut buf = vec![0u8; chunk];
+    let (mut offset, mut failures, mut pieces) = (0u64, 0, 0);
+    let moved = |r: &ureq::Response| -> u64 { r.header("Range").and_then(|x| x.rsplit('-').next()).and_then(|n| n.parse::<u64>().ok()).map_or(0, |n| n + 1) };
+    loop {
+        source.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        let mut got = 0;
+        while got < chunk {
+            let n = source.read(&mut buf[got..]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        let range = if size == 0 { "bytes */0".to_string() } else { format!("bytes {}-{}/{}", offset, offset + got as u64 - 1, size) };
+        let res = agent.put(&session).set("Content-Range", &range).send_bytes(&buf[..got]);
+        match res {
+            Ok(r) if r.status() == 308 => {
+                offset = moved(&r);
+                pieces += 1;
+                failures = 0;
+            }
+            Ok(r) => {
+                let mut v = json_of(r)?;
+                v["pieces"] = json!(pieces + 1);
+                return Ok(v);
+            }
+            Err(ureq::Error::Status(404, _)) => return Err("the upload session has expired: start again".into()),
+            Err(ureq::Error::Status(c, r)) if c < 500 && c != 429 => return Err(error_text(c, &serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(Value::Null))),
+            Err(e) => {
+                failures += 1;
+                if failures > 4 {
+                    return Err(format!("the upload failed four times over: {}", e));
+                }
+                std::thread::sleep(Duration::from_millis(300 << failures));
+                // Ask how much arrived: an empty PUT with a range of `*`.
+                match agent.put(&session).set("Content-Range", &format!("bytes */{}", size)).send_bytes(b"") {
+                    Ok(r) if r.status() == 308 => offset = moved(&r),
+                    Ok(r) => return json_of(r),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Uploads text through a resumable session. `options` as for `gdrive_upload`, and `chunk_kb`, a multiple of 256 (4096 when not given). Gives its metadata, with `pieces`.
+pub fn gdrive_upload_resumable(name: &str, content: &str, mime: &str, options: serde_json::Value) -> Result<Value, String> {
+    let bytes = content.as_bytes();
+    resumable(name, mime, &mut Cursor::new(bytes), bytes.len() as u64, &options)
+}
+
+/// Uploads a local file through a resumable session, in pieces, so that it can be of any size.
+pub fn gdrive_upload_file(local: &str, name: &str, mime: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut f = std::fs::File::open(local).map_err(|e| format!("{}: {}", local, e))?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    resumable(name, mime, &mut f, size, &options)
+}
+
+fn bytes_of(url: String) -> Result<Vec<u8>, String> {
+    match raw("GET", &url, Sent::Nothing)? {
+        Ok(r) => {
+            let mut b = Vec::new();
+            r.into_reader().read_to_end(&mut b).map_err(|e| e.to_string())?;
+            Ok(b)
+        }
+        Err((c, v)) => {
+            if v["error"]["errors"][0]["reason"] == "fileNotDownloadable" {
+                return Err("that is a Google Doc: use gdrive_export with a type like text/plain or application/pdf".into());
+            }
+            Err(error_text(c, &v))
+        }
+    }
+}
+
+/// A file's content as text.
+pub fn gdrive_download(id: &str) -> Result<String, String> {
+    let b = bytes_of(format!("{}/drive/v3/files/{}?alt=media&supportsAllDrives=true", base(), enc(id)))?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Saves a file's content to a local path; gives the size.
+pub fn gdrive_download_file(id: &str, local: &str) -> Result<i64, String> {
+    let b = bytes_of(format!("{}/drive/v3/files/{}?alt=media&supportsAllDrives=true", base(), enc(id)))?;
+    std::fs::write(local, &b).map_err(|e| format!("{}: {}", local, e))?;
+    Ok(b.len() as i64)
+}
+
+/// A Google Doc, Sheet or Slide exported as `mime` (text/plain, text/csv, application/pdf...), as text.
+pub fn gdrive_export(id: &str, mime: &str) -> Result<String, String> {
+    let b = bytes_of(format!("{}/drive/v3/files/{}/export?mimeType={}", base(), enc(id), enc(mime)))?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Shares a file. `permission`: `{ role: "reader", "commenter", "writer"..., type: "user", "group", "domain" or "anyone", email, domain }`; `notify` sends the email Drive sends. Gives `{ id, role, type }`.
+pub fn gdrive_share(id: &str, permission: serde_json::Value, notify: bool) -> Result<Value, String> {
+    let kind = permission["type"].as_str().ok_or("a permission needs a `type`: user, group, domain or anyone")?;
+    if !["user", "group", "domain", "anyone"].contains(&kind) {
+        return Err(format!("{:?} is not a permission type: user, group, domain or anyone", kind));
+    }
+    let mut b = json!({ "role": permission["role"].as_str().ok_or("a permission needs a `role`, like reader")?, "type": kind });
+    match kind {
+        "user" | "group" => b["emailAddress"] = json!(permission["email"].as_str().ok_or("this permission needs an `email`")?),
+        "domain" => b["domain"] = json!(permission["domain"].as_str().ok_or("this permission needs a `domain`")?),
+        _ => {}
+    }
+    call("POST", &format!("/drive/v3/files/{}/permissions?sendNotificationEmail={}&supportsAllDrives=true", enc(id), notify), Sent::Json(&b))
+}
+
+/// Who a file is shared with: each `{ id, type, role, emailAddress }`.
+pub fn gdrive_permissions(id: &str) -> Result<Value, String> {
+    Ok(call("GET", &format!("/drive/v3/files/{}/permissions?fields=permissions(id,type,role,emailAddress)&supportsAllDrives=true", enc(id)), Sent::Nothing)?["permissions"].clone())
+}
+
+/// Ends a share by the permission's id.
+pub fn gdrive_unshare(id: &str, permission_id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/drive/v3/files/{}/permissions/{}?supportsAllDrives=true", enc(id), enc(permission_id)), Sent::Nothing)?;
+    Ok(true)
+}
+
+/// Makes a folder inside `parent` ("" for the root), and gives its metadata.
+pub fn gdrive_create_folder(name: &str, parent: &str) -> Result<Value, String> {
+    let mut b = json!({ "name": name, "mimeType": "application/vnd.google-apps.folder" });
+    if !parent.is_empty() {
+        b["parents"] = json!([parent]);
+    }
+    call("POST", &format!("/drive/v3/files?supportsAllDrives=true&fields={}", enc(FIELDS)), Sent::Json(&b))
+}
+
+/// Moves a file to a folder, taking it from `from` ("" leaves it in its other folders too).
+pub fn gdrive_move(id: &str, to: &str, from: &str) -> Result<Value, String> {
+    let mut p = format!("/drive/v3/files/{}?addParents={}&supportsAllDrives=true&fields={}", enc(id), enc(to), enc(FIELDS));
+    if !from.is_empty() {
+        p.push_str(&format!("&removeParents={}", enc(from)));
+    }
+    call("PATCH", &p, Sent::Json(&json!({})))
+}
+
+/// Deletes a file for good, past the trash; false when there was none.
+pub fn gdrive_delete(id: &str) -> Result<bool, String> {
+    match raw("DELETE", &format!("{}/drive/v3/files/{}?supportsAllDrives=true", base(), enc(id)), Sent::Nothing)? {
+        Ok(_) => Ok(true),
+        Err((404, _)) => Ok(false),
+        Err((c, v)) => Err(error_text(c, &v)),
+    }
+}

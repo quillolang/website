@@ -1,0 +1,448 @@
+//! Lock files read into one list of name, version and source: Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock and go.sum, with what changed between two.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! toml = "0.8"
+
+use serde_json::{json, Value};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+fn entry(ecosystem: &str, name: &str, version: &str, source: Option<String>, integrity: Option<String>, dev: bool) -> Value {
+    let kind = source.as_deref().map(source_kind);
+    json!({ "ecosystem": ecosystem, "name": name, "version": version, "source": source, "kind": kind, "integrity": integrity, "dev": dev })
+}
+
+fn source_kind(s: &str) -> &'static str {
+    if s.starts_with("git+") || s.starts_with("git:") || s.starts_with("github:") || s.contains(".git#") || s.contains("codeload.github.com") {
+        "git"
+    } else if s.starts_with("registry+") || s.starts_with("sparse+") || s.contains("registry.npmjs.org") || s.contains("registry.yarnpkg.com") || s == "npm" || s == "pypi" || s == "proxy" {
+        "registry"
+    } else if s.starts_with("file:") || s.starts_with("link:") || s.starts_with("workspace:") || s.starts_with("portal:") || s == "directory" || s == "file" {
+        "path"
+    } else {
+        "url"
+    }
+}
+
+fn read_cargo(text: &str) -> Result<Vec<Value>, String> {
+    let v: toml::Value = text.parse().map_err(|e| format!("Cargo.lock is not TOML: {}", e))?;
+    let list = v.get("package").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let mut out = vec![];
+    let mut sums = BTreeMap::new();
+    // Version 1 kept checksums in a [metadata] table, one key per package.
+    if let Some(m) = v.get("metadata").and_then(|m| m.as_table()) {
+        for (k, x) in m {
+            if let (Some(r), Some(c)) = (k.strip_prefix("checksum "), x.as_str()) {
+                sums.insert(r.to_string(), c.to_string());
+            }
+        }
+    }
+    for p in &list {
+        let name = p.get("name").and_then(|x| x.as_str()).ok_or("a [[package]] has no name")?;
+        let version = p.get("version").and_then(|x| x.as_str()).ok_or("a [[package]] has no version")?;
+        let source = p.get("source").and_then(|x| x.as_str()).map(str::to_string);
+        let key = format!("{} {} ({})", name, version, source.as_deref().unwrap_or(""));
+        let sum = p.get("checksum").and_then(|x| x.as_str()).map(str::to_string).or(sums.get(&key).filter(|c| *c != "<none>").cloned());
+        out.push(entry("cargo", name, version, source.or(Some("path".to_string())).map(|s| if s == "path" { "directory".to_string() } else { s }), sum, false));
+    }
+    Ok(out)
+}
+
+fn walk_npm_v1(deps: &serde_json::Map<String, Value>, out: &mut Vec<Value>, depth: usize) {
+    if depth > 256 {
+        return;
+    }
+    for (name, d) in deps {
+        if let Some(v) = d.get("version").and_then(Value::as_str) {
+            // `version` holds the URL for a git or file dependency.
+            let (ver, src) = if v.contains(':') && !v.starts_with("npm:") { (d["from"].as_str().unwrap_or(v), Some(v.to_string())) } else { (v, d.get("resolved").and_then(Value::as_str).map(str::to_string)) };
+            out.push(entry("npm", name, ver, src, d.get("integrity").and_then(Value::as_str).map(str::to_string), d.get("dev").and_then(Value::as_bool).unwrap_or(false)));
+        }
+        if let Some(n) = d.get("dependencies").and_then(Value::as_object) {
+            walk_npm_v1(n, out, depth + 1);
+        }
+    }
+}
+
+fn read_npm(text: &str) -> Result<Vec<Value>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("package-lock.json is not JSON: {}", e))?;
+    let mut out = vec![];
+    if let Some(p) = v.get("packages").and_then(Value::as_object) {
+        for (path, d) in p {
+            if path.is_empty() || d.get("link").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            // The last node_modules/ says the name: "node_modules/a/node_modules/@s/b" is @s/b.
+            let tail = path.rsplit("node_modules/").next().unwrap_or(path);
+            if !path.contains("node_modules/") {
+                continue; // A workspace's own folder.
+            }
+            let name = d.get("name").and_then(Value::as_str).unwrap_or(tail);
+            let version = d.get("version").and_then(Value::as_str).unwrap_or("");
+            out.push(entry("npm", name, version, d.get("resolved").and_then(Value::as_str).map(str::to_string), d.get("integrity").and_then(Value::as_str).map(str::to_string), d.get("dev").and_then(Value::as_bool).unwrap_or(false)));
+        }
+        return Ok(out);
+    }
+    match v.get("dependencies").and_then(Value::as_object) {
+        Some(d) => walk_npm_v1(d, &mut out, 0),
+        None => return Err("package-lock.json has neither `packages` nor `dependencies`".to_string()),
+    }
+    Ok(out)
+}
+
+fn unquote(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
+/// `@scope/name@npm:^1.0` as `(@scope/name, npm:^1.0)`: the name's own `@` comes first, at index 0.
+fn split_spec(spec: &str) -> (&str, &str) {
+    let from = if spec.starts_with('@') { 1 } else { 0 };
+    match spec[from..].find('@') {
+        Some(i) => (&spec[..from + i], &spec[from + i + 1..]),
+        None => (spec, ""),
+    }
+}
+
+fn read_yarn(text: &str) -> Result<Vec<Value>, String> {
+    let berry = text.contains("__metadata:");
+    let mut out = vec![];
+    let mut heads: Option<String> = None;
+    let (mut version, mut resolved, mut integrity): (Option<String>, Option<String>, Option<String>) = (None, None, None);
+    let mut flush = |h: &mut Option<String>, v: &mut Option<String>, r: &mut Option<String>, i: &mut Option<String>| -> Result<(), String> {
+        if let Some(head) = h.take() {
+            let first = head.split(", ").next().unwrap_or(&head);
+            let first = unquote(first.split(',').next().unwrap_or(first));
+            let (name, range) = split_spec(first);
+            if first != "__metadata" {
+                let version = v.take().ok_or(format!("{} has no version", first))?;
+                if !range.starts_with("workspace:") {
+                    let src = r.take().or_else(|| range.split_once(':').map(|x| x.0.to_string()));
+                    out.push(entry("yarn", name, &version, src, i.take(), false));
+                }
+            }
+        }
+        *v = None;
+        *r = None;
+        *i = None;
+        Ok(())
+    };
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            flush(&mut heads, &mut version, &mut resolved, &mut integrity)?;
+            heads = Some(line.trim_end().trim_end_matches(':').to_string());
+            continue;
+        }
+        if line.starts_with("    ") {
+            continue; // Inside `dependencies:`.
+        }
+        let t = line.trim();
+        if berry {
+            if let Some((k, v)) = t.split_once(": ") {
+                match k {
+                    "version" => version = Some(unquote(v).to_string()),
+                    "resolution" => resolved = Some(split_spec(unquote(v)).1.split(':').next().unwrap_or("").to_string()),
+                    "checksum" => integrity = Some(unquote(v).to_string()),
+                    _ => {}
+                }
+            }
+        } else if let Some((k, v)) = t.split_once(' ') {
+            match k {
+                "version" => version = Some(unquote(v).to_string()),
+                "resolved" => resolved = Some(unquote(v).to_string()),
+                "integrity" => integrity = Some(unquote(v).to_string()),
+                _ => {}
+            }
+        }
+    }
+    flush(&mut heads, &mut version, &mut resolved, &mut integrity)?;
+    drop(flush);
+    Ok(out)
+}
+
+/// Three spellings of a key: `/foo/1.2.3` (v5), `/foo@1.2.3` (v6), `foo@1.2.3` (v9), each perhaps with `(peer@1)` or `_peer@1`.
+fn pnpm_key(key: &str) -> Option<(String, String)> {
+    let k = key.trim().trim_end_matches(':').trim_matches(|c| c == '\'' || c == '"');
+    let k = k.split('(').next().unwrap_or(k);
+    let Some(k) = k.strip_prefix('/') else {
+        let (name, ver) = split_spec(k);
+        return if ver.is_empty() { None } else { Some((name.to_string(), ver.to_string())) };
+    };
+    let scoped = k.starts_with('@');
+    let (name, ver) = split_spec(k);
+    if !ver.is_empty() && name.matches('/').count() == usize::from(scoped) {
+        return Some((name.to_string(), ver.split('_').next().unwrap_or(ver).to_string()));
+    }
+    let segs: Vec<&str> = k.splitn(if scoped { 3 } else { 2 }, '/').collect();
+    let (name, ver) = if scoped { (format!("{}/{}", segs[0], segs.get(1)?), *segs.get(2)?) } else { (segs[0].to_string(), *segs.get(1)?) };
+    Some((name, ver.split('_').next().unwrap_or(ver).to_string()))
+}
+
+fn read_pnpm(text: &str) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = vec![];
+    let mut section = "";
+    let mut cur: Option<(String, String, Option<String>, Option<String>, bool)> = None;
+    let push = |c: &mut Option<(String, String, Option<String>, Option<String>, bool)>, out: &mut Vec<Value>| {
+        if let Some((n, v, s, i, d)) = c.take() {
+            if !out.iter().any(|e| e["name"] == json!(n) && e["version"] == json!(v)) {
+                out.push(entry("pnpm", &n, &v, s, i, d));
+            }
+        }
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            push(&mut cur, &mut out);
+            section = line.trim_end().trim_end_matches(':');
+            continue;
+        }
+        if section != "packages" {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        if indent == 2 && t.ends_with(':') || indent == 2 && t.ends_with("{}") {
+            push(&mut cur, &mut out);
+            let key = t.trim_end_matches("{}").trim_end();
+            if let Some((n, v)) = pnpm_key(key) {
+                let git = v.contains("://") || v.starts_with("github.com/");
+                cur = Some((n, if git { v.rsplit('/').next().unwrap_or(&v).to_string() } else { v.clone() }, if git { Some(format!("git+{}", v)) } else { Some("npm".to_string()) }, None, false));
+            }
+        } else if indent == 4 {
+            if let Some(c) = cur.as_mut() {
+                if let Some(r) = t.strip_prefix("resolution: {").and_then(|r| r.strip_suffix('}')) {
+                    for part in r.split(", ") {
+                        match part.split_once(": ") {
+                            Some(("integrity", x)) => c.3 = Some(x.to_string()),
+                            Some(("tarball", x)) => c.2 = Some(x.to_string()),
+                            Some(("repo", x)) => c.2 = Some(format!("git+{}", x)),
+                            _ => {}
+                        }
+                    }
+                } else if t == "dev: true" {
+                    c.4 = true;
+                }
+            }
+        }
+    }
+    push(&mut cur, &mut out);
+    Ok(out)
+}
+
+fn read_poetry(text: &str) -> Result<Vec<Value>, String> {
+    let v: toml::Value = text.parse().map_err(|e| format!("poetry.lock is not TOML: {}", e))?;
+    let mut out = vec![];
+    for p in v.get("package").and_then(|p| p.as_array()).into_iter().flatten() {
+        let name = p.get("name").and_then(|x| x.as_str()).ok_or("a [[package]] has no name")?;
+        let version = p.get("version").and_then(|x| x.as_str()).ok_or("a [[package]] has no version")?;
+        let src = p.get("source");
+        let kind = src.and_then(|s| s.get("type")).and_then(|x| x.as_str());
+        let url = src.and_then(|s| s.get("url")).and_then(|x| x.as_str());
+        let source = match (kind, url) {
+            (Some("git"), Some(u)) => Some(format!("git+{}", u)),
+            (Some(_), Some(u)) => Some(u.to_string()),
+            _ => Some("pypi".to_string()),
+        };
+        let first = p.get("files").and_then(|f| f.as_array()).and_then(|f| f.first()).and_then(|f| f.get("hash")).and_then(|h| h.as_str()).map(str::to_string);
+        let dev = p.get("category").and_then(|c| c.as_str()) == Some("dev") || p.get("groups").and_then(|g| g.as_array()).map_or(false, |g| g.iter().all(|x| x.as_str() != Some("main")));
+        out.push(entry("poetry", &name.to_lowercase().replace('_', "-"), version, source, first, dev));
+    }
+    Ok(out)
+}
+
+fn read_gosum(text: &str) -> Result<Vec<Value>, String> {
+    let mut seen: BTreeMap<(String, String), (Option<String>, bool)> = BTreeMap::new();
+    let mut order = vec![];
+    for (i, l) in text.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = l.split_whitespace().collect();
+        if p.len() != 3 || !p[2].starts_with("h1:") {
+            return Err(format!("go.sum line {}: expected `module version h1:hash`", i + 1));
+        }
+        let (ver, only_mod) = match p[1].strip_suffix("/go.mod") {
+            Some(v) => (v, true),
+            None => (p[1], false),
+        };
+        let k = (p[0].to_string(), ver.to_string());
+        if !seen.contains_key(&k) {
+            order.push(k.clone());
+        }
+        let e = seen.entry(k).or_insert((None, true));
+        if only_mod {
+            e.0 = e.0.take().or(Some(p[2].to_string()));
+        } else {
+            e.0 = Some(p[2].to_string());
+            e.1 = false;
+        }
+    }
+    Ok(order.into_iter().map(|k| {
+        let (hash, mod_only) = &seen[&k];
+        let mut e = entry("go", &k.0, k.1.trim_start_matches('v'), Some("proxy".to_string()), hash.clone(), false);
+        e["go_mod_only"] = json!(mod_only);
+        e
+    }).collect())
+}
+
+fn detect(name: &str, text: &str) -> Result<&'static str, String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    Ok(match base {
+        "Cargo.lock" => "cargo",
+        "package-lock.json" | "npm-shrinkwrap.json" => "npm",
+        "yarn.lock" => "yarn",
+        "pnpm-lock.yaml" => "pnpm",
+        "poetry.lock" => "poetry",
+        "go.sum" => "go",
+        _ => {
+            let t = text.trim_start();
+            if t.starts_with('{') && t.contains("\"lockfileVersion\"") {
+                "npm"
+            } else if t.contains("# yarn lockfile") || t.contains("__metadata:") {
+                "yarn"
+            } else if t.starts_with("lockfileVersion:") {
+                "pnpm"
+            } else if t.contains("[[package]]") && t.contains("[metadata]") && t.contains("python-versions") {
+                "poetry"
+            } else if t.contains("[[package]]") {
+                "cargo"
+            } else if t.lines().next().map_or(false, |l| l.split_whitespace().count() == 3 && l.contains(" h1:")) {
+                "go"
+            } else {
+                return Err(format!("cannot tell what kind of lock file {} is", name));
+            }
+        }
+    })
+}
+
+/// Reads a lock file by its name (or, for another name, by its look): a list of `{ ecosystem, name, version, source, kind, integrity, dev }`, sorted.
+pub fn lockfiles_read(name: &str, text: &str) -> Result<Vec<Value>, String> {
+    let text = text.trim_start_matches('\u{feff}');
+    let mut out = match detect(name, text)? {
+        "cargo" => read_cargo(text)?,
+        "npm" => read_npm(text)?,
+        "yarn" => read_yarn(text)?,
+        "pnpm" => read_pnpm(text)?,
+        "poetry" => read_poetry(text)?,
+        _ => read_gosum(text)?,
+    };
+    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()).then_with(|| compare(a["version"].as_str().unwrap_or(""), b["version"].as_str().unwrap_or(""))));
+    Ok(out)
+}
+
+/// Reads a lock file from a path, as `lockfiles_read` does.
+pub fn lockfiles_read_file(path: &str) -> Result<Vec<Value>, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    lockfiles_read(path, &t)
+}
+
+/// Which format text is in: `cargo`, `npm`, `yarn`, `pnpm`, `poetry` or `go`.
+pub fn lockfiles_detect(name: &str, text: &str) -> Result<String, String> {
+    detect(name, text).map(str::to_string)
+}
+
+/// Dotted numbers compared as numbers, and a pre-release before its release.
+fn compare(a: &str, b: &str) -> Ordering {
+    let split = |s: &str| {
+        let core = s.split('+').next().unwrap_or(s).to_string();
+        match core.split_once(['-', '~']) {
+            Some((x, y)) => (x.to_string(), Some(y.to_string())),
+            None => (core, None),
+        }
+    };
+    let ((ax, ap), (bx, bp)) = (split(a), split(b));
+    let parts = |s: &str| s.split('.').map(|p| p.parse::<u128>().ok()).collect::<Vec<_>>();
+    let (pa, pb) = (parts(&ax), parts(&bx));
+    for i in 0..pa.len().max(pb.len()) {
+        let o = match (pa.get(i).copied().flatten(), pb.get(i).copied().flatten()) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (None, None) if i < pa.len() && i < pb.len() => ax.cmp(&bx),
+            (Some(x), None) if i >= pb.len() => if x > 0 { Ordering::Greater } else { Ordering::Equal },
+            (None, Some(y)) if i >= pa.len() => if y > 0 { Ordering::Less } else { Ordering::Equal },
+            _ => ax.cmp(&bx),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    match (ap, bp) {
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => x.cmp(&y),
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn index(list: &[Value]) -> BTreeMap<String, Vec<&Value>> {
+    let mut m: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for e in list {
+        m.entry(e["name"].as_str().unwrap_or("").to_string()).or_default().push(e);
+    }
+    m
+}
+
+/// What changed between two lists, whatever files they came from: `{ added, removed, upgraded, downgraded, same_version_changed }`. The last is a package whose version stayed and whose hash or source did not, which deserves a look.
+pub fn lockfiles_diff(before: Vec<serde_json::Value>, after: Vec<serde_json::Value>) -> Value {
+    let (a, b) = (index(&before), index(&after));
+    let vers = |l: &Vec<&Value>| l.iter().filter_map(|e| e["version"].as_str().map(str::to_string)).collect::<Vec<_>>();
+    let (mut added, mut removed, mut up, mut down, mut tampered) = (vec![], vec![], vec![], vec![], vec![]);
+    for (k, l) in &b {
+        if !a.contains_key(k) {
+            for v in vers(l) {
+                added.push(json!({ "name": k, "version": v }));
+            }
+        }
+    }
+    for (k, l) in &a {
+        match b.get(k) {
+            None => for v in vers(l) {
+                removed.push(json!({ "name": k, "version": v }));
+            },
+            Some(m) => {
+                let (va, vb) = (vers(l), vers(m));
+                let only_a: Vec<&String> = va.iter().filter(|v| !vb.contains(v)).collect();
+                let only_b: Vec<&String> = vb.iter().filter(|v| !va.contains(v)).collect();
+                for (x, y) in only_a.iter().zip(only_b.iter()) {
+                    let t = json!({ "name": k, "from": x, "to": y });
+                    if compare(x, y) == Ordering::Greater { down.push(t) } else { up.push(t) }
+                }
+                for x in only_a.iter().skip(only_b.len()) {
+                    removed.push(json!({ "name": k, "version": x }));
+                }
+                for y in only_b.iter().skip(only_a.len()) {
+                    added.push(json!({ "name": k, "version": y }));
+                }
+                for e in l {
+                    if let Some(n) = m.iter().find(|n| n["version"] == e["version"]) {
+                        let differs = |f: &str| !e[f].is_null() && !n[f].is_null() && e[f] != n[f];
+                        if differs("integrity") || differs("source") {
+                            tampered.push(json!({ "name": k, "version": e["version"], "integrity": differs("integrity"), "source": differs("source") }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let by_name = |a: &Value, b: &Value| a["name"].as_str().cmp(&b["name"].as_str());
+    added.sort_by(by_name);
+    removed.sort_by(by_name);
+    json!({ "added": added, "removed": removed, "upgraded": up, "downgraded": down, "same_version_changed": tampered })
+}
+
+/// Counts, and packages locked at more than one version: `{ packages, unique, dev, kinds, duplicates, not_registry }`.
+pub fn lockfiles_summary(list: Vec<serde_json::Value>) -> Value {
+    let idx = index(&list);
+    let mut kinds: BTreeMap<String, i64> = BTreeMap::new();
+    for e in &list {
+        *kinds.entry(e["kind"].as_str().unwrap_or("unknown").to_string()).or_default() += 1;
+    }
+    let dups: Vec<Value> = idx.iter().filter(|(_, l)| { let mut v: Vec<&Value> = l.iter().map(|e| &e["version"]).collect(); v.dedup(); v.len() > 1 }).map(|(k, l)| json!({ "name": k, "versions": l.iter().map(|e| e["version"].clone()).collect::<Vec<_>>() })).collect();
+    let other: Vec<Value> = list.iter().filter(|e| e["kind"] != "registry" && e["kind"] != "path").map(|e| json!({ "name": e["name"], "version": e["version"], "source": e["source"] })).collect();
+    json!({ "packages": list.len(), "unique": idx.len(), "dev": list.iter().filter(|e| e["dev"] == json!(true)).count(), "kinds": kinds, "duplicates": dups, "not_registry": other })
+}

@@ -1,0 +1,261 @@
+//! Datadog from a program: metrics submitted through the v2 series API, events, logs batched and gzipped within the intake's limits, service checks, and tags tidied as Datadog wants them.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! flate2 = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde_json::{json, Value};
+use std::io::Write;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const LOG_BATCH: usize = 1000;
+const LOG_BYTES: usize = 5_000_000;
+const LOG_ONE: usize = 1_000_000;
+
+fn opt(o: &Value, k: &str, vars: &[&str]) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| vars.iter().find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty())))
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn site(o: &Value) -> String {
+    opt(o, "site", &["DD_SITE", "DATADOG_SITE"]).unwrap_or_else(|| "datadoghq.com".into())
+}
+
+fn api_base(o: &Value) -> String {
+    opt(o, "api_url", &["DATADOG_API_URL"]).unwrap_or_else(|| format!("https://api.{}", site(o))).trim_end_matches('/').to_string()
+}
+
+fn logs_base(o: &Value) -> String {
+    opt(o, "logs_url", &["DATADOG_LOGS_URL"]).unwrap_or_else(|| format!("https://http-intake.logs.{}", site(o))).trim_end_matches('/').to_string()
+}
+
+fn key(o: &Value) -> Result<String, String> {
+    opt(o, "api_key", &["DD_API_KEY", "DATADOG_API_KEY"]).ok_or("no API key: set DD_API_KEY, or give the option api_key".to_string())
+}
+
+fn post(url: &str, body: &[u8], gzip: bool, o: &Value) -> Result<Value, String> {
+    let k = key(o)?;
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build();
+    let mut tries = 0;
+    loop {
+        let mut r = agent.post(url).set("DD-API-KEY", &k).set("Content-Type", "application/json").set("User-Agent", "quillo-datadog/1.0");
+        if gzip {
+            r = r.set("Content-Encoding", "gzip");
+        }
+        match r.send_bytes(body) {
+            Ok(resp) => {
+                let t = resp.into_string().unwrap_or_default();
+                return Ok(serde_json::from_str(&t).unwrap_or(json!({})));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("x-ratelimit-reset").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                if (code == 429 || code >= 500) && tries < 2 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let list: Vec<&str> = v["errors"].as_array().map(|l| l.iter().filter_map(|e| e.as_str()).collect()).unwrap_or_default();
+                let msg = if list.is_empty() { t.trim().chars().take(300).collect() } else { list.join("; ") };
+                let hint = if code == 403 { " (check DD_API_KEY and DD_SITE: a key works on its own site only)" } else { "" };
+                return Err(format!("Datadog {}: {}{}", code, msg, hint));
+            }
+            Err(e) => return Err(format!("cannot reach Datadog: {}", e)),
+        }
+    }
+}
+
+// A tag starts with a letter, holds letters, digits and - _ : . / only, in lower case, 200 at most.
+fn tag(t: &str) -> String {
+    let lower = t.trim().to_lowercase();
+    let clean: String = lower.chars().map(|c| if c.is_alphanumeric() || "-_:./".contains(c) { c } else { '_' }).collect();
+    let mut s = clean.trim_start_matches(|c: char| !c.is_alphabetic()).trim_end_matches(':').to_string();
+    while s.contains("__") {
+        s = s.replace("__", "_");
+    }
+    s.chars().take(200).collect()
+}
+
+/// Tags as Datadog keeps them: `tags` is a map ({ env: "Prod EU" } gives env:prod_eu) or a list of texts; lower-cased, odd characters made _.
+pub fn datadog_tags(tags: serde_json::Value) -> Result<Vec<String>, String> {
+    let list: Vec<String> = match &tags {
+        Value::Null => vec![],
+        Value::Object(m) => m.iter().map(|(k, v)| tag(&format!("{}:{}", k, v.as_str().map(str::to_string).unwrap_or(v.to_string())))).collect(),
+        Value::Array(l) => l.iter().map(|t| t.as_str().map(tag).ok_or("tags must be texts".to_string())).collect::<Result<_, _>>()?,
+        Value::String(s) => vec![tag(s)],
+        _ => return Err("tags is a map or a list of texts".into()),
+    };
+    Ok(list.into_iter().filter(|t| !t.is_empty()).collect())
+}
+
+fn metric_type(t: &str) -> Result<i64, String> {
+    match t {
+        "" | "gauge" => Ok(3),
+        "count" => Ok(1),
+        "rate" => Ok(2),
+        o => Err(format!("{:?} is not a metric type: gauge, count or rate", o)),
+    }
+}
+
+fn series(name: &str, value: f64, o: &Value) -> Result<Value, String> {
+    if name.is_empty() || name.len() > 200 || !name.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return Err(format!("{:?} is not a metric name: 1 to 200 of a-z, 0-9, _ and ., starting with a letter", name));
+    }
+    let ts = o.get("timestamp").and_then(|t| t.as_i64()).unwrap_or_else(now);
+    if ts > now() + 600 || ts < now() - 3600 {
+        return Err("a point's timestamp must be within the last hour and at most 10 minutes ahead".into());
+    }
+    let kind = metric_type(o.get("type").and_then(|t| t.as_str()).unwrap_or(""))?;
+    let mut s = json!({ "metric": name, "type": kind, "points": [{ "timestamp": ts, "value": value }], "tags": datadog_tags(o.get("tags").cloned().unwrap_or(Value::Null))? });
+    if kind != 3 {
+        s["interval"] = json!(o.get("interval").and_then(|i| i.as_i64()).unwrap_or(10));
+    }
+    if let Some(h) = o.get("host").and_then(|h| h.as_str()) {
+        s["resources"] = json!([{ "name": h, "type": "host" }]);
+    }
+    if let Some(u) = o.get("unit") {
+        s["unit"] = u.clone();
+    }
+    Ok(s)
+}
+
+/// Sends one point of a metric. Options: type (gauge, count, rate), tags, host, unit, interval (seconds, for count and rate), timestamp, api_key (else DD_API_KEY), site (else DD_SITE), api_url (else DATADOG_API_URL).
+pub fn datadog_metric(name: &str, value: f64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = series(name, value, &options)?;
+    let url = format!("{}/api/v2/series", api_base(&options));
+    post(&url, json!({ "series": [s] }).to_string().as_bytes(), false, &options)
+}
+
+/// Sends many metrics in one request: `points` are { name, value, type, tags, host, unit, interval, timestamp }.
+pub fn datadog_metrics(points: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut list = vec![];
+    for p in &points {
+        let name = p["name"].as_str().ok_or("each point needs a `name`")?;
+        let v = p["value"].as_f64().ok_or(format!("the point {} has no number in `value`", name))?;
+        list.push(series(name, v, p)?);
+    }
+    if list.is_empty() {
+        return Err("no points to send".into());
+    }
+    post(&format!("{}/api/v2/series", api_base(&options)), &gzip_of(&json!({ "series": list }).to_string())?, true, &options)
+}
+
+/// Posts an event to the event stream: a `title` (cut at 100 characters) and `text` (4000). Options: alert_type (error, warning, info, success), tags, aggregation_key, source_type_name, priority (normal, low), host, date_happened.
+pub fn datadog_event(title: &str, text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if title.trim().is_empty() {
+        return Err("an event needs a title".into());
+    }
+    let mut b = json!({ "title": title.chars().take(100).collect::<String>(), "text": text.chars().take(4000).collect::<String>(), "tags": datadog_tags(options.get("tags").cloned().unwrap_or(Value::Null))? });
+    if let Some(a) = options.get("alert_type").and_then(|a| a.as_str()) {
+        if !["error", "warning", "info", "success", "user_update", "recommendation", "snapshot"].contains(&a) {
+            return Err(format!("{:?} is not an alert_type", a));
+        }
+    }
+    for k in ["alert_type", "aggregation_key", "source_type_name", "priority", "host", "date_happened"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    let r = post(&format!("{}/api/v1/events", api_base(&options)), b.to_string().as_bytes(), false, &options)?;
+    Ok(json!({ "status": r["status"], "id": r.pointer("/event/id"), "url": r.pointer("/event/url") }))
+}
+
+/// Reports a service check: `check` a name, `status` 0 ok, 1 warning, 2 critical, 3 unknown, `host` the host. Options: tags, message, timestamp.
+pub fn datadog_check(check: &str, status: i64, host: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !(0..=3).contains(&status) {
+        return Err(format!("a check's status is 0 to 3, not {}", status));
+    }
+    let mut b = json!({ "check": check, "status": status, "host_name": host, "tags": datadog_tags(options.get("tags").cloned().unwrap_or(Value::Null))? });
+    for k in ["message", "timestamp"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    post(&format!("{}/api/v1/check_run", api_base(&options)), b.to_string().as_bytes(), false, &options)
+}
+
+fn gzip_of(text: &str) -> Result<Vec<u8>, String> {
+    let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+    e.write_all(text.as_bytes()).map_err(|x| x.to_string())?;
+    e.finish().map_err(|x| x.to_string())
+}
+
+fn log_entry(l: &Value, o: &Value) -> Result<Value, String> {
+    let mut e = match l {
+        Value::String(s) => json!({ "message": s }),
+        Value::Object(_) => l.clone(),
+        _ => return Err("a log is a text or a map".into()),
+    };
+    for (k, key) in [("service", "service"), ("hostname", "hostname"), ("source", "ddsource")] {
+        if e.get(key).is_none() {
+            if let Some(v) = o.get(k) {
+                e[key] = v.clone();
+            }
+        }
+    }
+    if e.get("ddtags").is_none() {
+        let tags = datadog_tags(o.get("tags").cloned().unwrap_or(Value::Null))?;
+        if !tags.is_empty() {
+            e["ddtags"] = json!(tags.join(","));
+        }
+    }
+    Ok(e)
+}
+
+/// Sends logs to the intake, gzipped, in as many batches as its limits of 1000 entries and 5 MB take. Each is a text, or a map with `message` and any attributes. Options: service, hostname, source, tags, logs_url (else DATADOG_LOGS_URL). An entry over 1 MB is refused here, as the intake would cut it. Gives { sent, batches }.
+pub fn datadog_logs(logs: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let url = format!("{}/api/v2/logs", logs_base(&options));
+    let mut batch: Vec<String> = vec![];
+    let mut size = 2;
+    let (mut sent, mut batches) = (0, 0);
+    let mut flush = |batch: &mut Vec<String>, size: &mut usize| -> Result<(), String> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let body = format!("[{}]", batch.join(","));
+        post(&url, &gzip_of(&body)?, true, &options)?;
+        sent += batch.len();
+        batches += 1;
+        batch.clear();
+        *size = 2;
+        Ok(())
+    };
+    for (i, l) in logs.iter().enumerate() {
+        let t = log_entry(l, &options)?.to_string();
+        if t.len() > LOG_ONE {
+            return Err(format!("log {} is {} bytes; one log is at most {}", i, t.len(), LOG_ONE));
+        }
+        if batch.len() >= LOG_BATCH || size + t.len() + 1 > LOG_BYTES {
+            flush(&mut batch, &mut size)?;
+        }
+        size += t.len() + 1;
+        batch.push(t);
+    }
+    flush(&mut batch, &mut size)?;
+    Ok(json!({ "sent": sent, "batches": batches }))
+}
+
+/// One log line, sent at once.
+pub fn datadog_log(message: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    datadog_logs(vec![json!(message)], options)
+}
+
+/// Whether the API key is good on this site.
+pub fn datadog_validate(options: serde_json::Value) -> Result<bool, String> {
+    let k = key(&options)?;
+    let url = format!("{}/api/v1/validate", api_base(&options));
+    match ureq::get(&url).timeout(Duration::from_secs(15)).set("DD-API-KEY", &k).call() {
+        Ok(r) => Ok(r.into_string().map(|t| t.contains("true")).unwrap_or(false)),
+        Err(ureq::Error::Status(403, _)) => Ok(false),
+        Err(ureq::Error::Status(c, _)) => Err(format!("Datadog {}", c)),
+        Err(e) => Err(format!("cannot reach Datadog: {}", e)),
+    }
+}

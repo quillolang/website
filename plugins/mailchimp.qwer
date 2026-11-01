@@ -1,0 +1,273 @@
+//! Mailchimp's Marketing API: audience members by the MD5 of their lower-cased email, upserts, batch subscribes of 500, tags, webhooks made, and webhook posts read from their odd nested form.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! md-5 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use md5::{Digest, Md5};
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+const BATCH: usize = 500;
+const STATUSES: &[&str] = &["subscribed", "unsubscribed", "cleaned", "pending", "transactional"];
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn base(o: &Value, key: &str) -> Result<String, String> {
+    if let Some(u) = opt(o, "base_url", "MAILCHIMP_API_URL") {
+        return Ok(u.trim_end_matches('/').to_string());
+    }
+    // The key ends in its data centre: abc123-us21 lives on us21.api.mailchimp.com.
+    let dc = opt(o, "server", "MAILCHIMP_SERVER").or_else(|| key.rsplit_once('-').map(|(_, d)| d.to_string())).filter(|d| d.chars().all(|c| c.is_ascii_alphanumeric())).ok_or("the API key has no data centre after a dash: set MAILCHIMP_SERVER (like us21)")?;
+    Ok(format!("https://{}.api.mailchimp.com/3.0", dc))
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let key = opt(o, "api_key", "MAILCHIMP_API_KEY").ok_or("no API key: set MAILCHIMP_API_KEY, or give the option api_key")?;
+    let b = base(o, &key)?;
+    let header = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("quillo:{}", key)));
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(120)).build();
+    let text = body.map(|v| v.to_string());
+    let url = format!("{}{}", b, path);
+    let mut tries = 0;
+    loop {
+        let r = agent.request(method, &url).set("Authorization", &header).set("User-Agent", "quillo-mailchimp/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Mailchimp's answer is not JSON: {:?}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let t = resp.into_string().unwrap_or_default();
+                if (code == 429 || code == 503) && tries < 3 {
+                    std::thread::sleep(Duration::from_millis(1000 * (tries + 1)));
+                    tries += 1;
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let fields: Vec<String> = v["errors"].as_array().map(|l| l.iter().map(|e| format!("{}: {}", e["field"].as_str().unwrap_or("?"), e["message"].as_str().unwrap_or(""))).collect()).unwrap_or_default();
+                let tail = if fields.is_empty() { String::new() } else { format!(" ({})", fields.join("; ")) };
+                return Err(format!("Mailchimp {} {}: {}{}", code, v["title"].as_str().unwrap_or("Error"), v["detail"].as_str().unwrap_or(t.trim()), tail));
+            }
+            Err(e) => return Err(format!("cannot reach Mailchimp at {}: {}", b, e)),
+        }
+    }
+}
+
+/// Calls any endpoint: `method`, `path` like /lists, `body` or null. Options: api_key (else MAILCHIMP_API_KEY), server (else from the key), base_url (else MAILCHIMP_API_URL).
+pub fn mailchimp_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+/// The subscriber hash Mailchimp names a member by: the MD5 of the lower-cased email.
+pub fn mailchimp_hash(email: &str) -> String {
+    hex::encode(Md5::digest(email.trim().to_lowercase().as_bytes()))
+}
+
+fn member_path(list: &str, email: &str) -> String {
+    format!("/lists/{}/members/{}", enc(list), mailchimp_hash(email))
+}
+
+fn email_ok(e: &str) -> Result<(), String> {
+    let good = e.split_once('@').map(|(a, b)| !a.is_empty() && b.contains('.')).unwrap_or(false);
+    if good { Ok(()) } else { Err(format!("{:?} is not an email address", e)) }
+}
+
+fn status_ok(s: &str) -> Result<(), String> {
+    if STATUSES.contains(&s) { Ok(()) } else { Err(format!("{:?} is not a status: {}", s, STATUSES.join(", "))) }
+}
+
+/// Adds or changes a member, so it can be run twice. Options: status_if_new ("subscribed", or "pending" for double opt-in; "pending" unless said), status (changes an existing member too), merge_fields ({ FNAME, LNAME }), language, vip, tags (new members only), interests. Gives the member.
+pub fn mailchimp_upsert(list: &str, email: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    email_ok(email)?;
+    let new = options.get("status_if_new").and_then(|s| s.as_str()).unwrap_or("pending");
+    status_ok(new)?;
+    let mut b = json!({ "email_address": email.trim(), "status_if_new": new });
+    if let Some(s) = options.get("status").and_then(|s| s.as_str()) {
+        status_ok(s)?;
+        b["status"] = json!(s);
+    }
+    for k in ["merge_fields", "language", "vip", "tags", "interests"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    call("PUT", &member_path(list, email), Some(&b), &options)
+}
+
+/// One member by email.
+pub fn mailchimp_member(list: &str, email: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", &member_path(list, email), None, &options)
+}
+
+/// A member's status, or null when the address is not on the list.
+pub fn mailchimp_status(list: &str, email: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    match call("GET", &member_path(list, email), None, &options) {
+        Ok(m) => Ok(m["status"].clone()),
+        Err(e) if e.starts_with("Mailchimp 404") => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
+/// Unsubscribes a member, keeping the record: the way to honour a request.
+pub fn mailchimp_unsubscribe(list: &str, email: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PATCH", &member_path(list, email), Some(&json!({ "status": "unsubscribed" })), &options)
+}
+
+/// Archives a member, off the bill and restorable by adding them again.
+pub fn mailchimp_archive(list: &str, email: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &member_path(list, email), None, &options)?;
+    Ok(true)
+}
+
+/// Deletes a member for good, for a right-to-erasure request: the address cannot be added again except by the person.
+pub fn mailchimp_forget(list: &str, email: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("POST", &format!("{}/actions/delete-permanent", member_path(list, email)), None, &options)?;
+    Ok(true)
+}
+
+/// A list's members, all pages, at 1000 a page. Options: status, fields, max_items.
+pub fn mailchimp_members(list: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut extra = String::new();
+    for k in ["status", "fields"] {
+        if let Some(v) = options.get(k).and_then(|v| v.as_str()) {
+            extra.push_str(&format!("&{}={}", k, enc(v)));
+        }
+    }
+    let mut out = vec![];
+    let mut offset = 0;
+    loop {
+        let r = call("GET", &format!("/lists/{}/members?count=1000&offset={}{}", enc(list), offset, extra), None, &options)?;
+        let page = r["members"].as_array().cloned().unwrap_or_default();
+        offset += page.len();
+        out.extend(page);
+        if offset >= r["total_items"].as_u64().unwrap_or(0) as usize || out.len() >= max || offset == 0 {
+            break;
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// Subscribes many at once, in requests of 500: each member is an email, or { email_address, status, merge_fields, tags... }, `status` "subscribed" unless said. `update_existing` true changes members already there. Gives { created, updated, failed, errors: [{ email, code, error }] }: one bad address does not stop the rest.
+pub fn mailchimp_batch_subscribe(list: &str, members: Vec<serde_json::Value>, update_existing: bool, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut rows = vec![];
+    for m in members {
+        rows.push(match m {
+            Value::String(e) => json!({ "email_address": e, "status": "subscribed" }),
+            Value::Object(mut o) => {
+                o.entry("status").or_insert(json!("subscribed"));
+                Value::Object(o)
+            }
+            o => return Err(format!("a member is an email or a map, not {}", o)),
+        });
+    }
+    let (mut created, mut updated, mut failed) = (0, 0, 0);
+    let mut errors = vec![];
+    for chunk in rows.chunks(BATCH) {
+        let r = call("POST", &format!("/lists/{}", enc(list)), Some(&json!({ "members": chunk, "update_existing": update_existing })), &options)?;
+        created += r["total_created"].as_i64().unwrap_or(0);
+        updated += r["total_updated"].as_i64().unwrap_or(0);
+        failed += r["error_count"].as_i64().unwrap_or(0);
+        for e in r["errors"].as_array().into_iter().flatten() {
+            errors.push(json!({ "email": e["email_address"], "code": e["error_code"], "error": e["error"] }));
+        }
+    }
+    Ok(json!({ "created": created, "updated": updated, "failed": failed, "errors": errors }))
+}
+
+/// Adds the tags in `add` to a member and takes off those in `remove`. Tags that do not exist yet are made.
+pub fn mailchimp_tag(list: &str, email: &str, add: Vec<String>, remove: Vec<String>, options: serde_json::Value) -> Result<bool, String> {
+    let tags: Vec<Value> = add.iter().map(|t| json!({ "name": t, "status": "active" })).chain(remove.iter().map(|t| json!({ "name": t, "status": "inactive" }))).collect();
+    if tags.is_empty() {
+        return Err("no tags to add or remove".into());
+    }
+    call("POST", &format!("{}/tags", member_path(list, email)), Some(&json!({ "tags": tags })), &options)?;
+    Ok(true)
+}
+
+/// A member's tags, by name.
+pub fn mailchimp_tags(list: &str, email: &str, options: serde_json::Value) -> Result<Vec<String>, String> {
+    let r = call("GET", &format!("{}/tags?count=1000", member_path(list, email)), None, &options)?;
+    Ok(r["tags"].as_array().map(|l| l.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()).unwrap_or_default())
+}
+
+/// Registers a webhook: its public `url`, `events` (of subscribe, unsubscribe, profile, cleaned, upemail, campaign) and `sources` (of user, admin, api). Mailchimp signs nothing, so put a secret in the URL and compare it with mailchimp_secret_ok. It sends a GET first, which must answer 200.
+pub fn mailchimp_webhook_create(list: &str, url: &str, events: Vec<String>, sources: Vec<String>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let on = |l: &[String], all: &[&str]| -> Value {
+        let mut m = Map::new();
+        for k in all {
+            m.insert(k.to_string(), json!(l.iter().any(|x| x == k)));
+        }
+        Value::Object(m)
+    };
+    let b = json!({ "url": url, "events": on(&events, &["subscribe", "unsubscribe", "profile", "cleaned", "upemail", "campaign"]), "sources": on(&sources, &["user", "admin", "api"]) });
+    call("POST", &format!("/lists/{}/webhooks", enc(list)), Some(&b), &options)
+}
+
+/// A list's webhooks.
+pub fn mailchimp_webhooks(list: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    Ok(call("GET", &format!("/lists/{}/webhooks", enc(list)), None, &options)?["webhooks"].as_array().cloned().unwrap_or_default())
+}
+
+/// Whether the secret in a webhook's URL is the expected one, compared in constant time.
+pub fn mailchimp_secret_ok(got: &str, expected: &str) -> bool {
+    !expected.is_empty() && got.len() == expected.len() && got.bytes().zip(expected.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if b.get(i + 1).map(u8::is_ascii_hexdigit).unwrap_or(false) && b.get(i + 2).map(u8::is_ascii_hexdigit).unwrap_or(false) => {
+                let h = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(h(b[i + 1]) * 16 + h(b[i + 2]));
+                i += 2;
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A webhook's body read: `type=subscribe&fired_at=...&data[merges][EMAIL]=a` is form-encoded with brackets, and comes out as { type, fired_at, data: { merges: { EMAIL } } }.
+pub fn mailchimp_read_webhook(body: &str) -> Result<serde_json::Value, String> {
+    let mut root = json!({});
+    for pair in body.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = pct(k);
+        let parts: Vec<&str> = key.split('[').map(|p| p.trim_end_matches(']')).collect();
+        let mut at = &mut root;
+        for p in &parts[..parts.len() - 1] {
+            if !at[*p].is_object() {
+                at[*p] = json!({});
+            }
+            at = &mut at[*p];
+        }
+        at[parts[parts.len() - 1]] = json!(pct(v));
+    }
+    if root.get("type").is_none() {
+        return Err("this is not a Mailchimp webhook: it has no type".into());
+    }
+    Ok(root)
+}

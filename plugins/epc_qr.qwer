@@ -1,0 +1,206 @@
+//! SEPA credit-transfer QR codes (EPC069-12, "GiroCode"): the payload built and read line by line, with IBAN, BIC, amount, reference and size rules, and an SVG of the code at error level M.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+use qrcode::render::svg;
+use qrcode::{EcLevel, QrCode};
+use serde_json::{json, Value};
+
+const MAX_BYTES: usize = 331;
+/// The countries in the SEPA schemes, each with the length of its IBAN.
+const SEPA: &[(&str, usize)] = &[
+    ("AD", 24), ("AL", 28), ("AT", 20), ("BE", 16), ("BG", 22), ("BL", 27), ("CH", 21), ("CY", 28), ("CZ", 24), ("DE", 22), ("DK", 18), ("EE", 20), ("ES", 24),
+    ("FI", 18), ("FR", 27), ("GB", 22), ("GF", 27), ("GG", 22), ("GI", 23), ("GP", 27), ("GR", 27), ("HR", 21), ("HU", 28), ("IE", 22), ("IM", 22), ("IS", 26),
+    ("IT", 27), ("JE", 22), ("LI", 21), ("LT", 20), ("LU", 20), ("LV", 21), ("MC", 27), ("MD", 24), ("ME", 22), ("MF", 27), ("MK", 19), ("MQ", 27), ("MT", 31),
+    ("NL", 18), ("NO", 15), ("PL", 28), ("PM", 27), ("PT", 25), ("RE", 27), ("RO", 24), ("RS", 22), ("SE", 24), ("SI", 19), ("SK", 24), ("SM", 27), ("VA", 22), ("YT", 27),
+];
+
+fn mod97(s: &str) -> Option<u32> {
+    let mut r = 0u32;
+    for c in s.chars() {
+        let d = c.to_digit(36)?;
+        r = if d > 9 { (r * 100 + d) % 97 } else { (r * 10 + d) % 97 };
+    }
+    Some(r)
+}
+
+/// Why an IBAN cannot go in a SEPA QR code, or null when it can: the country must be in SEPA, the length that country's, the check digits right.
+pub fn epc_qr_iban_problem(iban: &str) -> Option<String> {
+    let i: String = iban.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+    if i.len() < 5 || !i.is_ascii() || !i[..2].bytes().all(|b| b.is_ascii_alphabetic()) || !i[2..].bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Some(format!("`{}` is not an IBAN", iban));
+    }
+    let Some(&(_, want)) = SEPA.iter().find(|c| c.0 == &i[..2]) else {
+        return Some(format!("{} is not a SEPA country", &i[..2]));
+    };
+    if i.len() != want {
+        return Some(format!("a {} IBAN has {} characters, this has {}", &i[..2], want, i.len()));
+    }
+    if mod97(&format!("{}{}", &i[4..], &i[..4])) != Some(1) {
+        return Some(format!("the check digits of {} are wrong", i));
+    }
+    None
+}
+
+fn bic_ok(b: &str) -> bool {
+    (b.len() == 8 || b.len() == 11) && b.is_ascii() && b[..6].bytes().all(|c| c.is_ascii_uppercase()) && b[6..].bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+fn rf_ok(r: &str) -> bool {
+    r.len() >= 5 && r.len() <= 25 && r.starts_with("RF") && r[2..].bytes().all(|b| b.is_ascii_alphanumeric()) && mod97(&format!("{}{}", &r[4..], &r[..4])) == Some(1)
+}
+
+/// An amount as the code writes it: "EUR12.50" from "12.5" or 12.5. Euros only, 0.01 to 999999999.99, at most two decimals.
+pub fn epc_qr_amount(amount: serde_json::Value) -> Result<String, String> {
+    let a = match &amount {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        o => return Err(format!("amount {} is neither text nor a number", o)),
+    };
+    let a = a.strip_prefix("EUR").unwrap_or(&a);
+    let (w, f) = a.split_once('.').unwrap_or((a, ""));
+    if w.is_empty() || !w.bytes().all(|b| b.is_ascii_digit()) || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("amount `{}` is not a number", a));
+    }
+    if f.len() > 2 {
+        return Err(format!("amount {} has more than two decimals", a));
+    }
+    if w.trim_start_matches('0').len() > 9 {
+        return Err(format!("amount {} is over 999999999.99", a));
+    }
+    let cents: u64 = format!("{}{:0<2}", w, f).parse().map_err(|_| format!("amount `{}` is too large", a))?;
+    if cents == 0 {
+        return Err("the amount must be at least 0.01".into());
+    }
+    Ok(format!("EUR{}.{:02}", cents / 100, cents % 100))
+}
+
+fn s(v: &Value, k: &str) -> String {
+    v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string()
+}
+
+fn limit(what: &str, x: &str, max: usize) -> Result<(), String> {
+    let n = x.chars().count();
+    if n > max {
+        return Err(format!("{} is {} characters; at most {}", what, n, max));
+    }
+    if x.contains(['\n', '\r']) {
+        return Err(format!("{} holds a line break, which would shift the fields after it", what));
+    }
+    Ok(())
+}
+
+/// The payload of a SEPA QR code from `{ name, iban, amount, bic, purpose, reference, text, info, version, service }`. `name` and `iban` are needed; `reference` (an RF creditor reference) and `text` exclude each other. Version 002 by default, where the BIC may be left out; 001 needs it. `service` is SCT, or INST for an instant transfer.
+pub fn epc_qr_build(payment: serde_json::Value) -> Result<String, String> {
+    let name = s(&payment, "name");
+    if name.is_empty() {
+        return Err("the payee's name is required".into());
+    }
+    limit("name", &name, 70)?;
+    let iban: String = s(&payment, "iban").chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+    if let Some(p) = epc_qr_iban_problem(&iban) {
+        return Err(p);
+    }
+    let version = { let v = s(&payment, "version"); if v.is_empty() { "002".to_string() } else { v } };
+    let bic = s(&payment, "bic");
+    match version.as_str() {
+        "001" if bic.is_empty() => return Err("version 001 needs a BIC".into()),
+        "001" | "002" => {}
+        v => return Err(format!("version `{}` should be 001 or 002", v)),
+    }
+    if !bic.is_empty() && !bic_ok(&bic) {
+        return Err(format!("`{}` is not a BIC", bic));
+    }
+    let service = { let v = s(&payment, "service"); if v.is_empty() { "SCT".to_string() } else { v } };
+    if service != "SCT" && service != "INST" {
+        return Err(format!("service `{}` should be SCT or INST", service));
+    }
+    let amount = match payment.get("amount") {
+        None | Some(Value::Null) => String::new(),
+        Some(a) => epc_qr_amount(a.clone())?,
+    };
+    let purpose = s(&payment, "purpose").to_uppercase();
+    if purpose.len() > 4 || !purpose.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("purpose `{}` should be up to 4 letters and digits (an ISO 20022 code)", purpose));
+    }
+    let (reference, text, info) = (s(&payment, "reference"), s(&payment, "text"), s(&payment, "info"));
+    if !reference.is_empty() && !text.is_empty() {
+        return Err("give a reference or a text, not both".into());
+    }
+    limit("reference", &reference, 35)?;
+    if !reference.is_empty() && !rf_ok(&reference) {
+        return Err(format!("`{}` is not an RF creditor reference with good check digits", reference));
+    }
+    limit("text", &text, 140)?;
+    limit("info", &info, 70)?;
+    let mut lines = vec!["BCD".to_string(), version, "1".to_string(), service, bic, name, iban, amount, purpose, reference, text, info];
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let out = lines.join("\n");
+    if out.len() > MAX_BYTES {
+        return Err(format!("the payload is {} bytes; at most {}", out.len(), MAX_BYTES));
+    }
+    Ok(out)
+}
+
+/// Reads a payload back to `{ version, charset, service, bic, name, iban, amount, cents, purpose, reference, text, info }`, applying the same rules. Lines may end in LF or CRLF.
+pub fn epc_qr_parse(payload: &str) -> Result<Value, String> {
+    let lines: Vec<&str> = payload.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    if lines.first().copied() != Some("BCD") {
+        return Err("a SEPA QR payload starts with the line BCD".into());
+    }
+    if lines.len() < 7 {
+        return Err(format!("{} lines; a payload has at least 7", lines.len()));
+    }
+    if lines.len() > 12 {
+        return Err(format!("{} lines; a payload has at most 12", lines.len()));
+    }
+    if payload.len() > MAX_BYTES {
+        return Err(format!("the payload is {} bytes; at most {}", payload.len(), MAX_BYTES));
+    }
+    let get = |i: usize| lines.get(i).copied().unwrap_or("");
+    let charset = match get(2) {
+        "1" => "UTF-8",
+        "2" => "ISO-8859-1",
+        "3" => "ISO-8859-2",
+        "4" => "ISO-8859-4",
+        "5" => "ISO-8859-5",
+        "6" => "ISO-8859-7",
+        "7" => "ISO-8859-10",
+        "8" => "ISO-8859-15",
+        o => return Err(format!("line 3: character set `{}` should be 1 to 8", o)),
+    };
+    let amount = get(7);
+    let cents = if amount.is_empty() {
+        Value::Null
+    } else {
+        if !amount.starts_with("EUR") {
+            return Err(format!("line 8: amount `{}` should start with EUR", amount));
+        }
+        let a = epc_qr_amount(json!(amount)).map_err(|e| format!("line 8: {}", e))?;
+        let (w, f) = a[3..].split_once('.').unwrap();
+        json!(w.parse::<i64>().unwrap() * 100 + f.parse::<i64>().unwrap())
+    };
+    let v = json!({ "name": get(5), "iban": get(6), "bic": get(4), "amount": if amount.is_empty() { Value::Null } else { json!(&amount[3..]) },
+        "purpose": get(8), "reference": get(9), "text": get(10), "info": get(11), "version": get(1), "service": get(3) });
+    epc_qr_build(v.clone()).map_err(|e| format!("not a valid payment: {}", e))?;
+    Ok(json!({
+        "version": get(1), "charset": charset, "service": get(3), "bic": get(4), "name": get(5), "iban": get(6),
+        "amount": v["amount"], "cents": cents, "purpose": get(8), "reference": get(9), "text": get(10), "info": get(11),
+    }))
+}
+
+/// An SVG of the code, error level M as the guideline requires. `size` is the smallest width in pixels.
+pub fn epc_qr_svg(payload: &str, size: i64) -> Result<String, String> {
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M).map_err(|e| e.to_string())?;
+    let v = match code.version() { qrcode::Version::Normal(n) => n, qrcode::Version::Micro(n) => n };
+    if v > 13 {
+        return Err(format!("the code needs QR version {}; the guideline stops at 13", v));
+    }
+    let px = size.clamp(64, 4096) as u32;
+    Ok(code.render::<svg::Color>().min_dimensions(px, px).build())
+}

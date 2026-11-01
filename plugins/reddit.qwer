@@ -1,0 +1,287 @@
+//! Reddit's API without an SDK: OAuth by a script app's password or an app-only token, the User-Agent Reddit insists on, listings walked with `after` and flattened, comment trees read, posts and comments made with errors dug out of their 200 answers, entities left unescaped, and the rate-limit headers obeyed before Reddit has to refuse.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are the app's. REDDIT_USERNAME and REDDIT_PASSWORD sign in
+// a script app as that account; without them the token is app-only, which reads but cannot post.
+// REDDIT_USER_AGENT is required, as `<platform>:<app id>:<version> (by /u/<name>)`.
+// REDDIT_API_URL is the API (https://oauth.reddit.com), REDDIT_AUTH_URL the sign-in (https://www.reddit.com).
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("REDDIT_API_URL").unwrap_or_else(|| "https://oauth.reddit.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A User-Agent in the form Reddit asks for: `reddit_user_agent("web", "com.example.mugs", "1.0.0", "ada")` is `web:com.example.mugs:1.0.0 (by /u/ada)`.
+pub fn reddit_user_agent(platform: &str, app: &str, version: &str, username: &str) -> String {
+    format!("{}:{}:{} (by /u/{})", platform, app, version, username)
+}
+
+/// Whether a User-Agent has Reddit's form. Generic ones (a library's default) get throttled or banned, so this plugin refuses them first.
+pub fn reddit_user_agent_valid(agent: &str) -> bool {
+    let Some((head, tail)) = agent.split_once(" (by ") else { return false };
+    let parts: Vec<&str> = head.split(':').collect();
+    parts.len() >= 3 && parts.iter().all(|p| !p.is_empty()) && (tail.starts_with("/u/") || tail.starts_with("u/")) && tail.ends_with(')') && tail.len() > 4
+}
+
+fn agent_text() -> Result<String, String> {
+    let a = setting("REDDIT_USER_AGENT").ok_or("REDDIT_USER_AGENT is not set: Reddit wants `<platform>:<app id>:<version> (by /u/<name>)`")?;
+    if !reddit_user_agent_valid(&a) {
+        return Err(format!("REDDIT_USER_AGENT `{}` is not in Reddit's form, `<platform>:<app id>:<version> (by /u/<name>)`", a));
+    }
+    Ok(a)
+}
+
+static TOKEN: Mutex<Option<(String, i64, String)>> = Mutex::new(None);
+static LIMITS: Mutex<Option<(f64, f64, i64, f64)>> = Mutex::new(None);
+
+/// Signs in now: `mode` is "script", "app", or "" for what the settings allow. Gives { mode, scope }. Calls do this by themselves.
+pub fn reddit_sign_in(mode: &str) -> Result<serde_json::Value, String> {
+    let id = setting("REDDIT_CLIENT_ID").ok_or("REDDIT_CLIENT_ID is not set")?;
+    let secret = setting("REDDIT_CLIENT_SECRET").unwrap_or_default();
+    let which = if !mode.is_empty() { mode.to_string() } else if setting("REDDIT_USERNAME").is_some() { "script".to_string() } else { "app".to_string() };
+    let auth = format!("Basic {}", STANDARD.encode(format!("{}:{}", id, secret)));
+    let url = format!("{}/api/v1/access_token", setting("REDDIT_AUTH_URL").unwrap_or_else(|| "https://www.reddit.com".into()).trim_end_matches('/'));
+    let req = ureq::post(&url).timeout(Duration::from_secs(20)).set("Authorization", &auth).set("User-Agent", &agent_text()?);
+    let res = match which.as_str() {
+        "script" => {
+            let u = setting("REDDIT_USERNAME").ok_or("a script sign-in needs REDDIT_USERNAME")?;
+            let p = setting("REDDIT_PASSWORD").ok_or("a script sign-in needs REDDIT_PASSWORD")?;
+            req.send_form(&[("grant_type", "password"), ("username", &u), ("password", &p)])
+        }
+        "app" => req.send_form(&[("grant_type", "client_credentials")]),
+        o => return Err(format!("`{}` is not a sign-in: \"script\" or \"app\"", o)),
+    };
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(401, _)) => return Err("Reddit refused the sign-in, 401: check REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET".into()),
+        Err(ureq::Error::Status(c, r)) => return Err(format!("Reddit refused the sign-in, {}: {}", c, r.into_string().unwrap_or_default().chars().take(200).collect::<String>())),
+        Err(e) => return Err(format!("cannot reach Reddit's sign-in: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // A wrong password is a 200 that says so.
+    if let Some(e) = v["error"].as_str() {
+        let hint = if e == "invalid_grant" { " (check REDDIT_USERNAME and REDDIT_PASSWORD; 2FA accounts cannot use this)" } else { "" };
+        return Err(format!("Reddit refused the sign-in: {}{}", e, hint));
+    }
+    let t = v["access_token"].as_str().ok_or("Reddit gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, now() + v["expires_in"].as_i64().unwrap_or(3600), which.clone()));
+    Ok(json!({ "mode": which, "scope": v["scope"] }))
+}
+
+fn token(force: bool) -> Result<String, String> {
+    if !force {
+        if let Some((t, until, _)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if *until > now() + 60 {
+                return Ok(t.clone());
+            }
+        }
+    }
+    let mode = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(String::new(), |x| x.2.clone());
+    reddit_sign_in(&mode)?;
+    TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|x| x.0.clone()).ok_or("no token after signing in".to_string())
+}
+
+/// What the last answer said of the rate limit: { used, remaining, reset_seconds }, or null before one.
+pub fn reddit_rate_limit() -> serde_json::Value {
+    match *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((u, r, at, reset)) => json!({ "used": u, "remaining": r, "reset_seconds": (reset - (now() - at) as f64).max(0.0) }),
+        None => Value::Null,
+    }
+}
+
+fn note(r: &ureq::Response) {
+    let g = |h: &str| r.header(h).and_then(|v| v.parse::<f64>().ok());
+    if let (Some(u), Some(left), Some(reset)) = (g("x-ratelimit-used"), g("x-ratelimit-remaining"), g("x-ratelimit-reset")) {
+        *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some((u, left, now(), reset));
+    }
+}
+
+// Nothing is left in this window: wait for the next, rather than be refused.
+fn pause() {
+    let wait = match *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((_, left, at, reset)) if left < 1.0 => (reset - (now() - at) as f64).clamp(0.0, 10.0),
+        _ => 0.0,
+    };
+    if wait > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(wait));
+    }
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let what = v["reason"].as_str().or(v["message"].as_str()).map(str::to_string).unwrap_or_else(|| text.trim().chars().take(200).collect());
+    let hint = match status {
+        403 if what == "private" => ": a private subreddit",
+        403 if what == "quarantined" => ": a quarantined subreddit",
+        404 => " (no such thing, or it is banned)",
+        _ => "",
+    };
+    format!("Reddit {}: {}{}", status, what, hint)
+}
+
+fn call(method: &str, path: &str, form: Option<&[(String, String)]>) -> Result<Value, String> {
+    let agent_name = agent_text()?;
+    let sep = if path.contains('?') { "&" } else { "?" };
+    let url = format!("{}{}{}raw_json=1", api(), path, sep);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut renewed = false;
+    let mut waited = 0u32;
+    loop {
+        pause();
+        let req = agent.request(method, &url).set("Authorization", &format!("bearer {}", token(false)?)).set("User-Agent", &agent_name);
+        let res = match form {
+            Some(f) => {
+                let pairs: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                req.send_form(&pairs)
+            }
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                note(&r);
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Reddit's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                token(true)?;
+            }
+            Err(ureq::Error::Status(429, r)) if waited < 3 => {
+                note(&r);
+                let secs = r.header("x-ratelimit-reset").or(r.header("Retry-After")).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.5, 30.0);
+                waited += 1;
+                std::thread::sleep(Duration::from_secs_f64(secs));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                note(&r);
+                return Err(error_text(c, &r.into_string().unwrap_or_default()));
+            }
+            Err(e) => return Err(format!("cannot reach Reddit at {}: {}", api(), e)),
+        }
+    }
+}
+
+fn flat(child: &Value) -> Value {
+    let mut d = child["data"].clone();
+    d["kind"] = child["kind"].clone();
+    d
+}
+
+/// Any listing through `after`: `path` like "/r/rust/new" or "/user/ada/comments", `params` adds `t`, `q`...; `max_items` caps them (0: all that Reddit gives, about 1000). Each item is its `data`, with `kind` added.
+pub fn reddit_listing(path: &str, params: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let extra: String = params.as_object().map_or(String::new(), |m| m.iter().map(|(k, v)| format!("&{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect());
+    let mut out = vec![];
+    let mut after = String::new();
+    loop {
+        let a = if after.is_empty() { String::new() } else { format!("&after={}", enc(&after)) };
+        let v = call("GET", &format!("{}?limit=100{}{}", path, extra, a), None)?;
+        out.extend(v["data"]["children"].as_array().into_iter().flatten().map(flat));
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["data"]["after"].as_str() {
+            Some(n) => after = n.to_string(),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// A subreddit's posts: `sort` is "hot", "new", "top", "rising"; for "top", `params` may hold `t` ("day", "week"...); `max_items` caps them (0: all).
+pub fn reddit_posts(subreddit: &str, sort: &str, params: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let s = subreddit.trim_start_matches("/r/").trim_start_matches("r/");
+    if !["hot", "new", "top", "rising", "controversial"].contains(&sort) {
+        return Err(format!("`{}` is not a sort: hot, new, top, rising or controversial", sort));
+    }
+    reddit_listing(&format!("/r/{}/{}", enc(s), sort), params, max_items)
+}
+
+fn walk_tree(list: &Value, depth: i64, out: &mut Vec<Value>, more: &mut i64) {
+    for c in list["data"]["children"].as_array().into_iter().flatten() {
+        if c["kind"] == "more" {
+            *more += c["data"]["count"].as_i64().unwrap_or(0);
+            continue;
+        }
+        let d = &c["data"];
+        out.push(json!({ "id": d["id"], "name": d["name"], "author": d["author"], "body": d["body"], "score": d["score"], "depth": depth, "parent": d["parent_id"] }));
+        if d["replies"].is_object() {
+            walk_tree(&d["replies"], depth + 1, out, more);
+        }
+    }
+}
+
+/// A post and its comments: `post` the id with or without `t3_`, `sort` like "top" or "". Gives { post, comments: [{ id, author, body, score, depth, parent }], hidden }, the tree flattened with its depth, and `hidden` how many are behind "load more".
+pub fn reddit_comments(post: &str, sort: &str) -> Result<serde_json::Value, String> {
+    let id = post.trim_start_matches("t3_");
+    let q = if sort.is_empty() { String::new() } else { format!("?sort={}", enc(sort)) };
+    let v = call("GET", &format!("/comments/{}{}", enc(id), q), None)?;
+    let mut out = vec![];
+    let mut more = 0;
+    walk_tree(&v[1], 0, &mut out, &mut more);
+    Ok(json!({ "post": flat(&v[0]["data"]["children"][0]), "comments": out, "hidden": more }))
+}
+
+// A write answers 200 with { json: { errors: [[code, message, field]], data } }.
+fn write(path: &str, form: Vec<(String, String)>) -> Result<Value, String> {
+    let mut f = form;
+    f.push(("api_type".into(), "json".into()));
+    let v = call("POST", path, Some(&f))?;
+    if let Some(list) = v["json"]["errors"].as_array().filter(|l| !l.is_empty()) {
+        let parts: Vec<String> = list.iter().map(|e| format!("{}: {}", e[0].as_str().unwrap_or("ERROR"), e[1].as_str().unwrap_or(""))).collect();
+        return Err(format!("Reddit refused it: {}", parts.join("; ")));
+    }
+    Ok(v["json"]["data"].clone())
+}
+
+/// Submits a post: `kind` is "self" (`content` the text) or "link" (`content` the address). `params` adds `flair_id`, `nsfw`, `spoiler`, `resubmit`. Gives { id, name, url }. Needs a script sign-in.
+pub fn reddit_submit(subreddit: &str, kind: &str, title: &str, content: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if title.is_empty() || title.chars().count() > 300 {
+        return Err("a title is 1 to 300 characters".into());
+    }
+    let field = match kind {
+        "self" => "text",
+        "link" => "url",
+        o => return Err(format!("`{}` is not a kind: \"self\" or \"link\"", o)),
+    };
+    let mut f = vec![("sr".to_string(), subreddit.trim_start_matches("r/").to_string()), ("kind".to_string(), kind.to_string()), ("title".to_string(), title.to_string()), (field.to_string(), content.to_string())];
+    for (k, v) in params.as_object().into_iter().flatten() {
+        f.push((k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+    }
+    let d = write("/api/submit", f)?;
+    Ok(json!({ "id": d["id"], "name": d["name"], "url": d["url"] }))
+}
+
+/// Writes a comment under a post or a comment: `parent` its fullname, `t3_...` or `t1_...`. Gives the new comment.
+pub fn reddit_comment(parent: &str, text: &str) -> Result<serde_json::Value, String> {
+    if !parent.starts_with("t3_") && !parent.starts_with("t1_") {
+        return Err(format!("`{}` is not a fullname: t3_ for a post, t1_ for a comment", parent));
+    }
+    let d = write("/api/comment", vec![("thing_id".to_string(), parent.to_string()), ("text".to_string(), text.to_string())])?;
+    Ok(d["things"].get(0).map_or(Value::Null, flat))
+}
+
+/// The signed-in account.
+pub fn reddit_me() -> Result<serde_json::Value, String> {
+    call("GET", "/api/v1/me", None)
+}

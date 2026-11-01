@@ -1,0 +1,798 @@
+//! M3U and extended M3U playlists, PLS, and HLS master and media playlists read and written, with the attributes of each tag, relative URLs resolved, and the rules of RFC 8216 checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+const MEDIA_TAGS: [&str; 15] = ["EXTINF", "EXT-X-TARGETDURATION", "EXT-X-MEDIA-SEQUENCE", "EXT-X-DISCONTINUITY-SEQUENCE", "EXT-X-PLAYLIST-TYPE", "EXT-X-ENDLIST", "EXT-X-I-FRAMES-ONLY", "EXT-X-BYTERANGE", "EXT-X-DISCONTINUITY", "EXT-X-KEY", "EXT-X-MAP", "EXT-X-PROGRAM-DATE-TIME", "EXT-X-GAP", "EXT-X-DATERANGE", "EXT-X-BITRATE"];
+const MASTER_TAGS: [&str; 6] = ["EXT-X-STREAM-INF", "EXT-X-MEDIA", "EXT-X-I-FRAME-STREAM-INF", "EXT-X-SESSION-DATA", "EXT-X-SESSION-KEY", "EXT-X-CONTENT-STEERING"];
+
+/// RFC 3986 section 5, for segments and variants relative to their playlist.
+fn resolve(base: &str, r: &str) -> String {
+    if r.is_empty() || base.is_empty() {
+        return r.to_string();
+    }
+    let scheme_of = |u: &str| u.find(':').filter(|i| {
+        let s = &u[..*i];
+        !s.is_empty() && s.as_bytes()[0].is_ascii_alphabetic() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    }).map(|i| i);
+    if scheme_of(r).is_some() {
+        return r.to_string();
+    }
+    let Some(colon) = scheme_of(base) else {
+        // A base with no scheme is a path.
+        let dir = &base[..base.rfind('/').map_or(0, |i| i + 1)];
+        return if r.starts_with('/') { r.to_string() } else { normal(&format!("{}{}", dir, r)) };
+    };
+    let scheme = &base[..colon];
+    if r.starts_with("//") {
+        return format!("{}:{}", scheme, r);
+    }
+    let rest = &base[colon + 1..];
+    let (auth, path) = match rest.strip_prefix("//") {
+        Some(x) => {
+            let e = x.find(['/', '?', '#']).unwrap_or(x.len());
+            (Some(&x[..e]), &x[e..])
+        }
+        None => (None, rest),
+    };
+    let bare = path.split(['?', '#']).next().unwrap_or("");
+    let joined = if r.starts_with('/') {
+        normal(r)
+    } else if r.starts_with('?') {
+        format!("{}{}", bare, r)
+    } else if r.starts_with('#') {
+        format!("{}{}", path.split('#').next().unwrap_or(""), r)
+    } else {
+        let dir = if bare.is_empty() { "/" } else { &bare[..bare.rfind('/').map_or(0, |i| i + 1)] };
+        normal(&format!("{}{}", dir, r))
+    };
+    match auth {
+        Some(a) => format!("{}://{}{}", scheme, a, joined),
+        None => format!("{}:{}", scheme, joined),
+    }
+}
+
+/// Dots taken out of the path, the query left alone.
+fn normal(p: &str) -> String {
+    let (path, tail) = match p.find(['?', '#']) {
+        Some(i) => (&p[..i], &p[i..]),
+        None => (p, ""),
+    };
+    let mut out: Vec<&str> = vec![];
+    let segs: Vec<&str> = path.split('/').collect();
+    for (i, s) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        match *s {
+            "." => if last { out.push(""); },
+            ".." => {
+                if out.len() > 1 { out.pop(); }
+                if last { out.push(""); }
+            }
+            x => out.push(x),
+        }
+    }
+    format!("{}{}", out.join("/"), tail)
+}
+
+/// `A=1,B="x,y",C=0x1F,D=1920x1080`, by RFC 8216 section 4.2. A quoted value keeps a comma.
+fn attributes(s: &str) -> Vec<(String, String, bool)> {
+    let c: Vec<char> = s.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        while i < c.len() && (c[i] == ',' || c[i].is_whitespace()) {
+            i += 1;
+        }
+        let st = i;
+        while i < c.len() && c[i] != '=' && c[i] != ',' {
+            i += 1;
+        }
+        let k: String = c[st..i].iter().collect();
+        if i >= c.len() || c[i] != '=' {
+            continue;
+        }
+        i += 1;
+        let (v, quoted) = if c.get(i) == Some(&'"') {
+            i += 1;
+            let st = i;
+            while i < c.len() && c[i] != '"' {
+                i += 1;
+            }
+            let v: String = c[st..i].iter().collect();
+            i += 1;
+            (v, true)
+        } else {
+            let st = i;
+            while i < c.len() && c[i] != ',' {
+                i += 1;
+            }
+            (c[st..i].iter().collect::<String>().trim().to_string(), false)
+        };
+        if !k.trim().is_empty() {
+            out.push((k.trim().to_string(), v, quoted));
+        }
+    }
+    out
+}
+
+fn attr_map(s: &str, base: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    for (k, v, quoted) in attributes(s) {
+        let key = k.to_lowercase().replace('-', "_");
+        let val = if key == "uri" {
+            m.insert("resolved".into(), json!(resolve(base, &v)));
+            json!(v)
+        } else if quoted {
+            if key == "codecs" {
+                json!(v.split(',').map(|x| x.trim()).collect::<Vec<_>>())
+            } else {
+                json!(v)
+            }
+        } else if key == "resolution" {
+            match v.split_once(['x', 'X']).and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?))) {
+                Some((w, h)) => json!({ "width": w, "height": h }),
+                None => json!(v),
+            }
+        } else if v == "YES" {
+            json!(true)
+        } else if v == "NO" {
+            json!(false)
+        } else if v.starts_with("0x") || v.starts_with("0X") {
+            json!(v)
+        } else if let Ok(i) = v.parse::<i64>() {
+            json!(i)
+        } else if let Ok(f) = v.parse::<f64>() {
+            json!(f)
+        } else {
+            json!(v)
+        };
+        m.insert(key, val);
+    }
+    m
+}
+
+/// `#EXTINF:123.4 tvg-id="x" group-title="y z",The title`, IPTV attributes and all.
+fn extinf(s: &str) -> (Option<f64>, Map<String, Value>, Option<String>) {
+    let c: Vec<char> = s.chars().collect();
+    let mut q = false;
+    let mut comma = None;
+    for (i, x) in c.iter().enumerate() {
+        if *x == '"' {
+            q = !q;
+        } else if *x == ',' && !q {
+            comma = Some(i);
+            break;
+        }
+    }
+    let head: String = c[..comma.unwrap_or(c.len())].iter().collect();
+    let title: Option<String> = comma.map(|i| c[i + 1..].iter().collect::<String>().trim().to_string()).filter(|t| !t.is_empty());
+    let mut parts = head.trim().splitn(2, char::is_whitespace);
+    let dur = parts.next().and_then(|d| d.parse::<f64>().ok()).filter(|d| *d >= 0.0);
+    let mut m = Map::new();
+    if let Some(rest) = parts.next() {
+        // Space-separated here, unlike HLS.
+        let c: Vec<char> = rest.chars().collect();
+        let mut i = 0;
+        while i < c.len() {
+            while i < c.len() && c[i].is_whitespace() {
+                i += 1;
+            }
+            let st = i;
+            while i < c.len() && c[i] != '=' && !c[i].is_whitespace() {
+                i += 1;
+            }
+            let k: String = c[st..i].iter().collect();
+            if i >= c.len() || c[i] != '=' {
+                continue;
+            }
+            i += 1;
+            let v = if c.get(i) == Some(&'"') {
+                i += 1;
+                let st = i;
+                while i < c.len() && c[i] != '"' {
+                    i += 1;
+                }
+                let v: String = c[st..i].iter().collect();
+                i += 1;
+                v
+            } else {
+                let st = i;
+                while i < c.len() && !c[i].is_whitespace() {
+                    i += 1;
+                }
+                c[st..i].iter().collect()
+            };
+            if !k.is_empty() {
+                m.insert(k, json!(v));
+            }
+        }
+    }
+    (dur, m, title)
+}
+
+fn tag_of(l: &str) -> Option<(&str, &str)> {
+    let t = l.strip_prefix('#')?;
+    if !t.starts_with("EXT") {
+        return None;
+    }
+    Some(t.split_once(':').unwrap_or((t, "")))
+}
+
+fn lines_of(text: &str) -> Vec<&str> {
+    text.trim_start_matches('\u{feff}').lines().map(str::trim).collect()
+}
+
+fn read_pls(text: &str, base: &str) -> Result<Value, String> {
+    let mut entries: std::collections::BTreeMap<i64, Map<String, Value>> = std::collections::BTreeMap::new();
+    let mut declared = None;
+    for (i, l) in lines_of(text).iter().enumerate() {
+        if l.is_empty() || l.starts_with(';') || l.starts_with('[') {
+            continue;
+        }
+        let (k, v) = l.split_once('=').ok_or(format!("line {}: `{}` has no =", i + 1, l))?;
+        let low = k.trim().to_lowercase();
+        if low == "numberofentries" {
+            declared = v.trim().parse::<i64>().ok();
+            continue;
+        }
+        if low == "version" {
+            continue;
+        }
+        let digits = low.trim_start_matches(|c: char| c.is_alphabetic());
+        let word = &low[..low.len() - digits.len()];
+        let n: i64 = digits.parse().map_err(|_| format!("line {}: `{}` has no number", i + 1, k))?;
+        let e = entries.entry(n).or_default();
+        match word {
+            "file" => {
+                e.insert("url".into(), json!(v.trim()));
+                e.insert("resolved".into(), json!(resolve(base, v.trim())));
+            }
+            "title" => { e.insert("title".into(), json!(v.trim())); }
+            "length" => { e.insert("duration".into(), json!(v.trim().parse::<f64>().ok().filter(|d| *d >= 0.0))); }
+            _ => {}
+        }
+    }
+    let list: Vec<Value> = entries.into_values().map(Value::Object).collect();
+    for (i, e) in list.iter().enumerate() {
+        if e.get("url").is_none() {
+            return Err(format!("entry {} has no File", i + 1));
+        }
+    }
+    let mut problems = vec![];
+    if let Some(n) = declared.filter(|n| *n != list.len() as i64) {
+        problems.push(format!("NumberOfEntries says {} and {} are here", n, list.len()));
+    }
+    Ok(json!({ "kind": "pls", "entries": list, "problems": problems }))
+}
+
+fn read_plain(ls: &[&str], base: &str, extended: bool) -> Value {
+    let mut entries = vec![];
+    let (mut dur, mut attrs, mut title, mut group): (Option<f64>, Map<String, Value>, Option<String>, Option<String>) = (None, Map::new(), None, None);
+    let mut list_name = None;
+    for l in ls {
+        if l.is_empty() {
+            continue;
+        }
+        if let Some((tag, v)) = tag_of(l) {
+            match tag {
+                "EXTINF" => {
+                    let e = extinf(v);
+                    dur = e.0;
+                    attrs = e.1;
+                    title = e.2;
+                }
+                "EXTGRP" => group = Some(v.trim().to_string()),
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(n) = l.strip_prefix("#PLAYLIST:") {
+            list_name = Some(n.trim().to_string());
+            continue;
+        }
+        if l.starts_with('#') {
+            continue;
+        }
+        let g = group.take().or(attrs.get("group-title").and_then(Value::as_str).map(str::to_string));
+        entries.push(json!({ "url": l, "resolved": resolve(base, l), "title": title.take(), "duration": dur.take(), "group": g, "attributes": std::mem::take(&mut attrs) }));
+    }
+    let total: f64 = entries.iter().filter_map(|e| e["duration"].as_f64()).sum();
+    json!({ "kind": if extended { "extended_m3u" } else { "m3u" }, "name": list_name, "entries": entries, "total_duration": round(total) })
+}
+
+fn round(f: f64) -> f64 {
+    // Adding zero: an empty sum is -0.0, and that would print.
+    (f * 1e6).round() / 1e6 + 0.0
+}
+
+fn read_master(ls: &[&str], base: &str) -> Value {
+    let (mut variants, mut media, mut iframes, mut data, mut keys) = (vec![], vec![], vec![], vec![], vec![]);
+    let mut pending: Option<Map<String, Value>> = None;
+    let mut version = None;
+    let mut independent = false;
+    for l in ls {
+        if l.is_empty() {
+            continue;
+        }
+        if let Some((tag, v)) = tag_of(l) {
+            match tag {
+                "EXT-X-VERSION" => version = v.trim().parse::<i64>().ok(),
+                "EXT-X-INDEPENDENT-SEGMENTS" => independent = true,
+                "EXT-X-STREAM-INF" => pending = Some(attr_map(v, base)),
+                "EXT-X-MEDIA" => media.push(Value::Object(attr_map(v, base))),
+                "EXT-X-I-FRAME-STREAM-INF" => iframes.push(Value::Object(attr_map(v, base))),
+                "EXT-X-SESSION-DATA" => data.push(Value::Object(attr_map(v, base))),
+                "EXT-X-SESSION-KEY" => keys.push(Value::Object(attr_map(v, base))),
+                _ => {}
+            }
+            continue;
+        }
+        if l.starts_with('#') {
+            continue;
+        }
+        if let Some(mut m) = pending.take() {
+            m.insert("uri".into(), json!(l));
+            m.insert("resolved".into(), json!(resolve(base, l)));
+            variants.push(Value::Object(m));
+        }
+    }
+    json!({ "kind": "hls_master", "version": version, "independent_segments": independent, "variants": variants, "media": media, "iframe_streams": iframes, "session_data": data, "session_keys": keys })
+}
+
+fn read_media(ls: &[&str], base: &str) -> Value {
+    let (mut version, mut target, mut seq, mut disc, mut kind): (Option<i64>, Option<i64>, i64, i64, Option<String>) = (None, None, 0, 0, None);
+    let (mut endlist, mut iframes, mut independent) = (false, false, false);
+    let mut segments = vec![];
+    let (mut dur, mut title): (Option<f64>, Option<String>) = (None, None);
+    let (mut range, mut gap, mut new_disc, mut pdt): (Option<(i64, Option<i64>)>, bool, bool, Option<String>) = (None, false, false, None);
+    let (mut key, mut map): (Option<Map<String, Value>>, Option<Map<String, Value>>) = (None, None);
+    let mut next_offset = 0;
+    let mut extra: Vec<Value> = vec![];
+    let mut number = 0;
+    for l in ls {
+        if l.is_empty() {
+            continue;
+        }
+        if let Some((tag, v)) = tag_of(l) {
+            match tag {
+                "EXT-X-VERSION" => version = v.trim().parse().ok(),
+                "EXT-X-TARGETDURATION" => target = v.trim().parse().ok(),
+                "EXT-X-MEDIA-SEQUENCE" => seq = v.trim().parse().unwrap_or(0),
+                "EXT-X-DISCONTINUITY-SEQUENCE" => disc = v.trim().parse().unwrap_or(0),
+                "EXT-X-PLAYLIST-TYPE" => kind = Some(v.trim().to_string()),
+                "EXT-X-ENDLIST" => endlist = true,
+                "EXT-X-I-FRAMES-ONLY" => iframes = true,
+                "EXT-X-INDEPENDENT-SEGMENTS" => independent = true,
+                "EXTINF" => {
+                    let e = extinf(v);
+                    dur = e.0;
+                    title = e.2;
+                }
+                "EXT-X-BYTERANGE" => {
+                    let (a, b) = v.split_once('@').map_or((v, None), |(a, b)| (a, Some(b)));
+                    range = a.trim().parse().ok().map(|n| (n, b.and_then(|o| o.trim().parse().ok())));
+                }
+                "EXT-X-DISCONTINUITY" => new_disc = true,
+                "EXT-X-GAP" => gap = true,
+                "EXT-X-PROGRAM-DATE-TIME" => pdt = Some(v.trim().to_string()),
+                "EXT-X-KEY" => {
+                    let m = attr_map(v, base);
+                    key = if m.get("method") == Some(&json!("NONE")) { None } else { Some(m) };
+                }
+                "EXT-X-MAP" => map = Some(attr_map(v, base)),
+                "EXTM3U" => {}
+                o => extra.push(json!({ "tag": o, "value": v })),
+            }
+            continue;
+        }
+        if l.starts_with('#') {
+            continue;
+        }
+        let mut s = Map::new();
+        let sequence = seq + number;
+        number += 1;
+        s.insert("uri".into(), json!(l));
+        s.insert("resolved".into(), json!(resolve(base, l)));
+        s.insert("sequence".into(), json!(sequence));
+        s.insert("duration".into(), json!(dur.take()));
+        if let Some(t) = title.take() {
+            s.insert("title".into(), json!(t));
+        }
+        if let Some((n, o)) = range.take() {
+            // With no offset a range starts where the last one stopped.
+            let off = o.unwrap_or(next_offset);
+            next_offset = off + n;
+            s.insert("byterange".into(), json!({ "length": n, "offset": off }));
+        }
+        if new_disc {
+            s.insert("discontinuity".into(), json!(true));
+            new_disc = false;
+        }
+        if gap {
+            s.insert("gap".into(), json!(true));
+            gap = false;
+        }
+        if let Some(p) = pdt.take() {
+            s.insert("program_date_time".into(), json!(p));
+        }
+        if let Some(k) = &key {
+            let mut k2 = k.clone();
+            // AES-128 with no IV uses the media sequence number, as RFC 8216 section 5.2 says.
+            if !k2.contains_key("iv") && k2.get("method") == Some(&json!("AES-128")) {
+                k2.insert("iv".into(), json!(format!("0x{:032X}", sequence)));
+                k2.insert("iv_implied".into(), json!(true));
+            }
+            s.insert("key".into(), Value::Object(k2));
+        }
+        if let Some(m) = &map {
+            s.insert("map".into(), Value::Object(m.clone()));
+        }
+        segments.push(Value::Object(s));
+    }
+    let total: f64 = segments.iter().filter_map(|s| s["duration"].as_f64()).sum();
+    json!({
+        "kind": "hls_media", "version": version, "target_duration": target, "media_sequence": seq, "discontinuity_sequence": disc, "playlist_type": kind,
+        "i_frames_only": iframes, "independent_segments": independent, "ended": endlist, "live": !endlist && kind.as_deref() != Some("VOD"),
+        "segments": segments, "total_duration": round(total), "other_tags": extra,
+    })
+}
+
+fn kind_of(ls: &[&str]) -> &'static str {
+    let tags: Vec<&str> = ls.iter().filter_map(|l| tag_of(l).map(|x| x.0)).collect();
+    if tags.iter().any(|t| MASTER_TAGS.contains(t)) {
+        "master"
+    } else if tags.iter().any(|t| MEDIA_TAGS.contains(t) && *t != "EXTINF") {
+        "media"
+    } else if tags.first() == Some(&"EXTM3U") {
+        "extended"
+    } else {
+        "plain"
+    }
+}
+
+fn read(text: &str, base: &str) -> Result<Value, String> {
+    let t = text.trim_start_matches('\u{feff}').trim_start();
+    if t.is_empty() {
+        return Err("an empty playlist".to_string());
+    }
+    if t.to_lowercase().starts_with("[playlist]") {
+        return read_pls(t, base);
+    }
+    let ls = lines_of(t);
+    Ok(match kind_of(&ls) {
+        "master" => read_master(&ls, base),
+        "media" => read_media(&ls, base),
+        "extended" => read_plain(&ls, base, true),
+        _ => read_plain(&ls, base, false),
+    })
+}
+
+/// Reads any of them, told apart by what is in it: `kind` is `m3u`, `extended_m3u`, `pls`, `hls_master` or `hls_media`. `base` is the playlist's own URL or path (empty if none), and each URL comes back `resolved` against it.
+pub fn m3u_parse(text: &str, base: &str) -> Result<Value, String> {
+    read(text, base)
+}
+
+/// Reads a playlist from a path, relative names resolved against it.
+pub fn m3u_read_file(path: &str) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    // Older .m3u files are Latin-1.
+    let t = String::from_utf8(b).unwrap_or_else(|e| e.as_bytes().iter().map(|x| *x as char).collect());
+    read(&t, path)
+}
+
+/// One URL resolved against another, by RFC 3986.
+pub fn m3u_resolve(base: &str, url: &str) -> String {
+    resolve(base, url)
+}
+
+/// RFC 8216's rules for an HLS playlist: `[{ line, rule, message }]`: tags out of place, segments longer than the target duration, a version too low for what is used, variants with no BANDWIDTH, master and media tags mixed.
+pub fn m3u_check(text: &str) -> Result<Vec<Value>, String> {
+    let ls = lines_of(text);
+    let mut out = vec![];
+    let mut note = |line: usize, rule: &str, m: String| out.push(json!({ "line": line, "rule": rule, "message": m }));
+    if ls.first() != Some(&"#EXTM3U") {
+        note(1, "first-line", "an HLS playlist must start with #EXTM3U".to_string());
+    }
+    let tags: Vec<(usize, &str, &str)> = ls.iter().enumerate().filter_map(|(i, l)| tag_of(l).map(|(a, b)| (i + 1, a, b))).collect();
+    let is_master = tags.iter().any(|t| MASTER_TAGS.contains(&t.1));
+    let is_media = tags.iter().any(|t| MEDIA_TAGS.contains(&t.1));
+    if is_master && is_media {
+        note(1, "mixed", "master and media tags in one playlist".to_string());
+    }
+    let version = tags.iter().find(|t| t.1 == "EXT-X-VERSION").and_then(|t| t.2.trim().parse::<i64>().ok()).unwrap_or(1);
+    if tags.iter().filter(|t| t.1 == "EXT-X-VERSION").count() > 1 {
+        note(1, "version", "EXT-X-VERSION is given twice".to_string());
+    }
+    let mut need = |n: i64, what: &str, line: usize, out: &mut dyn FnMut(usize, &str, String)| {
+        if version < n {
+            out(line, "version", format!("{} needs EXT-X-VERSION {} or more, and this is {}", what, n, version));
+        }
+    };
+    if is_media {
+        let target = tags.iter().find(|t| t.1 == "EXT-X-TARGETDURATION").and_then(|t| t.2.trim().parse::<f64>().ok());
+        if target.is_none() {
+            note(1, "target-duration", "a media playlist needs EXT-X-TARGETDURATION".to_string());
+        }
+        let mut seen_uri = false;
+        for (n, t, v) in &tags {
+            match *t {
+                "EXTINF" => {
+                    let d = extinf(v).0;
+                    let Some(d) = d else {
+                        note(*n, "extinf", format!("`{}` has no duration", v));
+                        continue;
+                    };
+                    if v.split(',').next().unwrap_or("").contains('.') {
+                        need(3, "a fractional EXTINF", *n, &mut note);
+                    }
+                    if let Some(tt) = target {
+                        if d.round() > tt {
+                            note(*n, "target-duration", format!("a segment of {} rounds past the target of {}", d, tt));
+                        }
+                    }
+                    if !ls.get(*n).map_or(false, |x| !x.is_empty()) {
+                        note(*n, "extinf", "EXTINF with no URI after it".to_string());
+                    }
+                    seen_uri = true;
+                }
+                "EXT-X-BYTERANGE" => need(4, "EXT-X-BYTERANGE", *n, &mut note),
+                "EXT-X-I-FRAMES-ONLY" => need(4, "EXT-X-I-FRAMES-ONLY", *n, &mut note),
+                "EXT-X-MAP" => need(if tags.iter().any(|x| x.1 == "EXT-X-I-FRAMES-ONLY") { 5 } else { 6 }, "EXT-X-MAP", *n, &mut note),
+                "EXT-X-KEY" => {
+                    let a = attributes(v);
+                    let get = |k: &str| a.iter().find(|x| x.0 == k).map(|x| x.1.as_str());
+                    if get("IV").is_some() {
+                        need(2, "a KEY with an IV", *n, &mut note);
+                    }
+                    match get("METHOD") {
+                        None => note(*n, "key", "EXT-X-KEY needs a METHOD".to_string()),
+                        Some("NONE") => {}
+                        Some(_) if get("URI").is_none() => note(*n, "key", "EXT-X-KEY needs a URI unless METHOD is NONE".to_string()),
+                        _ => {}
+                    }
+                }
+                "EXT-X-MEDIA-SEQUENCE" | "EXT-X-DISCONTINUITY-SEQUENCE" if seen_uri => note(*n, "order", format!("{} must come before the first segment", t)),
+                _ => {}
+            }
+        }
+    }
+    let mut ids: Vec<String> = vec![];
+    for (n, t, v) in &tags {
+        let a = attributes(v);
+        let get = |k: &str| a.iter().find(|x| x.0 == k).map(|x| x.1.clone());
+        match *t {
+            "EXT-X-STREAM-INF" => {
+                if get("BANDWIDTH").is_none() {
+                    note(*n, "bandwidth", "EXT-X-STREAM-INF needs BANDWIDTH".to_string());
+                }
+                if !ls.get(*n).map_or(false, |x| !x.is_empty() && !x.starts_with('#')) {
+                    note(*n, "stream-inf", "EXT-X-STREAM-INF must be followed by a URI".to_string());
+                }
+            }
+            "EXT-X-MEDIA" => {
+                for k in ["TYPE", "GROUP-ID", "NAME"] {
+                    if get(k).is_none() {
+                        note(*n, "media", format!("EXT-X-MEDIA needs {}", k));
+                    }
+                }
+                if let (Some(g), Some(nm)) = (get("GROUP-ID"), get("NAME")) {
+                    let k = format!("{}\u{0}{}", g, nm);
+                    if ids.contains(&k) {
+                        note(*n, "media", format!("the name {} is used twice in group {}", nm, g));
+                    }
+                    ids.push(k);
+                }
+                if get("TYPE").as_deref() == Some("CLOSED-CAPTIONS") && get("URI").is_some() {
+                    note(*n, "media", "CLOSED-CAPTIONS may not have a URI".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(note);
+    Ok(out)
+}
+
+fn fmt_dur(v: &Value) -> String {
+    match v.as_f64() {
+        Some(d) => format!("{}", d),
+        None => "-1".to_string(),
+    }
+}
+
+fn no_breaks(s: &str, what: &str) -> Result<String, String> {
+    if s.contains(['\n', '\r']) {
+        return Err(format!("{} has a line break in it", what));
+    }
+    Ok(s.to_string())
+}
+
+fn quoted(s: &str) -> Result<String, String> {
+    if s.contains(['"', '\n', '\r']) {
+        return Err(format!("`{}` cannot be quoted in a playlist", s));
+    }
+    Ok(format!("\"{}\"", s))
+}
+
+fn attr_list(pairs: Vec<(&str, Option<String>)>) -> String {
+    pairs.into_iter().filter_map(|(k, v)| v.map(|x| format!("{}={}", k, x))).collect::<Vec<_>>().join(",")
+}
+
+fn q(v: &Value, key: &str) -> Result<Option<String>, String> {
+    match v.get(key).and_then(Value::as_str) {
+        Some(s) => Ok(Some(quoted(s)?)),
+        None => Ok(None),
+    }
+}
+
+fn n(v: &Value, key: &str) -> Option<String> {
+    v.get(key).filter(|x| x.is_number()).map(|x| x.to_string())
+}
+
+fn yes(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_bool).map(|b| if b { "YES".to_string() } else { "NO".to_string() })
+}
+
+fn key_line(k: &Value) -> Result<String, String> {
+    let method = k.get("method").and_then(Value::as_str).ok_or("a key needs a `method`")?;
+    let implied = k.get("iv_implied") == Some(&json!(true));
+    Ok(format!("#EXT-X-KEY:{}", attr_list(vec![("METHOD", Some(method.to_string())), ("URI", q(k, "uri")?), ("IV", if implied { None } else { k.get("iv").and_then(Value::as_str).map(str::to_string) }), ("KEYFORMAT", q(k, "keyformat")?), ("KEYFORMATVERSIONS", q(k, "keyformatversions")?)])))
+}
+
+fn write_media(d: &Value) -> Result<String, String> {
+    let segs = d.get("segments").and_then(Value::as_array).ok_or("a media playlist needs `segments`")?;
+    let longest = segs.iter().filter_map(|s| s["duration"].as_f64()).fold(0.0, f64::max);
+    let target = d.get("target_duration").and_then(Value::as_i64).unwrap_or(longest.round() as i64);
+    if (longest.round() as i64) > target {
+        return Err(format!("a segment of {} rounds past the target of {}", longest, target));
+    }
+    let uses_range = segs.iter().any(|s| s.get("byterange").is_some());
+    let uses_map = segs.iter().any(|s| s.get("map").is_some());
+    let frac = segs.iter().any(|s| s["duration"].as_f64().map_or(false, |x| x.fract() != 0.0));
+    let needed = if uses_map { 6 } else if uses_range { 4 } else if frac { 3 } else { 1 };
+    let version = d.get("version").and_then(Value::as_i64).unwrap_or(needed).max(needed);
+    let mut o = format!("#EXTM3U\n#EXT-X-VERSION:{}\n#EXT-X-TARGETDURATION:{}\n", version, target);
+    if let Some(s) = d.get("media_sequence").and_then(Value::as_i64).filter(|x| *x != 0) {
+        o.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", s));
+    }
+    if let Some(s) = d.get("discontinuity_sequence").and_then(Value::as_i64).filter(|x| *x != 0) {
+        o.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{}\n", s));
+    }
+    if let Some(s) = d.get("playlist_type").and_then(Value::as_str) {
+        if s != "VOD" && s != "EVENT" {
+            return Err(format!("`{}` is not a playlist type: VOD or EVENT", s));
+        }
+        o.push_str(&format!("#EXT-X-PLAYLIST-TYPE:{}\n", s));
+    }
+    if d.get("independent_segments") == Some(&json!(true)) {
+        o.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+    }
+    if d.get("i_frames_only") == Some(&json!(true)) {
+        o.push_str("#EXT-X-I-FRAMES-ONLY\n");
+    }
+    let (mut key, mut map): (Option<String>, Option<String>) = (None, None);
+    let mut next = 0;
+    for (i, s) in segs.iter().enumerate() {
+        let uri = s.get("uri").and_then(Value::as_str).ok_or(format!("segment {} needs a `uri`", i))?;
+        let dur = s.get("duration").filter(|x| x.is_number()).ok_or(format!("segment {} needs a `duration`", i))?;
+        if let Some(k) = s.get("key") {
+            let line = key_line(k)?;
+            if key.as_ref() != Some(&line) {
+                o.push_str(&line);
+                o.push('\n');
+                key = Some(line);
+            }
+        } else if key.take().is_some() {
+            o.push_str("#EXT-X-KEY:METHOD=NONE\n");
+        }
+        if let Some(m) = s.get("map") {
+            let line = format!("#EXT-X-MAP:{}", attr_list(vec![("URI", q(m, "uri")?), ("BYTERANGE", q(m, "byterange")?)]));
+            if map.as_ref() != Some(&line) {
+                o.push_str(&line);
+                o.push('\n');
+                map = Some(line);
+            }
+        }
+        if s.get("discontinuity") == Some(&json!(true)) {
+            o.push_str("#EXT-X-DISCONTINUITY\n");
+        }
+        if let Some(p) = s.get("program_date_time").and_then(Value::as_str) {
+            o.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", p));
+        }
+        o.push_str(&format!("#EXTINF:{},{}\n", fmt_dur(dur), no_breaks(s.get("title").and_then(Value::as_str).unwrap_or(""), "a title")?));
+        if let Some(r) = s.get("byterange") {
+            let len = r.get("length").and_then(Value::as_i64).ok_or(format!("segment {}: a byterange needs a `length`", i))?;
+            let off = r.get("offset").and_then(Value::as_i64).unwrap_or(next);
+            o.push_str(&if off == next && i > 0 { format!("#EXT-X-BYTERANGE:{}\n", len) } else { format!("#EXT-X-BYTERANGE:{}@{}\n", len, off) });
+            next = off + len;
+        }
+        if s.get("gap") == Some(&json!(true)) {
+            o.push_str("#EXT-X-GAP\n");
+        }
+        o.push_str(&no_breaks(uri, "a URI")?);
+        o.push('\n');
+    }
+    if d.get("ended").and_then(Value::as_bool).unwrap_or(d.get("live") != Some(&json!(true))) {
+        o.push_str("#EXT-X-ENDLIST\n");
+    }
+    Ok(o)
+}
+
+fn write_master(d: &Value) -> Result<String, String> {
+    let mut o = format!("#EXTM3U\n#EXT-X-VERSION:{}\n", d.get("version").and_then(Value::as_i64).unwrap_or(4));
+    if d.get("independent_segments") == Some(&json!(true)) {
+        o.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+    }
+    for m in d.get("media").and_then(Value::as_array).into_iter().flatten() {
+        let t = m.get("type").and_then(Value::as_str).ok_or("a rendition needs a `type`")?;
+        o.push_str(&format!("#EXT-X-MEDIA:{}\n", attr_list(vec![("TYPE", Some(t.to_string())), ("GROUP-ID", q(m, "group_id")?), ("LANGUAGE", q(m, "language")?), ("NAME", q(m, "name")?), ("DEFAULT", yes(m, "default")), ("AUTOSELECT", yes(m, "autoselect")), ("FORCED", yes(m, "forced")), ("CHANNELS", q(m, "channels")?), ("URI", q(m, "uri")?)])));
+    }
+    let list = d.get("variants").and_then(Value::as_array).ok_or("a master playlist needs `variants`")?;
+    for (i, v) in list.iter().enumerate() {
+        let uri = v.get("uri").and_then(Value::as_str).ok_or(format!("variant {} needs a `uri`", i))?;
+        let bw = n(v, "bandwidth").ok_or(format!("variant {} needs a `bandwidth`", i))?;
+        let codecs = match v.get("codecs") {
+            Some(Value::Array(a)) => Some(quoted(&a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))?),
+            Some(Value::String(s)) => Some(quoted(s)?),
+            _ => None,
+        };
+        let res = v.get("resolution").map(|r| match r {
+            Value::Object(_) => format!("{}x{}", r["width"], r["height"]),
+            x => x.as_str().unwrap_or("").to_string(),
+        });
+        o.push_str(&format!("#EXT-X-STREAM-INF:{}\n{}\n", attr_list(vec![("BANDWIDTH", Some(bw)), ("AVERAGE-BANDWIDTH", n(v, "average_bandwidth")), ("CODECS", codecs), ("RESOLUTION", res), ("FRAME-RATE", n(v, "frame_rate")), ("AUDIO", q(v, "audio")?), ("VIDEO", q(v, "video")?), ("SUBTITLES", q(v, "subtitles")?), ("CLOSED-CAPTIONS", q(v, "closed_captions")?)]), no_breaks(uri, "a URI")?));
+    }
+    for v in d.get("iframe_streams").and_then(Value::as_array).into_iter().flatten() {
+        o.push_str(&format!("#EXT-X-I-FRAME-STREAM-INF:{}\n", attr_list(vec![("BANDWIDTH", n(v, "bandwidth")), ("URI", q(v, "uri")?)])));
+    }
+    Ok(o)
+}
+
+/// Writes a playlist from what `m3u_parse` gives, or the same by hand: `kind` says which. Versions are raised to what is used, and a segment past its target duration is refused.
+pub fn m3u_write(playlist: serde_json::Value) -> Result<String, String> {
+    let kind = playlist.get("kind").and_then(Value::as_str).unwrap_or("extended_m3u");
+    match kind {
+        "hls_media" => write_media(&playlist),
+        "hls_master" => write_master(&playlist),
+        "pls" | "m3u" | "extended_m3u" => {
+            let list = playlist.get("entries").and_then(Value::as_array).ok_or("a playlist needs `entries`")?;
+            let mut o = String::new();
+            if kind == "pls" {
+                o.push_str("[playlist]\n");
+                for (i, e) in list.iter().enumerate() {
+                    let url = e.get("url").and_then(Value::as_str).ok_or(format!("entry {} needs a `url`", i))?;
+                    o.push_str(&format!("File{}={}\n", i + 1, no_breaks(url, "a URL")?));
+                    if let Some(t) = e.get("title").and_then(Value::as_str) {
+                        o.push_str(&format!("Title{}={}\n", i + 1, no_breaks(t, "a title")?));
+                    }
+                    o.push_str(&format!("Length{}={}\n", i + 1, e.get("duration").and_then(Value::as_f64).map_or("-1".to_string(), |d| format!("{}", d.round() as i64))));
+                }
+                o.push_str(&format!("NumberOfEntries={}\nVersion=2\n", list.len()));
+                return Ok(o);
+            }
+            if kind == "extended_m3u" {
+                o.push_str("#EXTM3U\n");
+            }
+            for (i, e) in list.iter().enumerate() {
+                let url = e.get("url").and_then(Value::as_str).ok_or(format!("entry {} needs a `url`", i))?;
+                if kind == "extended_m3u" {
+                    let mut head = fmt_dur(e.get("duration").unwrap_or(&Value::Null));
+                    for (k, v) in e.get("attributes").and_then(Value::as_object).into_iter().flatten() {
+                        head.push_str(&format!(" {}={}", k, quoted(v.as_str().unwrap_or(""))?));
+                    }
+                    o.push_str(&format!("#EXTINF:{},{}\n", head, no_breaks(e.get("title").and_then(Value::as_str).unwrap_or(""), "a title")?));
+                    if let Some(g) = e.get("group").and_then(Value::as_str).filter(|_| !e.get("attributes").map_or(false, |a| a.get("group-title").is_some())) {
+                        o.push_str(&format!("#EXTGRP:{}\n", no_breaks(g, "a group")?));
+                    }
+                }
+                o.push_str(&no_breaks(url, "a URL")?);
+                o.push('\n');
+            }
+            Ok(o)
+        }
+        o => Err(format!("`{}` is not a playlist kind", o)),
+    }
+}

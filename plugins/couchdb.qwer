@@ -1,0 +1,329 @@
+//! Apache CouchDB's HTTP API: documents written with their revisions, conflicts reported, a read-change-write that retries them, replication conflicts listed and resolved, bulk writes with each document's result read, Mango queries paged by bookmark, indexes, and the changes feed from a saved sequence.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// COUCHDB_API_URL is the server (http://localhost:5984 when not set), COUCHDB_USER and
+// COUCHDB_PASSWORD sign in with basic auth.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("COUCHDB_API_URL").unwrap_or_else(|| "http://localhost:5984".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// A document's id in a URL: `_design/x` and `_local/x` keep their slash, and any other slash is part of the id.
+fn doc_path(id: &str) -> String {
+    for p in ["_design/", "_local/"] {
+        if let Some(r) = id.strip_prefix(p) {
+            return format!("{}{}", p, enc(r));
+        }
+    }
+    enc(id)
+}
+
+fn check_db(name: &str) -> Result<(), String> {
+    let ok = name.chars().next().map_or(false, |c| c.is_ascii_lowercase()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_$()+-/".contains(c));
+    if !ok {
+        return Err(format!("{:?} is not a database name: lowercase letters first, then digits and _$()+-/", name));
+    }
+    Ok(())
+}
+
+fn send(method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let mut req = agent.request(method, &format!("{}{}", base(), path)).set("Accept", "application/json");
+    if let (Some(u), Some(p)) = (env("COUCHDB_USER"), env("COUCHDB_PASSWORD")) {
+        req = req.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+    }
+    let res = match body {
+        Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+        None => req.call(),
+    };
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach CouchDB at {}: {}", base(), e)),
+    };
+    Ok((status, serde_json::from_str(&text).unwrap_or(json!({ "error": "not json", "reason": text }))))
+}
+
+fn refused(status: u16, v: &Value) -> String {
+    format!("CouchDB answered {} {}: {}", status, v["error"].as_str().unwrap_or("error"), v["reason"].as_str().unwrap_or(""))
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let (status, v) = send(method, path, body)?;
+    if status >= 300 {
+        return Err(refused(status, &v));
+    }
+    Ok(v)
+}
+
+fn query_of(pairs: &[(&str, String)]) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    format!("?{}", pairs.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect::<Vec<_>>().join("&"))
+}
+
+/// Makes a database; true when made, false when it was there.
+pub fn couchdb_create_db(db: &str) -> Result<bool, String> {
+    check_db(db)?;
+    let (status, v) = send("PUT", &format!("/{}", enc(db)), None)?;
+    if status == 412 {
+        return Ok(false);
+    }
+    if status >= 300 {
+        return Err(refused(status, &v));
+    }
+    Ok(true)
+}
+
+/// Deletes a database; true when it was there.
+pub fn couchdb_delete_db(db: &str) -> Result<bool, String> {
+    check_db(db)?;
+    let (status, v) = send("DELETE", &format!("/{}", enc(db)), None)?;
+    if status == 404 {
+        return Ok(false);
+    }
+    if status >= 300 {
+        return Err(refused(status, &v));
+    }
+    Ok(true)
+}
+
+/// Writes a document under `id`. An existing one needs its current `_rev` in `doc`, or CouchDB refuses it: that error is a conflict, says so, and means someone else wrote first. Gives `{ id, rev }`.
+pub fn couchdb_put(db: &str, id: &str, doc: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let (status, v) = send("PUT", &format!("/{}/{}", enc(db), doc_path(id)), Some(&doc))?;
+    if status == 409 {
+        return Err(format!("conflict: {} changed since rev {} was read", id, doc["_rev"].as_str().unwrap_or("(none given)")));
+    }
+    if status >= 300 {
+        return Err(refused(status, &v));
+    }
+    Ok(json!({ "id": v["id"], "rev": v["rev"] }))
+}
+
+/// Writes a new document with an id the server picks. Gives `{ id, rev }`.
+pub fn couchdb_insert(db: &str, doc: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let v = call("POST", &format!("/{}", enc(db)), Some(&doc))?;
+    Ok(json!({ "id": v["id"], "rev": v["rev"] }))
+}
+
+/// A document with `_id` and `_rev`, or null when there is none or it was deleted. `rev` "" for the current one.
+pub fn couchdb_get(db: &str, id: &str, rev: &str) -> Result<Value, String> {
+    check_db(db)?;
+    let q = if rev.is_empty() { vec![] } else { vec![("rev", rev.to_string())] };
+    let (status, v) = send("GET", &format!("/{}/{}{}", enc(db), doc_path(id), query_of(&q)), None)?;
+    // A missing database is also a 404 not_found, and that one is an error.
+    if status == 404 && v["reason"] != "Database does not exist." {
+        return Ok(Value::Null);
+    }
+    if status >= 300 {
+        return Err(refused(status, &v));
+    }
+    Ok(v)
+}
+
+/// Deletes a document at its current `rev`. False when it has gone already; a stale `rev` is a conflict error.
+pub fn couchdb_delete(db: &str, id: &str, rev: &str) -> Result<bool, String> {
+    check_db(db)?;
+    if rev.is_empty() {
+        return Err("a delete needs the document's current rev".into());
+    }
+    let (status, v) = send("DELETE", &format!("/{}/{}?rev={}", enc(db), doc_path(id), enc(rev)), None)?;
+    match status {
+        200 | 202 => Ok(true),
+        404 => Ok(false),
+        409 => Err(format!("conflict: {} changed since rev {}", id, rev)),
+        _ => Err(refused(status, &v)),
+    }
+}
+
+/// Changes fields of a document, reading it first and trying again when another write gets in between, up to five times. The document is made if there is none. Gives `{ id, rev, tries }`.
+pub fn couchdb_merge(db: &str, id: &str, changes: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let fields = changes.as_object().ok_or("changes are a map")?.clone();
+    for tries in 1..=5 {
+        let mut doc = couchdb_get(db, id, "")?;
+        if doc.is_null() {
+            doc = json!({});
+        }
+        for (k, v) in &fields {
+            doc[k.as_str()] = v.clone();
+        }
+        let (status, v) = send("PUT", &format!("/{}/{}", enc(db), doc_path(id)), Some(&doc))?;
+        if status < 300 {
+            return Ok(json!({ "id": v["id"], "rev": v["rev"], "tries": tries }));
+        }
+        if status != 409 {
+            return Err(refused(status, &v));
+        }
+        std::thread::sleep(Duration::from_millis(20 << tries));
+    }
+    Err(format!("{} kept changing: five tries lost to other writes", id))
+}
+
+/// Writes many documents at once. A request that succeeds can still hold refused documents, so each is read: `{ ok: [{ id, rev }], conflicts: [ids], failed: [{ id, error, reason }] }`. `options`: `new_edits` false writes documents with their `_rev` as a replicator does.
+pub fn couchdb_bulk(db: &str, docs: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let mut body = json!({ "docs": docs });
+    if options["new_edits"] == false {
+        body["new_edits"] = json!(false);
+    }
+    let r = call("POST", &format!("/{}/_bulk_docs", enc(db)), Some(&body))?;
+    let (mut ok, mut conflicts, mut failed) = (vec![], vec![], vec![]);
+    for x in r.as_array().into_iter().flatten() {
+        if x["ok"] == true || x.get("error").is_none() {
+            ok.push(json!({ "id": x["id"], "rev": x["rev"] }));
+        } else if x["error"] == "conflict" {
+            conflicts.push(x["id"].clone());
+        } else {
+            failed.push(json!({ "id": x["id"], "error": x["error"], "reason": x["reason"] }));
+        }
+    }
+    Ok(json!({ "ok": ok, "conflicts": conflicts, "failed": failed }))
+}
+
+/// The revisions in conflict on a document, after replication: `{ winner, losers: [documents] }`, or null when the document has none. CouchDB picks the same winner everywhere, but keeps the others until they are deleted.
+pub fn couchdb_conflicts(db: &str, id: &str) -> Result<Value, String> {
+    check_db(db)?;
+    let (status, doc) = send("GET", &format!("/{}/{}?conflicts=true", enc(db), doc_path(id)), None)?;
+    if status == 404 {
+        return Ok(Value::Null);
+    }
+    if status >= 300 {
+        return Err(refused(status, &doc));
+    }
+    let revs: Vec<String> = doc["_conflicts"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+    if revs.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut losers = vec![];
+    for r in &revs {
+        losers.push(call("GET", &format!("/{}/{}?rev={}", enc(db), doc_path(id), enc(r)), None)?);
+    }
+    let mut winner = doc;
+    if let Some(m) = winner.as_object_mut() {
+        m.remove("_conflicts");
+    }
+    Ok(json!({ "winner": winner, "losers": losers }))
+}
+
+/// Ends a conflict: writes `doc` (the merged fields) over the winning revision and deletes the losing ones, in one request. Gives `{ rev, removed }`.
+pub fn couchdb_resolve(db: &str, id: &str, doc: serde_json::Value) -> Result<Value, String> {
+    let c = couchdb_conflicts(db, id)?;
+    if c.is_null() {
+        return Err(format!("{} has no conflicts", id));
+    }
+    let mut merged = doc;
+    merged["_id"] = json!(id);
+    merged["_rev"] = c["winner"]["_rev"].clone();
+    let mut docs = vec![merged];
+    for l in c["losers"].as_array().into_iter().flatten() {
+        docs.push(json!({ "_id": id, "_rev": l["_rev"], "_deleted": true }));
+    }
+    let r = couchdb_bulk(db, docs, Value::Null)?;
+    if r["conflicts"].as_array().map_or(false, |a| !a.is_empty()) {
+        return Err(format!("{} changed while resolving it: read it again", id));
+    }
+    let ok = r["ok"].as_array().cloned().unwrap_or_default();
+    Ok(json!({ "rev": ok.first().map_or(Value::Null, |x| x["rev"].clone()), "removed": ok.len().saturating_sub(1) }))
+}
+
+/// A Mango query: `selector` in CouchDB's form, `options` `fields`, `sort`, `limit`, `skip`, `use_index`, `bookmark`. Gives `{ docs, bookmark, warning }`. A `warning` says no index helped.
+pub fn couchdb_find(db: &str, selector: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let mut b = if options.is_object() { options } else { json!({}) };
+    b["selector"] = selector;
+    let r = call("POST", &format!("/{}/_find", enc(db)), Some(&b))?;
+    let mut o = json!({ "docs": r["docs"], "bookmark": r["bookmark"] });
+    if let Some(w) = r.get("warning") {
+        o["warning"] = w.clone();
+    }
+    Ok(o)
+}
+
+/// Every document matching a selector, up to `max`, page by page with bookmarks: `{ docs, complete }`.
+pub fn couchdb_find_all(db: &str, selector: serde_json::Value, options: serde_json::Value, max: i64) -> Result<Value, String> {
+    let mut o = if options.is_object() { options } else { json!({}) };
+    let limit = o["limit"].as_i64().unwrap_or(100).clamp(1, 1000);
+    o["limit"] = json!(limit);
+    let mut docs: Vec<Value> = vec![];
+    loop {
+        let r = couchdb_find(db, selector.clone(), o.clone())?;
+        let page = r["docs"].as_array().cloned().unwrap_or_default();
+        let n = page.len() as i64;
+        docs.extend(page);
+        if n < limit || r["bookmark"] == "nil" {
+            return Ok(json!({ "docs": docs, "complete": true }));
+        }
+        if docs.len() as i64 >= max {
+            docs.truncate(max.max(0) as usize);
+            return Ok(json!({ "docs": docs, "complete": false }));
+        }
+        o["bookmark"] = r["bookmark"].clone();
+    }
+}
+
+/// An index for Mango on `fields`. Gives `{ id, name, result }`, `result` "created" or "exists".
+pub fn couchdb_create_index(db: &str, fields: serde_json::Value, name: &str) -> Result<Value, String> {
+    check_db(db)?;
+    let mut b = json!({ "index": { "fields": fields }, "type": "json" });
+    if !name.is_empty() {
+        b["name"] = json!(name);
+    }
+    call("POST", &format!("/{}/_index", enc(db)), Some(&b))
+}
+
+/// What changed since `since` ("0" or "" from the start, "now" for only what comes next, or the `last_seq` saved from before). `options`: `limit`, `include_docs`, `descending`, `selector` (a Mango selector), `wait_ms` (wait this long for a change when there is none). Gives `{ changes: [{ id, seq, rev, deleted, doc }], last_seq, pending }`; save `last_seq`, opaque text, for the next call.
+pub fn couchdb_changes(db: &str, since: &str, options: serde_json::Value) -> Result<Value, String> {
+    check_db(db)?;
+    let mut q = vec![("since", if since.is_empty() { "0".to_string() } else { since.to_string() })];
+    if let Some(l) = options["limit"].as_i64() {
+        q.push(("limit", l.to_string()));
+    }
+    if options["include_docs"] == true {
+        q.push(("include_docs", "true".to_string()));
+    }
+    if options["descending"] == true {
+        q.push(("descending", "true".to_string()));
+    }
+    if let Some(w) = options["wait_ms"].as_i64() {
+        q.push(("feed", "longpoll".to_string()));
+        q.push(("timeout", w.to_string()));
+    }
+    let r = if let Some(sel) = options.get("selector") {
+        q.push(("filter", "_selector".to_string()));
+        call("POST", &format!("/{}/_changes{}", enc(db), query_of(&q)), Some(&json!({ "selector": sel })))?
+    } else {
+        call("GET", &format!("/{}/_changes{}", enc(db), query_of(&q)), None)?
+    };
+    let changes: Vec<Value> = r["results"].as_array().into_iter().flatten().map(|c| {
+        let mut o = json!({ "id": c["id"], "seq": c["seq"], "rev": c["changes"][0]["rev"] });
+        if c["deleted"] == true {
+            o["deleted"] = json!(true);
+        }
+        if let Some(d) = c.get("doc") {
+            o["doc"] = d.clone();
+        }
+        o
+    }).collect();
+    Ok(json!({ "changes": changes, "last_seq": r["last_seq"], "pending": r["pending"] }))
+}

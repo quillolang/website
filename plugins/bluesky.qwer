@@ -1,0 +1,332 @@
+//! Bluesky over the AT Protocol: a session that refreshes itself, posts whose links, mentions and hashtags become facets with the UTF-8 byte offsets the protocol wants, images, and feeds read with cursors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! unicode-segmentation = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use unicode_segmentation::UnicodeSegmentation;
+
+const POST_GRAPHEMES: usize = 300;
+const POST_BYTES: usize = 3000;
+
+fn base(o: &Value) -> String {
+    o.get("service").and_then(|s| s.as_str()).map(str::to_string).or_else(|| std::env::var("BLUESKY_API_URL").ok()).filter(|u| !u.is_empty()).unwrap_or_else(|| "https://bsky.social".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// The newest tokens of each account: a refresh replaces both, and the old refresh token stops working.
+fn tokens() -> &'static Mutex<HashMap<String, (String, String)>> {
+    static T: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn access(s: &Value) -> Result<(String, String), String> {
+    let did = s["did"].as_str().ok_or("the session has no did: use what bluesky_login gave")?.to_string();
+    if let Some(t) = tokens().lock().map_err(|e| e.to_string())?.get(&did) {
+        return Ok(t.clone());
+    }
+    let a = s["accessJwt"].as_str().ok_or("the session has no accessJwt")?.to_string();
+    let r = s["refreshJwt"].as_str().unwrap_or("").to_string();
+    Ok((a, r))
+}
+
+enum Fail {
+    Expired,
+    Other(String),
+}
+
+fn raw(url: &str, token: Option<&str>, ctype: Option<&str>, body: Option<&[u8]>) -> Result<Value, Fail> {
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let mut r = if body.is_some() { agent.post(url) } else { agent.get(url) };
+        r = r.set("User-Agent", "quillo-bluesky/1.0");
+        if let Some(t) = token { r = r.set("Authorization", &format!("Bearer {}", t)); }
+        if let Some(t) = ctype { r = r.set("Content-Type", t); }
+        let res = match body {
+            Some(b) => r.send_bytes(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| Fail::Other(e.to_string()))?;
+                if t.trim().is_empty() {
+                    return Ok(json!({}));
+                }
+                return serde_json::from_str(&t).map_err(|_| Fail::Other(format!("the answer is not JSON: {:?}", t.chars().take(200).collect::<String>())));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()).or_else(|| {
+                    let reset = resp.header("ratelimit-reset")?.trim().parse::<u64>().ok()?;
+                    Some(reset.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()))
+                });
+                let t = resp.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let kind = v["error"].as_str().unwrap_or("Error");
+                if kind == "ExpiredToken" {
+                    return Err(Fail::Expired);
+                }
+                if code == 429 && tries < 2 && wait.unwrap_or(1) <= 30 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                return Err(Fail::Other(format!("Bluesky {} {}: {}", code, kind, v["message"].as_str().unwrap_or(t.trim()))));
+            }
+            Err(e) => return Err(Fail::Other(format!("cannot reach Bluesky: {}", e))),
+        }
+    }
+}
+
+// Runs a call with the session's token, refreshing it once if it has expired.
+fn with_session(s: &Value, o: &Value, nsid: &str, query: &str, ctype: Option<&str>, body: Option<&[u8]>) -> Result<Value, String> {
+    let url = format!("{}/xrpc/{}{}", base(o), nsid, query);
+    let (a, r) = access(s)?;
+    match raw(&url, Some(&a), ctype, body) {
+        Ok(v) => Ok(v),
+        Err(Fail::Other(e)) => Err(e),
+        Err(Fail::Expired) => {
+            let fresh = match raw(&format!("{}/xrpc/com.atproto.server.refreshSession", base(o)), Some(&r), None, Some(b"")) {
+                Ok(v) => v,
+                Err(Fail::Expired) => return Err("the session has run out: log in again".into()),
+                Err(Fail::Other(e)) => return Err(e),
+            };
+            let (a2, r2) = (fresh["accessJwt"].as_str().unwrap_or("").to_string(), fresh["refreshJwt"].as_str().unwrap_or("").to_string());
+            if let Some(did) = s["did"].as_str() {
+                tokens().lock().map_err(|e| e.to_string())?.insert(did.to_string(), (a2.clone(), r2));
+            }
+            raw(&url, Some(&a2), ctype, body).map_err(|e| match e {
+                Fail::Other(m) => m,
+                Fail::Expired => "the refreshed token was refused".into(),
+            })
+        }
+    }
+}
+
+fn post_json(s: &Value, o: &Value, nsid: &str, body: &Value) -> Result<Value, String> {
+    with_session(s, o, nsid, "", Some("application/json"), Some(body.to_string().as_bytes()))
+}
+
+/// Logs in (com.atproto.server.createSession): `identifier` a handle or email, `password` an app password, never the account's own. Options: service (else BLUESKY_API_URL), auth_factor_token. Gives a session { did, handle, accessJwt, refreshJwt } that renews itself.
+pub fn bluesky_login(identifier: &str, password: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "identifier": identifier, "password": password });
+    if let Some(t) = options.get("auth_factor_token") {
+        b["authFactorToken"] = t.clone();
+    }
+    let url = format!("{}/xrpc/com.atproto.server.createSession", base(&options));
+    let r = raw(&url, None, Some("application/json"), Some(b.to_string().as_bytes())).map_err(|e| match e {
+        Fail::Other(m) => m,
+        Fail::Expired => "the login was refused".to_string(),
+    })?;
+    if let Some(did) = r["did"].as_str() {
+        let t = (r["accessJwt"].as_str().unwrap_or("").to_string(), r["refreshJwt"].as_str().unwrap_or("").to_string());
+        tokens().lock().map_err(|e| e.to_string())?.insert(did.to_string(), t);
+    }
+    Ok(json!({ "did": r["did"], "handle": r["handle"], "accessJwt": r["accessJwt"], "refreshJwt": r["refreshJwt"], "email": r.get("email").cloned().unwrap_or(Value::Null) }))
+}
+
+/// The DID of a handle (com.atproto.identity.resolveHandle).
+pub fn bluesky_resolve(handle: &str, options: serde_json::Value) -> Result<String, String> {
+    let url = format!("{}/xrpc/com.atproto.identity.resolveHandle?handle={}", base(&options), enc(handle.trim_start_matches('@')));
+    match raw(&url, None, None, None) {
+        Ok(v) => v["did"].as_str().map(str::to_string).ok_or("no did in the answer".to_string()),
+        Err(Fail::Other(e)) => Err(e),
+        Err(Fail::Expired) => Err("refused".into()),
+    }
+}
+
+fn word_end(c: char) -> bool {
+    c.is_whitespace() || "()[]{}<>\"'".contains(c)
+}
+
+fn trim_url(s: &str) -> &str {
+    s.trim_end_matches(['.', ',', ';', ':', '!', '?'])
+}
+
+// A byte is the start of a word when it opens the text or follows a space or an opening bracket.
+fn at_start(text: &str, i: usize) -> bool {
+    text[..i].chars().next_back().map(|c| c.is_whitespace() || "([{\"'".contains(c)).unwrap_or(true)
+}
+
+fn scan(text: &str) -> Vec<(usize, usize, String, String)> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let ch = rest.chars().next().unwrap();
+        if !at_start(text, i) {
+            i += ch.len_utf8();
+            continue;
+        }
+        let word = &rest[..rest.find(word_end).unwrap_or(rest.len())];
+        let len = if ch == '@' {
+            let name = trim_url(&word[1..]);
+            let ok = name.contains('.') && !name.starts_with('.') && !name.ends_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if ok { out.push((i, i + 1 + name.len(), "mention".to_string(), name.to_string())); }
+            1 + name.len()
+        } else if ch == '#' {
+            let name = trim_url(&word[1..]);
+            // A tag holds no spaces, and only digits is not a tag; 64 graphemes at most.
+            if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) && name.graphemes(true).count() <= 64 {
+                out.push((i, i + 1 + name.len(), "tag".to_string(), name.to_string()));
+            }
+            1 + name.len()
+        } else if word.starts_with("https://") || word.starts_with("http://") {
+            let u = trim_url(word);
+            out.push((i, i + u.len(), "link".to_string(), u.to_string()));
+            u.len()
+        } else {
+            let u = trim_url(word);
+            // A bare domain like example.com/x links to https://.
+            let host = u.split('/').next().unwrap_or("");
+            let tld = host.rsplit('.').next().unwrap_or("");
+            if host.contains('.') && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()) && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                out.push((i, i + u.len(), "link".to_string(), format!("https://{}", u)));
+            }
+            word.len().max(ch.len_utf8())
+        };
+        i += len.max(ch.len_utf8());
+        while !text.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The facets of a text: links, @mentions and #tags, each { index: { byteStart, byteEnd }, features }, the offsets counting UTF-8 bytes. A mention whose handle does not resolve stays plain text. Bare domains link to https.
+pub fn bluesky_facets(text: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    for (start, end, kind, value) in scan(text) {
+        let feature = match kind.as_str() {
+            "link" => json!({ "$type": "app.bsky.richtext.facet#link", "uri": value }),
+            "tag" => json!({ "$type": "app.bsky.richtext.facet#tag", "tag": value }),
+            _ => match bluesky_resolve(&value, options.clone()) {
+                Ok(did) => json!({ "$type": "app.bsky.richtext.facet#mention", "did": did }),
+                Err(_) => continue,
+            },
+        };
+        out.push(json!({ "index": { "byteStart": start, "byteEnd": end }, "features": [feature] }));
+    }
+    Ok(out)
+}
+
+// As the protocol wants it: RFC 3339 in UTC.
+fn now_iso() -> String {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = d.as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", year, month, day, rem / 3600, rem % 3600 / 60, rem % 60, d.subsec_millis())
+}
+
+/// Posts `text`, finding its facets, within the limit of 300 graphemes. Options: reply ({ root, parent }, each { uri, cid }), langs (like ["en"]), embed, facets (your own, in place of the found ones), created_at. Gives { uri, cid, url }.
+pub fn bluesky_post(session: serde_json::Value, text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let g = text.graphemes(true).count();
+    if g > POST_GRAPHEMES || text.len() > POST_BYTES {
+        return Err(format!("the post has {} graphemes in {} bytes; Bluesky takes {} and {}", g, text.len(), POST_GRAPHEMES, POST_BYTES));
+    }
+    let facets = match options.get("facets") {
+        Some(f) => f.clone(),
+        None => json!(bluesky_facets(text, options.clone())?),
+    };
+    let mut rec = json!({ "$type": "app.bsky.feed.post", "text": text, "createdAt": options.get("created_at").and_then(|c| c.as_str()).map(str::to_string).unwrap_or_else(now_iso) });
+    if facets.as_array().map(|f| !f.is_empty()).unwrap_or(false) {
+        rec["facets"] = facets;
+    }
+    for (k, key) in [("reply", "reply"), ("langs", "langs"), ("embed", "embed")] {
+        if let Some(v) = options.get(k) {
+            rec[key] = v.clone();
+        }
+    }
+    let repo = session["did"].clone();
+    let r = post_json(&session, &options, "com.atproto.repo.createRecord", &json!({ "repo": repo, "collection": "app.bsky.feed.post", "record": rec }))?;
+    let uri = r["uri"].as_str().unwrap_or("").to_string();
+    Ok(json!({ "uri": uri, "cid": r["cid"], "url": bluesky_url(&uri, session["handle"].as_str().unwrap_or("")) }))
+}
+
+/// The web address of an at:// post URI, under a handle (or "" to use the DID).
+pub fn bluesky_url(uri: &str, handle: &str) -> String {
+    let parts: Vec<&str> = uri.trim_start_matches("at://").split('/').collect();
+    if parts.len() != 3 {
+        return String::new();
+    }
+    format!("https://bsky.app/profile/{}/post/{}", if handle.is_empty() { parts[0] } else { handle }, parts[2])
+}
+
+/// Deletes a post of yours by its at:// URI.
+pub fn bluesky_delete(session: serde_json::Value, uri: &str, options: serde_json::Value) -> Result<bool, String> {
+    let rkey = uri.rsplit('/').next().unwrap_or("");
+    if !uri.starts_with("at://") || rkey.is_empty() {
+        return Err(format!("{:?} is not an at:// post URI", uri));
+    }
+    post_json(&session, &options, "com.atproto.repo.deleteRecord", &json!({ "repo": session["did"], "collection": "app.bsky.feed.post", "rkey": rkey }))?;
+    Ok(true)
+}
+
+/// Uploads an image file (1 MB at most) as a blob and gives an `embed` of it for bluesky_post, with `alt` as its description.
+pub fn bluesky_image(session: serde_json::Value, path: &str, alt: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    if bytes.len() > 1_000_000 {
+        return Err(format!("{} is {} bytes; an image is at most 1,000,000", path, bytes.len()));
+    }
+    let mime = match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        e => return Err(format!("Bluesky takes no .{} images", e)),
+    };
+    let r = with_session(&session, &options, "com.atproto.repo.uploadBlob", "", Some(mime), Some(&bytes))?;
+    Ok(json!({ "$type": "app.bsky.embed.images", "images": [{ "alt": alt, "image": r["blob"] }] }))
+}
+
+fn feed_item(item: &Value) -> Value {
+    let p = &item["post"];
+    json!({
+        "uri": p["uri"], "cid": p["cid"], "author": p.pointer("/author/handle"), "name": p.pointer("/author/displayName"),
+        "text": p.pointer("/record/text"), "created_at": p.pointer("/record/createdAt"),
+        "likes": p["likeCount"], "reposts": p["repostCount"], "replies": p["replyCount"],
+        "reposted_by": item.pointer("/reason/by/handle").cloned().unwrap_or(Value::Null),
+        "reply_to": item.pointer("/reply/parent/uri").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn feed(session: &Value, options: &Value, nsid: &str, first: String) -> Result<Value, String> {
+    let mut q = first;
+    q.push_str(&format!("{}limit={}", if q.is_empty() { "?" } else { "&" }, options.get("limit").and_then(|l| l.as_i64()).unwrap_or(50).clamp(1, 100)));
+    if let Some(c) = options.get("cursor").and_then(|c| c.as_str()).filter(|c| !c.is_empty()) {
+        q.push_str(&format!("&cursor={}", enc(c)));
+    }
+    let r = with_session(session, options, nsid, &q, None, None)?;
+    Ok(json!({ "posts": r["feed"].as_array().map(|l| l.iter().map(feed_item).collect::<Vec<_>>()).unwrap_or_default(), "cursor": r.get("cursor").cloned().unwrap_or(Value::Null) }))
+}
+
+/// The session's home timeline. Options: limit (1 to 100), cursor. Gives { posts: [{ uri, cid, author, name, text, created_at, likes, reposts, replies, reposted_by, reply_to }], cursor }; no cursor means the end.
+pub fn bluesky_timeline(session: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    feed(&session, &options, "app.bsky.feed.getTimeline", String::new())
+}
+
+/// One account's posts, by handle or DID; options as for bluesky_timeline, with filter ("posts_no_replies", "posts_with_media").
+pub fn bluesky_author_feed(session: serde_json::Value, actor: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q = format!("?actor={}", enc(actor.trim_start_matches('@')));
+    if let Some(f) = options.get("filter").and_then(|f| f.as_str()) {
+        q.push_str(&format!("&filter={}", enc(f)));
+    }
+    feed(&session, &options, "app.bsky.feed.getAuthorFeed", q)
+}

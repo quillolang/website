@@ -1,0 +1,297 @@
+//! GitLab's REST API: issues, merge requests, notes and pipelines, projects named by path, every list followed through its X-Next-Page header, 429s waited out, and the webhook's token checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct Conf {
+    base: String,
+    token: Option<String>,
+}
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn conf(o: &Value) -> Conf {
+    let mut base = opt(o, "base_url", "GITLAB_API_URL").unwrap_or_else(|| "https://gitlab.com".into()).trim_end_matches('/').to_string();
+    if !base.ends_with("/api/v4") {
+        base.push_str("/api/v4");
+    }
+    Conf { base, token: opt(o, "token", "GITLAB_TOKEN") }
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// A project is its numeric id or its path, which goes in the URL with its slashes encoded.
+fn project(p: &str) -> Result<String, String> {
+    if p.is_empty() {
+        return Err("no project: give its id, or a path like group/subgroup/name".into());
+    }
+    Ok(enc(p))
+}
+
+fn error_text(code: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    // `message` may be a text, a map of field to problems, or a list; some errors use `error`.
+    let msg = match v.get("message").or(v.get("error")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(m)) => m.iter().map(|(k, x)| match x {
+            Value::Array(l) => format!("{} {}", k, l.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join(", ")),
+            o => format!("{} {}", k, o),
+        }).collect::<Vec<_>>().join("; "),
+        Some(Value::Array(l)) => l.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("; "),
+        _ => body.trim().chars().take(300).collect(),
+    };
+    let hint = match code {
+        401 => " (check GITLAB_TOKEN)",
+        403 => " (the token lacks the scope or role for this)",
+        _ => "",
+    };
+    format!("GitLab {}: {}{}", code, msg, hint)
+}
+
+struct Answer {
+    status: u16,
+    body: Value,
+    next_page: Option<String>,
+    next_url: Option<String>,
+    total: Option<i64>,
+}
+
+fn link(header: &str, rel: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        if params.split(';').any(|p| p.trim() == format!("rel=\"{}\"", rel)) { Some(url.trim().trim_matches(['<', '>']).to_string()) } else { None }
+    })
+}
+
+fn call(c: &Conf, method: &str, target: &str, body: Option<&Value>) -> Result<Answer, String> {
+    let url = if target.starts_with("http") { target.to_string() } else { format!("{}{}", c.base, target) };
+    if !url.starts_with(&c.base) {
+        return Err(format!("{} is not on {}", url, c.base));
+    }
+    let text = body.map(|b| b.to_string());
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let mut r = agent.request(method, &url).set("User-Agent", "quillo-gitlab/1.0");
+        if let Some(t) = &c.token {
+            r = r.set("PRIVATE-TOKEN", t);
+        }
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let status = resp.status();
+                let next_page = resp.header("x-next-page").filter(|h| !h.is_empty()).map(str::to_string);
+                let next_url = resp.header("link").and_then(|h| link(h, "next"));
+                let total = resp.header("x-total").and_then(|h| h.parse().ok());
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                let body = if t.trim().is_empty() { Value::Null } else { serde_json::from_str(&t).unwrap_or(json!(t)) };
+                return Ok(Answer { status, body, next_page, next_url, total });
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()).or_else(|| {
+                    let reset = resp.header("ratelimit-reset")?.trim().parse::<u64>().ok()?;
+                    Some(reset.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()))
+                });
+                let t = resp.into_string().unwrap_or_default();
+                let retry = code == 429 || (method == "GET" && matches!(code, 502 | 503 | 504));
+                if retry && tries < 2 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                return Err(error_text(code, &t));
+            }
+            Err(e) => return Err(format!("cannot reach {}: {}", c.base, e)),
+        }
+    }
+}
+
+/// Calls any endpoint under /api/v4: `method`, `path` with its query, `body` or null. Options: token (else GITLAB_TOKEN), base_url (else GITLAB_API_URL, else gitlab.com). Gives { status, body, next_page, total }.
+pub fn gitlab_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = if body.is_null() { None } else { Some(&body) };
+    let a = call(&conf(&options), &method.to_uppercase(), path, b)?;
+    Ok(json!({ "status": a.status, "body": a.body, "next_page": a.next_page, "total": a.total }))
+}
+
+fn q(o: &Value, keys: &[&str]) -> String {
+    let mut out = vec![];
+    for k in keys {
+        match o.get(*k) {
+            Some(Value::String(s)) if !s.is_empty() => out.push(format!("{}={}", k, enc(s))),
+            Some(Value::Number(n)) => out.push(format!("{}={}", k, n)),
+            Some(Value::Bool(b)) => out.push(format!("{}={}", k, b)),
+            Some(Value::Array(l)) => {
+                let t: Vec<String> = l.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                if !t.is_empty() {
+                    out.push(format!("{}={}", k, enc(&t.join(","))));
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() { String::new() } else { format!("?{}", out.join("&")) }
+}
+
+/// Every item of a list at 100 a page, by X-Next-Page, or the Link header where a list is keyset-paged (add pagination=keyset to the path). Options add max_items.
+pub fn gitlab_all(path: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let c = conf(&options);
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let sep = if path.contains('?') { "&" } else { "?" };
+    let mut out = vec![];
+    let mut target = format!("{}{}per_page=100", path, sep);
+    loop {
+        let a = call(&c, "GET", &target, None)?;
+        out.extend(a.body.as_array().cloned().unwrap_or_default());
+        if out.len() >= max {
+            break;
+        }
+        if let Some(n) = a.next_url {
+            target = n;
+        } else if let Some(p) = a.next_page {
+            target = format!("{}{}per_page=100&page={}", path, sep, p);
+        } else {
+            break;
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// Opens an issue: `params` holds title (needed), description, labels (comma separated), assignee_ids, confidential, due_date.
+pub fn gitlab_issue_create(project_id: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/issues", project(project_id)?), Some(&params))?.body)
+}
+
+/// One issue by its `iid`, the number people see.
+pub fn gitlab_issue(project_id: &str, iid: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", &format!("/projects/{}/issues/{}", project(project_id)?, iid), None)?.body)
+}
+
+/// Changes an issue: title, description, labels, add_labels, state_event ("close", "reopen").
+pub fn gitlab_issue_update(project_id: &str, iid: i64, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "PUT", &format!("/projects/{}/issues/{}", project(project_id)?, iid), Some(&params))?.body)
+}
+
+/// A project's issues, all pages. Options: state (opened, closed), labels, search, assignee_id, order_by, sort, max_items.
+pub fn gitlab_issues(project_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/projects/{}/issues{}", project(project_id)?, q(&options, &["state", "labels", "search", "assignee_id", "order_by", "sort"]));
+    gitlab_all(&path, options)
+}
+
+/// Comments on an issue. Gives the note.
+pub fn gitlab_issue_note(project_id: &str, iid: i64, body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/issues/{}/notes", project(project_id)?, iid), Some(&json!({ "body": body })))?.body)
+}
+
+/// The notes on an issue, all pages, without the system ones such as "closed".
+pub fn gitlab_issue_notes(project_id: &str, iid: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let all = gitlab_all(&format!("/projects/{}/issues/{}/notes", project(project_id)?, iid), options)?;
+    Ok(all.into_iter().filter(|n| n["system"] != true).collect())
+}
+
+/// Opens a merge request: `params` holds source_branch, target_branch, title (all needed), description, remove_source_branch, squash, labels.
+pub fn gitlab_mr_create(project_id: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["source_branch", "target_branch", "title"] {
+        if params.get(k).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+            return Err(format!("a merge request needs `{}`", k));
+        }
+    }
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/merge_requests", project(project_id)?), Some(&params))?.body)
+}
+
+/// One merge request by iid. `detailed_merge_status` says what stops it being merged.
+pub fn gitlab_mr(project_id: &str, iid: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", &format!("/projects/{}/merge_requests/{}", project(project_id)?, iid), None)?.body)
+}
+
+/// A project's merge requests, all pages. Options: state (opened, merged, closed), labels, target_branch, source_branch, max_items.
+pub fn gitlab_mrs(project_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/projects/{}/merge_requests{}", project(project_id)?, q(&options, &["state", "labels", "target_branch", "source_branch", "order_by", "sort"]));
+    gitlab_all(&path, options)
+}
+
+/// Comments on a merge request.
+pub fn gitlab_mr_note(project_id: &str, iid: i64, body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/merge_requests/{}/notes", project(project_id)?, iid), Some(&json!({ "body": body })))?.body)
+}
+
+/// Approves a merge request.
+pub fn gitlab_mr_approve(project_id: &str, iid: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/merge_requests/{}/approve", project(project_id)?, iid), Some(&json!({})))?.body)
+}
+
+/// Merges a merge request: `params` holds sha (refuse unless the head is this), squash, should_remove_source_branch, merge_when_pipeline_succeeds. GitLab answers 405 or 422 when it cannot, 409 when the sha moved.
+pub fn gitlab_mr_merge(project_id: &str, iid: i64, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = if params.is_null() { json!({}) } else { params };
+    Ok(call(&conf(&options), "PUT", &format!("/projects/{}/merge_requests/{}/merge", project(project_id)?, iid), Some(&p))?.body)
+}
+
+/// Starts a pipeline on `git_ref`, with `variables` a map of name to value (or null).
+pub fn gitlab_pipeline_create(project_id: &str, git_ref: &str, variables: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "ref": git_ref });
+    if let Value::Object(m) = &variables {
+        b["variables"] = json!(m.iter().map(|(k, v)| json!({ "key": k, "value": v.as_str().map(str::to_string).unwrap_or(v.to_string()), "variable_type": "env_var" })).collect::<Vec<_>>());
+    }
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/pipeline", project(project_id)?), Some(&b))?.body)
+}
+
+/// One pipeline by id: { status, ref, sha, duration, web_url, ... }.
+pub fn gitlab_pipeline(project_id: &str, id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", &format!("/projects/{}/pipelines/{}", project(project_id)?, id), None)?.body)
+}
+
+/// A project's pipelines, all pages. Options: status, ref, sha, source, max_items.
+pub fn gitlab_pipelines(project_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/projects/{}/pipelines{}", project(project_id)?, q(&options, &["status", "ref", "sha", "source", "order_by", "sort"]));
+    gitlab_all(&path, options)
+}
+
+/// A pipeline's jobs, all pages.
+pub fn gitlab_pipeline_jobs(project_id: &str, id: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    gitlab_all(&format!("/projects/{}/pipelines/{}/jobs", project(project_id)?, id), options)
+}
+
+/// Retries a pipeline's failed jobs.
+pub fn gitlab_pipeline_retry(project_id: &str, id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/pipelines/{}/retry", project(project_id)?, id), Some(&json!({})))?.body)
+}
+
+/// Cancels a pipeline's running jobs.
+pub fn gitlab_pipeline_cancel(project_id: &str, id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/projects/{}/pipelines/{}/cancel", project(project_id)?, id), Some(&json!({})))?.body)
+}
+
+/// Whether a webhook is really from GitLab: its X-Gitlab-Token header (`headers` are the request's) against the hook's secret token (else GITLAB_WEBHOOK_TOKEN), compared in constant time. GitLab sends the token itself and signs nothing, so use https.
+pub fn gitlab_webhook_ok(headers: std::collections::HashMap<String, serde_json::Value>, token: &str) -> bool {
+    let want = if token.is_empty() { std::env::var("GITLAB_WEBHOOK_TOKEN").unwrap_or_default() } else { token.to_string() };
+    let got = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-gitlab-token")).and_then(|(_, v)| v.as_str()).unwrap_or("");
+    !want.is_empty() && want.len() == got.len() && want.bytes().zip(got.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A webhook's body read: { kind (issue, merge_request, pipeline, push, note...), project, user, action, iid, state, ref, payload }.
+pub fn gitlab_read_webhook(body: &str) -> Result<serde_json::Value, String> {
+    let p: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    let a = &p["object_attributes"];
+    Ok(json!({
+        "kind": p.get("object_kind").or(p.get("event_name")).cloned().unwrap_or(Value::Null),
+        "project": p.pointer("/project/path_with_namespace").cloned().unwrap_or(Value::Null),
+        "user": p.pointer("/user/username").or(p.get("user_username")).cloned().unwrap_or(Value::Null),
+        "action": a.get("action").cloned().unwrap_or(Value::Null),
+        "iid": a.get("iid").cloned().unwrap_or(Value::Null),
+        "state": a.get("state").or(a.get("status")).cloned().unwrap_or(Value::Null),
+        "ref": p.get("ref").or(a.get("ref")).cloned().unwrap_or(Value::Null),
+        "payload": p,
+    }))
+}

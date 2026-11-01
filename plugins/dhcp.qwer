@@ -1,0 +1,564 @@
+//! DHCPv4 (RFC 2131, RFC 2132): packets built and parsed with options by name, long options split and joined, overloaded sname and file fields, relay agent, classless routes and domain search lists read, a discover and offer exchange, a full lease, and offers and acks made for a small server on `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+const COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const BOOTREQUEST: u8 = 1;
+const BOOTREPLY: u8 = 2;
+
+const TYPES: [&str; 9] = ["discover", "offer", "request", "decline", "ack", "nak", "release", "inform", "force_renew"];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Ip,
+    Ips,
+    Text,
+    U8,
+    U16,
+    U32,
+    Flag,
+    Hex,
+    MessageType,
+    Params,
+    Routes,
+    Search,
+    Relay,
+    Overload,
+}
+
+const OPTIONS: &[(u8, &str, Kind)] = &[
+    (1, "subnet_mask", Kind::Ip), (2, "time_offset", Kind::U32), (3, "routers", Kind::Ips), (4, "time_servers", Kind::Ips), (6, "dns_servers", Kind::Ips),
+    (12, "hostname", Kind::Text), (15, "domain_name", Kind::Text), (17, "root_path", Kind::Text), (19, "ip_forwarding", Kind::Flag), (23, "default_ttl", Kind::U8),
+    (26, "mtu", Kind::U16), (28, "broadcast", Kind::Ip), (33, "static_routes", Kind::Ips), (40, "nis_domain", Kind::Text), (41, "nis_servers", Kind::Ips),
+    (42, "ntp_servers", Kind::Ips), (43, "vendor_info", Kind::Hex), (44, "netbios_servers", Kind::Ips), (46, "netbios_node_type", Kind::U8), (50, "requested_ip", Kind::Ip),
+    (51, "lease_time", Kind::U32), (52, "overload", Kind::Overload), (53, "message_type", Kind::MessageType), (54, "server_id", Kind::Ip), (55, "parameter_list", Kind::Params),
+    (56, "message", Kind::Text), (57, "max_message_size", Kind::U16), (58, "renewal_time", Kind::U32), (59, "rebinding_time", Kind::U32), (60, "vendor_class", Kind::Text),
+    (61, "client_id", Kind::Hex), (66, "tftp_server", Kind::Text), (67, "bootfile", Kind::Text), (77, "user_class", Kind::Text), (80, "rapid_commit", Kind::Flag),
+    (81, "client_fqdn", Kind::Hex), (82, "relay_info", Kind::Relay), (93, "client_arch", Kind::U16), (97, "client_uuid", Kind::Hex), (108, "ipv6_only_preferred", Kind::U32),
+    (114, "captive_portal", Kind::Text), (116, "auto_config", Kind::U8), (118, "subnet_selection", Kind::Ip), (119, "domain_search", Kind::Search), (121, "classless_routes", Kind::Routes),
+    (150, "tftp_servers", Kind::Ips), (252, "wpad", Kind::Text),
+];
+
+fn by_code(c: u8) -> Option<&'static (u8, &'static str, Kind)> {
+    OPTIONS.iter().find(|o| o.0 == c)
+}
+
+fn by_name(n: &str) -> Option<&'static (u8, &'static str, Kind)> {
+    OPTIONS.iter().find(|o| o.1 == n)
+}
+
+fn dns_names(b: &[u8]) -> Result<Vec<String>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let mut name = vec![];
+        let mut at = i;
+        let mut jumped = false;
+        let mut hops = 0;
+        loop {
+            let n = *b.get(at).ok_or("a search list is cut off")? as usize;
+            if n == 0 {
+                if !jumped {
+                    i = at + 1;
+                }
+                break;
+            }
+            if n & 0xc0 == 0xc0 {
+                let p = ((n & 0x3f) << 8) | *b.get(at + 1).ok_or("a search list is cut off")? as usize;
+                if !jumped {
+                    i = at + 2;
+                }
+                jumped = true;
+                hops += 1;
+                if hops > 16 || p >= b.len() {
+                    return Err("a search list's compression pointer goes astray".into());
+                }
+                at = p;
+                continue;
+            }
+            let l = b.get(at + 1..at + 1 + n).ok_or("a search list is cut off")?;
+            name.push(String::from_utf8_lossy(l).to_string());
+            at += 1 + n;
+        }
+        out.push(name.join("."));
+    }
+    Ok(out)
+}
+
+fn read_option(code: u8, d: &[u8]) -> Result<Value, String> {
+    let Some((_, _, kind)) = by_code(code) else { return Ok(json!(hex::encode(d))) };
+    let bad = |what: &str| format!("option {} is not {}: {} bytes", code, what, d.len());
+    Ok(match kind {
+        Kind::Ip => {
+            if d.len() != 4 {
+                return Err(bad("an address"));
+            }
+            json!(Ipv4Addr::new(d[0], d[1], d[2], d[3]).to_string())
+        }
+        Kind::Ips => {
+            if d.len() % 4 != 0 {
+                return Err(bad("a list of addresses"));
+            }
+            json!(d.chunks(4).map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3]).to_string()).collect::<Vec<_>>())
+        }
+        Kind::Text => json!(String::from_utf8_lossy(d).trim_end_matches('\0')),
+        Kind::U8 | Kind::Overload if d.len() == 1 => json!(d[0]),
+        Kind::U16 if d.len() == 2 => json!(u16::from_be_bytes([d[0], d[1]])),
+        Kind::U32 if d.len() == 4 => json!(u32::from_be_bytes([d[0], d[1], d[2], d[3]])),
+        Kind::Flag => json!(d.first().map_or(true, |x| *x != 0)),
+        Kind::MessageType if d.len() == 1 => json!(TYPES.get(d[0] as usize - 1).cloned().unwrap_or("unknown")),
+        Kind::Params => json!(d.iter().map(|c| by_code(*c).map_or(json!(c), |o| json!(o.1))).collect::<Vec<_>>()),
+        Kind::Hex => json!(hex::encode(d)),
+        Kind::Search => json!(dns_names(d)?),
+        Kind::Routes => {
+            let mut out = vec![];
+            let mut i = 0;
+            while i < d.len() {
+                let bits = d[i] as usize;
+                if bits > 32 {
+                    return Err("a classless route's mask is over 32 bits".into());
+                }
+                let n = (bits + 7) / 8;
+                let net = d.get(i + 1..i + 1 + n).ok_or("a classless route is cut off")?;
+                let via = d.get(i + 1 + n..i + 5 + n).ok_or("a classless route is cut off")?;
+                let mut a = [0u8; 4];
+                a[..n].copy_from_slice(net);
+                out.push(json!({ "network": format!("{}/{}", Ipv4Addr::from(a), bits), "via": Ipv4Addr::new(via[0], via[1], via[2], via[3]).to_string() }));
+                i += 5 + n;
+            }
+            json!(out)
+        }
+        Kind::Relay => {
+            let mut m = Map::new();
+            let mut i = 0;
+            while i + 2 <= d.len() {
+                let (c, n) = (d[i], d[i + 1] as usize);
+                let v = d.get(i + 2..i + 2 + n).ok_or("relay information is cut off")?;
+                let name = match c {
+                    1 => "circuit_id".to_string(),
+                    2 => "remote_id".to_string(),
+                    x => format!("sub_{}", x),
+                };
+                m.insert(name, match std::str::from_utf8(v) {
+                    Ok(t) if !t.chars().any(|c| c.is_control()) => json!(t),
+                    _ => json!(hex::encode(v)),
+                });
+                i += 2 + n;
+            }
+            Value::Object(m)
+        }
+        _ => return Err(bad("the right size")),
+    })
+}
+
+fn ip_of(v: &Value, what: &str) -> Result<[u8; 4], String> {
+    let s = v.as_str().ok_or(format!("{} needs an address", what))?;
+    s.parse::<Ipv4Addr>().map(|a| a.octets()).map_err(|_| format!("`{}` is not an IPv4 address ({})", s, what))
+}
+
+fn write_option(name: &str, v: &Value) -> Result<(u8, Vec<u8>), String> {
+    if let Ok(code) = name.parse::<u8>() {
+        return Ok((code, hex::decode(v.as_str().ok_or(format!("option {} takes hex", code))?).map_err(|_| format!("option {} takes hex", code))?));
+    }
+    let (code, _, kind) = *by_name(name).ok_or(format!("`{}` is not an option this knows; give its number with hex", name))?;
+    let d: Vec<u8> = match kind {
+        Kind::Ip => ip_of(v, name)?.to_vec(),
+        Kind::Ips => {
+            let one = [v.clone()];
+            let list = v.as_array().map(|a| a.as_slice()).unwrap_or(&one);
+            let mut o = vec![];
+            for x in list {
+                o.extend(ip_of(x, name)?);
+            }
+            o
+        }
+        Kind::Text => v.as_str().ok_or(format!("{} needs text", name))?.as_bytes().to_vec(),
+        Kind::U8 | Kind::Overload => vec![v.as_u64().filter(|x| *x < 256).ok_or(format!("{} is a number to 255", name))? as u8],
+        Kind::U16 => (v.as_u64().filter(|x| *x < 65536).ok_or(format!("{} is a number to 65535", name))? as u16).to_be_bytes().to_vec(),
+        Kind::U32 => (v.as_u64().filter(|x| *x <= u32::MAX as u64).ok_or(format!("{} is a 32-bit number", name))? as u32).to_be_bytes().to_vec(),
+        Kind::Flag => if v.as_bool().unwrap_or(true) { if code == 80 { vec![] } else { vec![1] } } else { vec![0] },
+        Kind::MessageType => {
+            let t = v.as_str().ok_or("message_type is text")?;
+            vec![TYPES.iter().position(|x| *x == t).ok_or(format!("`{}` is not a message type", t))? as u8 + 1]
+        }
+        Kind::Params => {
+            let mut o = vec![];
+            for p in v.as_array().ok_or("parameter_list is a list")? {
+                o.push(match p {
+                    Value::Number(n) => n.as_u64().unwrap_or(0) as u8,
+                    Value::String(s) => by_name(s).ok_or(format!("`{}` is not an option this knows", s))?.0,
+                    _ => return Err("parameter_list holds names or numbers".into()),
+                });
+            }
+            o
+        }
+        Kind::Hex => hex::decode(v.as_str().ok_or(format!("{} takes hex", name))?).map_err(|_| format!("{} takes hex", name))?,
+        Kind::Search => {
+            let mut o = vec![];
+            for d in v.as_array().ok_or("domain_search is a list")? {
+                for l in d.as_str().ok_or("domain_search holds names")?.split('.') {
+                    o.push(l.len() as u8);
+                    o.extend(l.as_bytes());
+                }
+                o.push(0);
+            }
+            o
+        }
+        Kind::Routes => {
+            let mut o = vec![];
+            for r in v.as_array().ok_or("classless_routes is a list")? {
+                let net = r.get("network").and_then(|x| x.as_str()).ok_or("a route needs `network`")?;
+                let (a, b) = net.split_once('/').ok_or(format!("`{}` is not a network", net))?;
+                let bits: usize = b.parse().ok().filter(|x| *x <= 32).ok_or(format!("`{}` is not a network", net))?;
+                let ip: Ipv4Addr = a.parse().map_err(|_| format!("`{}` is not a network", net))?;
+                o.push(bits as u8);
+                o.extend(&ip.octets()[..(bits + 7) / 8]);
+                o.extend(ip_of(r.get("via").unwrap_or(&Value::Null), "via")?);
+            }
+            o
+        }
+        Kind::Relay => {
+            let mut o = vec![];
+            for (k, c) in [("circuit_id", 1u8), ("remote_id", 2)] {
+                if let Some(t) = v.get(k).and_then(|x| x.as_str()) {
+                    o.extend([c, t.len() as u8]);
+                    o.extend(t.as_bytes());
+                }
+            }
+            o
+        }
+    };
+    Ok((code, d))
+}
+
+fn mac_of(s: &str) -> Result<[u8; 6], String> {
+    let b: Vec<u8> = s.split(|c| c == ':' || c == '-').map(|x| u8::from_str_radix(x, 16)).collect::<Result<_, _>>().map_err(|_| format!("`{}` is not a MAC address", s))?;
+    <[u8; 6]>::try_from(b.as_slice()).map_err(|_| format!("`{}` is not a MAC address", s))
+}
+
+fn build(p: &Value) -> Result<Vec<u8>, String> {
+    let mut b = vec![0u8; 240];
+    let op = match p.get("op").and_then(|v| v.as_str()).unwrap_or("request") {
+        "request" => BOOTREQUEST,
+        "reply" => BOOTREPLY,
+        x => return Err(format!("`{}` is not an op: request or reply", x)),
+    };
+    b[0] = op;
+    b[1] = 1;
+    b[2] = 6;
+    b[3] = p.get("hops").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let xid = p.get("xid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    b[4..8].copy_from_slice(&xid.to_be_bytes());
+    b[8..10].copy_from_slice(&(p.get("secs").and_then(|v| v.as_u64()).unwrap_or(0) as u16).to_be_bytes());
+    if p.get("broadcast").and_then(|v| v.as_bool()).unwrap_or(false) {
+        b[10] = 0x80;
+    }
+    for (k, at) in [("ciaddr", 12), ("yiaddr", 16), ("siaddr", 20), ("giaddr", 24)] {
+        if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
+            b[at..at + 4].copy_from_slice(&ip_of(v, k)?);
+        }
+    }
+    let mac = mac_of(p.get("mac").and_then(|v| v.as_str()).ok_or("a packet needs `mac`")?)?;
+    b[28..34].copy_from_slice(&mac);
+    if let Some(s) = p.get("sname").and_then(|v| v.as_str()) {
+        if s.len() > 63 {
+            return Err("sname holds 63 bytes".into());
+        }
+        b[44..44 + s.len()].copy_from_slice(s.as_bytes());
+    }
+    if let Some(s) = p.get("file").and_then(|v| v.as_str()) {
+        if s.len() > 127 {
+            return Err("file holds 127 bytes".into());
+        }
+        b[108..108 + s.len()].copy_from_slice(s.as_bytes());
+    }
+    b[236..240].copy_from_slice(&COOKIE);
+    let empty = Map::new();
+    let opts = p.get("options").and_then(|v| v.as_object()).unwrap_or(&empty);
+    // Message type first, as some clients insist.
+    if let Some(t) = opts.get("message_type") {
+        let (c, d) = write_option("message_type", t)?;
+        b.extend([c, d.len() as u8]);
+        b.extend(d);
+    }
+    for (k, v) in opts {
+        if k == "message_type" {
+            continue;
+        }
+        let (c, d) = write_option(k, v)?;
+        // RFC 3396: an option past 255 bytes goes in pieces, joined by the reader.
+        if d.is_empty() {
+            b.extend([c, 0]);
+        }
+        for part in d.chunks(255) {
+            b.extend([c, part.len() as u8]);
+            b.extend(part);
+        }
+    }
+    b.push(255);
+    // BOOTP relays drop anything under 300 bytes.
+    if b.len() < 300 {
+        b.resize(300, 0);
+    }
+    Ok(b)
+}
+
+fn scan(d: &[u8], order: &mut Vec<u8>, into: &mut std::collections::HashMap<u8, Vec<u8>>) -> Result<(), String> {
+    let mut i = 0;
+    while i < d.len() {
+        let c = d[i];
+        if c == 255 {
+            return Ok(());
+        }
+        if c == 0 {
+            i += 1;
+            continue;
+        }
+        let n = *d.get(i + 1).ok_or(format!("option {} has no length", c))? as usize;
+        let v = d.get(i + 2..i + 2 + n).ok_or(format!("option {} says {} bytes, past the end", c, n))?;
+        if !order.contains(&c) {
+            order.push(c);
+        }
+        into.entry(c).or_default().extend(v);
+        i += 2 + n;
+    }
+    Ok(())
+}
+
+fn parse(b: &[u8]) -> Result<Value, String> {
+    if b.len() < 240 {
+        return Err(format!("{} bytes is too short for a DHCP packet (240 at least)", b.len()));
+    }
+    if b[236..240] != COOKIE {
+        return Err("no DHCP magic cookie: a plain BOOTP packet, or not DHCP".into());
+    }
+    if b[1] != 1 || b[2] != 6 {
+        return Err(format!("hardware type {} with address length {}: only Ethernet is read", b[1], b[2]));
+    }
+    let mut order = vec![];
+    let mut raw = std::collections::HashMap::new();
+    scan(&b[240..], &mut order, &mut raw)?;
+    let cstr = |x: &[u8]| String::from_utf8_lossy(&x[..x.iter().position(|c| *c == 0).unwrap_or(x.len())]).to_string();
+    let over = raw.get(&52).and_then(|v| v.first()).cloned().unwrap_or(0);
+    // Overload: more options live in `file`, then `sname`.
+    if over & 1 != 0 {
+        scan(&b[108..236], &mut order, &mut raw)?;
+    }
+    if over & 2 != 0 {
+        scan(&b[44..108], &mut order, &mut raw)?;
+    }
+    let mut options = Map::new();
+    for c in &order {
+        if *c == 52 {
+            continue;
+        }
+        let v = read_option(*c, &raw[c])?;
+        let name = by_code(*c).map_or(format!("option_{}", c), |o| o.1.to_string());
+        options.insert(name, v);
+    }
+    let ip = |at: usize| Ipv4Addr::new(b[at], b[at + 1], b[at + 2], b[at + 3]).to_string();
+    let mut m = json!({
+        "op": if b[0] == BOOTREQUEST { "request" } else { "reply" },
+        "type": options.get("message_type").cloned().unwrap_or(Value::Null),
+        "xid": u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+        "secs": u16::from_be_bytes([b[8], b[9]]),
+        "broadcast": b[10] & 0x80 != 0,
+        "hops": b[3],
+        "ciaddr": ip(12), "yiaddr": ip(16), "siaddr": ip(20), "giaddr": ip(24),
+        "mac": b[28..34].iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":"),
+    });
+    if over & 2 == 0 && b[44] != 0 {
+        m["sname"] = json!(cstr(&b[44..108]));
+    }
+    if over & 1 == 0 && b[108] != 0 {
+        m["file"] = json!(cstr(&b[108..236]));
+    }
+    m["options"] = Value::Object(options);
+    Ok(m)
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex".to_string()),
+        _ => Err("give a packet as hex or a list of numbers".into()),
+    }
+}
+
+/// Reads a DHCP packet (hex, or `p.bytes` from `udp.listen`): its fields and its `options` by name, split options joined, overloaded `sname` and `file` read, route and search lists decoded.
+pub fn dhcp_parse(packet: serde_json::Value) -> Result<Value, String> {
+    parse(&bytes_of(&packet)?)
+}
+
+/// Builds a packet as bytes: `{ op, mac, xid, secs, broadcast, ciaddr, yiaddr, siaddr, giaddr, sname, file, options: { message_type: "discover", hostname: "x" } }`. Options are by name, or by number with hex.
+pub fn dhcp_build(packet: serde_json::Value) -> Result<Vec<u8>, String> {
+    build(&packet)
+}
+
+fn new_xid() -> Result<u32, String> {
+    let mut b = [0u8; 4];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(u32::from_be_bytes(b))
+}
+
+fn endpoint(o: &Value) -> Result<SocketAddr, String> {
+    let s = o.get("server").and_then(|v| v.as_str()).unwrap_or("255.255.255.255:67");
+    let t = if s.contains(':') { s.to_string() } else { format!("{}:67", s) };
+    t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.find(|a| a.is_ipv4()).ok_or(format!("{}: no IPv4 address", t))
+}
+
+fn socket(o: &Value) -> Result<UdpSocket, String> {
+    let port = o.get("client_port").and_then(|v| v.as_u64()).unwrap_or(68) as u16;
+    let s = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("binding UDP port {} needs root; give `client_port` and `server` for a relay or test", port)
+        } else {
+            format!("cannot bind UDP port {}: {}", port, e)
+        }
+    })?;
+    s.set_broadcast(true).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+fn ask(sock: &UdpSocket, to: SocketAddr, packet: &[u8], xid: u32, want: &[&str], o: &Value) -> Result<Value, String> {
+    let wait = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(4000);
+    let tries = o.get("retries").and_then(|v| v.as_u64()).unwrap_or(3);
+    let mut buf = [0u8; 1500];
+    // RFC 2131 4.1: wait about 4 s, doubling, between sends.
+    let mut gap = Duration::from_millis(wait);
+    for _ in 0..=tries {
+        sock.send_to(packet, to).map_err(|e| format!("cannot send to {}: {}", to, e))?;
+        let end = Instant::now() + gap;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            match sock.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    if n < 240 || u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) != xid || buf[0] != BOOTREPLY {
+                        continue; // another client's
+                    }
+                    let m = parse(&buf[..n])?;
+                    if want.iter().any(|w| m["type"] == *w) {
+                        return Ok(m);
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        gap *= 2;
+    }
+    Err(format!("no DHCP {} came from {} after {} sends", want[0], to, tries + 1))
+}
+
+fn hello(kind: &str, mac: &str, xid: u32, o: &Value, extra: Map<String, Value>) -> Result<Vec<u8>, String> {
+    let mut opts = Map::new();
+    opts.insert("message_type".into(), json!(kind));
+    let list = o.get("parameter_list").cloned().unwrap_or(json!(["subnet_mask", "routers", "dns_servers", "domain_name", "lease_time", "renewal_time", "rebinding_time"]));
+    opts.insert("parameter_list".into(), list);
+    for k in ["hostname", "vendor_class", "client_id"] {
+        if let Some(v) = o.get(k) {
+            opts.insert(k.into(), v.clone());
+        }
+    }
+    for (k, v) in extra {
+        opts.insert(k, v);
+    }
+    build(&json!({ "op": "request", "mac": mac, "xid": xid, "broadcast": o.get("broadcast").and_then(|v| v.as_bool()).unwrap_or(true), "ciaddr": o.get("ciaddr"), "options": opts }))
+}
+
+/// Sends a DISCOVER and answers the first OFFER, without asking for the lease: `{ address, server, lease_time, ... }`. Options: `server` ("host:port"; the broadcast address unless given), `client_port` (68, which needs root), `hostname`, `requested_ip`, `timeout_ms`, `retries`, `parameter_list`.
+pub fn dhcp_discover(mac: &str, options: serde_json::Value) -> Result<Value, String> {
+    let sock = socket(&options)?;
+    let to = endpoint(&options)?;
+    let xid = new_xid()?;
+    let mut extra = Map::new();
+    if let Some(r) = options.get("requested_ip") {
+        extra.insert("requested_ip".into(), r.clone());
+    }
+    let p = hello("discover", mac, xid, &options, extra)?;
+    let m = ask(&sock, to, &p, xid, &["offer"], &options)?;
+    Ok(summary(&m))
+}
+
+fn summary(m: &Value) -> Value {
+    let o = &m["options"];
+    json!({
+        "type": m["type"], "address": m["yiaddr"], "server": o.get("server_id"), "mac": m["mac"],
+        "subnet_mask": o.get("subnet_mask"), "routers": o.get("routers"), "dns_servers": o.get("dns_servers"),
+        "domain_name": o.get("domain_name"), "lease_time": o.get("lease_time"), "renewal_time": o.get("renewal_time"),
+        "options": o,
+    })
+}
+
+/// A whole lease: DISCOVER, OFFER, REQUEST, ACK. A NAK is an error with the server's message. Options as for `dhcp_discover`.
+pub fn dhcp_lease(mac: &str, options: serde_json::Value) -> Result<Value, String> {
+    let sock = socket(&options)?;
+    let to = endpoint(&options)?;
+    let xid = new_xid()?;
+    let p = hello("discover", mac, xid, &options, Map::new())?;
+    let offer = ask(&sock, to, &p, xid, &["offer"], &options)?;
+    let mut extra = Map::new();
+    extra.insert("requested_ip".into(), offer["yiaddr"].clone());
+    extra.insert("server_id".into(), offer["options"]["server_id"].clone());
+    let r = hello("request", mac, xid, &options, extra)?;
+    let got = ask(&sock, to, &r, xid, &["ack", "nak"], &options)?;
+    if got["type"] == "nak" {
+        return Err(format!("the server refused the lease: {}", got["options"]["message"].as_str().unwrap_or("no reason given")));
+    }
+    Ok(summary(&got))
+}
+
+/// Gives a lease back with a DHCPRELEASE; no answer comes to one.
+pub fn dhcp_release(mac: &str, address: &str, server_id: &str, options: serde_json::Value) -> Result<bool, String> {
+    let sock = socket(&options)?;
+    let to = endpoint(&options)?;
+    let mut extra = Map::new();
+    extra.insert("server_id".into(), json!(server_id));
+    let mut o = options.clone();
+    o["ciaddr"] = json!(address);
+    o["broadcast"] = json!(false);
+    o["parameter_list"] = json!([]);
+    let p = hello("release", mac, new_xid()?, &o, extra)?;
+    sock.send_to(&p, to).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Answers a client's packet for a server on `udp.listen`: `request` is `p.bytes`, `kind` is "offer", "ack" or "nak", and `answer` has `yiaddr`, `server_id` and options by name. The xid, MAC, flags and giaddr are copied from the request.
+pub fn dhcp_reply(request: Vec<i64>, kind: &str, answer: serde_json::Value) -> Result<Vec<u8>, String> {
+    if !["offer", "ack", "nak"].contains(&kind) {
+        return Err(format!("`{}` is not a reply: offer, ack or nak", kind));
+    }
+    let b: Vec<u8> = request.iter().map(|x| *x as u8).collect();
+    let q = parse(&b)?;
+    let mut opts = Map::new();
+    opts.insert("message_type".into(), json!(kind));
+    let server = answer.get("server_id").ok_or("the answer needs `server_id`")?;
+    opts.insert("server_id".into(), server.clone());
+    if let Some(m) = answer.as_object() {
+        for (k, v) in m {
+            if !["yiaddr", "server_id", "siaddr", "sname", "file"].contains(&k.as_str()) {
+                opts.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let mut p = json!({ "op": "reply", "mac": q["mac"], "xid": q["xid"], "broadcast": q["broadcast"], "giaddr": q["giaddr"], "options": opts });
+    for k in ["yiaddr", "siaddr", "sname", "file"] {
+        if let Some(v) = answer.get(k) {
+            p[k] = v.clone();
+        }
+    }
+    build(&p)
+}

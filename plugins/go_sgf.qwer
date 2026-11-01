@@ -1,0 +1,710 @@
+//! Go game records in SGF: read and written with their variations and escapes, a board replayed with captures, ko and suicide rules, and a position scored by area.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashSet;
+
+const MAX: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Default)]
+struct Tree {
+    nodes: Vec<Vec<(String, Vec<String>)>>,
+    kids: Vec<Tree>,
+}
+
+struct P<'a> {
+    b: &'a [u8],
+    i: usize,
+    depth: usize,
+}
+
+impl<'a> P<'a> {
+    fn ws(&mut self) {
+        while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn at(&self) -> usize {
+        self.i
+    }
+    // A value: `\` takes the next character literally; a `\` before a line break joins lines.
+    fn value(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut o: Vec<u8> = vec![];
+        while self.i < self.b.len() {
+            match self.b[self.i] {
+                b']' => {
+                    self.i += 1;
+                    return Ok(String::from_utf8_lossy(&o).into_owned());
+                }
+                b'\\' => {
+                    self.i += 1;
+                    match self.b.get(self.i) {
+                        Some(b'\n') => {
+                            self.i += 1;
+                            if self.b.get(self.i) == Some(&b'\r') {
+                                self.i += 1;
+                            }
+                        }
+                        Some(b'\r') => {
+                            self.i += 1;
+                            if self.b.get(self.i) == Some(&b'\n') {
+                                self.i += 1;
+                            }
+                        }
+                        Some(c) => {
+                            o.push(*c);
+                            self.i += 1;
+                        }
+                        None => break,
+                    }
+                }
+                c => {
+                    o.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        Err(format!("a value at byte {} has no closing `]`", self.at()))
+    }
+    fn tree(&mut self) -> Result<Tree, String> {
+        self.depth += 1;
+        if self.depth > 2000 {
+            return Err("variations nest too deeply".into());
+        }
+        self.i += 1;
+        let mut t = Tree::default();
+        self.ws();
+        while self.b.get(self.i) == Some(&b';') {
+            self.i += 1;
+            let mut node = vec![];
+            loop {
+                self.ws();
+                let s = self.i;
+                while self.i < self.b.len() && self.b[self.i].is_ascii_alphabetic() {
+                    self.i += 1;
+                }
+                if s == self.i {
+                    break;
+                }
+                // Old files write `GaMe`: the capitals are the property.
+                let id: String = self.b[s..self.i].iter().filter(|c| c.is_ascii_uppercase()).map(|c| *c as char).collect();
+                self.ws();
+                if self.b.get(self.i) != Some(&b'[') {
+                    return Err(format!("property `{}` at byte {} has no value", id, s));
+                }
+                let mut vals = vec![];
+                while self.b.get(self.i) == Some(&b'[') {
+                    vals.push(self.value()?);
+                    self.ws();
+                }
+                node.push((id, vals));
+            }
+            t.nodes.push(node);
+            self.ws();
+        }
+        if t.nodes.is_empty() {
+            return Err(format!("a game tree at byte {} has no node", self.at()));
+        }
+        while self.b.get(self.i) == Some(&b'(') {
+            t.kids.push(self.tree()?);
+            self.ws();
+        }
+        if self.b.get(self.i) != Some(&b')') {
+            return Err(format!("expected `)` at byte {}", self.at()));
+        }
+        self.i += 1;
+        self.depth -= 1;
+        Ok(t)
+    }
+}
+
+fn parse(text: &str) -> Result<Vec<Tree>, String> {
+    if text.len() > MAX {
+        return Err("that SGF is over 32 MB".into());
+    }
+    let mut p = P { b: text.as_bytes(), i: 0, depth: 0 };
+    let mut out = vec![];
+    // Text before the first `(;` is not part of the file (FF[4] allows that).
+    while let Some(r) = text[p.i..].find("(") {
+        p.i += r;
+        let save = p.i;
+        p.i += 1;
+        p.ws();
+        let good = p.b.get(p.i) == Some(&b';');
+        p.i = save;
+        if !good {
+            if out.is_empty() {
+                p.i += 1;
+                continue;
+            }
+            return Err(format!("expected `(;` at byte {}", p.i));
+        }
+        out.push(p.tree()?);
+        p.ws();
+    }
+    if out.is_empty() {
+        return Err("no game tree: an SGF file starts `(;`".into());
+    }
+    Ok(out)
+}
+
+// A list of branches, each naming its parent, rather than nested maps: Quillo takes a plugin's value
+// only to 127 levels, and a game with 60 forks in a line would go past that.
+fn tree_rows(t: &Tree, parent: i64, out: &mut Vec<Value>) {
+    let node = |n: &Vec<(String, Vec<String>)>| -> Value {
+        Value::Object(n.iter().map(|(k, v)| (k.clone(), if v.len() == 1 { json!(v[0]) } else { json!(v) })).collect::<Map<_, _>>())
+    };
+    let me = out.len() as i64;
+    out.push(json!({ "parent": parent, "nodes": t.nodes.iter().map(node).collect::<Vec<_>>() }));
+    for k in &t.kids {
+        tree_rows(k, me, out);
+    }
+}
+
+fn tree_json(t: &Tree) -> Value {
+    let mut out = vec![];
+    tree_rows(t, -1, &mut out);
+    Value::Array(out)
+}
+
+fn prop<'a>(t: &'a Tree, id: &str) -> Option<&'a str> {
+    t.nodes.first()?.iter().find(|p| p.0 == id).and_then(|p| p.1.first()).map(|s| s.as_str())
+}
+
+fn size_of(t: &Tree) -> Result<(usize, usize), String> {
+    let s = prop(t, "SZ").unwrap_or("19");
+    let (a, b) = s.split_once(':').unwrap_or((s, s));
+    let w: usize = a.trim().parse().map_err(|_| format!("the board size `{}` is not a number", s))?;
+    let h: usize = b.trim().parse().map_err(|_| format!("the board size `{}` is not a number", s))?;
+    if !(1..=52).contains(&w) || !(1..=52).contains(&h) {
+        return Err(format!("a board is 1 to 52 lines, not {}", s));
+    }
+    Ok((w, h))
+}
+
+const INFO: &[(&str, &str)] = &[
+    ("GM", "game"), ("FF", "format"), ("CA", "charset"), ("AP", "application"), ("SZ", "size"), ("KM", "komi"), ("HA", "handicap"), ("RU", "rules"), ("RE", "result"),
+    ("PB", "black"), ("PW", "white"), ("BR", "black_rank"), ("WR", "white_rank"), ("BT", "black_team"), ("WT", "white_team"), ("DT", "date"), ("EV", "event"),
+    ("RO", "round"), ("PC", "place"), ("GN", "name"), ("GC", "comment"), ("TM", "main_time"), ("OT", "overtime"), ("SO", "source"), ("US", "user"), ("AN", "annotator"),
+];
+
+fn info(t: &Tree) -> Value {
+    let mut m = Map::new();
+    for (k, name) in INFO {
+        if let Some(v) = prop(t, k) {
+            m.insert((*name).to_string(), json!(v));
+        }
+    }
+    Value::Object(m)
+}
+
+fn result_of(r: &str) -> Value {
+    let u = r.trim().to_uppercase();
+    if u == "0" || u == "DRAW" {
+        return json!({ "winner": null, "by": "draw", "points": null });
+    }
+    if u.is_empty() || u == "?" || u == "VOID" {
+        return json!({ "winner": null, "by": if u == "VOID" { "void" } else { "unknown" }, "points": null });
+    }
+    let (who, how) = u.split_once('+').unwrap_or((&u, ""));
+    let winner = match who {
+        "B" => "black",
+        "W" => "white",
+        _ => return json!({ "winner": null, "by": r, "points": null }),
+    };
+    match how {
+        "R" | "RESIGN" => json!({ "winner": winner, "by": "resignation", "points": null }),
+        "T" | "TIME" => json!({ "winner": winner, "by": "time", "points": null }),
+        "F" | "FORFEIT" => json!({ "winner": winner, "by": "forfeit", "points": null }),
+        "" => json!({ "winner": winner, "by": "unknown", "points": null }),
+        p => json!({ "winner": winner, "by": "points", "points": p.parse::<f64>().ok() }),
+    }
+}
+
+fn point(s: &str, h: usize, w: usize) -> Result<Option<(usize, usize)>, String> {
+    if s.is_empty() || (s == "tt" && w <= 19 && h <= 19) {
+        return Ok(None); // A pass.
+    }
+    let c = |b: u8| -> Option<usize> {
+        match b {
+            b'a'..=b'z' => Some((b - b'a') as usize),
+            b'A'..=b'Z' => Some((b - b'A') as usize + 26),
+            _ => None,
+        }
+    };
+    let b = s.as_bytes();
+    if b.len() != 2 {
+        return Err(format!("`{}` is not a point", s));
+    }
+    let (x, y) = (c(b[0]).ok_or(format!("`{}` is not a point", s))?, c(b[1]).ok_or(format!("`{}` is not a point", s))?);
+    if x >= w || y >= h {
+        return Err(format!("`{}` is off the board", s));
+    }
+    Ok(Some((x, y)))
+}
+
+fn points_of(vals: &[String], w: usize, h: usize) -> Result<Vec<(usize, usize)>, String> {
+    let mut out = vec![];
+    for v in vals {
+        // `aa:cc` is a rectangle.
+        if let Some((a, b)) = v.split_once(':') {
+            let (p, q) = (point(a, h, w)?.ok_or("a rectangle needs real points")?, point(b, h, w)?.ok_or("a rectangle needs real points")?);
+            for x in p.0..=q.0 {
+                for y in p.1..=q.1 {
+                    out.push((x, y));
+                }
+            }
+        } else if let Some(p) = point(v, h, w)? {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+// GTP style: columns skip I, rows count from the bottom.
+fn coord(x: usize, y: usize, h: usize) -> String {
+    let c = if x < 8 { (b'A' + x as u8) as char } else { (b'A' + x as u8 + 1) as char };
+    format!("{}{}", c, h - y)
+}
+
+#[derive(Clone)]
+struct Board {
+    w: usize,
+    h: usize,
+    cell: Vec<u8>, // 0 empty, 1 black, 2 white.
+    ko: Option<usize>,
+    caps: [usize; 3],
+}
+
+impl Board {
+    fn new(w: usize, h: usize) -> Board {
+        Board { w, h, cell: vec![0; w * h], ko: None, caps: [0; 3] }
+    }
+    fn near(&self, i: usize) -> Vec<usize> {
+        let (x, y) = (i % self.w, i / self.w);
+        let mut o = Vec::with_capacity(4);
+        if x > 0 {
+            o.push(i - 1);
+        }
+        if x + 1 < self.w {
+            o.push(i + 1);
+        }
+        if y > 0 {
+            o.push(i - self.w);
+        }
+        if y + 1 < self.h {
+            o.push(i + self.w);
+        }
+        o
+    }
+    fn group(&self, i: usize) -> (Vec<usize>, usize) {
+        let color = self.cell[i];
+        let mut seen = vec![false; self.cell.len()];
+        let mut libs = HashSet::new();
+        let mut stack = vec![i];
+        let mut stones = vec![];
+        seen[i] = true;
+        while let Some(s) = stack.pop() {
+            stones.push(s);
+            for n in self.near(s) {
+                if self.cell[n] == 0 {
+                    libs.insert(n);
+                } else if self.cell[n] == color && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        (stones, libs.len())
+    }
+    // Plays a stone; gives what is wrong with the move, if anything.
+    fn play(&mut self, color: u8, i: usize) -> Result<usize, String> {
+        if self.cell[i] != 0 {
+            return Err("that point is taken".into());
+        }
+        if self.ko == Some(i) {
+            return Err("that retakes a ko at once".into());
+        }
+        self.cell[i] = color;
+        let other = 3 - color;
+        let mut taken = vec![];
+        for n in self.near(i) {
+            if self.cell[n] == other {
+                let (stones, libs) = self.group(n);
+                if libs == 0 {
+                    for s in &stones {
+                        self.cell[*s] = 0;
+                    }
+                    taken.extend(stones);
+                }
+            }
+        }
+        let (own, libs) = self.group(i);
+        if libs == 0 {
+            self.cell[i] = 0;
+            return Err("that is suicide".into());
+        }
+        self.caps[color as usize] += taken.len();
+        // Ko: one stone taken by one stone that is left with one liberty, the taken point.
+        self.ko = if taken.len() == 1 && own.len() == 1 && libs == 1 { Some(taken[0]) } else { None };
+        Ok(taken.len())
+    }
+    fn lines(&self) -> Vec<String> {
+        self.cell.chunks(self.w).map(|r| r.iter().map(|c| ['.', 'X', 'O'][*c as usize]).collect()).collect()
+    }
+}
+
+fn rules_of(options: &Value) -> Result<(bool, bool), String> {
+    let superko = options.get("superko").and_then(|v| v.as_bool()).unwrap_or(false);
+    let suicide = options.get("suicide").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok((superko, suicide))
+}
+
+struct Line {
+    setup: Vec<(u8, Vec<(usize, usize)>)>,
+    moves: Vec<(u8, Option<(usize, usize)>, Option<String>)>,
+}
+
+// Follows `path`, the variation to take at each fork; 0 throughout is the main line.
+fn line_of(t: &Tree, path: &[usize], w: usize, h: usize) -> Result<Line, String> {
+    let mut l = Line { setup: vec![], moves: vec![] };
+    let mut cur = t;
+    let mut fork = 0;
+    loop {
+        for n in &cur.nodes {
+            let mut comment = None;
+            for (k, v) in n {
+                match k.as_str() {
+                    "AB" => l.setup.push((1, points_of(v, w, h)?)),
+                    "AW" => l.setup.push((2, points_of(v, w, h)?)),
+                    "AE" => l.setup.push((0, points_of(v, w, h)?)),
+                    "C" => comment = v.first().cloned(),
+                    _ => {}
+                }
+            }
+            for (k, v) in n {
+                if k == "B" || k == "W" {
+                    l.moves.push((if k == "B" { 1 } else { 2 }, point(v.first().map(|s| s.as_str()).unwrap_or(""), h, w)?, comment.clone()));
+                }
+            }
+        }
+        if cur.kids.is_empty() {
+            return Ok(l);
+        }
+        let i = path.get(fork).copied().unwrap_or(0);
+        cur = cur.kids.get(i).ok_or(format!("fork {} has {} variations, not {}", fork + 1, cur.kids.len(), i + 1))?;
+        fork += 1;
+    }
+}
+
+fn path_of(v: &Value) -> Vec<usize> {
+    v.get("path").and_then(|p| p.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect()).unwrap_or_default()
+}
+
+fn replay(t: &Tree, options: &Value) -> Result<(Board, Vec<Value>, usize), String> {
+    let (w, h) = size_of(t)?;
+    let (superko, suicide) = rules_of(options)?;
+    let upto = options.get("move").and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(usize::MAX);
+    let line = line_of(t, &path_of(options), w, h)?;
+    let mut b = Board::new(w, h);
+    for (c, ps) in &line.setup {
+        for (x, y) in ps {
+            b.cell[y * w + x] = *c;
+        }
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    seen.insert(b.cell.clone());
+    let mut log = vec![];
+    for (i, (c, p, comment)) in line.moves.iter().enumerate() {
+        if i >= upto {
+            break;
+        }
+        let who = if *c == 1 { "black" } else { "white" };
+        let (at, taken) = match p {
+            None => {
+                b.ko = None;
+                ("pass".to_string(), 0)
+            }
+            Some((x, y)) => {
+                let spot = y * w + x;
+                let name = coord(*x, *y, h);
+                let taken = match b.play(*c, spot) {
+                    Ok(n) => n,
+                    Err(e) if suicide && e == "that is suicide" => {
+                        let (stones, _) = {
+                            b.cell[spot] = *c;
+                            b.group(spot)
+                        };
+                        for s in &stones {
+                            b.cell[*s] = 0;
+                        }
+                        b.caps[3 - *c as usize] += stones.len();
+                        0
+                    }
+                    Err(e) => return Err(format!("move {}, {} at {}: {}", i + 1, who, name, e)),
+                };
+                if superko && !seen.insert(b.cell.clone()) {
+                    return Err(format!("move {}, {} at {}: that repeats an earlier position", i + 1, who, name));
+                }
+                (name, taken)
+            }
+        };
+        log.push(json!({ "number": i + 1, "color": who, "point": at, "captured": taken, "comment": comment }));
+    }
+    let n = log.len();
+    Ok((b, log, n))
+}
+
+/// An SGF file read: [{ info, result, moves, nodes, variations, tree }], one for each game in it. `info` has names like black, white, komi and date; `result` reads `B+R` and `W+3.5`; `moves` counts the main line and `tree` keeps every property, as a list of branches that sgf_write takes back.
+pub fn sgf_parse(text: &str) -> Result<Value, String> {
+    let games = parse(text)?;
+    let mut out = vec![];
+    for t in &games {
+        let (w, h) = size_of(t)?;
+        let line = line_of(t, &[], w, h)?;
+        fn count(t: &Tree) -> (usize, usize) {
+            let (n, v) = t.kids.iter().map(count).fold((t.nodes.len(), t.kids.len().saturating_sub(1)), |a, b| (a.0 + b.0, a.1 + b.1));
+            (n, v)
+        }
+        let (nodes, vars) = count(t);
+        out.push(json!({
+            "info": info(t), "result": prop(t, "RE").map(result_of), "moves": line.moves.len(), "nodes": nodes, "variations": vars + 1, "tree": tree_json(t),
+        }));
+    }
+    Ok(json!(out))
+}
+
+/// The moves of a line: [{ number, color, point, sgf, comment }], `point` like D4 or `pass`. `options`: { path: [..], game }: at each fork take that variation, 0 being the main line.
+pub fn sgf_moves(text: &str, options: serde_json::Value) -> Result<Value, String> {
+    let g = parse(text)?;
+    let t = g.get(options.get("game").and_then(|v| v.as_u64()).unwrap_or(0) as usize).ok_or("no such game in the file")?;
+    let (w, h) = size_of(t)?;
+    let l = line_of(t, &path_of(&options), w, h)?;
+    Ok(json!(l.moves.iter().enumerate().map(|(i, (c, p, cm))| json!({
+        "number": i + 1, "color": if *c == 1 { "black" } else { "white" },
+        "point": p.map(|(x, y)| coord(x, y, h)).unwrap_or("pass".into()),
+        "sgf": p.map(|(x, y)| format!("{}{}", (b'a' + x as u8) as char, (b'a' + y as u8) as char)).unwrap_or_default(),
+        "comment": cm,
+    })).collect::<Vec<_>>()))
+}
+
+/// Each line of play from the root to a leaf: [{ path, moves, last }], with the `path` to give sgf_moves and go_replay.
+pub fn sgf_variations(text: &str) -> Result<Value, String> {
+    let g = parse(text)?;
+    let t = g.first().ok_or("no game")?;
+    let (w, h) = size_of(t)?;
+    let mut out = vec![];
+    fn walk(t: &Tree, path: &mut Vec<usize>, leaves: &mut Vec<Vec<usize>>) {
+        if t.kids.is_empty() {
+            leaves.push(path.clone());
+        }
+        for (i, k) in t.kids.iter().enumerate() {
+            path.push(i);
+            walk(k, path, leaves);
+            path.pop();
+        }
+    }
+    let mut leaves = vec![];
+    walk(t, &mut vec![], &mut leaves);
+    for p in leaves {
+        let l = line_of(t, &p, w, h)?;
+        out.push(json!({ "path": p, "moves": l.moves.len(), "last": l.moves.last().and_then(|m| m.1).map(|(x, y)| coord(x, y, h)) }));
+    }
+    Ok(json!(out))
+}
+
+fn esc(v: &str) -> String {
+    v.replace('\\', "\\\\").replace(']', "\\]")
+}
+
+fn write_branch(rows: &[Value], at: usize, kids: &[Vec<usize>], o: &mut String) -> Result<(), String> {
+    o.push('(');
+    for n in rows[at].get("nodes").and_then(|x| x.as_array()).ok_or("a branch has `nodes`")? {
+        o.push(';');
+        for (k, val) in n.as_object().ok_or("a node is a map")? {
+            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_uppercase()) {
+                return Err(format!("`{}` is not a property name", k));
+            }
+            o.push_str(k);
+            match val {
+                Value::Array(a) => {
+                    for x in a {
+                        o.push_str(&format!("[{}]", esc(x.as_str().unwrap_or(&x.to_string()))));
+                    }
+                }
+                x => o.push_str(&format!("[{}]", esc(x.as_str().unwrap_or(&x.to_string())))),
+            }
+        }
+    }
+    for k in &kids[at] {
+        write_branch(rows, *k, kids, o)?;
+    }
+    o.push(')');
+    Ok(())
+}
+
+/// A `tree` back to SGF text, as sgf_parse gives it or built by hand: a list of branches [{ parent, nodes: [{ B: "pd" }] }], the first with parent -1, and each later one naming its parent's place in the list, which must come before it. Escapes `]` and `\\`.
+pub fn sgf_write(tree: serde_json::Value) -> Result<String, String> {
+    let rows = tree.as_array().filter(|a| !a.is_empty()).ok_or("a tree is a list of branches")?;
+    let mut kids = vec![vec![]; rows.len()];
+    for (i, r) in rows.iter().enumerate() {
+        let p = r.get("parent").and_then(|v| v.as_i64()).ok_or(format!("branch {} has no parent", i))?;
+        if i == 0 {
+            if p != -1 {
+                return Err("the first branch has parent -1".into());
+            }
+        } else if p < 0 || p >= i as i64 {
+            return Err(format!("branch {} has parent {}, which is not before it", i, p));
+        } else {
+            kids[p as usize].push(i);
+        }
+    }
+    let mut o = String::new();
+    write_branch(rows, 0, &kids, &mut o)?;
+    Ok(o)
+}
+
+/// A game from moves, as SGF: `moves` a list of points like "D4" or "pass", black first unless `info.handicap` says, and `info` of { size, komi, black, white, date, result }.
+pub fn sgf_from_moves(moves: Vec<String>, info: serde_json::Value) -> Result<String, String> {
+    let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(19);
+    if !(1..=25).contains(&size) {
+        return Err(format!("a board here is 1 to 25 lines, not {}", size));
+    }
+    let h = size as usize;
+    let mut o = format!("(;GM[1]FF[4]CA[UTF-8]SZ[{}]", size);
+    for (k, id) in [("komi", "KM"), ("black", "PB"), ("white", "PW"), ("date", "DT"), ("result", "RE")] {
+        if let Some(v) = info.get(k) {
+            o.push_str(&format!("{}[{}]", id, esc(v.as_str().map(String::from).unwrap_or(v.to_string()).as_str())));
+        }
+    }
+    let mut black = true;
+    for m in &moves {
+        let u = m.trim().to_uppercase();
+        let spot = if u == "PASS" {
+            String::new()
+        } else {
+            let c = u.chars().next().ok_or("an empty move")?;
+            let x = (c as i64) - 65 - if c > 'I' { 1 } else { 0 };
+            if c == 'I' || !(0..size).contains(&x) {
+                return Err(format!("`{}` is off a {}-line board: columns skip I", m, size));
+            }
+            let row: usize = u[1..].parse().map_err(|_| format!("`{}` is not a point", m))?;
+            if row < 1 || row > h {
+                return Err(format!("`{}` is off a {}-line board", m, size));
+            }
+            format!("{}{}", (b'a' + x as u8) as char, (b'a' + (h - row) as u8) as char)
+        };
+        o.push_str(&format!(";{}[{}]", if black { "B" } else { "W" }, spot));
+        black = !black;
+    }
+    o.push(')');
+    Ok(o)
+}
+
+/// A game played out on a board: { board, moves, captured: { black, white }, ko, to_play }. `board` is rows of `.`, `X` and `O`. Illegal moves stop it with an error value saying which move and why. `options`: { move (stop after that many), path, superko (positional), suicide (allowed, as under New Zealand rules) }.
+pub fn go_replay(text: &str, options: serde_json::Value) -> Result<Value, String> {
+    let g = parse(text)?;
+    let t = g.first().ok_or("no game")?;
+    let (b, log, n) = replay(t, &options)?;
+    let last_black = log.last().map(|m| m["color"] == "black").unwrap_or(false);
+    Ok(json!({
+        "board": b.lines(), "moves": n, "log": log,
+        "captured": { "black": b.caps[1], "white": b.caps[2] },
+        "ko": b.ko.map(|k| coord(k % b.w, k / b.w, b.h)),
+        "to_play": if last_black { "white" } else { "black" },
+    }))
+}
+
+fn score_cells(b: &Board, komi: f64, dead: &HashSet<usize>) -> Value {
+    let mut cell = b.cell.clone();
+    for d in dead {
+        cell[*d] = 0;
+    }
+    let n = Board { cell, ..b.clone() };
+    let mut seen = vec![false; n.cell.len()];
+    let (mut bs, mut ws) = (0usize, 0usize);
+    let (mut bt, mut wt, mut neutral) = (0usize, 0usize, 0usize);
+    for (i, c) in n.cell.iter().enumerate() {
+        match c {
+            1 => bs += 1,
+            2 => ws += 1,
+            _ if !seen[i] => {
+                // An empty region is a colour's if only that colour touches it (Tromp-Taylor).
+                let (mut touch, mut stack, mut size) = (0u8, vec![i], 0);
+                seen[i] = true;
+                while let Some(s) = stack.pop() {
+                    size += 1;
+                    for x in n.near(s) {
+                        if n.cell[x] == 0 {
+                            if !seen[x] {
+                                seen[x] = true;
+                                stack.push(x);
+                            }
+                        } else {
+                            touch |= n.cell[x];
+                        }
+                    }
+                }
+                match touch {
+                    1 => bt += size,
+                    2 => wt += size,
+                    _ => neutral += size,
+                }
+            }
+            _ => {}
+        }
+    }
+    let (black, white) = ((bs + bt) as f64, (ws + wt) as f64 + komi);
+    let margin = (black - white).abs();
+    let result = if black > white { format!("B+{}", margin) } else if white > black { format!("W+{}", margin) } else { "0".to_string() };
+    json!({ "black": { "stones": bs, "territory": bt, "total": black }, "white": { "stones": ws, "territory": wt, "komi": komi, "total": white }, "neutral": neutral, "result": result })
+}
+
+/// A position scored by area, Tromp-Taylor style: stones on the board plus empty regions only one colour touches, komi to white. Takes SGF text or rows of `.XO`. `options`: { komi (else the file's, or 7.5), dead: stones to take off first, as points like D4, move, path }. Dead stones must be named: nothing here guesses life and death.
+pub fn go_score(game: &str, options: serde_json::Value) -> Result<Value, String> {
+    let (b, file_komi) = if game.trim_start().starts_with('(') {
+        let g = parse(game)?;
+        let t = g.first().ok_or("no game")?;
+        let k = prop(t, "KM").and_then(|v| v.parse::<f64>().ok());
+        (replay(t, &options)?.0, k)
+    } else {
+        let rows: Vec<&str> = game.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let (h, w) = (rows.len(), rows.first().map(|r| r.chars().count()).unwrap_or(0));
+        if h == 0 || rows.iter().any(|r| r.chars().count() != w) {
+            return Err("rows of a board must be the same length".into());
+        }
+        let mut b = Board::new(w, h);
+        for (y, r) in rows.iter().enumerate() {
+            for (x, c) in r.chars().enumerate() {
+                b.cell[y * w + x] = match c.to_ascii_uppercase() {
+                    '.' | '+' | '-' => 0,
+                    'X' | 'B' | '#' => 1,
+                    'O' | 'W' => 2,
+                    o => return Err(format!("`{}` is not a stone: use `.`, `X` and `O`", o)),
+                };
+            }
+        }
+        (b, None)
+    };
+    let komi = options.get("komi").and_then(|v| v.as_f64()).or(file_komi).unwrap_or(7.5);
+    let mut dead = HashSet::new();
+    for d in options.get("dead").and_then(|v| v.as_array()).into_iter().flatten() {
+        let t = d.as_str().ok_or("dead stones are points like D4")?.to_uppercase();
+        let c = t.chars().next().ok_or("an empty point")?;
+        let x = (c as i64) - 65 - if c > 'I' { 1 } else { 0 };
+        let row: usize = t[1..].parse().map_err(|_| format!("`{}` is not a point", t))?;
+        if x < 0 || x as usize >= b.w || row < 1 || row > b.h {
+            return Err(format!("`{}` is off the board", t));
+        }
+        let i = (b.h - row) * b.w + x as usize;
+        if b.cell[i] == 0 {
+            return Err(format!("no stone at {}", t));
+        }
+        dead.extend(b.group(i).0);
+    }
+    Ok(score_cells(&b, komi, &dead))
+}

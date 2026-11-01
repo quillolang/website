@@ -1,0 +1,300 @@
+//! BigCommerce's APIs without an SDK: the catalog on V3 and its data and meta envelope, orders on V2 with bare lists and an empty 204, both kinds of error, batch answers that partly fail, the rate-limit headers waited out and reported, and an app's signed payloads checked in both the old form and the JWT.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// BIGCOMMERCE_STORE_HASH and BIGCOMMERCE_ACCESS_TOKEN reach the store; BIGCOMMERCE_API_URL the API
+// (https://api.bigcommerce.com when not set).
+
+const PAGE: i64 = 250;
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn root() -> Result<String, String> {
+    let host = setting("BIGCOMMERCE_API_URL").unwrap_or_else(|| "https://api.bigcommerce.com".into());
+    let hash = setting("BIGCOMMERCE_STORE_HASH").ok_or("BIGCOMMERCE_STORE_HASH is not set")?;
+    Ok(format!("{}/stores/{}", host.trim_end_matches('/'), hash))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~:".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn query(filter: &Value) -> String {
+    filter.as_object().map_or(String::new(), |m| {
+        m.iter()
+            .map(|(k, v)| {
+                let t = match v {
+                    Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect::<Vec<_>>().join(","),
+                    Value::String(s) => s.clone(),
+                    o => o.to_string(),
+                };
+                format!("&{}={}", enc(k), enc(&t))
+            })
+            .collect()
+    })
+}
+
+static LIMITS: Mutex<Option<Value>> = Mutex::new(None);
+
+fn note(r: &ureq::Response) {
+    let g = |h: &str| r.header(h).and_then(|v| v.parse::<i64>().ok());
+    if let Some(left) = g("X-Rate-Limit-Requests-Left") {
+        *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({ "left": left, "quota": g("X-Rate-Limit-Requests-Quota"), "reset_ms": g("X-Rate-Limit-Time-Reset-Ms"), "window_ms": g("X-Rate-Limit-Time-Window-Ms") }));
+    }
+}
+
+/// What the last answer said of the rate limit: { left, quota, reset_ms, window_ms }, or null before one.
+pub fn bigcommerce_rate_limit() -> serde_json::Value {
+    LIMITS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Value::Null)
+}
+
+// V3 gives { status, title, errors: { field: text } }; V2 a list of { status, message }.
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if let Some(list) = v.as_array() {
+        let parts: Vec<String> = list.iter().filter_map(|e| e["message"].as_str().map(|m| {
+            let d = e["details"].as_object().map_or(String::new(), |o| o.iter().map(|(k, x)| format!(" ({}: {})", k, x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))).collect());
+            format!("{}{}", m, d)
+        })).collect();
+        if !parts.is_empty() {
+            return format!("BigCommerce {}: {}", status, parts.join("; "));
+        }
+    }
+    if let Some(t) = v["title"].as_str() {
+        let fields = v["errors"].as_object().map_or(String::new(), |o| {
+            let l: Vec<String> = o.iter().map(|(k, x)| format!("{}: {}", k, x.as_str().unwrap_or(""))).collect();
+            if l.is_empty() { String::new() } else { format!(" ({})", l.join("; ")) }
+        });
+        return format!("BigCommerce {}: {}{}", status, t, fields);
+    }
+    let hint = if status == 401 { " (check BIGCOMMERCE_ACCESS_TOKEN)" } else if status == 403 { " (the token lacks this scope)" } else { "" };
+    format!("BigCommerce {}: {}{}", status, text.trim().chars().take(300).collect::<String>(), hint)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("BIGCOMMERCE_ACCESS_TOKEN").ok_or("BIGCOMMERCE_ACCESS_TOKEN is not set")?;
+    let url = format!("{}{}", root()?, path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    for attempt in 0..5 {
+        let req = agent.request(method, &url).set("X-Auth-Token", &token).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                note(&r);
+                let code = r.status();
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                // A V2 list with nothing in it is a 204 with no body.
+                if code == 204 || t.trim().is_empty() {
+                    return Ok(Value::Null);
+                }
+                return serde_json::from_str(&t).map_err(|_| format!("BigCommerce's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            // The window's end is in the header: a 429 costs nothing, so it is safe for any method.
+            Err(ureq::Error::Status(429, r)) if attempt < 4 => {
+                note(&r);
+                let wait = r.header("X-Rate-Limit-Time-Reset-Ms").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000) + 50));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                note(&r);
+                return Err(error_text(c, &r.into_string().unwrap_or_default()));
+            }
+            Err(e) => return Err(format!("cannot reach BigCommerce at {}: {}", url, e)),
+        }
+    }
+    Err("BigCommerce stayed over its limit through five tries".into())
+}
+
+/// Any other call: `path` under the store, with its version, like "/v3/customers", `body` or null. Gives the answer as it came.
+pub fn bigcommerce_call(method: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) })
+}
+
+// V3: { data, meta: { pagination: { current_page, total_pages } } }.
+fn walk_v3(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let q = query(filter);
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let v = call("GET", &format!("{}?limit={}&page={}{}", path, PAGE, page, q), None)?;
+        out.extend(v["data"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if page >= v["meta"]["pagination"]["total_pages"].as_i64().unwrap_or(1) {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+// V2: a bare list, and a 204 past the end.
+fn walk_v2(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let q = query(filter);
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let v = call("GET", &format!("{}?limit={}&page={}{}", path, PAGE, page, q), None)?;
+        let items = v.as_array().cloned().unwrap_or_default();
+        let n = items.len() as i64;
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < PAGE {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+/// Products through every page (V3): `filter` is BigCommerce's (`include` as "variants,images", `sku`, `name:like`, `is_visible`...), `max_items` caps them (0: all).
+pub fn bigcommerce_products(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_v3("/v3/catalog/products", &filter, max_items)
+}
+
+/// One product by id; `include` is "variants,images" or "".
+pub fn bigcommerce_product(id: i64, include: &str) -> Result<serde_json::Value, String> {
+    let q = if include.is_empty() { String::new() } else { format!("?include={}", enc(include)) };
+    Ok(call("GET", &format!("/v3/catalog/products/{}{}", id, q), None)?["data"].clone())
+}
+
+/// Makes a product: `name`, `type` ("physical" or "digital"), `weight` and `price` are required.
+pub fn bigcommerce_product_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("POST", "/v3/catalog/products", Some(&fields))?["data"].clone())
+}
+
+/// Changes a product.
+pub fn bigcommerce_product_update(id: i64, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("PUT", &format!("/v3/catalog/products/{}", id), Some(&fields))?["data"].clone())
+}
+
+/// Deletes a product.
+pub fn bigcommerce_product_delete(id: i64) -> Result<bool, String> {
+    call("DELETE", &format!("/v3/catalog/products/{}", id), None)?;
+    Ok(true)
+}
+
+/// Changes many products, 10 at a time as the API wants: each record has its `id`. Gives { updated, errors }.
+pub fn bigcommerce_products_update(records: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    if records.iter().any(|r| !r["id"].is_i64()) {
+        return Err("each record needs its `id`".into());
+    }
+    let mut updated = 0;
+    let mut errors = vec![];
+    for chunk in records.chunks(10) {
+        let v = call("PUT", "/v3/catalog/products", Some(&Value::Array(chunk.to_vec())))?;
+        updated += v["data"].as_array().map_or(0, |d| d.len());
+        // A 207: some went in, and the rest are here.
+        errors.extend(v["errors"].as_array().cloned().unwrap_or_default());
+    }
+    Ok(json!({ "updated": updated, "errors": errors }))
+}
+
+/// A product's variants through every page.
+pub fn bigcommerce_variants(product_id: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_v3(&format!("/v3/catalog/products/{}/variants", product_id), &Value::Null, 0)
+}
+
+/// Categories through every page; `filter` as BigCommerce's, `max_items` caps them (0: all).
+pub fn bigcommerce_categories(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_v3("/v3/catalog/categories", &filter, max_items)
+}
+
+/// Orders through every page (V2): `filter` is BigCommerce's (`status_id`, `min_date_created`, `customer_id`, `sort`...), `max_items` caps them (0: all). No orders is an empty list, though the API says 204.
+pub fn bigcommerce_orders(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_v2("/v2/orders", &filter, max_items)
+}
+
+/// One order by id (V2).
+pub fn bigcommerce_order(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/v2/orders/{}", id), None)
+}
+
+/// The products of an order (V2), through every page.
+pub fn bigcommerce_order_products(id: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_v2(&format!("/v2/orders/{}/products", id), &Value::Null, 0)
+}
+
+/// Makes an order (V2): `products` and `billing_address` are required.
+pub fn bigcommerce_order_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("POST", "/v2/orders", Some(&fields))
+}
+
+/// Changes an order (V2), as `{ status_id: 10 }`.
+pub fn bigcommerce_order_update(id: i64, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/v2/orders/{}", id), Some(&fields))
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Checks the older `signed_payload` an app's load callback gets (`base64 of JSON`.`base64 of the hex HMAC`), with the app's client secret. Gives the payload { user, owner, context, store_hash, timestamp }.
+pub fn bigcommerce_signed_payload(signed_payload: &str, client_secret: &str) -> Result<serde_json::Value, String> {
+    let (data, sig) = signed_payload.split_once('.').ok_or("a signed payload has two parts, joined by a dot")?;
+    let json_bytes = STANDARD.decode(data).map_err(|_| "the payload's first part is not base64".to_string())?;
+    let given = STANDARD.decode(sig).map_err(|_| "the payload's signature is not base64".to_string())?;
+    let raw = hex::decode(&given).map_err(|_| "the payload's signature is not a hex digest".to_string())?;
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(client_secret.as_bytes()).expect("HMAC takes any key");
+    m.update(&json_bytes);
+    if m.verify_slice(&raw).is_err() {
+        return Err("the signed payload does not match: a wrong client secret, or it was changed".into());
+    }
+    serde_json::from_slice(&json_bytes).map_err(|e| format!("the payload is not JSON: {}", e))
+}
+
+/// Checks a `signed_payload_jwt` (HS256 with the client secret), with its `aud`, `iss`, `exp` and `nbf`. Gives the claims, `store_hash` taken out of `sub`. `at` is the time to check against (0: now).
+pub fn bigcommerce_signed_jwt(token: &str, client_id: &str, client_secret: &str, at: i64) -> Result<serde_json::Value, String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("a JWT has three parts".into());
+    }
+    let head: Value = URL_SAFE_NO_PAD.decode(parts[0]).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or("the JWT's header is not readable")?;
+    if head["alg"] != "HS256" {
+        return Err(format!("the JWT's algorithm is {}, not HS256", head["alg"]));
+    }
+    let sig = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|_| "the JWT's signature is not base64url".to_string())?;
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(client_secret.as_bytes()).expect("HMAC takes any key");
+    m.update(format!("{}.{}", parts[0], parts[1]).as_bytes());
+    if m.verify_slice(&sig).is_err() {
+        return Err("the JWT's signature does not match: a wrong client secret, or it was changed".into());
+    }
+    let mut c: Value = URL_SAFE_NO_PAD.decode(parts[1]).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or("the JWT's claims are not readable")?;
+    let t = if at > 0 { at } else { now() };
+    if c["aud"].as_str() != Some(client_id) {
+        return Err(format!("the JWT is for {}, not this app", c["aud"]));
+    }
+    if c["iss"] != "bc" {
+        return Err(format!("the JWT's issuer is {}, not bc", c["iss"]));
+    }
+    if c["exp"].as_i64().map_or(true, |e| e < t) {
+        return Err("the JWT has expired".into());
+    }
+    if c["nbf"].as_i64().map_or(false, |n| n > t + 30) {
+        return Err("the JWT is not valid yet".into());
+    }
+    let hash = c["sub"].as_str().and_then(|s| s.strip_prefix("stores/")).map(str::to_string);
+    c["store_hash"] = json!(hash);
+    Ok(c)
+}

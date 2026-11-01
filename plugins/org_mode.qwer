@@ -1,0 +1,1018 @@
+//! Org files read: headlines, TODO keywords, priorities, tags, properties, timestamps and tables; turned into HTML; and agenda items by date with repeaters expanded.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+const MAX_DAYS: i64 = 3660;
+const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn attr(s: &str) -> String {
+    esc(s).replace('"', "&quot;")
+}
+
+fn safe_url(u: &str) -> Option<String> {
+    let low: String = u.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect::<String>().to_lowercase();
+    if ["javascript:", "vbscript:", "data:text/html", "elisp:", "shell:"].iter().any(|p| low.starts_with(p)) {
+        return None;
+    }
+    Some(u.trim().to_string())
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn month_days(y: i64, m: i64) -> i64 {
+    match m {
+        2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn date_text(day: i64) -> String {
+    let (y, m, d) = civil_from_days(day);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn parse_date(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (s[..4].parse().ok()?, s[5..7].parse().ok()?, s[8..10].parse().ok()?);
+    if !(1..=12).contains(&m) || d < 1 || d > month_days(y, m) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// A date a repeater away. A month too short for the day ends at its last day.
+fn add_period(day: i64, n: i64, unit: char) -> i64 {
+    match unit {
+        'd' => day + n,
+        'w' => day + 7 * n,
+        'm' | 'y' => {
+            let (y, m, d) = civil_from_days(day);
+            let months = if unit == 'm' { n } else { 12 * n };
+            let total = y * 12 + (m - 1) + months;
+            let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+            days_from_civil(ny, nm, d.min(month_days(ny, nm)))
+        }
+        _ => day + 1,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Ts {
+    active: bool,
+    day: i64,
+    weekday: Option<String>,
+    time: Option<String>,
+    end_time: Option<String>,
+    end_day: Option<i64>,
+    repeat: Option<(String, i64, char)>,
+    warn: Option<(i64, char)>,
+    text: String,
+}
+
+impl Ts {
+    fn json(&self) -> Value {
+        json!({
+            "text": self.text, "active": self.active, "date": date_text(self.day), "day": self.weekday,
+            "day_ok": self.weekday.as_deref().map_or(true, |w| DAYS[(self.day + 4).rem_euclid(7) as usize].eq_ignore_ascii_case(w.get(..3).unwrap_or(w))),
+            "time": self.time, "end_time": self.end_time, "end_date": self.end_day.map(date_text),
+            "repeater": self.repeat.as_ref().map(|r| json!({ "kind": r.0, "every": r.1, "unit": r.2.to_string() })),
+            "warning": self.warn.map(|w| json!({ "every": w.0, "unit": w.1.to_string() })),
+        })
+    }
+}
+
+fn clock(t: &str) -> Option<String> {
+    let (h, m) = t.split_once(':')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 || !h.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (a, b): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (a < 24 && b < 60).then(|| format!("{:02}:{:02}", a, b))
+}
+
+/// One `<...>` or `[...]` at the start of `s`: the value and how long it is in characters.
+fn one_stamp(s: &[char]) -> Option<(Ts, usize)> {
+    let open = *s.first()?;
+    let close = match open {
+        '<' => '>',
+        '[' => ']',
+        _ => return None,
+    };
+    let end = s.iter().position(|c| *c == close)?;
+    let inner: String = s[1..end].iter().collect();
+    let mut words = inner.split_whitespace();
+    let date = words.next()?;
+    if date.len() != 10 {
+        return None;
+    }
+    let day = parse_date(date)?;
+    let mut ts = Ts { active: open == '<', day, weekday: None, time: None, end_time: None, end_day: None, repeat: None, warn: None, text: s[..=end].iter().collect() };
+    for w in words {
+        let first = w.chars().next()?;
+        if first.is_alphabetic() {
+            ts.weekday = Some(w.to_string());
+        } else if first.is_ascii_digit() {
+            match w.split_once('-') {
+                Some((a, b)) => {
+                    ts.time = Some(clock(a)?);
+                    ts.end_time = Some(clock(b)?);
+                }
+                None => ts.time = Some(clock(w)?),
+            }
+        } else if first == '+' || first == '.' {
+            let kind = w.trim_end_matches(|c: char| c.is_alphanumeric()).to_string();
+            let body = &w[kind.len()..];
+            let unit = body.chars().last()?;
+            if !"hdwmy".contains(unit) {
+                return None;
+            }
+            ts.repeat = Some((kind, body[..body.len() - 1].parse().ok()?, unit));
+        } else if first == '-' {
+            let body = w.trim_start_matches('-');
+            let unit = body.chars().last()?;
+            if !"hdwmy".contains(unit) {
+                return None;
+            }
+            ts.warn = Some((body[..body.len() - 1].parse().ok()?, unit));
+        } else {
+            return None;
+        }
+    }
+    Some((ts, end + 1))
+}
+
+/// `<a>` or `<a>--<b>` at the start of `s`.
+fn stamp_at(s: &[char]) -> Option<(Ts, usize)> {
+    let (mut a, n) = one_stamp(s)?;
+    if s.get(n) == Some(&'-') && s.get(n + 1) == Some(&'-') {
+        if let Some((b, m)) = s.get(n + 2..).and_then(one_stamp) {
+            if b.active == a.active {
+                a.end_day = Some(b.day);
+                a.end_time = b.time.clone();
+                a.text = s[..n + 2 + m].iter().collect();
+                return Some((a, n + 2 + m));
+            }
+        }
+    }
+    Some((a, n))
+}
+
+fn stamps_in(text: &str) -> Vec<Ts> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '<' || c[i] == '[' {
+            if let Some((t, n)) = stamp_at(&c[i..]) {
+                out.push(t);
+                i += n;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+#[derive(Clone)]
+struct Head {
+    level: usize,
+    keyword: Option<String>,
+    done: bool,
+    priority: Option<String>,
+    title: String,
+    tags: Vec<String>,
+    planning: Vec<(String, Ts)>,
+    props: Vec<(String, String)>,
+    body: Vec<String>,
+    line: usize,
+    path: Vec<String>,
+    inherited: Vec<String>,
+}
+
+struct Org {
+    settings: Map<String, Value>,
+    todo: Vec<String>,
+    done: Vec<String>,
+    heads: Vec<Head>,
+    intro: Vec<String>,
+    problems: Vec<String>,
+}
+
+fn keywords(v: &str, todo: &mut Vec<String>, done: &mut Vec<String>) {
+    let clean = |w: &str| w.split('(').next().unwrap_or(w).to_string();
+    let words: Vec<&str> = v.split_whitespace().collect();
+    match words.iter().position(|w| *w == "|") {
+        Some(p) => {
+            todo.extend(words[..p].iter().map(|w| clean(w)));
+            done.extend(words[p + 1..].iter().map(|w| clean(w)));
+        }
+        None => {
+            // With no bar, the last is the done state.
+            if let Some((l, rest)) = words.split_last() {
+                todo.extend(rest.iter().map(|w| clean(w)));
+                done.push(clean(l));
+            }
+        }
+    }
+}
+
+fn split_tags(t: &str) -> (&str, Vec<String>) {
+    let r = t.trim_end();
+    let Some(last) = r.rsplit(|c: char| c == ' ' || c == '\t').next() else { return (r, vec![]) };
+    if last.len() > 2 && last.starts_with(':') && last.ends_with(':') && last[1..last.len() - 1].split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || "_@#%".contains(c))) {
+        return (r[..r.len() - last.len()].trim_end(), last[1..last.len() - 1].split(':').map(str::to_string).collect());
+    }
+    (r, vec![])
+}
+
+fn read(text: &str) -> Org {
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut o = Org { settings: Map::new(), todo: vec![], done: vec![], heads: vec![], intro: vec![], problems: vec![] };
+    // Keywords first: a #+TODO may stand anywhere.
+    let mut custom = false;
+    for l in &lines {
+        let t = l.trim();
+        for p in ["#+TODO:", "#+SEQ_TODO:", "#+TYP_TODO:", "#+todo:"] {
+            if let Some(v) = t.strip_prefix(p) {
+                custom = true;
+                let (mut a, mut b) = (std::mem::take(&mut o.todo), std::mem::take(&mut o.done));
+                keywords(v, &mut a, &mut b);
+                o.todo = a;
+                o.done = b;
+            }
+        }
+    }
+    if !custom {
+        o.todo = vec!["TODO".into()];
+        o.done = vec!["DONE".into()];
+    }
+    let mut block: Option<(String, usize)> = None;
+    let mut stack: Vec<(usize, String, Vec<String>)> = vec![];
+    let mut filetags: Vec<String> = vec![];
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        let n = i + 1;
+        i += 1;
+        let t = l.trim();
+        let low = t.to_lowercase();
+        if let Some(r) = low.strip_prefix("#+begin_") {
+            if block.is_none() {
+                block = Some((r.split_whitespace().next().unwrap_or("").to_string(), n));
+            }
+        } else if let Some(r) = low.strip_prefix("#+end_") {
+            if block.as_ref().map_or(false, |b| b.0 == r.trim()) {
+                block = None;
+            }
+        }
+        if block.is_none() && l.starts_with('*') {
+            let stars = l.chars().take_while(|c| *c == '*').count();
+            if l[stars..].starts_with(' ') {
+                let mut rest = l[stars..].trim();
+                let mut keyword = None;
+                let first = rest.split_whitespace().next().unwrap_or("");
+                if o.todo.iter().chain(o.done.iter()).any(|k| k == first) {
+                    keyword = Some(first.to_string());
+                    rest = rest[first.len()..].trim_start();
+                }
+                let mut priority = None;
+                if rest.len() >= 4 && rest.starts_with("[#") && rest.as_bytes()[3] == b']' {
+                    priority = Some(rest[2..3].to_string());
+                    rest = rest[4..].trim_start();
+                }
+                let (title, tags) = split_tags(rest);
+                while stack.last().map_or(false, |s| s.0 >= stars) {
+                    stack.pop();
+                }
+                let path: Vec<String> = stack.iter().map(|s| s.1.clone()).collect();
+                let mut inherited = filetags.clone();
+                for s in &stack {
+                    for x in &s.2 {
+                        if !inherited.contains(x) {
+                            inherited.push(x.clone());
+                        }
+                    }
+                }
+                stack.push((stars, title.to_string(), tags.clone()));
+                let mut h = Head { level: stars, done: keyword.as_ref().map_or(false, |k| o.done.contains(k)), keyword, priority, title: title.to_string(), tags, planning: vec![], props: vec![], body: vec![], line: n, path, inherited };
+                // Planning and the property drawer come right under the headline.
+                while i < lines.len() {
+                    let x = lines[i].trim();
+                    if x.starts_with("SCHEDULED:") || x.starts_with("DEADLINE:") || x.starts_with("CLOSED:") {
+                        let c: Vec<char> = x.chars().collect();
+                        let mut k = 0;
+                        while k < c.len() {
+                            let tail: String = c[k..].iter().collect();
+                            let word = ["SCHEDULED:", "DEADLINE:", "CLOSED:"].iter().find(|w| tail.starts_with(**w));
+                            if let Some(w) = word {
+                                let mut p = k + w.len();
+                                while p < c.len() && c[p] == ' ' {
+                                    p += 1;
+                                }
+                                if let Some((ts, m)) = stamp_at(&c[p..]) {
+                                    h.planning.push((w.trim_end_matches(':').to_lowercase(), ts));
+                                    k = p + m;
+                                    continue;
+                                }
+                            }
+                            k += 1;
+                        }
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if lines.get(i).map(|x| x.trim()) == Some(":PROPERTIES:") {
+                    let start = i + 1;
+                    let mut k = start;
+                    while k < lines.len() && lines[k].trim() != ":END:" {
+                        k += 1;
+                    }
+                    if k >= lines.len() {
+                        o.problems.push(format!("line {}: a drawer is never closed", start));
+                    }
+                    for x in &lines[start..k.min(lines.len())] {
+                        let r = x.trim().trim_start_matches(':');
+                        if let Some((a, b)) = r.split_once(':') {
+                            h.props.push((a.to_string(), b.trim().to_string()));
+                        }
+                    }
+                    i = (k + 1).min(lines.len());
+                }
+                o.heads.push(h);
+                continue;
+            }
+        }
+        if block.is_none() {
+            if let Some(r) = t.strip_prefix("#+") {
+                if let Some((k, v)) = r.split_once(':') {
+                    let key = k.to_lowercase();
+                    let keep = !key.starts_with("begin") && !key.starts_with("end") && key != "tblfm";
+                    if keep && o.heads.is_empty() {
+                        if key == "filetags" {
+                            filetags = v.trim().trim_matches(':').split(':').filter(|x| !x.is_empty()).map(str::to_string).collect();
+                        }
+                        o.settings.insert(key, json!(v.trim()));
+                        continue;
+                    }
+                }
+            }
+        }
+        match o.heads.last_mut() {
+            Some(h) => h.body.push(l.to_string()),
+            None => o.intro.push(l.to_string()),
+        }
+    }
+    if let Some((name, n)) = block {
+        o.problems.push(format!("line {}: a {} block is never closed", n, name));
+    }
+    o
+}
+
+fn head_json(h: &Head, list: &[Head], at: &mut usize) -> Value {
+    let mut planning = Map::new();
+    for (k, t) in &h.planning {
+        planning.insert(k.clone(), t.json());
+    }
+    let props: Map<String, Value> = h.props.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+    let mut all = h.inherited.clone();
+    for t in &h.tags {
+        if !all.contains(t) {
+            all.push(t.clone());
+        }
+    }
+    let body: Vec<&str> = h.body.iter().map(String::as_str).collect();
+    let text = body.join("\n");
+    let mut kids = vec![];
+    while *at < list.len() && list[*at].level > h.level {
+        let k = &list[*at];
+        *at += 1;
+        kids.push(head_json(k, list, at));
+    }
+    json!({
+        "level": h.level, "keyword": h.keyword, "done": h.done, "priority": h.priority, "title": h.title, "tags": h.tags, "all_tags": all,
+        "planning": planning, "properties": props, "timestamps": stamps_in(&text).iter().map(Ts::json).collect::<Vec<_>>(), "body": text.trim(), "line": h.line, "children": kids,
+    })
+}
+
+/// Reads an Org file: `{ settings, keywords, headlines, intro, problems }`. Headlines nest, each with `keyword`, `priority`, `title`, `tags`, `all_tags`, `planning`, `properties`, `timestamps`, `body`, `children`.
+pub fn org_parse(text: &str) -> Result<Value, String> {
+    let o = read(text);
+    let mut out = vec![];
+    let mut at = 0;
+    while at < o.heads.len() {
+        let h = &o.heads[at];
+        at += 1;
+        out.push(head_json(h, &o.heads, &mut at));
+    }
+    Ok(json!({ "settings": o.settings, "keywords": { "todo": o.todo, "done": o.done }, "headlines": out, "intro": o.intro.join("\n").trim(), "problems": o.problems }))
+}
+
+/// Reads an Org file from a path, as `org_parse` does.
+pub fn org_read_file(path: &str) -> Result<Value, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    org_parse(&t)
+}
+
+/// One timestamp taken apart: `{ active, date, day, day_ok, time, end_time, end_date, repeater, warning }`. `day_ok` is false when the weekday written is not that date's.
+pub fn org_timestamp(text: &str) -> Result<Value, String> {
+    let c: Vec<char> = text.trim().chars().collect();
+    match stamp_at(&c) {
+        Some((t, n)) if n == c.len() => Ok(t.json()),
+        _ => Err(format!("`{}` is not a timestamp", text)),
+    }
+}
+
+/// Every headline with a keyword: `{ keyword, done, priority, title, tags, path, scheduled, deadline }`, not-done first, then by priority.
+pub fn org_todos(text: &str) -> Result<Vec<Value>, String> {
+    let o = read(text);
+    let mut list: Vec<&Head> = o.heads.iter().filter(|h| h.keyword.is_some()).collect();
+    list.sort_by_key(|h| (h.done, h.priority.clone().unwrap_or("B".to_string())));
+    Ok(list.iter().map(|h| {
+        let get = |k: &str| h.planning.iter().find(|p| p.0 == k).map(|p| date_text(p.1.day));
+        json!({ "keyword": h.keyword, "done": h.done, "priority": h.priority, "title": h.title, "tags": h.tags, "path": h.path, "scheduled": get("scheduled"), "deadline": get("deadline"), "line": h.line })
+    }).collect())
+}
+
+fn next_dates(t: &Ts, from: i64, to: i64) -> Vec<i64> {
+    let mut out = vec![];
+    match &t.repeat {
+        Some((_, n, unit)) if *n > 0 && *unit != 'h' => {
+            let mut d = t.day;
+            let mut k = 0;
+            // By steps from the first date, so a month's end comes out the same each time.
+            while d <= to && k < 100_000 {
+                if d >= from {
+                    out.push(d);
+                }
+                k += 1;
+                d = add_period(t.day, n * k, *unit);
+            }
+        }
+        _ => {
+            if t.day >= from && t.day <= to {
+                out.push(t.day);
+            }
+        }
+    }
+    out
+}
+
+/// What falls in a date range, as `{ date, time, kind, keyword, title, tags, line, warning }`: scheduled items, deadlines, and active timestamps in text, repeaters expanded and multi-day ranges a day each. Done items are left out.
+pub fn org_agenda(text: &str, from: &str, to: &str) -> Result<Vec<Value>, String> {
+    let (a, b) = (parse_date(from).filter(|_| from.len() == 10).ok_or(format!("`{}` is not a date", from))?, parse_date(to).filter(|_| to.len() == 10).ok_or(format!("`{}` is not a date", to))?);
+    if b < a {
+        return Err(format!("{} is after {}", from, to));
+    }
+    if b - a > MAX_DAYS {
+        return Err("a range of ten years at most".to_string());
+    }
+    let o = read(text);
+    let mut out: Vec<(i64, String, usize, Value)> = vec![];
+    for h in o.heads.iter().filter(|h| !h.done) {
+        let mut add = |day: i64, time: Option<String>, kind: &str, note: Option<String>| {
+            out.push((day, time.clone().unwrap_or("~".to_string()), h.line, json!({
+                "date": date_text(day), "time": time, "kind": kind, "keyword": h.keyword, "priority": h.priority, "title": h.title, "tags": h.tags, "line": h.line, "warning": note,
+            })));
+        };
+        for (k, t) in &h.planning {
+            if k == "closed" {
+                continue;
+            }
+            for d in next_dates(t, a, b) {
+                let note = match (k.as_str(), t.warn) {
+                    ("deadline", Some((n, unit))) => Some(format!(" (warns from {})", date_text(add_period(d, -n, unit)))),
+                    _ => None,
+                };
+                add(d, t.time.clone(), k, note);
+            }
+        }
+        let body = h.body.join("\n");
+        for t in stamps_in(&format!("{}\n{}", h.title, body)).iter().filter(|t| t.active) {
+            match t.end_day {
+                Some(e) => {
+                    let n = e - t.day + 1;
+                    for d in t.day.max(a)..=e.min(b) {
+                        add(d, if d == t.day { t.time.clone() } else { None }, "timestamp", Some(format!(" ({}/{})", d - t.day + 1, n)));
+                    }
+                }
+                None => for d in next_dates(t, a, b) {
+                    add(d, t.time.clone(), "timestamp", None);
+                },
+            }
+        }
+    }
+    out.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+    Ok(out.into_iter().map(|x| x.3).collect())
+}
+
+fn is_table_line(t: &str) -> bool {
+    t.trim_start().starts_with('|')
+}
+
+fn table_cells(l: &str) -> Vec<String> {
+    let t = l.trim().trim_start_matches('|').trim_end_matches('|');
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn is_rule(l: &str) -> bool {
+    l.trim_start().starts_with("|-")
+}
+
+fn table_value(text_rows: &[&str], caption: Option<&str>, path: Vec<String>, line: usize) -> Value {
+    let rule_at = text_rows.iter().position(|l| is_rule(l));
+    let rows: Vec<Vec<String>> = text_rows.iter().filter(|l| !is_rule(l)).map(|l| table_cells(l)).collect();
+    let header = rule_at == Some(1) && rows.len() > 1;
+    let records: Vec<Value> = if header {
+        rows[1..].iter().map(|r| {
+            let mut m = Map::new();
+            for (k, v) in rows[0].iter().zip(r.iter()) {
+                m.insert(k.clone(), v.parse::<i64>().map(|i| json!(i)).or(v.parse::<f64>().map(|f| json!(f))).unwrap_or(json!(v)));
+            }
+            Value::Object(m)
+        }).collect()
+    } else {
+        vec![]
+    };
+    json!({ "caption": caption, "under": path, "line": line, "header": if header { Value::Array(rows[0].iter().map(|s| json!(s)).collect()) } else { Value::Null }, "rows": if header { json!(rows[1..]) } else { json!(rows) }, "records": records })
+}
+
+/// Every table, with the headlines it sits under: `{ caption, under, header, rows, records }`. With a rule under the first row, `records` are maps by column, numbers as numbers.
+pub fn org_tables(text: &str) -> Result<Vec<Value>, String> {
+    let o = read(text);
+    let mut out = vec![];
+    let mut scan = |body: &[String], path: Vec<String>, base: usize| {
+        let mut i = 0;
+        let mut caption: Option<String> = None;
+        let mut in_block = false;
+        while i < body.len() {
+            let t = body[i].trim();
+            let low = t.to_lowercase();
+            if low.starts_with("#+begin_") {
+                in_block = true;
+            } else if low.starts_with("#+end_") {
+                in_block = false;
+            }
+            if let Some(c) = t.strip_prefix("#+CAPTION:").or(t.strip_prefix("#+caption:")) {
+                caption = Some(c.trim().to_string());
+            }
+            if !in_block && is_table_line(t) {
+                let s = i;
+                while i < body.len() && is_table_line(&body[i]) {
+                    i += 1;
+                }
+                let rows: Vec<&str> = body[s..i].iter().map(String::as_str).collect();
+                out.push(table_value(&rows, caption.as_deref(), path.clone(), base + s + 1));
+                caption = None;
+                continue;
+            }
+            i += 1;
+        }
+    };
+    scan(&o.intro, vec![], 0);
+    for h in &o.heads {
+        let mut p = h.path.clone();
+        p.push(h.title.clone());
+        scan(&h.body, p, h.line);
+    }
+    Ok(out)
+}
+
+fn pre_ok(c: Option<&char>) -> bool {
+    c.map_or(true, |x| x.is_whitespace() || "-('\"{".contains(*x))
+}
+
+fn post_ok(c: Option<&char>) -> bool {
+    c.map_or(true, |x| x.is_whitespace() || "-.,:!?;'\")}[".contains(*x))
+}
+
+fn inline(t: &str, notes: &mut Vec<String>) -> String {
+    let c: Vec<char> = t.chars().collect();
+    let mut o = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        let x = c[i];
+        let prev = if i == 0 { None } else { c.get(i - 1) };
+        if x == '[' && c.get(i + 1) == Some(&'[') {
+            if let Some(e) = (i + 2..c.len().saturating_sub(1)).find(|k| c[*k] == ']' && c[*k + 1] == ']') {
+                let body: String = c[i + 2..e].iter().collect();
+                let (url, desc) = body.split_once("][").map_or((body.as_str(), None), |(a, b)| (a, Some(b)));
+                let img = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"].iter().any(|s| url.to_lowercase().ends_with(s));
+                let shown = desc.map_or(esc(url), |d| inline(d, notes));
+                match safe_url(url) {
+                    Some(u) if img && desc.is_none() => o.push_str(&format!("<img src=\"{}\" alt=\"\">", attr(&u))),
+                    Some(u) => {
+                        let href = u.strip_prefix("file:").unwrap_or(&u).to_string();
+                        let href = href.strip_prefix('*').map_or(href.clone(), |h| format!("#{}", slug(h)));
+                        o.push_str(&format!("<a href=\"{}\">{}</a>", attr(&href), shown));
+                    }
+                    None => o.push_str(&shown),
+                }
+                i = e + 2;
+                continue;
+            }
+        }
+        if x == '[' && c[i..].iter().take(4).collect::<String>() == "[fn:" {
+            if let Some(e) = c[i..].iter().position(|y| *y == ']').map(|p| p + i) {
+                let label: String = c[i + 4..e].iter().collect();
+                if !notes.contains(&label) {
+                    notes.push(label.clone());
+                }
+                o.push_str(&format!("<sup class=\"footnote\"><a href=\"#fn-{0}\">{0}</a></sup>", attr(&label)));
+                i = e + 1;
+                continue;
+            }
+        }
+        if x == '<' || x == '[' {
+            if let Some((ts, n)) = stamp_at(&c[i..]) {
+                let cls = if ts.active { "timestamp" } else { "timestamp inactive" };
+                o.push_str(&format!("<time class=\"{}\" datetime=\"{}\">{}</time>", cls, date_text(ts.day), esc(&ts.text.replace(['<', '>', '[', ']'], ""))));
+                i += n;
+                continue;
+            }
+        }
+        if "*/_+=~".contains(x) && pre_ok(prev) && c.get(i + 1).map_or(false, |n| !n.is_whitespace()) {
+            let mut e = i + 2;
+            let mut hit = None;
+            while e < c.len() {
+                if c[e] == x && !c[e - 1].is_whitespace() && post_ok(c.get(e + 1)) {
+                    hit = Some(e);
+                    break;
+                }
+                e += 1;
+            }
+            if let Some(e) = hit {
+                let body: String = c[i + 1..e].iter().collect();
+                let html = match x {
+                    '*' => format!("<strong>{}</strong>", inline(&body, notes)),
+                    '/' => format!("<em>{}</em>", inline(&body, notes)),
+                    '_' => format!("<u>{}</u>", inline(&body, notes)),
+                    '+' => format!("<del>{}</del>", inline(&body, notes)),
+                    _ => format!("<code>{}</code>", esc(&body)),
+                };
+                o.push_str(&html);
+                i = e + 1;
+                continue;
+            }
+        }
+        if pre_ok(prev) && (c[i..].iter().take(7).collect::<String>() == "http://" || c[i..].iter().take(8).collect::<String>() == "https://") {
+            let mut e = i;
+            while e < c.len() && !c[e].is_whitespace() && !"<>\"".contains(c[e]) {
+                e += 1;
+            }
+            while e > i && ".,;:!?)".contains(c[e - 1]) {
+                e -= 1;
+            }
+            let u: String = c[i..e].iter().collect();
+            o.push_str(&format!("<a href=\"{0}\">{1}</a>", attr(&u), esc(&u)));
+            i = e;
+            continue;
+        }
+        o.push_str(&esc(&x.to_string()));
+        i += 1;
+    }
+    o
+}
+
+fn slug(t: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in t.to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            if dash && !out.is_empty() {
+                out.push('-');
+            }
+            dash = false;
+            out.push(c);
+        } else {
+            dash = true;
+        }
+    }
+    out
+}
+
+/// A list item: `(indent, kind, text)`, kind `u` or `o`.
+fn list_item(l: &str) -> Option<(usize, char, String)> {
+    let t = l.trim_start();
+    let pad = l.len() - t.len();
+    for m in ["- ", "+ "] {
+        if let Some(r) = t.strip_prefix(m) {
+            return Some((pad, 'u', r.trim().to_string()));
+        }
+    }
+    if pad > 0 {
+        if let Some(r) = t.strip_prefix("* ") {
+            return Some((pad, 'u', r.trim().to_string()));
+        }
+    }
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    if n > 0 && (t[n..].starts_with(". ") || t[n..].starts_with(") ")) {
+        return Some((pad, 'o', t[n + 2..].trim().to_string()));
+    }
+    None
+}
+
+fn list_html(lines: &[String], i: &mut usize, pad: usize, notes: &mut Vec<String>, depth: usize) -> String {
+    let Some((_, kind, _)) = lines.get(*i).and_then(|l| list_item(l)) else { return String::new() };
+    let mut desc = false;
+    let tag_of = |k: char, d: bool| if d { "dl" } else if k == 'o' { "ol" } else { "ul" };
+    if let Some((_, _, t)) = list_item(&lines[*i]) {
+        desc = kind == 'u' && t.contains(" :: ");
+    }
+    let tag = tag_of(kind, desc);
+    let mut o = format!("<{}>\n", tag);
+    while *i < lines.len() {
+        let Some((p, k, text)) = list_item(&lines[*i]) else { break };
+        if p != pad || k != kind {
+            break;
+        }
+        *i += 1;
+        let mut text = text;
+        // Lines under an item go on with it.
+        while *i < lines.len() && !lines[*i].trim().is_empty() && list_item(&lines[*i]).is_none() && lines[*i].len() - lines[*i].trim_start().len() > pad {
+            text.push(' ');
+            text.push_str(lines[*i].trim());
+            *i += 1;
+        }
+        let mut nested = String::new();
+        while *i < lines.len() && depth < 16 {
+            match list_item(&lines[*i]) {
+                Some((q, _, _)) if q > pad => nested.push_str(&list_html(lines, i, q, notes, depth + 1)),
+                _ => break,
+            }
+        }
+        if desc {
+            let (term, def) = text.split_once(" :: ").unwrap_or((&text, ""));
+            o.push_str(&format!("<dt>{}</dt>\n<dd>{}{}</dd>\n", inline(term, notes), inline(def, notes), nested));
+            continue;
+        }
+        let (check, body) = if let Some(r) = text.strip_prefix("[X] ").or(text.strip_prefix("[x] ")) {
+            ("<input type=\"checkbox\" checked disabled> ", r.to_string())
+        } else if let Some(r) = text.strip_prefix("[ ] ").or(text.strip_prefix("[-] ")) {
+            ("<input type=\"checkbox\" disabled> ", r.to_string())
+        } else {
+            ("", text.clone())
+        };
+        o.push_str(&format!("<li>{}{}", check, inline(&body, notes)));
+        if !nested.is_empty() {
+            o.push('\n');
+            o.push_str(&nested);
+        }
+        o.push_str("</li>\n");
+    }
+    o.push_str(&format!("</{}>\n", tag));
+    o
+}
+
+fn table_html(rows: &[&str], caption: Option<&str>, notes: &mut Vec<String>) -> String {
+    let rule = rows.iter().position(|l| is_rule(l));
+    let mut o = String::from("<table>\n");
+    if let Some(c) = caption {
+        o.push_str(&format!("<caption>{}</caption>\n", inline(c, notes)));
+    }
+    let head_to = rule.filter(|r| *r > 0);
+    let mut in_body = false;
+    if head_to.is_some() {
+        o.push_str("<thead>\n");
+    } else {
+        o.push_str("<tbody>\n");
+        in_body = true;
+    }
+    for (i, l) in rows.iter().enumerate() {
+        if is_rule(l) {
+            if Some(i) == head_to {
+                o.push_str("</thead>\n<tbody>\n");
+                in_body = true;
+            }
+            continue;
+        }
+        let tag = if head_to.map_or(false, |h| i < h) { "th" } else { "td" };
+        o.push_str("<tr>");
+        for c in table_cells(l) {
+            o.push_str(&format!("<{0}>{1}</{0}>", tag, inline(&c, notes)));
+        }
+        o.push_str("</tr>\n");
+    }
+    o.push_str(if in_body { "</tbody>\n</table>\n" } else { "</thead>\n</table>\n" });
+    o
+}
+
+fn body_html(lines: &[String], notes: &mut Vec<String>, defs: &mut Vec<(String, String)>, raw: bool, depth: usize) -> String {
+    let mut o = String::new();
+    let mut i = 0;
+    let mut caption: Option<String> = None;
+    while i < lines.len() {
+        let l = &lines[i];
+        let t = l.trim();
+        if t.is_empty() {
+            i += 1;
+            continue;
+        }
+        if let Some(r) = t.strip_prefix("[fn:") {
+            if let Some((label, text)) = r.split_once(']') {
+                defs.push((label.to_string(), text.trim().to_string()));
+                i += 1;
+                continue;
+            }
+        }
+        let low = t.to_lowercase();
+        if let Some(r) = low.strip_prefix("#+begin_") {
+            let name = r.split_whitespace().next().unwrap_or("").to_string();
+            let args = t.split_whitespace().skip(1).collect::<Vec<_>>();
+            let end = format!("#+end_{}", name);
+            let start = i + 1;
+            i = start;
+            while i < lines.len() && lines[i].trim().to_lowercase() != end {
+                i += 1;
+            }
+            let body = &lines[start..i.min(lines.len())];
+            let pad = body.iter().filter(|x| !x.trim().is_empty()).map(|x| x.len() - x.trim_start().len()).min().unwrap_or(0);
+            let plain: Vec<String> = body.iter().map(|x| x.get(pad..).unwrap_or("").to_string()).collect();
+            i += 1;
+            match name.as_str() {
+                "src" => {
+                    let lang = args.first().filter(|a| !a.starts_with('-') && !a.starts_with(':')).map_or(String::new(), |a| format!(" class=\"language-{}\"", attr(a)));
+                    o.push_str(&format!("<pre><code{}>{}</code></pre>\n", lang, esc(&plain.join("\n"))));
+                }
+                "example" => o.push_str(&format!("<pre class=\"example\">{}</pre>\n", esc(&plain.join("\n")))),
+                "quote" if depth < 16 => o.push_str(&format!("<blockquote>\n{}</blockquote>\n", body_html(&plain, notes, defs, raw, depth + 1))),
+                "center" if depth < 16 => o.push_str(&format!("<div class=\"center\">\n{}</div>\n", body_html(&plain, notes, defs, raw, depth + 1))),
+                "verse" => o.push_str(&format!("<p class=\"verse\">{}</p>\n", plain.iter().map(|x| inline(x, notes)).collect::<Vec<_>>().join("<br>\n"))),
+                "comment" => {}
+                "export" => {
+                    let html = args.first().map_or(false, |a| a.eq_ignore_ascii_case("html"));
+                    if html && raw {
+                        o.push_str(&plain.join("\n"));
+                        o.push('\n');
+                    } else if html {
+                        o.push_str(&format!("<pre class=\"export-refused\">{}</pre>\n", esc(&plain.join("\n"))));
+                    }
+                }
+                _ => o.push_str(&format!("<div class=\"{}\">\n{}</div>\n", attr(&name), body_html(&plain, notes, defs, raw, depth + 1))),
+            }
+            continue;
+        }
+        if let Some(c) = t.strip_prefix("#+CAPTION:").or(t.strip_prefix("#+caption:")) {
+            caption = Some(c.trim().to_string());
+            i += 1;
+            continue;
+        }
+        if t.starts_with("#+") || t == "#" || t.starts_with("# ") {
+            i += 1;
+            continue;
+        }
+        // Drawers, and whatever they hold, are not for reading.
+        if t.len() > 2 && t.starts_with(':') && t.ends_with(':') && t[1..t.len() - 1].chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            let e = lines[i + 1..].iter().position(|x| x.trim().eq_ignore_ascii_case(":END:"));
+            if let Some(p) = e {
+                i += p + 2;
+                continue;
+            }
+        }
+        if t == ":" || t.starts_with(": ") {
+            let mut b = vec![];
+            while i < lines.len() {
+                let x = lines[i].trim();
+                match x.strip_prefix(": ") {
+                    Some(r) => b.push(r.to_string()),
+                    None if x == ":" => b.push(String::new()),
+                    None => break,
+                }
+                i += 1;
+            }
+            o.push_str(&format!("<pre class=\"example\">{}</pre>\n", esc(&b.join("\n"))));
+            continue;
+        }
+        if t.len() >= 5 && t.chars().all(|c| c == '-') {
+            o.push_str("<hr>\n");
+            i += 1;
+            continue;
+        }
+        if is_table_line(t) {
+            let s = i;
+            while i < lines.len() && is_table_line(&lines[i]) {
+                i += 1;
+            }
+            let rows: Vec<&str> = lines[s..i].iter().map(String::as_str).collect();
+            o.push_str(&table_html(&rows, caption.as_deref(), notes));
+            caption = None;
+            continue;
+        }
+        if let Some((pad, _, _)) = list_item(l) {
+            o.push_str(&list_html(lines, &mut i, pad, notes, 0));
+            continue;
+        }
+        let mut para = vec![t.to_string()];
+        i += 1;
+        while i < lines.len() {
+            let x = lines[i].trim();
+            if x.is_empty() || x.starts_with("#+") || is_table_line(x) || x.starts_with(": ") || list_item(&lines[i]).is_some() {
+                break;
+            }
+            para.push(x.to_string());
+            i += 1;
+        }
+        o.push_str(&format!("<p>{}</p>\n", inline(&para.join(" "), notes)));
+    }
+    o
+}
+
+/// The file as HTML: headlines with their keywords and tags, lists, tables, blocks, footnotes. `options.raw_html: true` lets `#+BEGIN_EXPORT html` through, which only trusted text should; `options.drop_tags` leaves out headlines so tagged, `noexport` always.
+pub fn org_to_html(text: &str, options: serde_json::Value) -> Result<String, String> {
+    let o = read(text);
+    let raw = options.get("raw_html").and_then(Value::as_bool).unwrap_or(false);
+    let drop: Vec<String> = options.get("drop_tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).chain(std::iter::once("noexport".to_string())).collect();
+    let mut notes = vec![];
+    let mut defs = vec![];
+    let mut out = String::new();
+    if let Some(t) = o.settings.get("title").and_then(Value::as_str) {
+        out.push_str(&format!("<h1>{}</h1>\n", inline(t, &mut notes)));
+    }
+    out.push_str(&body_html(&o.intro, &mut notes, &mut defs, raw, 0));
+    let mut skip_below: Option<usize> = None;
+    let mut used: Vec<String> = vec![];
+    for h in &o.heads {
+        if let Some(l) = skip_below {
+            if h.level > l {
+                continue;
+            }
+            skip_below = None;
+        }
+        if h.tags.iter().any(|t| drop.contains(t)) {
+            skip_below = Some(h.level);
+            continue;
+        }
+        let id = {
+            let base = slug(&h.title);
+            let mut n = base.clone();
+            let mut k = 2;
+            while used.contains(&n) {
+                n = format!("{}-{}", base, k);
+                k += 1;
+            }
+            used.push(n.clone());
+            n
+        };
+        let tag = (h.level + 1).min(6);
+        let mut title = String::new();
+        if let Some(k) = &h.keyword {
+            title.push_str(&format!("<span class=\"{} {}\">{}</span> ", if h.done { "done" } else { "todo" }, attr(k), esc(k)));
+        }
+        if let Some(p) = &h.priority {
+            title.push_str(&format!("<span class=\"priority\">[{}]</span> ", esc(p)));
+        }
+        title.push_str(&inline(&h.title, &mut notes));
+        for t in &h.tags {
+            title.push_str(&format!(" <span class=\"tag\">{}</span>", esc(t)));
+        }
+        out.push_str(&format!("<h{0} id=\"{1}\">{2}</h{0}>\n", tag, attr(&id), title));
+        if !h.planning.is_empty() {
+            let line: Vec<String> = h.planning.iter().map(|(k, t)| format!("<span class=\"{}\">{}:</span> <time datetime=\"{}\">{}</time>", k, k.to_uppercase(), date_text(t.day), esc(&t.text.replace(['<', '>', '[', ']'], "")))).collect();
+            out.push_str(&format!("<p class=\"planning\">{}</p>\n", line.join(" ")));
+        }
+        out.push_str(&body_html(&h.body, &mut notes, &mut defs, raw, 0));
+    }
+    if !notes.is_empty() {
+        out.push_str("<ol class=\"footnotes\">\n");
+        let mut sub = vec![];
+        for n in notes.clone() {
+            let t = defs.iter().find(|d| d.0 == n).map_or(String::new(), |d| d.1.clone());
+            out.push_str(&format!("<li id=\"fn-{}\">{}</li>\n", attr(&n), inline(&t, &mut sub)));
+        }
+        out.push_str("</ol>\n");
+    }
+    Ok(out)
+}

@@ -1,0 +1,896 @@
+//! ASN.1 DER and BER read to a tree and written: tags, OIDs with a name table, time types, integers of any size, strings of each kind, and PEM; bad lengths are errors, never panics, and indefinite lengths are refused in DER.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+const MAX_DEPTH: usize = 64;
+
+const OIDS: [(&str, &str); 58] = [
+    ("2.5.4.3", "commonName"), ("2.5.4.4", "surname"), ("2.5.4.5", "serialNumber"), ("2.5.4.6", "countryName"), ("2.5.4.7", "localityName"), ("2.5.4.8", "stateOrProvinceName"), ("2.5.4.9", "streetAddress"), ("2.5.4.10", "organizationName"), ("2.5.4.11", "organizationalUnitName"), ("2.5.4.12", "title"), ("2.5.4.42", "givenName"),
+    ("0.9.2342.19200300.100.1.25", "domainComponent"), ("0.9.2342.19200300.100.1.1", "userId"),
+    ("1.2.840.113549.1.1.1", "rsaEncryption"), ("1.2.840.113549.1.1.5", "sha1WithRSAEncryption"), ("1.2.840.113549.1.1.10", "rsassaPss"), ("1.2.840.113549.1.1.11", "sha256WithRSAEncryption"), ("1.2.840.113549.1.1.12", "sha384WithRSAEncryption"), ("1.2.840.113549.1.1.13", "sha512WithRSAEncryption"),
+    ("1.2.840.10045.2.1", "id-ecPublicKey"), ("1.2.840.10045.3.1.7", "prime256v1"), ("1.3.132.0.34", "secp384r1"), ("1.3.132.0.35", "secp521r1"), ("1.2.840.10045.4.3.2", "ecdsa-with-SHA256"), ("1.2.840.10045.4.3.3", "ecdsa-with-SHA384"), ("1.2.840.10045.4.3.4", "ecdsa-with-SHA512"),
+    ("1.3.101.110", "X25519"), ("1.3.101.112", "ED25519"), ("1.3.101.113", "ED448"),
+    ("1.3.14.3.2.26", "sha1"), ("2.16.840.1.101.3.4.2.1", "sha256"), ("2.16.840.1.101.3.4.2.2", "sha384"), ("2.16.840.1.101.3.4.2.3", "sha512"),
+    ("2.5.29.14", "subjectKeyIdentifier"), ("2.5.29.15", "keyUsage"), ("2.5.29.17", "subjectAltName"), ("2.5.29.18", "issuerAltName"), ("2.5.29.19", "basicConstraints"), ("2.5.29.31", "cRLDistributionPoints"), ("2.5.29.32", "certificatePolicies"), ("2.5.29.35", "authorityKeyIdentifier"), ("2.5.29.37", "extKeyUsage"),
+    ("1.3.6.1.5.5.7.1.1", "authorityInfoAccess"), ("1.3.6.1.5.5.7.3.1", "serverAuth"), ("1.3.6.1.5.5.7.3.2", "clientAuth"), ("1.3.6.1.5.5.7.3.3", "codeSigning"), ("1.3.6.1.5.5.7.3.4", "emailProtection"), ("1.3.6.1.5.5.7.48.1", "OCSP"), ("1.3.6.1.5.5.7.48.2", "caIssuers"),
+    ("1.2.840.113549.1.7.1", "pkcs7-data"), ("1.2.840.113549.1.7.2", "pkcs7-signedData"), ("1.2.840.113549.1.9.1", "emailAddress"), ("1.2.840.113549.1.9.3", "contentType"), ("1.2.840.113549.1.9.4", "messageDigest"), ("1.2.840.113549.1.9.5", "signingTime"), ("1.2.840.113549.1.9.14", "extensionRequest"), ("1.2.840.113549.1.5.13", "pbes2"), ("1.2.840.113549.1.5.12", "pbkdf2"),
+];
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn unhex(t: &str) -> Result<Vec<u8>, String> {
+    let c: String = t.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    if c.len() % 2 != 0 || !c.is_ascii() {
+        return Err("hex must have two digits to a byte".to_string());
+    }
+    (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).map_err(|_| format!("`{}` is not hex", &c[i..i + 2]))).collect()
+}
+
+/// Big-endian bytes to decimal text, by long division.
+fn to_decimal(b: &[u8]) -> String {
+    let mut digits: Vec<u8> = vec![0];
+    for x in b {
+        let mut carry = *x as u32;
+        for d in digits.iter_mut() {
+            let v = *d as u32 * 256 + carry;
+            *d = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
+}
+
+/// Decimal text to big-endian bytes, least bytes needed.
+fn from_decimal(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = vec![0];
+    for c in s.bytes() {
+        let mut carry = (c - b'0') as u32;
+        for b in out.iter_mut().rev() {
+            let v = *b as u32 * 10 + carry;
+            *b = v as u8;
+            carry = v >> 8;
+        }
+        if carry > 0 {
+            out.insert(0, carry as u8);
+        }
+    }
+    out
+}
+
+/// A two's complement value as text.
+fn integer_text(b: &[u8]) -> String {
+    if b.is_empty() {
+        return "0".to_string();
+    }
+    if b[0] & 0x80 == 0 {
+        return to_decimal(b);
+    }
+    let mut m: Vec<u8> = b.iter().map(|x| !x).collect();
+    for x in m.iter_mut().rev() {
+        let (v, over) = x.overflowing_add(1);
+        *x = v;
+        if !over {
+            break;
+        }
+    }
+    format!("-{}", to_decimal(&m))
+}
+
+fn integer_value(b: &[u8]) -> Value {
+    let t = integer_text(b);
+    t.parse::<i64>().map(|i| json!(i)).unwrap_or(json!(t))
+}
+
+fn tag_name(n: u64) -> Option<&'static str> {
+    Some(match n {
+        0 => "EOC", 1 => "BOOLEAN", 2 => "INTEGER", 3 => "BIT STRING", 4 => "OCTET STRING", 5 => "NULL", 6 => "OBJECT", 7 => "OBJECT DESCRIPTOR", 8 => "EXTERNAL", 9 => "REAL", 10 => "ENUMERATED", 12 => "UTF8STRING", 13 => "RELATIVE-OID", 16 => "SEQUENCE", 17 => "SET",
+        18 => "NUMERICSTRING", 19 => "PRINTABLESTRING", 20 => "T61STRING", 21 => "VIDEOTEXSTRING", 22 => "IA5STRING", 23 => "UTCTIME", 24 => "GENERALIZEDTIME", 25 => "GRAPHICSTRING", 26 => "VISIBLESTRING", 27 => "GENERALSTRING", 28 => "UNIVERSALSTRING", 30 => "BMPSTRING",
+        _ => return None,
+    })
+}
+
+fn class_name(c: u8) -> &'static str {
+    ["universal", "application", "context", "private"][c as usize]
+}
+
+fn decode_oid(b: &[u8], at: usize, der: bool) -> Result<String, String> {
+    if b.is_empty() {
+        return Err(format!("offset {}: an empty OBJECT IDENTIFIER", at));
+    }
+    let mut arcs: Vec<String> = vec![];
+    let mut cur: Vec<u8> = vec![];
+    let mut start = true;
+    for (i, x) in b.iter().enumerate() {
+        if start && *x == 0x80 && der {
+            return Err(format!("offset {}: an OID arc has a padded form", at + i));
+        }
+        start = x & 0x80 == 0;
+        cur.push(x & 0x7f);
+        if x & 0x80 == 0 {
+            // Seven bits at a time to bytes, then to text.
+            let mut bytes: Vec<u8> = vec![0];
+            for g in &cur {
+                let mut carry = *g as u32;
+                for b in bytes.iter_mut().rev() {
+                    let v = ((*b as u32) << 7) | carry;
+                    *b = v as u8;
+                    carry = v >> 8;
+                }
+                if carry > 0 {
+                    bytes.insert(0, carry as u8);
+                }
+            }
+            let t = to_decimal(&bytes);
+            if arcs.is_empty() {
+                match t.parse::<u64>() {
+                    Ok(v) if v < 40 => { arcs.push("0".into()); arcs.push(v.to_string()); }
+                    Ok(v) if v < 80 => { arcs.push("1".into()); arcs.push((v - 40).to_string()); }
+                    Ok(v) => { arcs.push("2".into()); arcs.push((v - 80).to_string()); }
+                    Err(_) => { arcs.push("2".into()); arcs.push(big_sub(&t, 80)); }
+                }
+            } else {
+                arcs.push(t);
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        return Err(format!("offset {}: an OID ends in the middle of an arc", at));
+    }
+    Ok(arcs.join("."))
+}
+
+fn big_sub(t: &str, n: u32) -> String {
+    let mut d: Vec<i32> = t.bytes().rev().map(|b| (b - b'0') as i32).collect();
+    let mut borrow = n as i32;
+    for x in d.iter_mut() {
+        let v = *x - borrow % 10;
+        borrow /= 10;
+        if v < 0 {
+            *x = v + 10;
+            borrow += 1;
+        } else {
+            *x = v;
+        }
+    }
+    let s: String = d.iter().rev().map(|x| (b'0' + *x as u8) as char).collect();
+    let s = s.trim_start_matches('0');
+    if s.is_empty() { "0".to_string() } else { s.to_string() }
+}
+
+fn digits(s: &str, n: usize) -> Option<u32> {
+    let p = s.get(..n)?;
+    if p.bytes().all(|b| b.is_ascii_digit()) { p.parse().ok() } else { None }
+}
+
+fn days_in(y: u32, m: u32) -> u32 {
+    match m {
+        2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn check_date(y: u32, mo: u32, d: u32, h: u32, mi: u32, s: u32, t: &str, at: usize) -> Result<(), String> {
+    if mo == 0 || mo > 12 || d == 0 || d > days_in(y, mo) || h > 23 || mi > 59 || s > 60 {
+        return Err(format!("offset {}: `{}` is not a real time", at, t));
+    }
+    Ok(())
+}
+
+/// UTCTime as ISO 8601. Two-digit years by RFC 5280: under 50 is 20xx.
+fn utc_time(b: &[u8], at: usize, der: bool) -> Result<String, String> {
+    let t = std::str::from_utf8(b).map_err(|_| format!("offset {}: a time is not text", at))?;
+    let bad = || format!("offset {}: `{}` is not a UTCTime", at, t);
+    let yy = digits(t, 2).ok_or_else(bad)?;
+    let (mo, d, h, mi) = (digits(&t[2..], 2).ok_or_else(bad)?, digits(t.get(4..).ok_or_else(bad)?, 2).ok_or_else(bad)?, digits(t.get(6..).ok_or_else(bad)?, 2).ok_or_else(bad)?, digits(t.get(8..).ok_or_else(bad)?, 2).ok_or_else(bad)?);
+    let mut rest = t.get(10..).ok_or_else(bad)?;
+    let mut s = None;
+    if let Some(x) = digits(rest, 2) {
+        s = Some(x);
+        rest = &rest[2..];
+    }
+    let y = if yy < 50 { 2000 + yy } else { 1900 + yy };
+    check_date(y, mo, d, h, mi, s.unwrap_or(0), t, at)?;
+    if der && (rest != "Z" || s.is_none()) {
+        return Err(format!("offset {}: `{}`: DER needs seconds and Z in a UTCTime", at, t));
+    }
+    let zone = zone(rest).ok_or_else(bad)?;
+    Ok(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}", y, mo, d, h, mi, s.unwrap_or(0), zone))
+}
+
+fn zone(z: &str) -> Option<String> {
+    if z == "Z" {
+        return Some("Z".to_string());
+    }
+    if z.is_empty() {
+        return Some(String::new());
+    }
+    let sign = z.get(..1).filter(|s| *s == "+" || *s == "-")?;
+    let (h, m) = (digits(&z[1..], 2)?, digits(z.get(3..)?, 2)?);
+    (z.len() == 5 && h <= 14 && m < 60).then(|| format!("{}{:02}:{:02}", sign, h, m))
+}
+
+fn generalized_time(b: &[u8], at: usize, der: bool) -> Result<String, String> {
+    let t = std::str::from_utf8(b).map_err(|_| format!("offset {}: a time is not text", at))?;
+    let bad = || format!("offset {}: `{}` is not a GeneralizedTime", at, t);
+    let y = digits(t, 4).ok_or_else(bad)?;
+    let mo = digits(t.get(4..).ok_or_else(bad)?, 2).ok_or_else(bad)?;
+    let d = digits(t.get(6..).ok_or_else(bad)?, 2).ok_or_else(bad)?;
+    let h = digits(t.get(8..).ok_or_else(bad)?, 2).ok_or_else(bad)?;
+    let mut rest = t.get(10..).ok_or_else(bad)?;
+    let (mut mi, mut s) = (None, None);
+    if let Some(x) = digits(rest, 2) {
+        mi = Some(x);
+        rest = &rest[2..];
+        if let Some(x) = digits(rest, 2) {
+            s = Some(x);
+            rest = &rest[2..];
+        }
+    }
+    let mut frac = String::new();
+    if rest.starts_with('.') || rest.starts_with(',') {
+        let n = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return Err(bad());
+        }
+        frac = format!(".{}", &rest[1..1 + n]);
+        rest = &rest[1 + n..];
+    }
+    check_date(y, mo, d, h, mi.unwrap_or(0), s.unwrap_or(0), t, at)?;
+    if der && (rest != "Z" || s.is_none() || frac.ends_with('0') || frac == ".") {
+        return Err(format!("offset {}: `{}`: DER needs seconds, Z, and no trailing zeros", at, t));
+    }
+    let zone = zone(rest).ok_or_else(bad)?;
+    Ok(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{}", y, mo, d, h, mi.unwrap_or(0), s.unwrap_or(0), frac, zone))
+}
+
+fn string_value(tag: u64, b: &[u8], at: usize) -> Result<Value, String> {
+    Ok(match tag {
+        12 => json!(std::str::from_utf8(b).map_err(|_| format!("offset {}: a UTF8String is not UTF-8", at))?),
+        30 => {
+            if b.len() % 2 != 0 {
+                return Err(format!("offset {}: a BMPString has an odd length", at));
+            }
+            let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            json!(String::from_utf16(&u).map_err(|_| format!("offset {}: a BMPString holds bad text", at))?)
+        }
+        28 => {
+            if b.len() % 4 != 0 {
+                return Err(format!("offset {}: a UniversalString is not in fours", at));
+            }
+            let mut s = String::new();
+            for c in b.chunks_exact(4) {
+                s.push(char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).ok_or(format!("offset {}: a UniversalString holds bad text", at))?);
+            }
+            json!(s)
+        }
+        // T61 is close enough to Latin-1 for what certificates hold; the others are ASCII.
+        _ => json!(b.iter().map(|x| *x as char).collect::<String>()),
+    })
+}
+
+struct Cx<'a> {
+    b: &'a [u8],
+    der: bool,
+    deep: bool,
+    names: HashMap<String, String>,
+}
+
+struct Head {
+    class: u8,
+    constructed: bool,
+    tag: u64,
+    len: Option<usize>,
+    size: usize,
+}
+
+fn head(b: &[u8], at: usize, der: bool) -> Result<Head, String> {
+    let first = *b.get(at).ok_or(format!("offset {}: the data ends where a tag should be", at))?;
+    let (class, constructed) = (first >> 6, first & 0x20 != 0);
+    let mut tag = (first & 0x1f) as u64;
+    let mut i = at + 1;
+    if tag == 0x1f {
+        tag = 0;
+        let mut n = 0;
+        loop {
+            let x = *b.get(i).ok_or(format!("offset {}: the data ends inside a tag", at))?;
+            i += 1;
+            if n == 0 && x == 0x80 {
+                return Err(format!("offset {}: a long tag has a padded form", at));
+            }
+            tag = tag.checked_mul(128).and_then(|t| t.checked_add((x & 0x7f) as u64)).ok_or(format!("offset {}: a tag number too large", at))?;
+            n += 1;
+            if x & 0x80 == 0 {
+                break;
+            }
+        }
+        if tag < 31 && der {
+            return Err(format!("offset {}: tag {} must use the short form", at, tag));
+        }
+    }
+    let l = *b.get(i).ok_or(format!("offset {}: the data ends where a length should be", at))?;
+    i += 1;
+    let len = if l == 0x80 {
+        if der {
+            return Err(format!("offset {}: an indefinite length, which DER does not allow", at));
+        }
+        if !constructed {
+            return Err(format!("offset {}: an indefinite length on a primitive value", at));
+        }
+        None
+    } else if l < 0x80 {
+        Some(l as usize)
+    } else {
+        let n = (l & 0x7f) as usize;
+        if l == 0xff {
+            return Err(format!("offset {}: length byte 0xFF is reserved", at));
+        }
+        let bytes = b.get(i..i + n).ok_or(format!("offset {}: the data ends inside a length", at))?;
+        i += n;
+        if der && (bytes[0] == 0 || (n == 1 && bytes[0] < 0x80)) {
+            return Err(format!("offset {}: a length not in its shortest form", at));
+        }
+        let mut v: usize = 0;
+        for x in bytes {
+            v = v.checked_mul(256).and_then(|y| y.checked_add(*x as usize)).ok_or(format!("offset {}: a length too large to hold", at))?;
+        }
+        Some(v)
+    };
+    Ok(Head { class, constructed, tag, len, size: i - at })
+}
+
+impl Cx<'_> {
+    fn node(&self, at: usize, limit: usize, depth: usize) -> Result<(Value, usize), String> {
+        if depth > MAX_DEPTH {
+            return Err(format!("offset {}: nested deeper than {}", at, MAX_DEPTH));
+        }
+        let h = head(&self.b[..limit], at, self.der)?;
+        let start = at + h.size;
+        let mut m = Map::new();
+        let universal = h.class == 0;
+        let name = if universal { tag_name(h.tag).map(str::to_string) } else { None };
+        m.insert("offset".into(), json!(at));
+        m.insert("header".into(), json!(h.size));
+        m.insert("class".into(), json!(class_name(h.class)));
+        m.insert("tag".into(), json!(h.tag));
+        m.insert("constructed".into(), json!(h.constructed));
+        m.insert("type".into(), json!(name.clone().unwrap_or_else(|| match h.class { 0 => format!("universal {}", h.tag), 1 => format!("application {}", h.tag), 2 => format!("[{}]", h.tag), _ => format!("private {}", h.tag) })));
+        if h.constructed {
+            if universal && self.der && matches!(h.tag, 1 | 2 | 3 | 4 | 5 | 6 | 10 | 12 | 18..=30) {
+                return Err(format!("offset {}: {} must be primitive in DER", at, name.unwrap_or_default()));
+            }
+            if universal && !matches!(h.tag, 8 | 11 | 16 | 17 | 3 | 4 | 12 | 18..=30) {
+                return Err(format!("offset {}: {} cannot be constructed", at, name.unwrap_or_default()));
+            }
+            let mut kids = vec![];
+            let mut p = start;
+            let end = match h.len {
+                Some(n) => {
+                    let e = start.checked_add(n).filter(|e| *e <= limit).ok_or(format!("offset {}: the length {} runs past the end", at, n))?;
+                    while p < e {
+                        let (k, next) = self.node(p, e, depth + 1)?;
+                        kids.push(k);
+                        p = next;
+                    }
+                    e
+                }
+                None => loop {
+                    if self.b[..limit].get(p..p + 2) == Some(&[0, 0]) {
+                        break p + 2;
+                    }
+                    if p >= limit {
+                        return Err(format!("offset {}: an indefinite length never ends", at));
+                    }
+                    let (k, next) = self.node(p, limit, depth + 1)?;
+                    kids.push(k);
+                    p = next;
+                },
+            };
+            m.insert("length".into(), json!(end - start));
+            if h.len.is_none() {
+                m.insert("indefinite".into(), json!(true));
+            }
+            if universal && h.tag == 17 && self.der {
+                self.check_set(&kids, at)?;
+            }
+            m.insert("children".into(), Value::Array(kids));
+            return Ok((Value::Object(m), end));
+        }
+        let n = h.len.unwrap_or(0);
+        let end = start.checked_add(n).filter(|e| *e <= limit).ok_or(format!("offset {}: the length {} runs past the end", at, n))?;
+        let body = &self.b[start..end];
+        m.insert("length".into(), json!(n));
+        if universal {
+            self.value(h.tag, body, at, &mut m, depth)?;
+        } else {
+            m.insert("hex".into(), json!(hex(body)));
+            if body.iter().all(|c| (0x20..0x7f).contains(c)) && !body.is_empty() {
+                m.insert("text".into(), json!(String::from_utf8_lossy(body)));
+            }
+        }
+        Ok((Value::Object(m), end))
+    }
+
+    /// DER: the elements of a SET stand in the order of their encodings.
+    fn check_set(&self, kids: &[Value], at: usize) -> Result<(), String> {
+        let bytes = |k: &Value| {
+            let (o, h, l) = (k["offset"].as_u64().unwrap_or(0) as usize, k["header"].as_u64().unwrap_or(0) as usize, k["length"].as_u64().unwrap_or(0) as usize);
+            &self.b[o..o + h + l]
+        };
+        for w in kids.windows(2) {
+            if bytes(&w[0]) > bytes(&w[1]) {
+                return Err(format!("offset {}: a SET not in sorted order, which DER needs", at));
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&self, tag: u64, b: &[u8], at: usize, m: &mut Map<String, Value>, depth: usize) -> Result<(), String> {
+        match tag {
+            0 => return Err(format!("offset {}: an end marker outside an indefinite length", at)),
+            1 => {
+                if b.len() != 1 {
+                    return Err(format!("offset {}: a BOOLEAN of {} bytes", at, b.len()));
+                }
+                if self.der && b[0] != 0 && b[0] != 0xff {
+                    return Err(format!("offset {}: a true BOOLEAN must be FF in DER", at));
+                }
+                m.insert("value".into(), json!(b[0] != 0));
+            }
+            2 | 10 => {
+                if b.is_empty() {
+                    return Err(format!("offset {}: an empty INTEGER", at));
+                }
+                if self.der && b.len() > 1 && ((b[0] == 0 && b[1] & 0x80 == 0) || (b[0] == 0xff && b[1] & 0x80 != 0)) {
+                    return Err(format!("offset {}: an INTEGER not in its shortest form", at));
+                }
+                m.insert("value".into(), integer_value(b));
+                if b.len() > 8 {
+                    m.insert("hex".into(), json!(hex(b)));
+                }
+            }
+            3 => {
+                let unused = *b.first().ok_or(format!("offset {}: an empty BIT STRING", at))? as u32;
+                if unused > 7 || (b.len() == 1 && unused != 0) {
+                    return Err(format!("offset {}: a BIT STRING with {} unused bits", at, unused));
+                }
+                if self.der && unused > 0 && b[b.len() - 1] & ((1 << unused) - 1) as u8 != 0 {
+                    return Err(format!("offset {}: DER needs a BIT STRING's unused bits at zero", at));
+                }
+                m.insert("unused_bits".into(), json!(unused));
+                m.insert("hex".into(), json!(hex(&b[1..])));
+                if b.len() <= 5 {
+                    let bits: String = b[1..].iter().map(|x| format!("{:08b}", x)).collect();
+                    m.insert("bits".into(), json!(&bits[..bits.len() - unused as usize]));
+                }
+                self.inner(&b[1..], at, m, depth);
+            }
+            4 => {
+                m.insert("hex".into(), json!(hex(b)));
+                self.inner(b, at, m, depth);
+            }
+            5 => {
+                if !b.is_empty() {
+                    return Err(format!("offset {}: a NULL with a body", at));
+                }
+                m.insert("value".into(), Value::Null);
+            }
+            6 => {
+                let oid = decode_oid(b, at, self.der)?;
+                let name = self.names.get(&oid).cloned().or_else(|| OIDS.iter().find(|o| o.0 == oid).map(|o| o.1.to_string()));
+                m.insert("value".into(), json!(oid));
+                m.insert("name".into(), json!(name));
+            }
+            12 | 18..=22 | 25..=28 | 30 => {
+                m.insert("value".into(), string_value(tag, b, at)?);
+            }
+            23 => {
+                m.insert("value".into(), json!(utc_time(b, at, self.der)?));
+            }
+            24 => {
+                m.insert("value".into(), json!(generalized_time(b, at, self.der)?));
+            }
+            _ => {
+                m.insert("hex".into(), json!(hex(b)));
+            }
+        }
+        Ok(())
+    }
+
+    /// With `deep`, an OCTET or BIT STRING that holds a whole DER value is opened too: extensions and keys do.
+    fn inner(&self, b: &[u8], _at: usize, m: &mut Map<String, Value>, depth: usize) {
+        if !self.deep || b.len() < 2 {
+            return;
+        }
+        let c = Cx { b, der: self.der, deep: true, names: self.names.clone() };
+        if b[0] & 0x20 == 0 && b[0] != 0x02 && b[0] != 0x03 && b[0] != 0x04 {
+            return;
+        }
+        if let Ok((v, end)) = c.node(0, b.len(), depth + 1) {
+            if end == b.len() {
+                m.insert("inner".into(), v);
+            }
+        }
+    }
+}
+
+fn parse(b: &[u8], der: bool, deep: bool, names: HashMap<String, String>) -> Result<Vec<Value>, String> {
+    let c = Cx { b, der, deep, names };
+    let mut at = 0;
+    let mut out = vec![];
+    while at < b.len() {
+        let (v, next) = c.node(at, b.len(), 0)?;
+        out.push(v);
+        at = next;
+    }
+    if out.is_empty() {
+        return Err("no data".to_string());
+    }
+    Ok(out)
+}
+
+fn options_of(o: &Value) -> Result<(bool, bool, HashMap<String, String>), String> {
+    let der = match o.get("mode").and_then(Value::as_str).unwrap_or("der") {
+        "der" => true,
+        "ber" => false,
+        m => return Err(format!("`{}` is not a mode: der or ber", m)),
+    };
+    let names = o.get("names").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default();
+    Ok((der, o.get("deep").and_then(Value::as_bool).unwrap_or(false), names))
+}
+
+/// Reads hex (colons and spaces allowed) to a list of trees. `options`: `mode` (`der`, the default, or `ber`), `deep` to open strings that hold DER, `names` for more OIDs. Each node has `offset`, `class`, `tag`, `type`, `length`, and `value`, `hex` or `children`.
+pub fn asn1_der_read(data: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (der, deep, names) = options_of(&options)?;
+    parse(&unhex(data)?, der, deep, names)
+}
+
+/// Reads base64 text, as `asn1_der_read` does hex.
+pub fn asn1_der_read_base64(data: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (der, deep, names) = options_of(&options)?;
+    let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    parse(&STANDARD.decode(clean).map_err(|e| format!("bad base64: {}", e))?, der, deep, names)
+}
+
+/// Reads a file, DER bytes or PEM: the first PEM block if it is one.
+pub fn asn1_der_read_file(path: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let (der, deep, names) = options_of(&options)?;
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let bytes = if b.starts_with(b"-----BEGIN") {
+        let blocks = pem_blocks(&String::from_utf8_lossy(&b))?;
+        blocks.into_iter().next().ok_or("no PEM block")?.1
+    } else {
+        b
+    };
+    parse(&bytes, der, deep, names)
+}
+
+fn pem_blocks(text: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = vec![];
+    let mut cur: Option<(String, String)> = None;
+    for (i, l) in text.lines().enumerate() {
+        let t = l.trim();
+        if let Some(n) = t.strip_prefix("-----BEGIN ").and_then(|x| x.strip_suffix("-----")) {
+            if cur.is_some() {
+                return Err(format!("line {}: a block opens inside a block", i + 1));
+            }
+            cur = Some((n.to_string(), String::new()));
+        } else if let Some(n) = t.strip_prefix("-----END ").and_then(|x| x.strip_suffix("-----")) {
+            let (label, body) = cur.take().ok_or(format!("line {}: an END with no BEGIN", i + 1))?;
+            if label != n {
+                return Err(format!("line {}: BEGIN {} ends with END {}", i + 1, label, n));
+            }
+            out.push((label, STANDARD.decode(body).map_err(|e| format!("line {}: bad base64: {}", i + 1, e))?));
+        } else if let Some(c) = cur.as_mut() {
+            if !t.contains(':') {
+                c.1.push_str(t);
+            }
+        }
+    }
+    if let Some((label, _)) = cur {
+        return Err(format!("the block {} never ends", label));
+    }
+    Ok(out)
+}
+
+/// PEM blocks in text: `[{ label, hex, bytes }]`.
+pub fn asn1_der_pem_read(text: &str) -> Result<Vec<Value>, String> {
+    Ok(pem_blocks(text)?.into_iter().map(|(l, b)| json!({ "label": l, "hex": hex(&b), "bytes": b.len() })).collect())
+}
+
+/// Hex as a PEM block with a label such as `CERTIFICATE`.
+pub fn asn1_der_pem_write(label: &str, data: &str) -> Result<String, String> {
+    if label.is_empty() || label.contains(['-', '\n']) {
+        return Err(format!("`{}` is not a PEM label", label));
+    }
+    let b64 = STANDARD.encode(unhex(data)?);
+    let mut out = format!("-----BEGIN {}-----\n", label);
+    for c in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(c));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {}-----\n", label));
+    Ok(out)
+}
+
+fn dump_node(n: &Value, d: usize, out: &mut String) {
+    let cons = n["constructed"] == json!(true);
+    out.push_str(&format!("{:5}:d={}  hl={} l={:4} {}: {}", n["offset"].as_i64().unwrap_or(0), d, n["header"], n["length"].as_i64().unwrap_or(0), if cons { "cons" } else { "prim" }, n["type"].as_str().unwrap_or("")));
+    if let Some(v) = n["value"].as_str() {
+        out.push_str(&format!(" :{}", n["name"].as_str().unwrap_or(v)));
+    } else if n["value"].is_i64() {
+        out.push_str(&format!(" :{}", n["value"]));
+    }
+    out.push('\n');
+    for k in n["children"].as_array().into_iter().flatten() {
+        dump_node(k, d + 1, out);
+    }
+}
+
+/// The tree as lines in the manner of `openssl asn1parse`: offset, depth, header and length, each node's type and value.
+pub fn asn1_der_dump(data: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut out = String::new();
+    for n in asn1_der_read(data, options)? {
+        dump_node(&n, 0, &mut out);
+    }
+    Ok(out)
+}
+
+fn walk_oids(n: &Value, out: &mut Vec<Value>) {
+    if n["type"] == "OBJECT" {
+        out.push(json!({ "oid": n["value"], "name": n["name"], "offset": n["offset"] }));
+    }
+    for k in n["children"].as_array().into_iter().flatten() {
+        walk_oids(k, out);
+    }
+    if n.get("inner").is_some() {
+        walk_oids(&n["inner"], out);
+    }
+}
+
+/// Every OID in the data, in order, with its name where known: what a certificate or signature uses.
+pub fn asn1_der_oids(data: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    for n in asn1_der_read(data, options)? {
+        walk_oids(&n, &mut out);
+    }
+    Ok(out)
+}
+
+// Writing.
+
+fn put_len(n: usize, out: &mut Vec<u8>) {
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = n.to_be_bytes();
+        let skip = b.iter().position(|x| *x != 0).unwrap_or(b.len() - 1);
+        out.push(0x80 | (b.len() - skip) as u8);
+        out.extend_from_slice(&b[skip..]);
+    }
+}
+
+fn put_tag(class: u8, constructed: bool, tag: u64, out: &mut Vec<u8>) {
+    let lead = (class << 6) | if constructed { 0x20 } else { 0 };
+    if tag < 31 {
+        out.push(lead | tag as u8);
+    } else {
+        out.push(lead | 0x1f);
+        let mut g = vec![(tag & 0x7f) as u8];
+        let mut t = tag >> 7;
+        while t > 0 {
+            g.push(0x80 | (t & 0x7f) as u8);
+            t >>= 7;
+        }
+        g.reverse();
+        out.extend_from_slice(&g);
+    }
+}
+
+fn encode_integer(v: &Value) -> Result<Vec<u8>, String> {
+    let t = match v {
+        Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+        Value::String(s) => s.trim().to_string(),
+        o => return Err(format!("{} is not an integer", o)),
+    };
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, t.as_str()),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an integer", t));
+    }
+    let mut m = from_decimal(digits);
+    while m.len() > 1 && m[0] == 0 {
+        m.remove(0);
+    }
+    if neg && m != [0] {
+        for x in m.iter_mut() {
+            *x = !*x;
+        }
+        for x in m.iter_mut().rev() {
+            let (v, over) = x.overflowing_add(1);
+            *x = v;
+            if !over {
+                break;
+            }
+        }
+        if m[0] & 0x80 == 0 {
+            m.insert(0, 0xff);
+        }
+        while m.len() > 1 && m[0] == 0xff && m[1] & 0x80 != 0 {
+            m.remove(0);
+        }
+    } else if m[0] & 0x80 != 0 {
+        m.insert(0, 0);
+    }
+    Ok(m)
+}
+
+fn encode_oid(s: &str) -> Result<Vec<u8>, String> {
+    let dotted = if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') { s.to_string() } else { OIDS.iter().find(|o| o.1 == s).map(|o| o.0.to_string()).ok_or(format!("`{}` is not an OID or a known name", s))? };
+    let arcs: Vec<&str> = dotted.split('.').collect();
+    if arcs.len() < 2 || arcs.iter().any(|a| a.is_empty()) {
+        return Err(format!("`{}` needs at least two arcs", dotted));
+    }
+    let first: u32 = arcs[0].parse().ok().filter(|f| *f <= 2).ok_or(format!("`{}`: the first arc is 0, 1 or 2", dotted))?;
+    let second: u128 = arcs[1].parse().map_err(|_| format!("`{}`: an arc too large", dotted))?;
+    if first < 2 && second >= 40 {
+        return Err(format!("`{}`: the second arc must be under 40", dotted));
+    }
+    let mut vals = vec![first as u128 * 40 + second];
+    for a in &arcs[2..] {
+        vals.push(a.parse().map_err(|_| format!("`{}`: an arc too large", dotted))?);
+    }
+    let mut out = vec![];
+    for v in vals {
+        let mut g = vec![(v & 0x7f) as u8];
+        let mut t = v >> 7;
+        while t > 0 {
+            g.push(0x80 | (t & 0x7f) as u8);
+            t >>= 7;
+        }
+        g.reverse();
+        out.extend_from_slice(&g);
+    }
+    Ok(out)
+}
+
+/// `2026-11-01T09:30:00Z` to the bytes of a time; `YYMMDD` for UTCTime, four digits for GeneralizedTime.
+fn encode_time(t: &str, utc: bool) -> Result<Vec<u8>, String> {
+    let bad = || format!("`{}` is not a UTC time like 2026-11-01T09:30:00Z", t);
+    let z = t.strip_suffix('Z').ok_or_else(bad)?;
+    let (date, time) = z.split_once('T').ok_or_else(bad)?;
+    let (time, frac) = time.split_once('.').unwrap_or((time, ""));
+    let d: String = date.chars().filter(|c| *c != '-').collect();
+    let c: String = time.chars().filter(|c| *c != ':').collect();
+    if d.len() != 8 || c.len() != 6 || !d.bytes().chain(c.bytes()).all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    check_date(d[..4].parse().unwrap_or(0), d[4..6].parse().unwrap_or(0), d[6..8].parse().unwrap_or(0), c[..2].parse().unwrap_or(0), c[2..4].parse().unwrap_or(0), c[4..6].parse().unwrap_or(0), t, 0).map_err(|_| bad())?;
+    if utc {
+        let y: u32 = d[..4].parse().unwrap_or(0);
+        if !(1950..2050).contains(&y) {
+            return Err(format!("`{}`: UTCTime holds 1950 to 2049; use GeneralizedTime", t));
+        }
+        if !frac.is_empty() {
+            return Err(format!("`{}`: UTCTime has no fractions", t));
+        }
+        return Ok(format!("{}{}Z", &d[2..], c).into_bytes());
+    }
+    let f = frac.trim_end_matches('0');
+    Ok(if f.is_empty() { format!("{}{}Z", d, c) } else { format!("{}{}.{}Z", d, c, f) }.into_bytes())
+}
+
+fn tag_of(name: &str) -> Option<u64> {
+    let n = name.to_uppercase().replace('_', " ");
+    let alias = match n.as_str() {
+        "OID" | "OBJECT IDENTIFIER" => "OBJECT",
+        "BITSTRING" => "BIT STRING",
+        "OCTETSTRING" => "OCTET STRING",
+        o => o,
+    };
+    (0..31u64).find(|t| tag_name(*t) == Some(alias))
+}
+
+fn encode(n: &Value, depth: usize) -> Result<Vec<u8>, String> {
+    if depth > MAX_DEPTH {
+        return Err("nested too deep".to_string());
+    }
+    let ty = n.get("type").and_then(Value::as_str).unwrap_or("");
+    let class = match n.get("class").and_then(Value::as_str) {
+        None | Some("universal") => 0u8,
+        Some("application") => 1,
+        Some("context") => 2,
+        Some("private") => 3,
+        Some(o) => return Err(format!("`{}` is not a class", o)),
+    };
+    let bracket = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')).and_then(|t| t.parse::<u64>().ok());
+    let class = if bracket.is_some() { 2 } else { class };
+    let tag = match n.get("tag").and_then(Value::as_u64).or(bracket) {
+        Some(t) if class != 0 || ty.is_empty() => t,
+        _ => tag_of(ty).ok_or(format!("`{}` is not an ASN.1 type", ty))?,
+    };
+    let kids = n.get("children").and_then(Value::as_array);
+    let mut body: Vec<u8> = vec![];
+    let mut constructed = false;
+    if let Some(list) = kids {
+        constructed = true;
+        let mut parts = list.iter().map(|k| encode(k, depth + 1)).collect::<Result<Vec<_>, _>>()?;
+        if class == 0 && tag == 17 {
+            parts.sort();
+        }
+        body = parts.concat();
+    } else if class != 0 {
+        body = unhex(n.get("hex").and_then(Value::as_str).unwrap_or(""))?;
+    } else {
+        let val = n.get("value");
+        let text = || val.and_then(Value::as_str).ok_or(format!("{} needs a text `value`", ty));
+        match tag {
+            1 => body = vec![if val == Some(&json!(true)) { 0xff } else { 0 }],
+            2 | 10 => body = encode_integer(val.ok_or(format!("{} needs a `value`", ty))?)?,
+            3 => {
+                let bits = n.get("unused_bits").and_then(Value::as_u64).unwrap_or(0);
+                let data = unhex(n.get("hex").and_then(Value::as_str).unwrap_or(""))?;
+                if bits > 7 || (data.is_empty() && bits != 0) {
+                    return Err(format!("a BIT STRING cannot have {} unused bits", bits));
+                }
+                if bits > 0 && data[data.len() - 1] & ((1u32 << bits) - 1) as u8 != 0 {
+                    return Err("a BIT STRING's unused bits must be zero".to_string());
+                }
+                body.push(bits as u8);
+                body.extend(data);
+            }
+            4 => body = unhex(n.get("hex").and_then(Value::as_str).ok_or("OCTET STRING needs `hex`")?)?,
+            5 => {}
+            6 => body = encode_oid(text()?)?,
+            23 => body = encode_time(text()?, true)?,
+            24 => body = encode_time(text()?, false)?,
+            12 => body = text()?.as_bytes().to_vec(),
+            30 => body = text()?.encode_utf16().flat_map(|u| u.to_be_bytes()).collect(),
+            19 => {
+                let t = text()?;
+                if !t.chars().all(|c| c.is_ascii_alphanumeric() || " '()+,-./:=?".contains(c)) {
+                    return Err(format!("`{}` has characters a PrintableString cannot hold", t));
+                }
+                body = t.as_bytes().to_vec();
+            }
+            18 | 20..=22 | 25..=27 => {
+                let t = text()?;
+                if !t.is_ascii() && tag != 20 {
+                    return Err(format!("`{}` is not ASCII: use UTF8STRING", t));
+                }
+                body = t.chars().map(|c| c as u32 as u8).collect();
+            }
+            16 | 17 => constructed = true,
+            _ => body = unhex(n.get("hex").and_then(Value::as_str).unwrap_or(""))?,
+        }
+    }
+    let mut out = vec![];
+    put_tag(class, constructed, tag, &mut out);
+    put_len(body.len(), &mut out);
+    out.extend(body);
+    Ok(out)
+}
+
+/// Writes DER from a tree: `{ type: "SEQUENCE", children: [...] }`, `{ type: "INTEGER", value }` (text for any size), `{ type: "OBJECT", value }` by number or name, `{ type: "[0]", children }`. Gives hex; a SET is sorted as DER needs. What `asn1_der_read` gives can be written back.
+pub fn asn1_der_write(tree: serde_json::Value) -> Result<String, String> {
+    match &tree {
+        Value::Array(a) => Ok(a.iter().map(|x| encode(x, 0).map(|b| hex(&b))).collect::<Result<Vec<_>, _>>()?.concat()),
+        x => Ok(hex(&encode(x, 0)?)),
+    }
+}

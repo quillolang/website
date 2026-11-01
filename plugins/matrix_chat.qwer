@@ -1,0 +1,195 @@
+//! Matrix's client-server API: log in with a password, send text, notices and any event to a room with a transaction id that makes a retry safe, join by alias, sync and read history, and wait out M_LIMIT_EXCEEDED.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn base(o: &Value) -> Result<String, String> {
+    opt(o, "homeserver", "MATRIX_API_URL").map(|b| b.trim_end_matches('/').to_string()).ok_or("no homeserver: set MATRIX_API_URL (like https://matrix.org), or give the option homeserver".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let code = v["errcode"].as_str().unwrap_or("M_UNKNOWN");
+    let msg = v["error"].as_str().map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let hint = match code {
+        "M_UNKNOWN_TOKEN" => " (log in again)",
+        "M_FORBIDDEN" if !msg.contains("password") => " (is the user in this room, and allowed to?)",
+        "M_NOT_FOUND" => " (check the room id or alias)",
+        _ => "",
+    };
+    format!("Matrix {} {}: {}{}", status, code, msg, hint)
+}
+
+fn call(o: &Value, method: &str, path: &str, body: Option<&Value>, read_ms: u64, auth: bool) -> Result<Value, String> {
+    let b = base(o)?;
+    let token = if auth { Some(opt(o, "token", "MATRIX_ACCESS_TOKEN").ok_or("no access token: set MATRIX_ACCESS_TOKEN, give the option token, or use matrix_login")?) } else { None };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_millis(read_ms)).build();
+    let text = body.map(|v| v.to_string());
+    let mut tries = 0;
+    loop {
+        let mut r = agent.request(method, &format!("{}{}", b, path)).set("User-Agent", "quillo-matrix/1.0");
+        if let Some(t) = &token {
+            r = r.set("Authorization", &format!("Bearer {}", t));
+        }
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("the homeserver's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(429, resp)) => {
+                let after = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()).map(|s| s * 1000);
+                let t = resp.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let wait = after.or(v["retry_after_ms"].as_u64()).unwrap_or(1000);
+                if tries >= 3 || wait > 60_000 {
+                    return Err(error_text(429, &t));
+                }
+                std::thread::sleep(Duration::from_millis(wait));
+                tries += 1;
+            }
+            Err(ureq::Error::Status(c, resp)) => return Err(error_text(c, &resp.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach the homeserver {}: {}", b, e)),
+        }
+    }
+}
+
+// A transaction id is unique to this device for its access token: the server drops a repeat, so
+// the same id on a retry cannot send twice.
+fn txn() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    format!("q{}.{}", t, N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Logs in with a password (m.login.password), `user` a localpart or @user:server. Gives { access_token, user_id, device_id }; keep them, as each login makes a new device. Options: homeserver (else MATRIX_API_URL), device_name, device_id.
+pub fn matrix_login(user: &str, password: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "type": "m.login.password", "identifier": { "type": "m.id.user", "user": user }, "password": password });
+    if let Some(n) = opt(&options, "device_name", "MATRIX_DEVICE_NAME") {
+        b["initial_device_display_name"] = json!(n);
+    }
+    if let Some(d) = options.get("device_id") {
+        b["device_id"] = d.clone();
+    }
+    let r = call(&options, "POST", "/_matrix/client/v3/login", Some(&b), 30_000, false)?;
+    Ok(json!({ "access_token": r["access_token"], "user_id": r["user_id"], "device_id": r["device_id"] }))
+}
+
+/// Who the access token belongs to: { user_id, device_id }. Options everywhere: token (else MATRIX_ACCESS_TOKEN), homeserver.
+pub fn matrix_whoami(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&options, "GET", "/_matrix/client/v3/account/whoami", None, 30_000, true)
+}
+
+/// Sends any event of type `event_type` to `room` (a room id) with `content`. Gives the event id.
+pub fn matrix_send_event(room: &str, event_type: &str, content: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    if !room.starts_with('!') {
+        return Err(format!("{:?} is not a room id, which starts with !: for an alias use matrix_resolve", room));
+    }
+    let id = options.get("txn_id").and_then(|t| t.as_str()).map(str::to_string).unwrap_or_else(txn);
+    let path = format!("/_matrix/client/v3/rooms/{}/send/{}/{}", enc(room), enc(event_type), enc(&id));
+    let r = call(&options, "PUT", &path, Some(&content), 30_000, true)?;
+    r["event_id"].as_str().map(str::to_string).ok_or(format!("no event_id in the answer: {}", r))
+}
+
+fn body_of(text: &str, kind: &str, options: &Value) -> Value {
+    let mut c = json!({ "msgtype": kind, "body": text });
+    if let Some(h) = options.get("html").and_then(|h| h.as_str()) {
+        c["format"] = json!("org.matrix.custom.html");
+        c["formatted_body"] = json!(h);
+    }
+    if let Some(r) = options.get("reply_to").and_then(|r| r.as_str()) {
+        c["m.relates_to"] = json!({ "m.in_reply_to": { "event_id": r } });
+    }
+    c
+}
+
+/// Sends a text message to `room`. Options: html (a formatted body; `text` stays the plain one), reply_to (an event id), txn_id (give the same one to a retry). Gives the event id.
+pub fn matrix_send(room: &str, text: &str, options: serde_json::Value) -> Result<String, String> {
+    matrix_send_event(room, "m.room.message", body_of(text, "m.text", &options), options)
+}
+
+/// Sends a notice, the kind of message bots use, which other bots are meant not to answer.
+pub fn matrix_notice(room: &str, text: &str, options: serde_json::Value) -> Result<String, String> {
+    matrix_send_event(room, "m.room.message", body_of(text, "m.notice", &options), options)
+}
+
+/// Joins a room by id or #alias:server. Gives its room id.
+pub fn matrix_join(room: &str, options: serde_json::Value) -> Result<String, String> {
+    let r = call(&options, "POST", &format!("/_matrix/client/v3/join/{}", enc(room)), Some(&json!({})), 30_000, true)?;
+    Ok(r["room_id"].as_str().unwrap_or("").to_string())
+}
+
+/// The room id of a #alias:server.
+pub fn matrix_resolve(alias: &str, options: serde_json::Value) -> Result<String, String> {
+    let r = call(&options, "GET", &format!("/_matrix/client/v3/directory/room/{}", enc(alias)), None, 30_000, true)?;
+    r["room_id"].as_str().map(str::to_string).ok_or(format!("no room_id in the answer: {}", r))
+}
+
+fn event(room: &str, e: &Value) -> Value {
+    json!({
+        "room": room, "event_id": e["event_id"], "type": e["type"], "sender": e["sender"], "ts": e["origin_server_ts"],
+        "msgtype": e.pointer("/content/msgtype").cloned().unwrap_or(Value::Null),
+        "body": e.pointer("/content/body").cloned().unwrap_or(Value::Null),
+        "content": e["content"],
+    })
+}
+
+/// One sync: `since` the next_batch of the last ("" for the first, which gives recent history), waiting up to `wait_ms` for something new. Options: limit (events per room), filter (an id or JSON). Gives { next_batch, events: [{ room, event_id, type, sender, ts, msgtype, body, content }], invited, limited_rooms }. `limited_rooms` lists rooms where events were skipped: read them with matrix_messages.
+pub fn matrix_sync(since: &str, wait_ms: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let wait = wait_ms.clamp(0, 60_000);
+    let mut path = format!("/_matrix/client/v3/sync?timeout={}", wait);
+    if !since.is_empty() {
+        path.push_str(&format!("&since={}", enc(since)));
+    }
+    let filter = match (options.get("filter"), options.get("limit").and_then(|l| l.as_i64())) {
+        (Some(Value::String(f)), _) => Some(f.clone()),
+        (Some(f), _) => Some(f.to_string()),
+        (None, Some(l)) => Some(json!({ "room": { "timeline": { "limit": l } } }).to_string()),
+        _ => None,
+    };
+    if let Some(f) = filter {
+        path.push_str(&format!("&filter={}", enc(&f)));
+    }
+    let r = call(&options, "GET", &path, None, wait as u64 + 30_000, true)?;
+    let (mut events, mut limited) = (vec![], vec![]);
+    if let Some(rooms) = r.pointer("/rooms/join").and_then(|j| j.as_object()) {
+        for (room, data) in rooms {
+            for e in data.pointer("/timeline/events").and_then(|l| l.as_array()).into_iter().flatten() {
+                events.push(event(room, e));
+            }
+            if data.pointer("/timeline/limited") == Some(&json!(true)) {
+                limited.push(json!({ "room": room, "prev_batch": data.pointer("/timeline/prev_batch") }));
+            }
+        }
+    }
+    let invited: Vec<String> = r.pointer("/rooms/invite").and_then(|j| j.as_object()).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    Ok(json!({ "next_batch": r["next_batch"], "events": events, "invited": invited, "limited_rooms": limited }))
+}
+
+/// A room's history, newest first, from a token (`from`, "" for the end) up to `limit` events. Gives { events, end }: pass `end` as `from` for older ones; no `end` means there are no more.
+pub fn matrix_messages(room: &str, from: &str, limit: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut path = format!("/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}", enc(room), limit.clamp(1, 1000));
+    if !from.is_empty() {
+        path.push_str(&format!("&from={}", enc(from)));
+    }
+    let r = call(&options, "GET", &path, None, 30_000, true)?;
+    let events: Vec<Value> = r["chunk"].as_array().map(|l| l.iter().map(|e| event(room, e)).collect()).unwrap_or_default();
+    Ok(json!({ "events": events, "end": r.get("end").cloned().unwrap_or(Value::Null) }))
+}

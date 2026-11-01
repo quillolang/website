@@ -1,0 +1,205 @@
+//! PostHog from the server: events and batches sent with their person and group properties, identify, alias and group identify in PostHog's own event forms, feature flags evaluated by /decide with their payloads parsed, partial failures and quota limits told apart, and a default when flags cannot be reached.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// POSTHOG_API_KEY is the project's key (phc_...), safe for a browser, so this cannot read your
+// data. POSTHOG_HOST is the instance (https://us.i.posthog.com when not set; https://eu.i.posthog.com
+// for the EU cloud).
+
+const BATCH_EVENTS: usize = 1000;
+const BATCH_BYTES: usize = 19_000_000;
+const EVENT_BYTES: usize = 1_000_000;
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn host() -> String {
+    setting("POSTHOG_HOST").unwrap_or_else(|| "https://us.i.posthog.com".into()).trim_end_matches('/').to_string()
+}
+
+fn key() -> Result<String, String> {
+    setting("POSTHOG_API_KEY").ok_or("POSTHOG_API_KEY is not set".to_string())
+}
+
+fn post(path: &str, body: &Value) -> Result<Value, String> {
+    let url = format!("{}{}", host(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let text = body.to_string();
+    // A capture has its own id, so PostHog keeps one of a repeated event.
+    for attempt in 0..4u32 {
+        match agent.post(&url).set("Content-Type", "application/json").set("User-Agent", "quillo-posthog/1.0").send_string(&text) {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("PostHog's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(429 | 500 | 502 | 503 | 504, r)) if attempt < 3 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(300u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let what = v["detail"].as_str().map(str::to_string).unwrap_or_else(|| t.trim().chars().take(300).collect());
+                let code = v["code"].as_str().map_or(String::new(), |x| format!(" {}", x));
+                return Err(format!("PostHog {}{}: {}", c, code, what));
+            }
+            Err(e) => return Err(format!("cannot reach PostHog at {}: {}", host(), e)),
+        }
+    }
+    Err("PostHog stayed busy through four tries".into())
+}
+
+fn event_of(event: &str, distinct_id: &str, properties: Value, options: &Value) -> Result<Value, String> {
+    if event.is_empty() {
+        return Err("an event needs a name".into());
+    }
+    if distinct_id.is_empty() {
+        return Err("an event needs a distinct_id, or it belongs to no one".into());
+    }
+    let mut props = match properties {
+        Value::Object(m) => m,
+        Value::Null => Map::new(),
+        _ => return Err("properties must be a map".into()),
+    };
+    if let Some(g) = options.get("groups").filter(|g| g.is_object()) {
+        props.insert("$groups".into(), g.clone());
+    }
+    let mut e = json!({ "event": event, "distinct_id": distinct_id, "properties": Value::Object(props) });
+    for k in ["timestamp", "uuid"] {
+        if let Some(v) = options.get(k).filter(|v| v.is_string()) {
+            e[k] = v.clone();
+        }
+    }
+    Ok(e)
+}
+
+/// Sends one event. `properties` is a map, and `options` may hold `groups` ({ company: "acme" }), `timestamp` (ISO 8601, for something that happened earlier) and `uuid` (so a repeat is kept once). Gives true.
+pub fn posthog_capture(event: &str, distinct_id: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    let mut e = event_of(event, distinct_id, properties, &options)?;
+    e["api_key"] = json!(key()?);
+    post("/capture/", &e)?;
+    Ok(true)
+}
+
+/// Sends many events: each { event, distinct_id, properties, timestamp, uuid, groups }, cut into batches of at most 1000 or 19 MB, as PostHog stops at 20. An event over 1 MB is an error before anything is sent. Gives { sent, batches }.
+pub fn posthog_batch(events: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let k = key()?;
+    let mut made = vec![];
+    for (i, x) in events.iter().enumerate() {
+        let name = x["event"].as_str().ok_or(format!("event {} has no `event`", i))?;
+        let id = x["distinct_id"].as_str().ok_or(format!("event {} has no `distinct_id`", i))?;
+        let e = event_of(name, id, x["properties"].clone(), x)?;
+        let size = e.to_string().len();
+        if size > EVENT_BYTES {
+            return Err(format!("event {} is {} bytes; PostHog takes at most {}", i, size, EVENT_BYTES));
+        }
+        made.push((e, size));
+    }
+    let mut batches = 0;
+    let mut group: Vec<Value> = vec![];
+    let mut bytes = 0;
+    for (e, size) in made {
+        if group.len() == BATCH_EVENTS || bytes + size > BATCH_BYTES {
+            post("/batch/", &json!({ "api_key": k, "batch": group }))?;
+            batches += 1;
+            group = vec![];
+            bytes = 0;
+        }
+        bytes += size;
+        group.push(e);
+    }
+    if !group.is_empty() {
+        post("/batch/", &json!({ "api_key": k, "batch": group }))?;
+        batches += 1;
+    }
+    Ok(json!({ "sent": events.len(), "batches": batches }))
+}
+
+/// Sets a person's properties: `set` overwrites, `set_once` keeps what is there. Sent as PostHog's `$identify` event.
+pub fn posthog_identify(distinct_id: &str, set: serde_json::Value, set_once: serde_json::Value) -> Result<bool, String> {
+    let mut p = Map::new();
+    if set.is_object() {
+        p.insert("$set".into(), set);
+    }
+    if set_once.is_object() {
+        p.insert("$set_once".into(), set_once);
+    }
+    if p.is_empty() {
+        return Err("identify needs properties to set".into());
+    }
+    posthog_capture("$identify", distinct_id, Value::Object(p), json!({}))
+}
+
+/// Says two ids are one person, as `$create_alias`. Do it once, when an anonymous visitor signs in.
+pub fn posthog_alias(distinct_id: &str, alias: &str) -> Result<bool, String> {
+    if alias.is_empty() || alias == distinct_id {
+        return Err("an alias must be another id".into());
+    }
+    posthog_capture("$create_alias", distinct_id, json!({ "alias": alias }), json!({}))
+}
+
+/// Sets a group's properties (`$groupidentify`): `group_type` like "company", `group_key` like "acme". The event's distinct_id is PostHog's own for groups.
+pub fn posthog_group_identify(group_type: &str, group_key: &str, properties: serde_json::Value) -> Result<bool, String> {
+    if group_type.is_empty() || group_key.is_empty() {
+        return Err("a group needs a type and a key".into());
+    }
+    let p = json!({ "$group_type": group_type, "$group_key": group_key, "$group_set": if properties.is_object() { properties } else { json!({}) } });
+    posthog_capture("$groupidentify", &format!("${}_{}", group_type, group_key), p, json!({}))
+}
+
+/// Evaluates every flag for a person through /decide: `options` may hold `groups`, `person_properties` and `group_properties`. Gives { flags: { key: true, false or a variant }, payloads: { key: value }, partial }: `partial` true means some could not be computed, so a flag not listed there is unknown, not off. A project over its flag quota is an error.
+pub fn posthog_flags(distinct_id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if distinct_id.is_empty() {
+        return Err("flags need a distinct_id".into());
+    }
+    let mut b = json!({ "api_key": key()?, "distinct_id": distinct_id });
+    for k in ["groups", "person_properties", "group_properties"] {
+        if let Some(v) = options.get(k).filter(|v| v.is_object()) {
+            b[k] = v.clone();
+        }
+    }
+    let v = post("/decide/?v=3", &b)?;
+    if v["quotaLimited"].as_array().map_or(false, |l| l.iter().any(|x| x == "feature_flags")) {
+        return Err("PostHog's feature flag quota is spent: every flag would read as off".into());
+    }
+    let mut payloads = Map::new();
+    for (k, p) in v["featureFlagPayloads"].as_object().into_iter().flatten() {
+        // A payload arrives as JSON inside a string.
+        let parsed = p.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| p.clone());
+        payloads.insert(k.clone(), parsed);
+    }
+    Ok(json!({ "flags": v["featureFlags"], "payloads": payloads, "partial": v["errorsWhileComputingFlags"] == json!(true) }))
+}
+
+/// One flag: true, false, a variant's name, or null if PostHog has no such flag for them.
+pub fn posthog_flag(distinct_id: &str, flag: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(posthog_flags(distinct_id, options)?["flags"].get(flag).cloned().unwrap_or(Value::Null))
+}
+
+/// Whether a flag is on for a person, never an error: on any failure, or when it could not be computed, it gives `fallback`, so a page does not break with PostHog.
+pub fn posthog_enabled(distinct_id: &str, flag: &str, fallback: bool, options: serde_json::Value) -> bool {
+    match posthog_flags(distinct_id, options) {
+        Ok(f) => match f["flags"].get(flag) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(_)) => true,
+            _ => fallback,
+        },
+        Err(_) => fallback,
+    }
+}
+
+/// Records that a person saw a flag (`$feature_flag_called`), which experiments are counted by.
+pub fn posthog_flag_called(distinct_id: &str, flag: &str, value: serde_json::Value) -> Result<bool, String> {
+    let mut props = Map::new();
+    props.insert("$feature_flag".into(), json!(flag));
+    props.insert("$feature_flag_response".into(), value.clone());
+    props.insert(format!("$feature/{}", flag), value);
+    posthog_capture("$feature_flag_called", distinct_id, Value::Object(props), json!({}))
+}

@@ -1,0 +1,370 @@
+//! Jupyter notebooks read and written: cells and outputs, stripped of outputs, turned into Markdown or a script, and image outputs pulled out to files.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! sha2 = "0.10"
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+
+fn multiline(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => String::new(),
+    }
+}
+
+/// A string as nbformat stores it: split into lines, each keeping its newline.
+fn lines_of(s: &str) -> Value {
+    if s.is_empty() {
+        return json!([]);
+    }
+    Value::Array(s.split_inclusive('\n').map(|l| json!(l)).collect())
+}
+
+/// nbformat 3 kept cells in worksheets, with `input`, `prompt_number`, `pyout` and `pyerr`: brought up to 4.
+fn upgrade(v: Value) -> Value {
+    let cells: Vec<Value> = v["worksheets"].as_array().into_iter().flatten().flat_map(|w| w["cells"].as_array().cloned().unwrap_or_default()).map(|c| {
+        let kind = c["cell_type"].as_str().unwrap_or("code");
+        match kind {
+            "code" => {
+                let outputs: Vec<Value> = c["outputs"].as_array().into_iter().flatten().map(|o| match o["output_type"].as_str() {
+                    Some("pyout") | Some("display_data") => {
+                        let mut data = Map::new();
+                        for (k, m) in [("text", "text/plain"), ("html", "text/html"), ("png", "image/png"), ("jpeg", "image/jpeg"), ("svg", "image/svg+xml"), ("latex", "text/latex"), ("json", "application/json")] {
+                            if let Some(x) = o.get(k) { data.insert(m.to_string(), x.clone()); }
+                        }
+                        if o["output_type"] == "pyout" {
+                            json!({ "output_type": "execute_result", "execution_count": o.get("prompt_number"), "data": data, "metadata": {} })
+                        } else {
+                            json!({ "output_type": "display_data", "data": data, "metadata": {} })
+                        }
+                    }
+                    Some("pyerr") => json!({ "output_type": "error", "ename": o.get("ename"), "evalue": o.get("evalue"), "traceback": o.get("traceback") }),
+                    Some("stream") => json!({ "output_type": "stream", "name": o.get("stream").and_then(Value::as_str).unwrap_or("stdout"), "text": o.get("text") }),
+                    _ => o.clone(),
+                }).collect();
+                json!({ "cell_type": "code", "execution_count": c.get("prompt_number"), "metadata": {}, "source": c.get("input"), "outputs": outputs })
+            }
+            "heading" => {
+                let level = c["level"].as_u64().unwrap_or(1).clamp(1, 6) as usize;
+                json!({ "cell_type": "markdown", "metadata": {}, "source": format!("{} {}", "#".repeat(level), multiline(c.get("source"))) })
+            }
+            _ => json!({ "cell_type": kind, "metadata": {}, "source": c.get("source") }),
+        }
+    }).collect();
+    json!({ "nbformat": 4, "nbformat_minor": 0, "metadata": v["metadata"], "cells": cells })
+}
+
+fn load(text: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("not JSON: {}", e))?;
+    let major = v.get("nbformat").and_then(Value::as_i64).ok_or("not a notebook: it has no `nbformat`")?;
+    match major {
+        4 | 5 if v.get("cells").map_or(false, Value::is_array) => Ok(v),
+        4 | 5 => Err("not a notebook: `cells` must be a list".to_string()),
+        3 => Ok(upgrade(v)),
+        n => Err(format!("nbformat {} is not read here: 3 or 4 only", n)),
+    }
+}
+
+fn language(nb: &Value) -> String {
+    nb["metadata"]["language_info"]["name"].as_str().or(nb["metadata"]["kernelspec"]["language"].as_str()).unwrap_or("python").to_string()
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' && it.peek() == Some(&'[') {
+            it.next();
+            for n in it.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn output(o: &Value) -> Value {
+    let kind = o["output_type"].as_str().unwrap_or("");
+    match kind {
+        "stream" => json!({ "type": "stream", "name": o.get("name"), "text": multiline(o.get("text")) }),
+        "error" => {
+            let tb: Vec<String> = o["traceback"].as_array().into_iter().flatten().filter_map(Value::as_str).map(strip_ansi).collect();
+            json!({ "type": "error", "name": o.get("ename"), "value": o.get("evalue"), "traceback": tb.join("\n") })
+        }
+        _ => {
+            let mut types = vec![];
+            if let Some(m) = o["data"].as_object() {
+                types = m.keys().cloned().collect();
+            }
+            json!({ "type": kind, "count": o.get("execution_count"), "mime_types": types, "text": o["data"].get("text/plain").map(|x| multiline(Some(x))), "images": types.iter().filter(|t| t.starts_with("image/")).count() })
+        }
+    }
+}
+
+/// Reads a notebook (nbformat 3 is brought up to 4): `{ format, language, kernel, cells, counts }`, sources joined into text and outputs in plain form.
+pub fn ipynb_read(text: &str) -> Result<Value, String> {
+    let nb = load(text)?;
+    let cells: Vec<Value> = nb["cells"].as_array().unwrap().iter().enumerate().map(|(i, c)| {
+        let kind = c["cell_type"].as_str().unwrap_or("");
+        let outputs: Vec<Value> = c["outputs"].as_array().into_iter().flatten().map(output).collect();
+        json!({
+            "index": i, "id": c.get("id"), "type": kind, "source": multiline(c.get("source")),
+            "execution_count": c.get("execution_count"), "outputs": outputs,
+            "tags": c["metadata"].get("tags").cloned().unwrap_or(json!([])),
+        })
+    }).collect();
+    let count = |k: &str| cells.iter().filter(|c| c["type"] == k).count();
+    let run = cells.iter().filter(|c| c["execution_count"].is_i64()).count();
+    let order: Vec<i64> = cells.iter().filter_map(|c| c["execution_count"].as_i64()).collect();
+    Ok(json!({
+        "format": format!("{}.{}", nb["nbformat"], nb.get("nbformat_minor").and_then(Value::as_i64).unwrap_or(0)),
+        "language": language(&nb), "kernel": nb["metadata"]["kernelspec"].get("name"),
+        "cells": cells,
+        "counts": { "code": count("code"), "markdown": count("markdown"), "raw": count("raw"), "run": run },
+        "in_order": order.windows(2).all(|w| w[0] < w[1]),
+        "errors": cells.iter().filter(|c| c["outputs"].as_array().map_or(false, |o| o.iter().any(|x| x["type"] == "error"))).count(),
+    }))
+}
+
+/// Reads a notebook from a path, as `ipynb_read` does.
+pub fn ipynb_read_file(path: &str) -> Result<Value, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    ipynb_read(&t)
+}
+
+fn cell_id(i: usize, source: &str) -> String {
+    let h = Sha256::digest(format!("{}\u{0}{}", i, source).as_bytes());
+    h.iter().take(4).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The notebook as Jupyter saves it: one-space indent, sorted keys, a final newline.
+fn dump(nb: &Value) -> Result<String, String> {
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&m[k]))).collect())
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            x => x.clone(),
+        }
+    }
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    serde::Serialize::serialize(&sorted(nb), &mut ser).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buf).into_owned() + "\n")
+}
+
+/// Builds a notebook from cells: `{ type: "code", source, outputs }`, `{ type: "markdown", source }` or `{ type: "raw", source }`, with ids as nbformat 4.5 wants them. `language` is the kernel's.
+pub fn ipynb_write(cells: Vec<serde_json::Value>, language: &str) -> Result<String, String> {
+    let mut out = vec![];
+    for (i, c) in cells.iter().enumerate() {
+        let kind = c.get("type").and_then(Value::as_str).unwrap_or("code");
+        if !["code", "markdown", "raw"].contains(&kind) {
+            return Err(format!("cell {}: `{}` is not a cell type: code, markdown or raw", i, kind));
+        }
+        let src = c.get("source").and_then(Value::as_str).ok_or(format!("cell {}: a cell needs a `source`", i))?;
+        let id = c.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| cell_id(i, src));
+        if id.is_empty() || id.len() > 64 || !id.chars().all(|x| x.is_ascii_alphanumeric() || x == '-' || x == '_') {
+            return Err(format!("cell {}: `{}` is not a cell id: 1 to 64 letters, digits, - or _", i, id));
+        }
+        let mut m = Map::new();
+        m.insert("cell_type".into(), json!(kind));
+        m.insert("id".into(), json!(id));
+        m.insert("metadata".into(), json!({}));
+        m.insert("source".into(), lines_of(src));
+        if kind == "code" {
+            m.insert("execution_count".into(), c.get("execution_count").cloned().unwrap_or(Value::Null));
+            let outs: Vec<Value> = c.get("outputs").and_then(Value::as_array).into_iter().flatten().map(|o| match o.get("type").and_then(Value::as_str) {
+                Some("stream") => json!({ "output_type": "stream", "name": o.get("name").and_then(Value::as_str).unwrap_or("stdout"), "text": lines_of(o.get("text").and_then(Value::as_str).unwrap_or("")) }),
+                _ => json!({ "output_type": "display_data", "data": { "text/plain": lines_of(o.get("text").and_then(Value::as_str).unwrap_or("")) }, "metadata": {} }),
+            }).collect();
+            m.insert("outputs".into(), Value::Array(outs));
+        }
+        out.push(Value::Object(m));
+    }
+    let (display, name) = match language {
+        "python" => ("Python 3", "python3"),
+        "r" => ("R", "ir"),
+        "julia" => ("Julia", "julia"),
+        l => (l, l),
+    };
+    dump(&json!({
+        "cells": out,
+        "metadata": { "kernelspec": { "display_name": display, "language": language, "name": name }, "language_info": { "name": language } },
+        "nbformat": 4, "nbformat_minor": 5,
+    }))
+}
+
+/// Outputs and execution counts taken out, for committing. `options.keep_tag` keeps the cells so tagged; `options.metadata: true` also drops each cell's metadata.
+pub fn ipynb_strip(text: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut nb = load(text)?;
+    let keep = options.get("keep_tag").and_then(Value::as_str);
+    let meta = options.get("metadata").and_then(Value::as_bool).unwrap_or(false);
+    for c in nb["cells"].as_array_mut().unwrap() {
+        let kept = keep.map_or(false, |k| c["metadata"]["tags"].as_array().map_or(false, |t| t.iter().any(|x| x == k)));
+        if c["cell_type"] == "code" && !kept {
+            c["outputs"] = json!([]);
+            c["execution_count"] = Value::Null;
+        }
+        if meta {
+            c["metadata"] = json!({});
+        }
+    }
+    dump(&nb)
+}
+
+fn fence(body: &str) -> String {
+    // A code cell holding ``` needs a longer fence.
+    let mut run = 0;
+    let mut most = 0;
+    for c in body.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        most = most.max(run);
+    }
+    "`".repeat((most + 1).max(3))
+}
+
+fn image_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+/// The notebook as Markdown: text as it is, code fenced in its language, outputs fenced as text, images by `options.images` ("inline", "omit", or a folder's name, as `ipynb_images` writes them).
+pub fn ipynb_to_markdown(text: &str, options: serde_json::Value) -> Result<String, String> {
+    let nb = load(text)?;
+    let lang = language(&nb);
+    let images = options.get("images").and_then(Value::as_str).unwrap_or("inline");
+    let mut parts: Vec<String> = vec![];
+    for (i, c) in nb["cells"].as_array().unwrap().iter().enumerate() {
+        let src = multiline(c.get("source"));
+        match c["cell_type"].as_str() {
+            Some("markdown") => parts.push(src.trim_end().to_string()),
+            Some("raw") => {
+                let f = fence(&src);
+                parts.push(format!("{}\n{}\n{}", f, src.trim_end(), f));
+            }
+            Some("code") => {
+                let f = fence(&src);
+                parts.push(format!("{}{}\n{}\n{}", f, lang, src.trim_end(), f));
+                for (j, o) in c["outputs"].as_array().into_iter().flatten().enumerate() {
+                    match o["output_type"].as_str() {
+                        Some("stream") => {
+                            let t = multiline(o.get("text"));
+                            let f = fence(&t);
+                            parts.push(format!("{}text\n{}\n{}", f, t.trim_end(), f));
+                        }
+                        Some("error") => {
+                            let t = format!("{}: {}", o["ename"].as_str().unwrap_or("Error"), o["evalue"].as_str().unwrap_or(""));
+                            parts.push(format!("```text\n{}\n```", strip_ansi(&t)));
+                        }
+                        Some(_) => {
+                            let data = &o["data"];
+                            let img = data.as_object().and_then(|m| m.keys().find(|k| image_ext(k).is_some())).cloned();
+                            if let (Some(mime), true) = (img, images != "omit") {
+                                let b64: String = multiline(data.get(&mime)).split_whitespace().collect();
+                                let ext = image_ext(&mime).unwrap_or("png");
+                                if images == "inline" {
+                                    if ext == "svg" {
+                                        parts.push(format!("![output](data:image/svg+xml;base64,{})", base64::engine::general_purpose::STANDARD.encode(multiline(data.get(&mime)))));
+                                    } else {
+                                        parts.push(format!("![output](data:{};base64,{})", mime, b64));
+                                    }
+                                } else {
+                                    parts.push(format!("![output]({}/cell{}-{}.{})", images, i, j, ext));
+                                }
+                            } else if let Some(t) = data.get("text/markdown") {
+                                parts.push(multiline(Some(t)).trim_end().to_string());
+                            } else if let Some(t) = data.get("text/plain") {
+                                let t = multiline(Some(t));
+                                let f = fence(&t);
+                                parts.push(format!("{}text\n{}\n{}", f, t.trim_end(), f));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(parts.join("\n\n") + "\n")
+}
+
+/// The notebook as a script: code cells as they are, Markdown in comments, and IPython's `%magic` and `!shell` lines commented out, so it runs under plain Python.
+pub fn ipynb_to_script(text: &str) -> Result<String, String> {
+    let nb = load(text)?;
+    let lang = language(&nb);
+    let c_style = ["javascript", "typescript", "rust", "go", "java", "c", "c++", "scala", "kotlin"].contains(&lang.as_str());
+    let comment = if c_style { "//" } else { "#" };
+    let mut parts = vec![];
+    for c in nb["cells"].as_array().unwrap() {
+        let src = multiline(c.get("source"));
+        if src.trim().is_empty() {
+            continue;
+        }
+        match c["cell_type"].as_str() {
+            Some("code") => {
+                let body: Vec<String> = src.lines().map(|l| {
+                    let t = l.trim_start();
+                    if lang == "python" && (t.starts_with('%') || t.starts_with('!') || (t.ends_with('?') && !t.starts_with('#'))) {
+                        format!("# {}", l)
+                    } else {
+                        l.to_string()
+                    }
+                }).collect();
+                parts.push(format!("{} In[{}]:\n{}", comment, c["execution_count"].as_i64().map_or(" ".to_string(), |n| n.to_string()).trim(), body.join("\n")));
+            }
+            Some("markdown") => {
+                parts.push(src.lines().map(|l| if l.is_empty() { comment.to_string() } else { format!("{} {}", comment, l) }).collect::<Vec<_>>().join("\n"));
+            }
+            _ => {}
+        }
+    }
+    Ok(parts.join("\n\n") + "\n")
+}
+
+/// Writes every image output to `folder` as `cell<i>-<j>.<ext>` and says what went where: `[{ cell, output, mime, path, bytes, sha256 }]`.
+pub fn ipynb_images(text: &str, folder: &str) -> Result<Vec<Value>, String> {
+    let nb = load(text)?;
+    std::fs::create_dir_all(folder).map_err(|e| format!("cannot make {}: {}", folder, e))?;
+    let mut out = vec![];
+    for (i, c) in nb["cells"].as_array().unwrap().iter().enumerate() {
+        for (j, o) in c["outputs"].as_array().into_iter().flatten().enumerate() {
+            let Some(data) = o["data"].as_object() else { continue };
+            for (mime, v) in data {
+                let Some(ext) = image_ext(mime) else { continue };
+                let raw = multiline(Some(v));
+                let bytes = if ext == "svg" {
+                    raw.into_bytes()
+                } else {
+                    let clean: String = raw.split_whitespace().collect();
+                    base64::engine::general_purpose::STANDARD.decode(clean).map_err(|e| format!("cell {} output {}: {} is not base64: {}", i, j, mime, e))?
+                };
+                let path = format!("{}/cell{}-{}.{}", folder.trim_end_matches('/'), i, j, ext);
+                std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {}", path, e))?;
+                out.push(json!({ "cell": i, "output": j, "mime": mime, "path": path, "bytes": bytes.len(), "sha256": Sha256::digest(&bytes).iter().map(|b| format!("{:02x}", b)).collect::<String>() }));
+            }
+        }
+    }
+    Ok(out)
+}

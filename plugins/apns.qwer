@@ -1,0 +1,408 @@
+//! Apple push notifications over HTTP/2: payloads built and sized, an ES256 provider token made and renewed, collapse ids and push types set, many devices sent to on one connection, and Apple's reasons such as BadDeviceToken and Unregistered read back.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! h2 = "0.4"
+//! http = "1"
+//! bytes = "1"
+//! tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+//! tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "1"
+//! p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use bytes::Bytes;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use p256::pkcs8::DecodePrivateKey;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_rustls::rustls;
+
+const PUSH_TYPES: &[&str] = &["alert", "background", "voip", "location", "complication", "fileprovider", "mdm", "liveactivity", "pushtotalk"];
+// A token is good for an hour, and may not be renewed more than every 20 minutes.
+const TOKEN_LIFE: u64 = 40 * 60;
+
+type Conn = h2::client::SendRequest<Bytes>;
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static R: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    R.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime"))
+}
+
+// One connection per host, kept: Apple treats opening one for each push as an attack.
+fn conns() -> &'static Mutex<HashMap<String, Conn>> {
+    static C: OnceLock<Mutex<HashMap<String, Conn>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tokens() -> &'static Mutex<HashMap<String, (String, u64)>> {
+    static T: OnceLock<Mutex<HashMap<String, (String, u64)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+struct Conf {
+    host: String,
+    port: u16,
+    key_pem: String,
+    key_id: String,
+    team_id: String,
+    ca: Option<String>,
+    timeout: Duration,
+}
+
+fn conf(o: &Value) -> Result<Conf, String> {
+    let sandbox = o.get("sandbox").and_then(|s| s.as_bool()).unwrap_or(false);
+    let addr = opt(o, "host", "APNS_HOST").unwrap_or_else(|| if sandbox { "api.sandbox.push.apple.com".into() } else { "api.push.apple.com".into() });
+    let addr = addr.trim_start_matches("https://").trim_end_matches('/').to_string();
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("{:?} is not a host and port", addr))?),
+        None => (addr, 443),
+    };
+    Ok(Conf {
+        host,
+        port,
+        key_pem: opt(o, "key", "APNS_KEY").ok_or("no signing key: set APNS_KEY to the text of the .p8 file, or give the option key")?.replace("\\n", "\n"),
+        key_id: opt(o, "key_id", "APNS_KEY_ID").ok_or("no key id: set APNS_KEY_ID (10 characters), or give the option key_id")?,
+        team_id: opt(o, "team_id", "APNS_TEAM_ID").ok_or("no team id: set APNS_TEAM_ID (10 characters), or give the option team_id")?,
+        ca: opt(o, "ca", "APNS_CA"),
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(15_000).clamp(100, 120_000) as u64),
+    })
+}
+
+fn b64(data: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+fn make_token(c: &Conf, at: u64) -> Result<String, String> {
+    let key = SigningKey::from_pkcs8_pem(c.key_pem.trim()).map_err(|e| format!("the signing key does not parse: {} (it is the text of the .p8 file)", e))?;
+    let unsigned = format!("{}.{}", b64(json!({ "alg": "ES256", "kid": c.key_id }).to_string().as_bytes()), b64(json!({ "iss": c.team_id, "iat": at }).to_string().as_bytes()));
+    let sig: Signature = key.sign(unsigned.as_bytes());
+    Ok(format!("{}.{}", unsigned, b64(&sig.to_bytes())))
+}
+
+fn token_for(c: &Conf, fresh: bool) -> Result<String, String> {
+    let id = format!("{}/{}/{}", c.team_id, c.key_id, c.key_pem);
+    let mut map = tokens().lock().map_err(|e| e.to_string())?;
+    if !fresh {
+        if let Some((t, at)) = map.get(&id) {
+            if now() < at + TOKEN_LIFE {
+                return Ok(t.clone());
+            }
+        }
+    }
+    let at = now();
+    let t = make_token(c, at)?;
+    map.insert(id, (t.clone(), at));
+    Ok(t)
+}
+
+/// The provider token (a JWT signed ES256 with the .p8 key) that goes in each request's authorization header; kept for 40 minutes, as Apple refuses a new one more often than every 20. Options: key, key_id, team_id (else APNS_KEY, APNS_KEY_ID, APNS_TEAM_ID).
+pub fn apns_token(options: serde_json::Value) -> Result<String, String> {
+    token_for(&conf(&options)?, false)
+}
+
+fn tls(ca: Option<&str>) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca {
+        Some(pem) => {
+            let mut r = pem.as_bytes();
+            for cert in rustls_pemfile::certs(&mut r) {
+                roots.add(cert.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+async fn connect(c: &Conf) -> Result<Conn, String> {
+    let addr = format!("{}:{}", c.host, c.port);
+    let tcp = tokio::time::timeout(c.timeout, tokio::net::TcpStream::connect(&addr)).await.map_err(|_| format!("connecting to {} timed out", addr))?.map_err(|e| format!("cannot reach {}: {}", addr, e))?;
+    let _ = tcp.set_nodelay(true);
+    let name = rustls::pki_types::ServerName::try_from(c.host.clone()).map_err(|e| format!("{:?}: {}", c.host, e))?;
+    let cfg = tls(c.ca.as_deref())?;
+    let stream = tokio::time::timeout(c.timeout, tokio_rustls::TlsConnector::from(cfg).connect(name, tcp)).await.map_err(|_| "the TLS handshake timed out".to_string())?.map_err(|e| format!("TLS with {} failed: {}", addr, e))?;
+    if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+        return Err(format!("{} did not agree to HTTP/2", addr));
+    }
+    let (send, conn) = h2::client::handshake(stream).await.map_err(|e| format!("the HTTP/2 handshake failed: {}", e))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(send)
+}
+
+async fn ready(c: &Conf) -> Result<Conn, String> {
+    let id = format!("{}:{}", c.host, c.port);
+    let kept = conns().lock().map_err(|e| e.to_string())?.get(&id).cloned();
+    if let Some(k) = kept {
+        // One Apple closed, or one idle too long, is not ready: open another.
+        if let Ok(Ok(k)) = tokio::time::timeout(c.timeout, k.ready()).await {
+            return Ok(k);
+        }
+    }
+    let k = connect(c).await?.ready().await.map_err(|e| e.to_string())?;
+    conns().lock().map_err(|e| e.to_string())?.insert(id, k.clone());
+    Ok(k)
+}
+
+struct Push {
+    headers: Vec<(&'static str, String)>,
+    body: Bytes,
+}
+
+struct Reply {
+    status: u16,
+    id: Option<String>,
+    unique: Option<String>,
+    reason: Option<String>,
+    timestamp: Option<i64>,
+}
+
+async fn post(c: &Conf, device: &str, p: &Push, jwt: &str) -> Result<Reply, String> {
+    let conn = ready(c).await?;
+    let mut b = http::Request::builder().method("POST").uri(format!("https://{}/3/device/{}", c.host, device)).header("authorization", format!("bearer {}", jwt)).header("content-type", "application/json");
+    for (k, v) in &p.headers {
+        b = b.header(*k, v.as_str());
+    }
+    let req = b.body(()).map_err(|e| e.to_string())?;
+    let (fut, mut stream) = conn.clone().send_request(req, false).map_err(|e| format!("sending: {}", e))?;
+    stream.send_data(p.body.clone(), true).map_err(|e| format!("sending: {}", e))?;
+    let resp = tokio::time::timeout(c.timeout, fut).await.map_err(|_| "Apple did not answer in time".to_string())?.map_err(|e| format!("no answer: {}", e))?;
+    let (parts, mut body) = resp.into_parts();
+    let h = |k: &str| parts.headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (id, unique) = (h("apns-id"), h("apns-unique-id"));
+    let mut buf = vec![];
+    while let Some(chunk) = body.data().await {
+        let d = chunk.map_err(|e| format!("reading the answer: {}", e))?;
+        let _ = body.flow_control().release_capacity(d.len());
+        buf.extend_from_slice(&d);
+    }
+    let v: Value = serde_json::from_slice(&buf).unwrap_or(Value::Null);
+    Ok(Reply { status: parts.status.as_u16(), id, unique, reason: v["reason"].as_str().map(str::to_string), timestamp: v["timestamp"].as_i64() })
+}
+
+fn meaning(reason: &str) -> &'static str {
+    match reason {
+        "BadDeviceToken" => "the token is not valid here: wrong environment, or not a token",
+        "Unregistered" => "the app is gone from the device, or the token has been replaced",
+        "DeviceTokenNotForTopic" => "the token belongs to another app",
+        "BadTopic" | "MissingTopic" | "TopicDisallowed" => "the topic is wrong: it is the app's bundle id, with .voip and so on for some types",
+        "BadCollapseId" => "the collapse id is over 64 bytes",
+        "BadExpirationDate" | "BadPriority" | "InvalidPushType" => "a header has a value Apple refuses",
+        "PayloadEmpty" | "PayloadTooLarge" => "the payload is empty or over its limit",
+        "ExpiredProviderToken" | "InvalidProviderToken" | "MissingProviderToken" => "the provider token was refused: check the key, key id and team id",
+        "TooManyProviderTokenUpdates" => "the provider token was renewed too often",
+        "TooManyRequests" => "too many pushes to this one device",
+        "InternalServerError" | "ServiceUnavailable" | "Shutdown" => "Apple's side: try again",
+        _ => "see Apple's table of reasons",
+    }
+}
+
+fn outcome(device: &str, r: Reply) -> Value {
+    let ok = r.status == 200;
+    let reason = r.reason.clone().unwrap_or_default();
+    let mut v = json!({ "ok": ok, "status": r.status, "apns_id": r.id, "device": device });
+    if let Some(u) = r.unique {
+        v["unique_id"] = json!(u);
+    }
+    if !ok {
+        v["reason"] = json!(reason);
+        v["meaning"] = json!(meaning(&reason));
+        // These tokens will never work again: drop them, or Apple starts to doubt the sender.
+        v["remove_token"] = json!(matches!(reason.as_str(), "BadDeviceToken" | "Unregistered" | "DeviceTokenNotForTopic"));
+        if let Some(t) = r.timestamp {
+            v["gone_since_ms"] = json!(t);
+        }
+    }
+    v
+}
+
+fn device_ok(t: &str) -> Result<(), String> {
+    if t.len() < 64 || t.len() % 2 != 0 || t.len() > 200 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{:?} is not a device token: 64 or more hex digits", t));
+    }
+    Ok(())
+}
+
+fn build(payload: &Value, o: &Value) -> Result<Push, String> {
+    if payload.get("aps").is_none() {
+        return Err("the payload has no `aps`: build it with apns_alert or apns_background".into());
+    }
+    let topic = opt(o, "topic", "APNS_TOPIC").ok_or("no topic: set APNS_TOPIC (the app's bundle id), or give the option topic")?;
+    let silent = payload.pointer("/aps/content-available") == Some(&json!(1)) && payload.pointer("/aps/alert").is_none() && payload.pointer("/aps/sound").is_none() && payload.pointer("/aps/badge").is_none();
+    let kind = o.get("push_type").and_then(|t| t.as_str()).unwrap_or(if silent { "background" } else { "alert" });
+    if !PUSH_TYPES.contains(&kind) {
+        return Err(format!("{:?} is not a push type: {}", kind, PUSH_TYPES.join(", ")));
+    }
+    let suffix = match kind {
+        "voip" => ".voip",
+        "complication" => ".complication",
+        "fileprovider" => ".pushkit.fileprovider",
+        "location" => ".location-query",
+        "liveactivity" => ".push-type.liveactivity",
+        "pushtotalk" => ".voip-ptt",
+        _ => "",
+    };
+    let topic = if topic.ends_with(suffix) { topic } else { format!("{}{}", topic, suffix) };
+    let priority = o.get("priority").and_then(|p| p.as_i64()).unwrap_or(if kind == "background" { 5 } else { 10 });
+    if ![1, 5, 10].contains(&priority) {
+        return Err(format!("a priority is 1, 5 or 10, not {}", priority));
+    }
+    if kind == "background" && priority == 10 {
+        return Err("a background push must have priority 5 or 1: Apple refuses 10".into());
+    }
+    let text = payload.to_string();
+    let limit = if kind == "voip" { 5120 } else { 4096 };
+    if text.len() > limit {
+        return Err(format!("the payload is {} bytes; a {} push takes {}", text.len(), kind, limit));
+    }
+    let mut headers = vec![("apns-topic", topic), ("apns-push-type", kind.to_string()), ("apns-priority", priority.to_string())];
+    if let Some(e) = o.get("expiration").and_then(|e| e.as_i64()) {
+        headers.push(("apns-expiration", e.to_string()));
+    }
+    if let Some(id) = o.get("collapse_id").and_then(|c| c.as_str()) {
+        if id.is_empty() || id.len() > 64 {
+            return Err(format!("a collapse id is 1 to 64 bytes; this one is {}", id.len()));
+        }
+        headers.push(("apns-collapse-id", id.to_string()));
+    }
+    if let Some(id) = o.get("apns_id").and_then(|c| c.as_str()) {
+        headers.push(("apns-id", id.to_string()));
+    }
+    Ok(Push { headers, body: Bytes::from(text) })
+}
+
+// Sends one, renewing a refused token once and trying again after Apple's own failures.
+async fn deliver(c: Arc<Conf>, device: String, p: Arc<Push>) -> Result<Value, String> {
+    let mut jwt = token_for(&c, false)?;
+    let mut renewed = false;
+    let mut tries = 0;
+    loop {
+        let r = match post(&c, &device, &p, &jwt).await {
+            Ok(r) => r,
+            Err(e) if tries < 2 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200 * tries)).await;
+                let _ = e;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let reason = r.reason.clone().unwrap_or_default();
+        if r.status == 403 && reason == "ExpiredProviderToken" && !renewed {
+            jwt = token_for(&c, true)?;
+            renewed = true;
+            continue;
+        }
+        if matches!(r.status, 429 | 500 | 503) && tries < 2 {
+            tries += 1;
+            tokio::time::sleep(Duration::from_millis(500 * tries)).await;
+            continue;
+        }
+        return Ok(outcome(&device, r));
+    }
+}
+
+/// Sends a payload to one device. Options: topic (else APNS_TOPIC), push_type (alert or background, guessed from the payload; voip, location and so on add the suffix to the topic), priority (10, or 5 for background), expiration (a Unix time; 0: try once), collapse_id (a newer push with it replaces an older one), apns_id, sandbox (true for development builds), host (else APNS_HOST), ca (a PEM, else APNS_CA), timeout_ms. Gives { ok, status, apns_id, device } or { ok: false, status, reason, meaning, remove_token, gone_since_ms }: a refusal is an answer, read here, and only a failure to talk to Apple is an error.
+pub fn apns_send(device_token: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    device_ok(device_token)?;
+    let c = Arc::new(conf(&options)?);
+    let p = Arc::new(build(&payload, &options)?);
+    rt().block_on(deliver(c, device_token.to_string(), p))
+}
+
+/// Sends one payload to many devices at once on one connection. Gives { sent, failed, remove, results }: `remove` lists the tokens to stop using.
+pub fn apns_send_many(device_tokens: Vec<String>, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for t in &device_tokens {
+        device_ok(t)?;
+    }
+    let c = Arc::new(conf(&options)?);
+    let p = Arc::new(build(&payload, &options)?);
+    let results: Vec<Value> = rt().block_on(async {
+        let mut out = vec![];
+        // A hundred at a time, a little under what Apple lets one connection carry.
+        for chunk in device_tokens.chunks(100) {
+            let tasks: Vec<_> = chunk.iter().map(|t| tokio::spawn(deliver(c.clone(), t.clone(), p.clone()))).collect();
+            for (t, task) in chunk.iter().zip(tasks) {
+                out.push(match task.await {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => json!({ "ok": false, "device": t, "reason": "NotSent", "meaning": e, "remove_token": false }),
+                    Err(e) => json!({ "ok": false, "device": t, "reason": "NotSent", "meaning": e.to_string(), "remove_token": false }),
+                });
+            }
+        }
+        out
+    });
+    let sent = results.iter().filter(|r| r["ok"] == true).count();
+    let remove: Vec<Value> = results.iter().filter(|r| r["remove_token"] == true).map(|r| r["device"].clone()).collect();
+    Ok(json!({ "sent": sent, "failed": results.len() - sent, "remove": remove, "results": results }))
+}
+
+/// An alert payload: a `title` and `body` (either may be ""). Options: subtitle, badge, sound ("default"), category, thread_id, mutable_content (lets a service extension change it), interruption_level (passive, active, time-sensitive, critical), relevance_score, target_content_id, title_loc_key, title_loc_args, loc_key, loc_args, data (a map of your own keys, beside `aps`).
+pub fn apns_alert(title: &str, body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut alert = json!({});
+    if !title.is_empty() { alert["title"] = json!(title); }
+    if !body.is_empty() { alert["body"] = json!(body); }
+    for (k, key) in [("subtitle", "subtitle"), ("title_loc_key", "title-loc-key"), ("title_loc_args", "title-loc-args"), ("loc_key", "loc-key"), ("loc_args", "loc-args")] {
+        if let Some(v) = options.get(k) {
+            alert[key] = v.clone();
+        }
+    }
+    if alert.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        return Err("an alert needs a title or a body".into());
+    }
+    let mut aps = json!({ "alert": alert });
+    for (k, key) in [("badge", "badge"), ("sound", "sound"), ("category", "category"), ("thread_id", "thread-id"), ("interruption_level", "interruption-level"), ("relevance_score", "relevance-score"), ("target_content_id", "target-content-id")] {
+        if let Some(v) = options.get(k) {
+            aps[key] = v.clone();
+        }
+    }
+    if options.get("mutable_content") == Some(&json!(true)) {
+        aps["mutable-content"] = json!(1);
+    }
+    with_data(aps, &options)
+}
+
+fn with_data(aps: Value, o: &Value) -> Result<Value, String> {
+    let mut p = json!({ "aps": aps });
+    if let Some(d) = o.get("data") {
+        for (k, v) in d.as_object().ok_or("data must be a map")? {
+            if k == "aps" {
+                return Err("`aps` is Apple's key: choose another".into());
+            }
+            p[k] = v.clone();
+        }
+    }
+    Ok(p)
+}
+
+/// A background payload: wakes the app without showing anything, and may be delayed or dropped by the system. Send it with priority 5, as apns_send does. `data` is a map of your own keys.
+pub fn apns_background(data: serde_json::Value) -> Result<serde_json::Value, String> {
+    with_data(json!({ "content-available": 1 }), &json!({ "data": if data.is_null() { json!({}) } else { data } }))
+}
+
+/// What a device token looks like cleaned: spaces and <> gone, lower case, as old apps sent them.
+pub fn apns_clean_token(token: &str) -> String {
+    token.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_lowercase()
+}

@@ -1,0 +1,1206 @@
+//! RDF in Turtle, N-Triples and JSON-LD: triples read and written, prefixes, relative IRIs resolved, blank nodes and collections, and simple pattern matching.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const MAX_DEPTH: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Term {
+    Iri(String),
+    Blank(String),
+    Lit(String, Option<String>, Option<String>),
+}
+
+impl Term {
+    fn json(&self) -> Value {
+        match self {
+            Term::Iri(v) => json!({ "type": "iri", "value": v }),
+            Term::Blank(v) => json!({ "type": "bnode", "value": v }),
+            Term::Lit(v, d, l) => {
+                let mut m = Map::new();
+                m.insert("type".into(), json!("literal"));
+                m.insert("value".into(), json!(v));
+                m.insert("datatype".into(), json!(d.clone().unwrap_or_else(|| if l.is_some() { format!("{}langString", RDF) } else { format!("{}string", XSD) })));
+                if let Some(x) = l {
+                    m.insert("language".into(), json!(x));
+                }
+                Value::Object(m)
+            }
+        }
+    }
+
+    fn from_json(v: &Value) -> Result<Term, String> {
+        match v {
+            Value::String(s) if s.starts_with("_:") => Ok(Term::Blank(s[2..].to_string())),
+            Value::String(s) => Ok(Term::Iri(s.clone())),
+            Value::Object(m) => {
+                let val = m.get("value").and_then(Value::as_str).ok_or("a term needs a `value`")?.to_string();
+                match m.get("type").and_then(Value::as_str) {
+                    Some("iri") => Ok(Term::Iri(val)),
+                    Some("bnode") => Ok(Term::Blank(val)),
+                    Some("literal") | None => {
+                        let lang = m.get("language").and_then(Value::as_str).map(str::to_string);
+                        let dt = m.get("datatype").and_then(Value::as_str).map(str::to_string).filter(|d| !(d == &format!("{}string", XSD) || (lang.is_some() && d == &format!("{}langString", RDF))));
+                        Ok(Term::Lit(val, dt, lang))
+                    }
+                    Some(t) => Err(format!("`{}` is not a term type: iri, bnode or literal", t)),
+                }
+            }
+            Value::Bool(b) => Ok(Term::Lit(b.to_string(), Some(format!("{}boolean", XSD)), None)),
+            Value::Number(n) if n.is_i64() => Ok(Term::Lit(n.to_string(), Some(format!("{}integer", XSD)), None)),
+            Value::Number(n) => Ok(Term::Lit(double_form(n.as_f64().unwrap_or(0.0)), Some(format!("{}double", XSD)), None)),
+            _ => Err("a term must be a string or a map".to_string()),
+        }
+    }
+}
+
+type Triple = (Term, Term, Term);
+
+fn double_form(f: f64) -> String {
+    format!("{:E}", f)
+}
+
+fn triple_json(t: &Triple) -> Value {
+    json!({ "subject": t.0.json(), "predicate": t.1.json(), "object": t.2.json() })
+}
+
+fn triples_in(list: &[Value]) -> Result<Vec<Triple>, String> {
+    let mut out = vec![];
+    for (i, t) in list.iter().enumerate() {
+        let part = |k: &str| -> Result<Term, String> { Term::from_json(t.get(k).ok_or(format!("triple {}: no `{}`", i, k))?).map_err(|e| format!("triple {}: {}", i, e)) };
+        let (s, p, o) = (part("subject")?, part("predicate")?, part("object")?);
+        if matches!(s, Term::Lit(..)) {
+            return Err(format!("triple {}: a subject cannot be a literal", i));
+        }
+        if !matches!(p, Term::Iri(_)) {
+            return Err(format!("triple {}: a predicate must be an IRI", i));
+        }
+        out.push((s, p, o));
+    }
+    Ok(out)
+}
+
+/// RFC 3986 section 5: a reference made absolute against a base.
+fn resolve(base: &str, r: &str) -> String {
+    let split = |u: &str| -> (Option<String>, Option<String>, String, Option<String>, Option<String>) {
+        let (u, frag) = match u.split_once('#') { Some((a, b)) => (a.to_string(), Some(b.to_string())), None => (u.to_string(), None) };
+        let (u, query) = match u.split_once('?') { Some((a, b)) => (a.to_string(), Some(b.to_string())), None => (u, None) };
+        let colon = u.find(':').filter(|i| {
+            let s = &u[..*i];
+            !s.is_empty() && s.as_bytes()[0].is_ascii_alphabetic() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+        });
+        let (scheme, rest) = match colon { Some(i) => (Some(u[..i].to_string()), u[i + 1..].to_string()), None => (None, u) };
+        let (auth, path) = match rest.strip_prefix("//") {
+            Some(r) => {
+                let end = r.find('/').unwrap_or(r.len());
+                (Some(r[..end].to_string()), r[end..].to_string())
+            }
+            None => (None, rest),
+        };
+        (scheme, auth, path, query, frag)
+    };
+    let remove_dots = |p: &str| -> String {
+        let mut out: Vec<&str> = vec![];
+        let segs: Vec<&str> = p.split('/').collect();
+        for (i, s) in segs.iter().enumerate() {
+            let last = i + 1 == segs.len();
+            match *s {
+                "." => if last { out.push(""); },
+                ".." => {
+                    if out.len() > 1 { out.pop(); }
+                    if last { out.push(""); }
+                }
+                x => out.push(x),
+            }
+        }
+        out.join("/")
+    };
+    let (rs, ra, rp, rq, rf) = split(r);
+    let (bs, ba, bp, bq, _) = split(base);
+    let (s, a, p, q) = if rs.is_some() {
+        (rs, ra, remove_dots(&rp), rq)
+    } else if ra.is_some() {
+        (bs, ra, remove_dots(&rp), rq)
+    } else if rp.is_empty() {
+        (bs, ba, bp, rq.or(bq))
+    } else if rp.starts_with('/') {
+        (bs, ba, remove_dots(&rp), rq)
+    } else {
+        let merged = if ba.is_some() && bp.is_empty() { format!("/{}", rp) } else { format!("{}{}", &bp[..bp.rfind('/').map_or(0, |i| i + 1)], rp) };
+        (bs, ba, remove_dots(&merged), rq)
+    };
+    let mut out = String::new();
+    if let Some(x) = s { out.push_str(&x); out.push(':'); }
+    if let Some(x) = a { out.push_str("//"); out.push_str(&x); }
+    out.push_str(&p);
+    if let Some(x) = q { out.push('?'); out.push_str(&x); }
+    if let Some(x) = rf { out.push('#'); out.push_str(&x); }
+    out
+}
+
+fn has_scheme(s: &str) -> bool {
+    match s.find(':') {
+        Some(i) if i > 0 => s.as_bytes()[0].is_ascii_alphabetic() && s[..i].bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)),
+        _ => false,
+    }
+}
+
+struct P {
+    c: Vec<char>,
+    i: usize,
+    line: usize,
+    prefixes: BTreeMap<String, String>,
+    base: Option<String>,
+    fresh: usize,
+    labels: BTreeMap<String, String>,
+    out: Vec<Triple>,
+    strict: bool,
+}
+
+impl P {
+    fn new(text: &str, base: Option<String>, strict: bool) -> P {
+        P { c: text.chars().collect(), i: 0, line: 1, prefixes: BTreeMap::new(), base, fresh: 0, labels: BTreeMap::new(), out: vec![], strict }
+    }
+    fn err<T>(&self, m: &str) -> Result<T, String> {
+        Err(format!("line {}: {}", self.line, m))
+    }
+    fn peek(&self) -> Option<char> {
+        self.c.get(self.i).copied()
+    }
+    fn starts(&self, s: &str) -> bool {
+        s.chars().enumerate().all(|(k, x)| self.c.get(self.i + k) == Some(&x))
+    }
+    fn skip(&mut self) {
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                self.line += 1;
+                self.i += 1;
+            } else if c.is_whitespace() {
+                self.i += 1;
+            } else if c == '#' {
+                while self.peek().map_or(false, |x| x != '\n') {
+                    self.i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    fn eat(&mut self, c: char) -> Result<(), String> {
+        self.skip();
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Ok(())
+        } else {
+            let found = self.peek().map_or("the end".to_string(), |x| format!("`{}`", x));
+            self.err(&format!("expected `{}`, found {}", c, found))
+        }
+    }
+    fn hex(&mut self, n: usize) -> Result<char, String> {
+        let s: String = self.c[self.i..(self.i + n).min(self.c.len())].iter().collect();
+        self.i += n;
+        match u32::from_str_radix(&s, 16).ok().and_then(char::from_u32) {
+            Some(c) if s.len() == n => Ok(c),
+            _ => self.err(&format!("`{}` is not a character code", s)),
+        }
+    }
+    fn iri_ref(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None => return self.err("an IRI is never closed"),
+                Some('>') => {
+                    self.i += 1;
+                    break;
+                }
+                Some('\\') => {
+                    self.i += 1;
+                    match self.peek() {
+                        Some('u') => { self.i += 1; let c = self.hex(4)?; s.push(c); }
+                        Some('U') => { self.i += 1; let c = self.hex(8)?; s.push(c); }
+                        _ => return self.err("only \\u and \\U escapes may be in an IRI"),
+                    }
+                }
+                Some(c) if (c as u32) <= 0x20 || "<\"{}|^`".contains(c) => return self.err(&format!("`{}` may not be in an IRI", c.escape_default())),
+                Some(c) => {
+                    s.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        if has_scheme(&s) {
+            return Ok(s);
+        }
+        if self.strict {
+            return self.err(&format!("<{}> is not absolute, and N-Triples needs that", s));
+        }
+        match &self.base {
+            Some(b) => Ok(resolve(b, &s)),
+            None => self.err(&format!("<{}> is relative and there is no base", s)),
+        }
+    }
+    fn string(&mut self) -> Result<String, String> {
+        let q = self.peek().unwrap_or('"');
+        let long = !self.strict && self.starts(&q.to_string().repeat(3));
+        self.i += if long { 3 } else { 1 };
+        let mut s = String::new();
+        loop {
+            let Some(c) = self.peek() else { return self.err("a string is never closed") };
+            if long && self.starts(&q.to_string().repeat(3)) {
+                self.i += 3;
+                return Ok(s);
+            }
+            if !long && c == q {
+                self.i += 1;
+                return Ok(s);
+            }
+            if c == '\n' {
+                if !long {
+                    return self.err("a line break in a short string");
+                }
+                self.line += 1;
+            }
+            self.i += 1;
+            if c == '\\' {
+                let e = self.peek();
+                self.i += 1;
+                match e {
+                    Some('t') => s.push('\t'),
+                    Some('b') => s.push('\u{8}'),
+                    Some('n') => s.push('\n'),
+                    Some('r') => s.push('\r'),
+                    Some('f') => s.push('\u{c}'),
+                    Some('"') => s.push('"'),
+                    Some('\'') => s.push('\''),
+                    Some('\\') => s.push('\\'),
+                    Some('u') => { let x = self.hex(4)?; s.push(x); }
+                    Some('U') => { let x = self.hex(8)?; s.push(x); }
+                    _ => return self.err("a bad escape in a string"),
+                }
+            } else {
+                s.push(c);
+            }
+        }
+    }
+    fn blank_label(&mut self) -> Result<String, String> {
+        self.i += 2;
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_alphanumeric() || c == '_' || c == '-' || (c == '.' && self.c.get(self.i + 1).map_or(false, |n| n.is_alphanumeric() || *n == '_' || *n == '-')) {
+                s.push(c);
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() {
+            return self.err("a blank node with no label");
+        }
+        // Labels are kept as written, unless one clashes with a made-up `bN`.
+        Ok(self.labels.entry(s.clone()).or_insert(s).clone())
+    }
+    fn new_blank(&mut self) -> Term {
+        loop {
+            let n = format!("b{}", self.fresh);
+            self.fresh += 1;
+            if !self.labels.contains_key(&n) {
+                return Term::Blank(n);
+            }
+        }
+    }
+    fn prefixed(&mut self) -> Result<String, String> {
+        let mut pre = String::new();
+        while let Some(c) = self.peek() {
+            if c == ':' {
+                break;
+            }
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                pre.push(c);
+                self.i += 1;
+            } else {
+                return self.err(&format!("expected a term, found `{}`", c));
+            }
+        }
+        if self.peek() != Some(':') {
+            return self.err(&format!("expected a term, found `{}`", pre));
+        }
+        self.i += 1;
+        let base = match self.prefixes.get(&pre) {
+            Some(b) => b.clone(),
+            None => return self.err(&format!("the prefix `{}:` is not declared", pre)),
+        };
+        let mut local = String::new();
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                let n = self.c.get(self.i + 1).copied().unwrap_or(' ');
+                if "_~.-!$&'()*+,;=/?#@%".contains(n) {
+                    local.push(n);
+                    self.i += 2;
+                } else {
+                    return self.err("a bad escape in a local name");
+                }
+            } else if c == '%' {
+                let h: String = self.c[(self.i + 1).min(self.c.len())..(self.i + 3).min(self.c.len())].iter().collect();
+                if h.len() != 2 || !h.chars().all(|x| x.is_ascii_hexdigit()) {
+                    return self.err("a bad % escape in a local name");
+                }
+                local.push('%');
+                local.push_str(&h);
+                self.i += 3;
+            } else if c.is_alphanumeric() || c == '_' || c == '-' || c == ':' || c == '\u{b7}' {
+                local.push(c);
+                self.i += 1;
+            } else if c == '.' && self.c.get(self.i + 1).map_or(false, |n| n.is_alphanumeric() || "_-:%\\".contains(*n)) {
+                local.push(c);
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(format!("{}{}", base, local))
+    }
+    fn number(&mut self) -> Option<Term> {
+        let start = self.i;
+        let mut j = self.i;
+        let at = |k: usize| self.c.get(k).copied().unwrap_or(' ');
+        if at(j) == '+' || at(j) == '-' {
+            j += 1;
+        }
+        let d0 = j;
+        while at(j).is_ascii_digit() {
+            j += 1;
+        }
+        let whole = j - d0;
+        let mut frac = 0;
+        if at(j) == '.' && (at(j + 1).is_ascii_digit() || (whole > 0 && (at(j + 1) == 'e' || at(j + 1) == 'E'))) {
+            j += 1;
+            let f0 = j;
+            while at(j).is_ascii_digit() {
+                j += 1;
+            }
+            frac = j - f0 + 1;
+        }
+        if whole == 0 && frac < 2 {
+            return None;
+        }
+        let mut exp = false;
+        if at(j) == 'e' || at(j) == 'E' {
+            let mut k = j + 1;
+            if at(k) == '+' || at(k) == '-' {
+                k += 1;
+            }
+            if at(k).is_ascii_digit() {
+                while at(k).is_ascii_digit() {
+                    k += 1;
+                }
+                j = k;
+                exp = true;
+            }
+        }
+        let text: String = self.c[start..j].iter().collect();
+        self.i = j;
+        let kind = if exp { "double" } else if frac > 0 { "decimal" } else { "integer" };
+        Some(Term::Lit(text, Some(format!("{}{}", XSD, kind)), None))
+    }
+    fn literal(&mut self) -> Result<Term, String> {
+        let v = self.string()?;
+        if self.peek() == Some('@') {
+            self.i += 1;
+            let mut l = String::new();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    l.push(c);
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            if l.is_empty() {
+                return self.err("`@` with no language");
+            }
+            return Ok(Term::Lit(v, None, Some(l.to_lowercase())));
+        }
+        if self.starts("^^") {
+            self.i += 2;
+            let dt = if self.peek() == Some('<') { self.iri_ref()? } else { self.prefixed()? };
+            return Ok(Term::Lit(v, if dt == format!("{}string", XSD) { None } else { Some(dt) }, None));
+        }
+        Ok(Term::Lit(v, None, None))
+    }
+    fn object(&mut self, depth: usize) -> Result<Term, String> {
+        if depth > MAX_DEPTH {
+            return self.err("nested too deep");
+        }
+        self.skip();
+        match self.peek() {
+            None => self.err("expected a term, found the end"),
+            Some('<') => Ok(Term::Iri(self.iri_ref()?)),
+            Some('"') | Some('\'') => self.literal(),
+            Some('_') if self.starts("_:") => Ok(Term::Blank(self.blank_label()?)),
+            Some('[') => {
+                self.i += 1;
+                let b = self.new_blank();
+                self.skip();
+                if self.peek() != Some(']') {
+                    self.predicates(&b, depth + 1)?;
+                }
+                self.eat(']')?;
+                Ok(b)
+            }
+            Some('(') => {
+                self.i += 1;
+                let nil = Term::Iri(format!("{}nil", RDF));
+                let mut head = nil.clone();
+                let mut last: Option<Term> = None;
+                loop {
+                    self.skip();
+                    if self.peek() == Some(')') {
+                        self.i += 1;
+                        break;
+                    }
+                    let item = self.object(depth + 1)?;
+                    let cell = self.new_blank();
+                    match &last {
+                        Some(l) => self.out.push((l.clone(), Term::Iri(format!("{}rest", RDF)), cell.clone())),
+                        None => head = cell.clone(),
+                    }
+                    self.out.push((cell.clone(), Term::Iri(format!("{}first", RDF)), item));
+                    last = Some(cell);
+                }
+                if let Some(l) = last {
+                    self.out.push((l, Term::Iri(format!("{}rest", RDF)), nil));
+                }
+                Ok(head)
+            }
+            Some(c) if c.is_ascii_digit() || c == '+' || c == '-' || c == '.' => match self.number() {
+                Some(n) => Ok(n),
+                None => self.err(&format!("expected a term, found `{}`", c)),
+            },
+            Some(_) => {
+                for (w, v) in [("true", "true"), ("false", "false")] {
+                    let next = self.c.get(self.i + w.len()).copied().unwrap_or(' ');
+                    if self.starts(w) && !next.is_alphanumeric() && next != ':' && next != '_' && next != '-' {
+                        self.i += w.len();
+                        return Ok(Term::Lit(v.to_string(), Some(format!("{}boolean", XSD)), None));
+                    }
+                }
+                Ok(Term::Iri(self.prefixed()?))
+            }
+        }
+    }
+    fn verb(&mut self) -> Result<Term, String> {
+        self.skip();
+        if self.peek() == Some('a') && self.c.get(self.i + 1).map_or(true, |c| c.is_whitespace() || "<\"[".contains(*c)) {
+            self.i += 1;
+            return Ok(Term::Iri(format!("{}type", RDF)));
+        }
+        if self.peek() == Some('<') {
+            return Ok(Term::Iri(self.iri_ref()?));
+        }
+        Ok(Term::Iri(self.prefixed()?))
+    }
+    fn predicates(&mut self, s: &Term, depth: usize) -> Result<(), String> {
+        loop {
+            let p = self.verb()?;
+            loop {
+                let o = self.object(depth)?;
+                self.out.push((s.clone(), p.clone(), o));
+                self.skip();
+                if self.peek() == Some(',') {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            self.skip();
+            if self.peek() != Some(';') {
+                return Ok(());
+            }
+            while self.peek() == Some(';') {
+                self.i += 1;
+                self.skip();
+            }
+            if matches!(self.peek(), Some('.') | Some(']')) {
+                return Ok(());
+            }
+        }
+    }
+    fn word(&self, w: &str) -> bool {
+        w.chars().enumerate().all(|(k, x)| self.c.get(self.i + k).map_or(false, |c| c.eq_ignore_ascii_case(&x))) && self.c.get(self.i + w.len()).map_or(false, |c| c.is_whitespace())
+    }
+    fn prefix_decl(&mut self, dot: bool) -> Result<(), String> {
+        self.skip();
+        let mut name = String::new();
+        while self.peek().map_or(false, |c| c != ':' && !c.is_whitespace()) {
+            name.push(self.c[self.i]);
+            self.i += 1;
+        }
+        if self.peek() != Some(':') {
+            return self.err("a prefix must end in `:`");
+        }
+        self.i += 1;
+        self.skip();
+        if self.peek() != Some('<') {
+            return self.err("a prefix needs an <IRI>");
+        }
+        let iri = self.iri_ref()?;
+        self.prefixes.insert(name, iri);
+        if dot {
+            self.eat('.')?;
+        }
+        Ok(())
+    }
+    fn base_decl(&mut self, dot: bool) -> Result<(), String> {
+        self.skip();
+        if self.peek() != Some('<') {
+            return self.err("a base needs an <IRI>");
+        }
+        self.base = Some(self.iri_ref()?);
+        if dot {
+            self.eat('.')?;
+        }
+        Ok(())
+    }
+    fn turtle(&mut self) -> Result<(), String> {
+        loop {
+            self.skip();
+            if self.peek().is_none() {
+                return Ok(());
+            }
+            if self.starts("@prefix") {
+                self.i += 7;
+                self.prefix_decl(true)?;
+            } else if self.starts("@base") {
+                self.i += 5;
+                self.base_decl(true)?;
+            } else if self.word("PREFIX") {
+                self.i += 6;
+                self.prefix_decl(false)?;
+            } else if self.word("BASE") {
+                self.i += 4;
+                self.base_decl(false)?;
+            } else {
+                let lead = self.peek();
+                let s = self.object(0)?;
+                if matches!(s, Term::Lit(..)) {
+                    return self.err("a literal cannot be a subject");
+                }
+                self.skip();
+                // `[ a :B ] .` needs no predicates.
+                if lead == Some('[') && self.peek() == Some('.') {
+                    self.i += 1;
+                    continue;
+                }
+                self.predicates(&s, 0)?;
+                self.eat('.')?;
+            }
+        }
+    }
+    fn ntriples(&mut self) -> Result<(), String> {
+        loop {
+            self.skip();
+            if self.peek().is_none() {
+                return Ok(());
+            }
+            let s = match self.peek() {
+                Some('<') => Term::Iri(self.iri_ref()?),
+                Some('_') if self.starts("_:") => Term::Blank(self.blank_label()?),
+                _ => return self.err("a subject must be <IRI> or _:label"),
+            };
+            self.skip();
+            if self.peek() != Some('<') {
+                return self.err("a predicate must be <IRI>");
+            }
+            let p = Term::Iri(self.iri_ref()?);
+            self.skip();
+            let o = match self.peek() {
+                Some('<') => Term::Iri(self.iri_ref()?),
+                Some('_') if self.starts("_:") => Term::Blank(self.blank_label()?),
+                Some('"') => self.literal()?,
+                _ => return self.err("an object must be <IRI>, _:label or a literal"),
+            };
+            let at = self.line;
+            self.eat('.')?;
+            self.out.push((s, p, o));
+            while matches!(self.peek(), Some(' ') | Some('\t') | Some('\r')) {
+                self.i += 1;
+            }
+            match self.peek() {
+                None | Some('\n') | Some('#') => {}
+                _ => return Err(format!("line {}: more than one triple on a line", at)),
+            }
+        }
+    }
+}
+
+// JSON-LD, the part of it most documents use: contexts given inline, terms, prefixes, @vocab, @base,
+// @language, @type coercion, @graph, @list, @set, @reverse and nested nodes. Remote contexts are refused.
+
+#[derive(Clone, Default)]
+struct Ctx {
+    terms: BTreeMap<String, Value>,
+    vocab: Option<String>,
+    base: Option<String>,
+    language: Option<String>,
+}
+
+fn apply_context(ctx: &mut Ctx, c: &Value) -> Result<(), String> {
+    match c {
+        Value::Array(a) => {
+            for x in a {
+                apply_context(ctx, x)?;
+            }
+        }
+        Value::Null => *ctx = Ctx { base: ctx.base.clone(), ..Ctx::default() },
+        Value::String(u) => return Err(format!("the remote context {} is not fetched: give the context inline", u)),
+        Value::Object(m) => {
+            for (k, v) in m {
+                match k.as_str() {
+                    "@vocab" => ctx.vocab = v.as_str().map(str::to_string),
+                    "@base" => ctx.base = v.as_str().map(str::to_string),
+                    "@language" => ctx.language = v.as_str().map(|s| s.to_lowercase()),
+                    "@version" | "@import" | "@protected" | "@propagate" => {}
+                    t => {
+                        ctx.terms.insert(t.to_string(), v.clone());
+                    }
+                }
+            }
+        }
+        _ => return Err("a context must be a map, a list or null".to_string()),
+    }
+    Ok(())
+}
+
+fn expand_iri(ctx: &Ctx, s: &str, vocab: bool, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if s.starts_with('@') {
+        return Some(s.to_string());
+    }
+    if vocab {
+        match ctx.terms.get(s) {
+            Some(Value::String(t)) if t != s => return expand_iri(ctx, t, true, depth + 1),
+            Some(Value::Object(o)) => {
+                if let Some(id) = o.get("@id").and_then(Value::as_str) {
+                    if id != s {
+                        return expand_iri(ctx, id, true, depth + 1);
+                    }
+                }
+            }
+            Some(Value::Null) => return None,
+            _ => {}
+        }
+    }
+    if let Some((pre, local)) = s.split_once(':') {
+        if pre == "_" || local.starts_with("//") {
+            return Some(s.to_string());
+        }
+        match ctx.terms.get(pre) {
+            Some(Value::String(t)) => return expand_iri(ctx, t, true, depth + 1).map(|b| format!("{}{}", b, local)),
+            Some(Value::Object(o)) => {
+                if let Some(id) = o.get("@id").and_then(Value::as_str) {
+                    return expand_iri(ctx, id, true, depth + 1).map(|b| format!("{}{}", b, local));
+                }
+            }
+            _ => {}
+        }
+        if has_scheme(s) {
+            return Some(s.to_string());
+        }
+    }
+    if vocab {
+        return ctx.vocab.as_ref().map(|v| format!("{}{}", v, s));
+    }
+    Some(match &ctx.base {
+        Some(b) => resolve(b, s),
+        None => s.to_string(),
+    })
+}
+
+fn node_term(s: &str) -> Term {
+    match s.strip_prefix("_:") {
+        Some(b) => Term::Blank(b.to_string()),
+        None => Term::Iri(s.to_string()),
+    }
+}
+
+struct Ld {
+    out: Vec<Triple>,
+    fresh: usize,
+}
+
+impl Ld {
+    fn blank(&mut self) -> Term {
+        self.fresh += 1;
+        Term::Blank(format!("b{}", self.fresh - 1))
+    }
+
+    fn value(&mut self, ctx: &Ctx, term: &str, v: &Value, depth: usize) -> Result<Vec<Term>, String> {
+        if depth > MAX_DEPTH {
+            return Err("nested too deep".to_string());
+        }
+        let def = ctx.terms.get(term).and_then(Value::as_object);
+        let coerce = def.and_then(|d| d.get("@type")).and_then(Value::as_str);
+        let lang_rule = def.and_then(|d| d.get("@language"));
+        let container = def.and_then(|d| d.get("@container")).map(|c| match c { Value::Array(a) => a.first().cloned().unwrap_or(Value::Null), x => x.clone() });
+        if let (Value::Array(a), Some("@list")) = (v, container.as_ref().and_then(Value::as_str)) {
+            return Ok(vec![self.list(ctx, a, depth)?]);
+        }
+        match v {
+            Value::Null => Ok(vec![]),
+            Value::Array(a) => {
+                let mut out = vec![];
+                for x in a {
+                    out.extend(self.value(ctx, term, x, depth + 1)?);
+                }
+                Ok(out)
+            }
+            Value::Object(m) => {
+                if let Some(val) = m.get("@value") {
+                    let lang = m.get("@language").and_then(Value::as_str).map(|l| l.to_lowercase());
+                    let ty = m.get("@type").and_then(Value::as_str).and_then(|t| expand_iri(ctx, t, true, 0));
+                    return Ok(self.scalar(val, ty, lang));
+                }
+                if let Some(l) = m.get("@list") {
+                    let items = l.as_array().cloned().unwrap_or_else(|| vec![l.clone()]);
+                    return Ok(vec![self.list(ctx, &items, depth)?]);
+                }
+                if let Some(l) = m.get("@set") {
+                    return self.value(ctx, term, l, depth + 1);
+                }
+                Ok(vec![self.node(ctx, m, depth + 1)?])
+            }
+            Value::String(s) => {
+                match coerce {
+                    Some("@id") => return Ok(vec![node_term(&expand_iri(ctx, s, false, 0).ok_or(format!("`{}` has no IRI", s))?)]),
+                    Some("@vocab") => return Ok(vec![node_term(&expand_iri(ctx, s, true, 0).ok_or(format!("`{}` has no IRI", s))?)]),
+                    Some(t) => return Ok(self.scalar(v, expand_iri(ctx, t, true, 0), None)),
+                    None => {}
+                }
+                let lang = match lang_rule {
+                    Some(Value::Null) => None,
+                    Some(Value::String(l)) => Some(l.to_lowercase()),
+                    _ => ctx.language.clone(),
+                };
+                Ok(self.scalar(v, None, lang))
+            }
+            x => Ok(self.scalar(x, coerce.and_then(|t| expand_iri(ctx, t, true, 0)), None)),
+        }
+    }
+
+    fn scalar(&mut self, v: &Value, ty: Option<String>, lang: Option<String>) -> Vec<Term> {
+        match v {
+            Value::Null => vec![],
+            Value::Bool(b) => vec![Term::Lit(b.to_string(), ty.or(Some(format!("{}boolean", XSD))), None)],
+            Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                let is_double = ty.as_deref() == Some(&format!("{}double", XSD)[..]);
+                if (n.is_i64() || n.is_u64() || (f.fract() == 0.0 && f.abs() < 1e21)) && !is_double {
+                    let text = if n.is_f64() { format!("{:.0}", f) } else { n.to_string() };
+                    vec![Term::Lit(text, ty.or(Some(format!("{}integer", XSD))), None)]
+                } else {
+                    vec![Term::Lit(double_form(f), ty.or(Some(format!("{}double", XSD))), None)]
+                }
+            }
+            Value::String(s) => vec![Term::Lit(s.clone(), ty.filter(|t| t != &format!("{}string", XSD)), lang)],
+            x => vec![Term::Lit(x.to_string(), ty, None)],
+        }
+    }
+
+    fn list(&mut self, ctx: &Ctx, items: &[Value], depth: usize) -> Result<Term, String> {
+        let nil = Term::Iri(format!("{}nil", RDF));
+        let mut terms = vec![];
+        for x in items {
+            terms.extend(self.value(ctx, "", x, depth + 1)?);
+        }
+        let mut head = nil;
+        for t in terms.into_iter().rev() {
+            let cell = self.blank();
+            self.out.push((cell.clone(), Term::Iri(format!("{}first", RDF)), t));
+            self.out.push((cell.clone(), Term::Iri(format!("{}rest", RDF)), head));
+            head = cell;
+        }
+        Ok(head)
+    }
+
+    fn node(&mut self, ctx: &Ctx, m: &Map<String, Value>, depth: usize) -> Result<Term, String> {
+        if depth > MAX_DEPTH {
+            return Err("nested too deep".to_string());
+        }
+        let mut ctx = ctx.clone();
+        if let Some(c) = m.get("@context") {
+            apply_context(&mut ctx, c)?;
+        }
+        let key = |ctx: &Ctx, name: &str| m.iter().find(|(k, _)| expand_iri(ctx, k, true, 0).as_deref() == Some(name)).map(|x| x.1.clone());
+        let id = key(&ctx, "@id");
+        let s = match id.as_ref().and_then(Value::as_str) {
+            Some(x) => node_term(&expand_iri(&ctx, x, false, 0).ok_or(format!("`{}` has no IRI", x))?),
+            None => self.blank(),
+        };
+        for (k, v) in m {
+            if k == "@context" {
+                continue;
+            }
+            let Some(p) = expand_iri(&ctx, k, true, 0) else { continue };
+            match p.as_str() {
+                "@id" => {}
+                "@type" => {
+                    let list = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+                    for t in list {
+                        if let Some(x) = t.as_str().and_then(|x| expand_iri(&ctx, x, true, 0)) {
+                            self.out.push((s.clone(), Term::Iri(format!("{}type", RDF)), node_term(&x)));
+                        }
+                    }
+                }
+                "@graph" | "@included" => {
+                    let list = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+                    for x in list {
+                        if let Value::Object(o) = x {
+                            self.node(&ctx, &o, depth + 1)?;
+                        }
+                    }
+                }
+                "@reverse" => {
+                    if let Value::Object(o) = v {
+                        for (rk, rv) in o {
+                            let Some(rp) = expand_iri(&ctx, rk, true, 0) else { continue };
+                            for t in self.value(&ctx, rk, rv, depth + 1)? {
+                                self.out.push((t, Term::Iri(rp.clone()), s.clone()));
+                            }
+                        }
+                    }
+                }
+                x if x.starts_with('@') => {}
+                _ if !has_scheme(&p) => {} // A key with no mapping is dropped, as JSON-LD says.
+                _ => {
+                    for o in self.value(&ctx, k, v, depth + 1)? {
+                        self.out.push((s.clone(), Term::Iri(p.clone()), o));
+                    }
+                }
+            }
+        }
+        Ok(s)
+    }
+}
+
+fn read_jsonld(text: &str, base: Option<String>) -> Result<(Vec<Triple>, BTreeMap<String, String>), String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {}", e))?;
+    let mut ld = Ld { out: vec![], fresh: 0 };
+    let ctx = Ctx { base, ..Ctx::default() };
+    let list = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+    let mut prefixes = BTreeMap::new();
+    for x in list {
+        let Value::Object(m) = x else { return Err("JSON-LD must be a map or a list of maps".to_string()) };
+        if let Some(Value::Object(c)) = m.get("@context") {
+            for (k, t) in c {
+                if let Some(s) = t.as_str().filter(|s| !k.starts_with('@') && (s.ends_with('#') || s.ends_with('/'))) {
+                    prefixes.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+        ld.node(&ctx, &m, 0)?;
+    }
+    Ok((ld.out, prefixes))
+}
+
+fn esc(s: &str, long_ok: bool) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' if !long_ok => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn esc_iri(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if (c as u32) <= 0x20 || "<>\"{}|\\^`".contains(c) {
+            out.push_str(&format!("\\u{:04X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn nt_term(t: &Term) -> String {
+    match t {
+        Term::Iri(v) => format!("<{}>", esc_iri(v)),
+        Term::Blank(v) => format!("_:{}", v),
+        Term::Lit(v, _, Some(l)) => format!("\"{}\"@{}", esc(v, false), l),
+        Term::Lit(v, Some(d), None) => format!("\"{}\"^^<{}>", esc(v, false), esc_iri(d)),
+        Term::Lit(v, None, None) => format!("\"{}\"", esc(v, false)),
+    }
+}
+
+fn compact(iri: &str, prefixes: &BTreeMap<String, String>) -> Option<String> {
+    let mut best: Option<(&String, &String)> = None;
+    for (p, b) in prefixes {
+        if iri.starts_with(b.as_str()) && best.map_or(true, |x| b.len() > x.1.len()) {
+            best = Some((p, b));
+        }
+    }
+    let (p, b) = best?;
+    let local = &iri[b.len()..];
+    let plain = local.chars().enumerate().all(|(i, c)| c.is_alphanumeric() || c == '_' || (i > 0 && c == '-'));
+    (plain).then(|| format!("{}:{}", p, local))
+}
+
+fn ttl_term(t: &Term, prefixes: &BTreeMap<String, String>) -> String {
+    match t {
+        Term::Iri(v) => compact(v, prefixes).unwrap_or_else(|| format!("<{}>", esc_iri(v))),
+        Term::Blank(v) => format!("_:{}", v),
+        Term::Lit(v, Some(d), None) => {
+            let short = |k: &str| d == &format!("{}{}", XSD, k);
+            let int = !v.is_empty() && v.trim_start_matches(['+', '-']).bytes().all(|b| b.is_ascii_digit()) && !v.trim_start_matches(['+', '-']).is_empty();
+            let dec = v.contains('.') && !v.contains(['e', 'E']) && v.trim_start_matches(['+', '-']).chars().all(|c| c.is_ascii_digit() || c == '.') && !v.ends_with('.');
+            let dbl = v.contains(['e', 'E']) && v.parse::<f64>().is_ok() && !v.to_lowercase().contains("inf") && !v.to_lowercase().contains("nan");
+            if (short("integer") && int) || (short("decimal") && dec) || (short("double") && dbl) || (short("boolean") && (v == "true" || v == "false")) {
+                v.clone()
+            } else {
+                let dt = compact(d, prefixes).unwrap_or_else(|| format!("<{}>", esc_iri(d)));
+                format!("\"{}\"^^{}", esc(v, false), dt)
+            }
+        }
+        x => nt_term(x),
+    }
+}
+
+fn write_turtle(list: &[Triple], prefixes: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (p, b) in prefixes {
+        out.push_str(&format!("@prefix {}: <{}> .\n", p, b));
+    }
+    if !prefixes.is_empty() {
+        out.push('\n');
+    }
+    let type_iri = format!("{}type", RDF);
+    let mut subjects: Vec<&Term> = vec![];
+    for t in list {
+        if !subjects.contains(&&t.0) {
+            subjects.push(&t.0);
+        }
+    }
+    for s in subjects {
+        let mut preds: Vec<(&Term, Vec<&Term>)> = vec![];
+        for t in list.iter().filter(|t| &t.0 == s) {
+            match preds.iter_mut().find(|p| p.0 == &t.1) {
+                Some(p) => p.1.push(&t.2),
+                None => preds.push((&t.1, vec![&t.2])),
+            }
+        }
+        // rdf:type first, as people write it.
+        preds.sort_by_key(|p| !matches!(p.0, Term::Iri(v) if *v == type_iri));
+        out.push_str(&ttl_term(s, prefixes));
+        for (i, (p, objs)) in preds.iter().enumerate() {
+            let name = if matches!(p, Term::Iri(v) if *v == type_iri) { "a".to_string() } else { ttl_term(p, prefixes) };
+            let objs: Vec<String> = objs.iter().map(|o| ttl_term(o, prefixes)).collect();
+            out.push_str(&format!("{} {} {}", if i == 0 { "" } else { "    " }, name, objs.join(", ")));
+            out.push_str(if i + 1 == preds.len() { " .\n" } else { " ;\n" });
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn jsonld_value(t: &Term, prefixes: &BTreeMap<String, String>) -> Value {
+    let name = |i: &str| compact(i, prefixes).unwrap_or_else(|| i.to_string());
+    match t {
+        Term::Iri(v) => json!({ "@id": name(v) }),
+        Term::Blank(v) => json!({ "@id": format!("_:{}", v) }),
+        Term::Lit(v, None, None) => json!(v),
+        Term::Lit(v, _, Some(l)) => json!({ "@value": v, "@language": l }),
+        Term::Lit(v, Some(d), None) => {
+            if d == &format!("{}integer", XSD) {
+                if let Ok(i) = v.parse::<i64>() {
+                    return json!(i);
+                }
+            }
+            if d == &format!("{}boolean", XSD) && (v == "true" || v == "false") {
+                return json!(v == "true");
+            }
+            json!({ "@value": v, "@type": name(d) })
+        }
+    }
+}
+
+fn write_jsonld(list: &[Triple], prefixes: &BTreeMap<String, String>) -> Result<String, String> {
+    let type_iri = format!("{}type", RDF);
+    let name = |i: &str| compact(i, prefixes).unwrap_or_else(|| i.to_string());
+    let mut nodes: Vec<(Term, Map<String, Value>)> = vec![];
+    for (s, p, o) in list {
+        let at = match nodes.iter().position(|n| &n.0 == s) {
+            Some(i) => i,
+            None => {
+                let mut m = Map::new();
+                m.insert("@id".into(), json!(match s { Term::Blank(b) => format!("_:{}", b), Term::Iri(i) => name(i), Term::Lit(..) => String::new() }));
+                nodes.push((s.clone(), m));
+                nodes.len() - 1
+            }
+        };
+        let m = &mut nodes[at].1;
+        let (key, val) = match p {
+            Term::Iri(v) if *v == type_iri => ("@type".to_string(), match o { Term::Iri(t) => json!(name(t)), x => jsonld_value(x, prefixes) }),
+            Term::Iri(v) => (name(v), jsonld_value(o, prefixes)),
+            _ => continue,
+        };
+        match m.get_mut(&key) {
+            Some(Value::Array(a)) => a.push(val),
+            Some(old) => { let first = old.take(); *old = json!([first, val]); }
+            None => { m.insert(key, val); }
+        }
+    }
+    let ctx: Map<String, Value> = prefixes.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+    serde_json::to_string_pretty(&json!({ "@context": ctx, "@graph": nodes.into_iter().map(|n| Value::Object(n.1)).collect::<Vec<_>>() })).map_err(|e| e.to_string())
+}
+
+fn prefix_map(v: &Value) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (k, x) in v.as_object().into_iter().flatten() {
+        out.insert(k.clone(), x.as_str().ok_or(format!("the prefix {} must be text", k))?.to_string());
+    }
+    Ok(out)
+}
+
+/// Reads RDF: `format` is `turtle`, `ntriples` or `jsonld`, and `base` resolves relative IRIs (empty for none): `{ triples, prefixes, base, count }`. A term is `{ type, value, datatype, language }`.
+pub fn rdf_parse(text: &str, format: &str, base: &str) -> Result<Value, String> {
+    let text = text.trim_start_matches('\u{feff}');
+    let base_opt = Some(base.to_string()).filter(|b| !b.is_empty());
+    let (list, prefixes, end_base) = match format {
+        "turtle" | "ttl" => {
+            let mut p = P::new(text, base_opt, false);
+            p.turtle()?;
+            (p.out, p.prefixes, p.base)
+        }
+        "ntriples" | "nt" => {
+            let mut p = P::new(text, None, true);
+            p.ntriples()?;
+            (p.out, p.prefixes, None)
+        }
+        "jsonld" | "json-ld" => {
+            let (l, pre) = read_jsonld(text, base_opt.clone())?;
+            (l, pre, base_opt)
+        }
+        f => return Err(format!("`{}` is not a format: turtle, ntriples or jsonld", f)),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<&Triple> = list.iter().filter(|t| seen.insert((*t).clone())).collect();
+    Ok(json!({ "triples": unique.iter().map(|t| triple_json(t)).collect::<Vec<_>>(), "prefixes": prefixes, "base": end_base, "count": unique.len() }))
+}
+
+/// Writes triples as `turtle`, `ntriples` or `jsonld`. `prefixes` is a map of name to IRI; a term may be a plain IRI string, or `_:b1`.
+pub fn rdf_write(triples: Vec<serde_json::Value>, format: &str, prefixes: serde_json::Value) -> Result<String, String> {
+    let list = triples_in(&triples)?;
+    let pre = prefix_map(&prefixes)?;
+    match format {
+        "turtle" | "ttl" => Ok(write_turtle(&list, &pre)),
+        "ntriples" | "nt" => Ok(list.iter().map(|t| format!("{} {} {} .\n", nt_term(&t.0), nt_term(&t.1), nt_term(&t.2))).collect()),
+        "jsonld" | "json-ld" => write_jsonld(&list, &pre),
+        f => Err(format!("`{}` is not a format: turtle, ntriples or jsonld", f)),
+    }
+}
+
+fn term_matches(t: &Term, p: &Value, pre: &BTreeMap<String, String>) -> Result<bool, String> {
+    match p {
+        Value::Null => Ok(true),
+        Value::String(s) => {
+            if let Some(iri) = s.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+                return Ok(matches!(t, Term::Iri(v) if v == iri));
+            }
+            if s.starts_with("_:") {
+                return Ok(matches!(t, Term::Blank(v) if *v == s[2..]));
+            }
+            let full = s.split_once(':').and_then(|(a, b)| pre.get(a).map(|x| format!("{}{}", x, b)));
+            Ok(match t {
+                Term::Iri(v) => v == s || full.as_ref() == Some(v),
+                Term::Lit(v, ..) => v == s,
+                Term::Blank(_) => false,
+            })
+        }
+        Value::Object(_) => Ok(*t == Term::from_json(p)?),
+        x => Ok(*t == Term::from_json(x)?),
+    }
+}
+
+/// Triples that fit a pattern: each of `subject`, `predicate`, `object` is null for anything, an IRI, `foaf:name` with `prefixes`, `<iri>`, `_:b0`, plain text for a literal, or a term.
+pub fn rdf_match(triples: Vec<serde_json::Value>, subject: serde_json::Value, predicate: serde_json::Value, object: serde_json::Value, prefixes: serde_json::Value) -> Result<Vec<Value>, String> {
+    let list = triples_in(&triples)?;
+    let pre = prefix_map(&prefixes)?;
+    let mut out = vec![];
+    for t in &list {
+        if term_matches(&t.0, &subject, &pre)? && term_matches(&t.1, &predicate, &pre)? && term_matches(&t.2, &object, &pre)? {
+            out.push(triple_json(t));
+        }
+    }
+    Ok(out)
+}
+
+/// One subject's properties as a map from predicate to values, with literals as plain values and lists of `rdf:first`/`rdf:rest` followed.
+pub fn rdf_describe(triples: Vec<serde_json::Value>, subject: &str, prefixes: serde_json::Value) -> Result<Value, String> {
+    let list = triples_in(&triples)?;
+    let pre = prefix_map(&prefixes)?;
+    let key = json!(subject);
+    let (first, rest, nil) = (format!("{}first", RDF), format!("{}rest", RDF), format!("{}nil", RDF));
+    let mut m = Map::new();
+    let plain = |t: &Term| -> Value {
+        match t {
+            Term::Iri(v) => json!(compact(v, &pre).unwrap_or_else(|| v.clone())),
+            Term::Blank(v) => json!(format!("_:{}", v)),
+            Term::Lit(v, Some(d), None) if *d == format!("{}integer", XSD) => v.parse::<i64>().map(|i| json!(i)).unwrap_or(json!(v)),
+            Term::Lit(v, Some(d), None) if *d == format!("{}boolean", XSD) => json!(v == "true"),
+            Term::Lit(v, Some(d), None) if *d == format!("{}decimal", XSD) || *d == format!("{}double", XSD) => v.parse::<f64>().map(|f| json!(f)).unwrap_or(json!(v)),
+            Term::Lit(v, ..) => json!(v),
+        }
+    };
+    for t in &list {
+        if !term_matches(&t.0, &key, &pre)? {
+            continue;
+        }
+        let k = match &t.1 { Term::Iri(v) => compact(v, &pre).unwrap_or_else(|| v.clone()), _ => continue };
+        // A collection comes back as a list.
+        let v = if list.iter().any(|x| x.0 == t.2 && matches!(&x.1, Term::Iri(p) if *p == first)) {
+            let mut items = vec![];
+            let mut cell = t.2.clone();
+            for _ in 0..100_000 {
+                if matches!(&cell, Term::Iri(n) if *n == nil) {
+                    break;
+                }
+                if let Some(x) = list.iter().find(|x| x.0 == cell && matches!(&x.1, Term::Iri(p) if *p == first)) {
+                    items.push(plain(&x.2));
+                }
+                match list.iter().find(|x| x.0 == cell && matches!(&x.1, Term::Iri(p) if *p == rest)) {
+                    Some(x) => cell = x.2.clone(),
+                    None => break,
+                }
+            }
+            Value::Array(items)
+        } else {
+            plain(&t.2)
+        };
+        match m.get_mut(&k) {
+            Some(Value::Array(a)) if !v.is_array() => a.push(v),
+            Some(old) => { let f = old.take(); *old = json!([f, v]); }
+            None => { m.insert(k, v); }
+        }
+    }
+    Ok(Value::Object(m))
+}

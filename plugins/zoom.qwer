@@ -1,0 +1,247 @@
+//! Zoom's API without an SDK: Server-to-Server OAuth with its token kept until it runs out, meetings made, read, changed and ended, lists through next_page_token, meeting UUIDs double-encoded when Zoom wants that, daily and per-second limits told apart, and webhooks: the x-zm-signature checked and the endpoint.url_validation challenge answered.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET are the Server-to-Server OAuth app's;
+// ZOOM_API_URL the API (https://api.zoom.us/v2 when not set), ZOOM_OAUTH_URL the sign-in
+// (https://zoom.us when not set).
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("ZOOM_API_URL").unwrap_or_else(|| "https://api.zoom.us/v2".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn token(force: bool) -> Result<String, String> {
+    let mut g = TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let (false, Some((t, until))) = (force, g.as_ref()) {
+        if *until > now() + 60 {
+            return Ok(t.clone());
+        }
+    }
+    let account = setting("ZOOM_ACCOUNT_ID").ok_or("ZOOM_ACCOUNT_ID is not set")?;
+    let id = setting("ZOOM_CLIENT_ID").ok_or("ZOOM_CLIENT_ID is not set")?;
+    let secret = setting("ZOOM_CLIENT_SECRET").ok_or("ZOOM_CLIENT_SECRET is not set")?;
+    let host = setting("ZOOM_OAUTH_URL").unwrap_or_else(|| "https://zoom.us".into());
+    let url = format!("{}/oauth/token", host.trim_end_matches('/'));
+    let auth = format!("Basic {}", STANDARD.encode(format!("{}:{}", id, secret)));
+    let res = ureq::post(&url).timeout(Duration::from_secs(20)).set("Authorization", &auth).send_form(&[("grant_type", "account_credentials"), ("account_id", &account)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("Zoom refused the sign-in, {}: {}", c, v["reason"].as_str().or(v["error"].as_str()).unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach Zoom's sign-in at {}: {}", url, e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let t = v["access_token"].as_str().ok_or("Zoom gave no access_token")?.to_string();
+    *g = Some((t.clone(), now() + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(t)
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let Some(m) = v["message"].as_str() else {
+        return format!("Zoom {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    };
+    let code = v["code"].as_i64().map_or(String::new(), |c| format!(" (code {})", c));
+    let fields: Vec<String> = v["errors"].as_array().into_iter().flatten().map(|e| format!("{}: {}", e["field"].as_str().unwrap_or("?"), e["message"].as_str().unwrap_or(""))).collect();
+    let tail = if fields.is_empty() { String::new() } else { format!(": {}", fields.join("; ")) };
+    format!("Zoom {}: {}{}{}", status, m, code, tail)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut renewed = false;
+    let mut waited = 0u32;
+    loop {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token(false)?)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Zoom's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                token(true)?;
+            }
+            Err(ureq::Error::Status(429, r)) => {
+                let kind = r.header("X-RateLimit-Type").unwrap_or("").to_string();
+                // A per-second limit is short; a daily one says in Retry-After when it resets.
+                if kind.to_lowercase().contains("daily") {
+                    return Err(format!("Zoom's daily limit is reached, until {}", r.header("Retry-After").unwrap_or("tomorrow")));
+                }
+                if waited == 4 {
+                    return Err(error_text(429, &r.into_string().unwrap_or_default()));
+                }
+                std::thread::sleep(Duration::from_millis(500u64 << waited));
+                waited += 1;
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Zoom at {}: {}", api(), e)),
+        }
+    }
+}
+
+/// Any other call: `method`, `path` like "/users/me/settings", `body` or null.
+pub fn zoom_call(method: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) })
+}
+
+fn walk(path: &str, field: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut base = String::from("page_size=300");
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            base.push_str(&format!("&{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+        }
+    }
+    let mut out = vec![];
+    let mut next = String::new();
+    loop {
+        let q = if next.is_empty() { base.clone() } else { format!("{}&next_page_token={}", base, enc(&next)) };
+        let v = call("GET", &format!("{}?{}", path, q), None)?;
+        out.extend(v[field].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["next_page_token"].as_str() {
+            Some(t) if !t.is_empty() => next = t.to_string(),
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// A meeting UUID ready for a path: encoded once, or twice when it starts with `/` or holds `//`, as Zoom demands.
+pub fn zoom_uuid(uuid: &str) -> String {
+    if uuid.starts_with('/') || uuid.contains("//") { enc(&enc(uuid)) } else { enc(uuid) }
+}
+
+/// Users of the account through every page; `status` is "active", "inactive", "pending" or "", and `max_items` caps them (0: all).
+pub fn zoom_users(status: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let f = if status.is_empty() { json!({}) } else { json!({ "status": status }) };
+    walk("/users", "users", &f, max_items)
+}
+
+/// Schedules a meeting for `user` ("me" means the app's account owner, or give an email or id). `fields` are Zoom's: `topic`, `start_time` (like "2026-11-20T10:00:00Z"), `duration` in minutes, `timezone`, `password` (at most 10 characters), `settings`. Type 2 unless given. Gives it, with `join_url`.
+pub fn zoom_meeting_create(user: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = if fields.is_object() { fields } else { json!({}) };
+    if b["password"].as_str().map_or(false, |p| p.chars().count() > 10) {
+        return Err("a Zoom meeting password is at most 10 characters".into());
+    }
+    if let Some(t) = b["start_time"].as_str() {
+        let shape = t.len() >= 19 && t.as_bytes()[10] == b'T';
+        if !shape {
+            return Err(format!("start_time `{}` is not a date and time, like 2026-11-20T10:00:00Z", t));
+        }
+        if !t.ends_with('Z') && b["timezone"].is_null() {
+            return Err("a start_time without Z needs a `timezone`, or Zoom reads it in the user's".into());
+        }
+    }
+    if b.get("type").is_none() {
+        b["type"] = json!(2);
+    }
+    call("POST", &format!("/users/{}/meetings", enc(user)), Some(&b))
+}
+
+/// One meeting by id.
+pub fn zoom_meeting(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/meetings/{}", id), None)
+}
+
+/// Changes a meeting; Zoom's answer is empty, so this gives true.
+pub fn zoom_meeting_update(id: i64, fields: serde_json::Value) -> Result<bool, String> {
+    call("PATCH", &format!("/meetings/{}", id), Some(&fields))?;
+    Ok(true)
+}
+
+/// Deletes a meeting; `notify` emails the host and those registered.
+pub fn zoom_meeting_delete(id: i64, notify: bool) -> Result<bool, String> {
+    call("DELETE", &format!("/meetings/{}?schedule_for_reminder={}&cancel_meeting_reminder={}", id, notify, notify), None)?;
+    Ok(true)
+}
+
+/// Ends a live meeting for everyone.
+pub fn zoom_meeting_end(id: i64) -> Result<bool, String> {
+    call("PUT", &format!("/meetings/{}/status", id), Some(&json!({ "action": "end" })))?;
+    Ok(true)
+}
+
+/// A user's meetings through every page: `kind` is "scheduled", "live", "upcoming"..., `max_items` caps them (0: all).
+pub fn zoom_meetings(user: &str, kind: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/users/{}/meetings", enc(user)), "meetings", &json!({ "type": if kind.is_empty() { "scheduled" } else { kind } }), max_items)
+}
+
+/// Who attended a finished meeting, by its UUID (encoded as Zoom needs), through every page.
+pub fn zoom_past_participants(uuid: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/past_meetings/{}/participants", zoom_uuid(uuid)), "participants", &Value::Null, max_items)
+}
+
+fn hmac_for(secret: &str, text: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(text.as_bytes());
+    m
+}
+
+/// The x-zm-signature value for `body` at `timestamp`, for tests: `v0=` and the hex HMAC-SHA256 of `v0:timestamp:body`.
+pub fn zoom_webhook_sign(body: &str, timestamp: &str, secret: &str) -> String {
+    format!("v0={}", hex::encode(hmac_for(secret, &format!("v0:{}:{}", timestamp, body)).finalize().into_bytes()))
+}
+
+/// The answer to `endpoint.url_validation`: { plainToken, encryptedToken }, the hex HMAC-SHA256 of the plain token by the app's secret token.
+pub fn zoom_url_validation(plain_token: &str, secret: &str) -> serde_json::Value {
+    json!({ "plainToken": plain_token, "encryptedToken": hex::encode(hmac_for(secret, plain_token).finalize().into_bytes()) })
+}
+
+/// Takes a webhook: `headers` the request's, `body` raw, `secret` the app's secret token, `tolerance_seconds` how old a timestamp may be (0 skips that). The signature is checked first. Gives { challenge } for an endpoint.url_validation, to send back as the JSON answer within 3 s; else { event, payload, event_ts }.
+pub fn zoom_webhook(headers: std::collections::HashMap<String, serde_json::Value>, body: &str, secret: &str, tolerance_seconds: i64) -> Result<serde_json::Value, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.as_str()).map(str::to_string);
+    let sig = h("x-zm-signature").ok_or("no x-zm-signature header: this did not come from Zoom")?;
+    let ts = h("x-zm-request-timestamp").ok_or("no x-zm-request-timestamp header")?;
+    let at: i64 = ts.parse().map_err(|_| format!("the timestamp `{}` is not a number", ts))?;
+    if tolerance_seconds > 0 && (now() - at).abs() > tolerance_seconds {
+        return Err(format!("the webhook was signed {} s ago, more than the {} s allowed", (now() - at).abs(), tolerance_seconds));
+    }
+    let raw = sig.strip_prefix("v0=").and_then(|s| hex::decode(s).ok()).ok_or("the x-zm-signature header is not v0= and hex")?;
+    if hmac_for(secret, &format!("v0:{}:{}", ts, body)).verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match: a wrong secret token, or the body was changed (use the raw body)".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    if v["event"] == "endpoint.url_validation" {
+        let plain = v["payload"]["plainToken"].as_str().ok_or("the validation has no plainToken")?;
+        return Ok(json!({ "challenge": zoom_url_validation(plain, secret) }));
+    }
+    Ok(json!({ "event": v["event"], "payload": v["payload"], "event_ts": v["event_ts"] }))
+}

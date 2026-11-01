@@ -1,0 +1,350 @@
+//! Ethereum addresses and signatures in pure Rust: EIP-55 checksums, addresses from public keys, EIP-681 payment URIs, Keccak-256, and personal_sign messages signed, recovered and verified on secp256k1.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+//! sha3 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use serde_json::{json, Map, Value};
+use sha3::{Digest, Keccak256};
+
+fn keccak(b: &[u8]) -> [u8; 32] {
+    Keccak256::digest(b).into()
+}
+
+fn unhex(s: &str, what: &str) -> Result<Vec<u8>, String> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or(t.strip_prefix("0X")).unwrap_or(t);
+    hex::decode(t).map_err(|_| format!("the {} is not hex: `{}`", what, s))
+}
+
+fn checksum(lower: &str) -> String {
+    let h = hex::encode(keccak(lower.as_bytes()));
+    let mut out = String::from("0x");
+    for (c, n) in lower.chars().zip(h.chars()) {
+        out.push(if n.to_digit(16).unwrap_or(0) >= 8 { c.to_ascii_uppercase() } else { c });
+    }
+    out
+}
+
+fn body(address: &str) -> Result<&str, String> {
+    let a = address.trim();
+    let b = a.strip_prefix("0x").or(a.strip_prefix("0X")).ok_or(format!("`{}` does not start with 0x", address))?;
+    if b.len() != 40 {
+        return Err(format!("`{}` has {} hex digits; an address has 40", address, b.len()));
+    }
+    if let Some(c) = b.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!("`{}` has `{}`, which is not a hex digit", address, c));
+    }
+    Ok(b)
+}
+
+/// An address with its EIP-55 capitals: "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359" is "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359".
+pub fn eth_checksum(address: &str) -> Result<String, String> {
+    Ok(checksum(&body(address)?.to_lowercase()))
+}
+
+/// An address checked: { valid, address, checksummed, reason }. All small or all capital letters are valid but carry no checksum, so `checksummed` is false; mixed case must match EIP-55, and `reason` shows the right spelling if not.
+pub fn eth_check(address: &str) -> Value {
+    let b = match body(address) {
+        Ok(b) => b,
+        Err(e) => return json!({ "valid": false, "address": null, "checksummed": false, "reason": e }),
+    };
+    let right = checksum(&b.to_lowercase());
+    let mixed = b.bytes().any(|c| c.is_ascii_lowercase()) && b.bytes().any(|c| c.is_ascii_uppercase());
+    if mixed && right[2..] != *b {
+        return json!({ "valid": false, "address": null, "checksummed": false, "reason": format!("the EIP-55 checksum fails: it should be {}", right) });
+    }
+    json!({ "valid": true, "address": right, "checksummed": mixed, "reason": null })
+}
+
+/// Keccak-256 as Ethereum uses it, not SHA3-256: of text, or of bytes given as `0x...` hex. Gives `0x` and 64 digits.
+pub fn eth_keccak(data: &str) -> Result<String, String> {
+    let d = if data.starts_with("0x") { unhex(data, "data")? } else { data.as_bytes().to_vec() };
+    Ok(format!("0x{}", hex::encode(keccak(&d))))
+}
+
+fn address_of(key: &VerifyingKey) -> String {
+    let p = key.to_encoded_point(false);
+    let h = keccak(&p.as_bytes()[1..]);
+    checksum(&hex::encode(&h[12..]))
+}
+
+/// The address of a public key in hex: 65 bytes starting 04, the 64 without it, or 33 compressed. A point not on the curve is an error value.
+pub fn eth_from_public_key(public_key: &str) -> Result<String, String> {
+    let mut k = unhex(public_key, "public key")?;
+    if k.len() == 64 {
+        k.insert(0, 4);
+    }
+    if !matches!(k.len(), 33 | 65) {
+        return Err(format!("a public key is 33, 64 or 65 bytes; this is {}", k.len()));
+    }
+    let key = VerifyingKey::from_sec1_bytes(&k).map_err(|_| "that public key is not a point on secp256k1".to_string())?;
+    Ok(address_of(&key))
+}
+
+fn personal_hash(message: &[u8]) -> [u8; 32] {
+    let mut d = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
+    d.extend_from_slice(message);
+    keccak(&d)
+}
+
+fn msg_bytes(message: &str) -> Result<Vec<u8>, String> {
+    if message.starts_with("0x") && message.len() % 2 == 0 && message[2..].bytes().all(|b| b.is_ascii_hexdigit()) && message.len() > 2 {
+        return unhex(message, "message");
+    }
+    Ok(message.as_bytes().to_vec())
+}
+
+/// The hash personal_sign signs: keccak of "\x19Ethereum Signed Message:\n", the length in bytes, and the message. A message of `0x` hex is taken as those bytes, as wallets do.
+pub fn eth_personal_hash(message: &str) -> Result<String, String> {
+    Ok(format!("0x{}", hex::encode(personal_hash(&msg_bytes(message)?))))
+}
+
+struct Parts {
+    sig: Signature,
+    recovery: u8,
+    high_s: bool,
+}
+
+fn parts(signature: &str) -> Result<Parts, String> {
+    let b = unhex(signature, "signature")?;
+    if b.len() != 65 {
+        return Err(format!("a signature is 65 bytes (r, s, v); this is {}", b.len()));
+    }
+    let v = match b[64] {
+        0 | 1 => b[64],
+        27 | 28 => b[64] - 27,
+        x => return Err(format!("v is {}; personal_sign gives 27 or 28 (or 0 or 1)", x)),
+    };
+    let sig = Signature::from_slice(&b[..64]).map_err(|_| "r or s is out of range for secp256k1".to_string())?;
+    // A high s is the same signature's twin (EIP-2): recover with it normalized and the odd bit flipped.
+    let (sig, recovery, high_s) = match sig.normalize_s() {
+        Some(low) => (low, v ^ 1, true),
+        None => (sig, v, false),
+    };
+    Ok(Parts { sig, recovery, high_s })
+}
+
+fn recover(hash: &[u8; 32], p: &Parts) -> Result<VerifyingKey, String> {
+    let id = RecoveryId::from_byte(p.recovery).ok_or("bad recovery id")?;
+    VerifyingKey::recover_from_prehash(hash, &p.sig, id).map_err(|_| "no public key fits that signature".to_string())
+}
+
+/// Who signed a message with personal_sign: { address, public_key, hash, high_s }. `high_s` true means a signature Ethereum transactions refuse under EIP-2, though recovery still gives an address.
+pub fn eth_recover(message: &str, signature: &str) -> Result<Value, String> {
+    let p = parts(signature)?;
+    let hash = personal_hash(&msg_bytes(message)?);
+    let key = recover(&hash, &p)?;
+    Ok(json!({
+        "address": address_of(&key),
+        "public_key": format!("0x{}", hex::encode(key.to_encoded_point(false).as_bytes())),
+        "hash": format!("0x{}", hex::encode(hash)),
+        "high_s": p.high_s,
+    }))
+}
+
+/// Who signed a 32-byte hash, for signatures not made by personal_sign (EIP-712 digests, for instance): gives the address.
+pub fn eth_recover_hash(hash: &str, signature: &str) -> Result<String, String> {
+    let h: [u8; 32] = unhex(hash, "hash")?.try_into().map_err(|_| "a hash is 32 bytes".to_string())?;
+    Ok(address_of(&recover(&h, &parts(signature)?)?))
+}
+
+/// Whether a message was signed by an address, for "sign in with a wallet". false for someone else's signature; an error value only when the address or signature is malformed.
+pub fn eth_verify(message: &str, signature: &str, address: &str) -> Result<bool, String> {
+    let want = checksum(&body(address)?.to_lowercase());
+    let p = parts(signature)?;
+    Ok(match recover(&personal_hash(&msg_bytes(message)?), &p) {
+        Ok(k) => !p.high_s && address_of(&k) == want,
+        Err(_) => false,
+    })
+}
+
+fn signing_key(private_key: &str) -> Result<SigningKey, String> {
+    let k = unhex(private_key, "private key")?;
+    SigningKey::from_slice(&k).map_err(|_| "a private key is 32 bytes, from 1 to the order of secp256k1".to_string())
+}
+
+/// A message signed the personal_sign way, with deterministic RFC 6979 nonces: { signature, address, r, s, v }. Read the key from env, never from a request.
+pub fn eth_sign(message: &str, private_key: &str) -> Result<Value, String> {
+    let key = signing_key(private_key)?;
+    let hash = personal_hash(&msg_bytes(message)?);
+    let (sig, id) = key.sign_prehash_recoverable(&hash).map_err(|e| e.to_string())?;
+    let v = 27 + id.to_byte();
+    let mut raw = sig.to_bytes().to_vec();
+    raw.push(v);
+    Ok(json!({
+        "signature": format!("0x{}", hex::encode(&raw)),
+        "address": address_of(key.verifying_key()),
+        "r": format!("0x{}", hex::encode(&raw[..32])),
+        "s": format!("0x{}", hex::encode(&raw[32..64])),
+        "v": v,
+    }))
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (vec![], 0);
+    while i < b.len() {
+        match s.get(i + 1..i + 3).filter(|_| b[i] == b'%').and_then(|x| u8::from_str_radix(x, 16).ok()) {
+            Some(h) => {
+                out.push(h);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// EIP-681 numbers: decimal with an optional exponent, "2.014e18", or hex "0x...", all exact.
+fn number(text: &str) -> Result<String, String> {
+    let t = text.trim();
+    if let Some(h) = t.strip_prefix("0x") {
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("`{}` is not a number", text));
+        }
+        let mut digits = vec![0u8];
+        for c in h.chars() {
+            let mut carry = c.to_digit(16).unwrap();
+            for d in digits.iter_mut() {
+                let v = *d as u32 * 16 + carry;
+                *d = (v % 10) as u8;
+                carry = v / 10;
+            }
+            while carry > 0 {
+                digits.push((carry % 10) as u8);
+                carry /= 10;
+            }
+        }
+        return Ok(digits.iter().rev().map(|d| (d + 48) as char).collect());
+    }
+    let low = t.to_lowercase();
+    let (m, e) = low.split_once('e').unwrap_or((&low, "0"));
+    let e: i64 = e.parse().map_err(|_| format!("`{}` is not a number", text))?;
+    let (w, f) = m.split_once('.').unwrap_or((m, ""));
+    if w.is_empty() || !w.bytes().all(|b| b.is_ascii_digit()) || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not a number", text));
+    }
+    let shift = e - f.len() as i64;
+    if shift.abs() > 100 {
+        return Err(format!("`{}` is out of range", text));
+    }
+    let all = format!("{}{}", w, f);
+    let mut s = if shift >= 0 {
+        all + &"0".repeat(shift as usize)
+    } else {
+        let cut = shift.unsigned_abs() as usize;
+        if cut >= all.len() || all[all.len() - cut..].bytes().any(|b| b != b'0') {
+            return Err(format!("`{}` is not a whole number of the smallest unit", text));
+        }
+        all[..all.len() - cut].to_string()
+    };
+    s = s.trim_start_matches('0').to_string();
+    Ok(if s.is_empty() { "0".into() } else { s })
+}
+
+fn target(t: &str) -> Result<Value, String> {
+    if t.starts_with("0x") || t.starts_with("0X") {
+        let c = eth_check(t);
+        if c["valid"] != json!(true) {
+            return Err(c["reason"].as_str().unwrap_or("bad address").to_string());
+        }
+        return Ok(c["address"].clone());
+    }
+    // An ENS name; a plugin cannot resolve one without a node, so it is handed over as it is.
+    if t.contains('.') && t.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)) {
+        return Ok(json!(t));
+    }
+    Err(format!("`{}` is neither an address nor an ENS name", t))
+}
+
+/// An EIP-681 `ethereum:` URI read: { prefix, target, chain_id, function, value, gas, gas_limit, gas_price, params, token_transfer }. `2.014e18` amounts become exact decimal text. For the ERC-20 `transfer` function, `token_transfer` has { token, to, amount }.
+pub fn eth_uri_parse(uri: &str) -> Result<Value, String> {
+    let u = uri.trim();
+    let rest = u.strip_prefix("ethereum:").ok_or("an EIP-681 URI starts with `ethereum:`")?;
+    let (main, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (main, function) = match main.split_once('/') {
+        Some((m, f)) => (m, Some(f)),
+        None => (main, None),
+    };
+    let (main, chain) = match main.rsplit_once('@') {
+        Some((m, c)) => (m, Some(c.parse::<u64>().map_err(|_| format!("the chain id `{}` is not a number", c))?)),
+        None => (main, None),
+    };
+    let (prefix, addr) = match main.split_once('-') {
+        Some((p, a)) if p.chars().all(|c| c.is_ascii_alphabetic()) && (a.starts_with("0x") || a.contains('.')) => (Some(p), a),
+        _ => (None, main),
+    };
+    let mut out = Map::new();
+    out.insert("prefix".into(), json!(prefix.unwrap_or("pay")));
+    out.insert("target".into(), target(addr)?);
+    out.insert("chain_id".into(), json!(chain.unwrap_or(1)));
+    out.insert("function".into(), json!(function));
+    for k in ["value", "gas", "gas_limit", "gas_price"] {
+        out.insert(k.into(), Value::Null);
+    }
+    let mut params = vec![];
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').ok_or(format!("`{}` has no value", pair))?;
+        let v = pct_decode(v);
+        match k {
+            "value" => {
+                out.insert("value".into(), json!(number(&v)?));
+            }
+            "gas" | "gasLimit" | "gasPrice" => {
+                out.insert(match k { "gas" => "gas", "gasLimit" => "gas_limit", _ => "gas_price" }.into(), json!(number(&v)?));
+            }
+            _ => {
+                let val = if k.starts_with("uint") || k.starts_with("int") { json!(number(&v)?) } else if k == "address" { target(&v)? } else { json!(v) };
+                params.push(json!({ "type": k, "value": val }));
+            }
+        }
+    }
+    let transfer = if function == Some("transfer") {
+        let to = params.iter().find(|p| p["type"] == "address").map(|p| p["value"].clone());
+        let amount = params.iter().find(|p| p["type"] == "uint256").map(|p| p["value"].clone());
+        match (to, amount) {
+            (Some(to), Some(amount)) => json!({ "token": out["target"], "to": to, "amount": amount }),
+            _ => return Err("an ERC-20 `transfer` needs `address=` and `uint256=`".into()),
+        }
+    } else {
+        Value::Null
+    };
+    out.insert("params".into(), Value::Array(params));
+    out.insert("token_transfer".into(), transfer);
+    Ok(Value::Object(out))
+}
+
+/// An EIP-681 URI from { to, chain_id, value (wei as text) } for a plain payment, or { token, to, amount, chain_id } for an ERC-20 transfer. Addresses are written with their checksum.
+pub fn eth_uri_build(request: serde_json::Value) -> Result<String, String> {
+    let text = |k: &str| match request.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    let to = text("to").ok_or("the request needs `to`")?;
+    let to = target(&to)?;
+    let to = to.as_str().unwrap_or_default();
+    let chain = match request.get("chain_id").and_then(|v| v.as_u64()) {
+        Some(1) | None => String::new(),
+        Some(c) => format!("@{}", c),
+    };
+    if let Some(token) = text("token") {
+        let token = target(&token)?;
+        let amount = number(&text("amount").ok_or("an ERC-20 transfer needs `amount` in the token's smallest unit")?)?;
+        return Ok(format!("ethereum:{}{}/transfer?address={}&uint256={}", token.as_str().unwrap_or_default(), chain, to, amount));
+    }
+    let q = match text("value") {
+        Some(v) => format!("?value={}", number(&v)?),
+        None => String::new(),
+    };
+    Ok(format!("ethereum:{}{}{}", to, chain, q))
+}

@@ -1,0 +1,328 @@
+//! USB devices from a program, in pure Rust (`nusb`): what is plugged in with vendor, product, serial, speed and interfaces, vendor and class names from a small built-in table, a device's descriptors read and parsed, and bulk and control transfers where the system lets a program have the device.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! nusb = "0.2"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use nusb::descriptors::{ConfigurationDescriptor, TransferType};
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Direction, In, Out, Recipient};
+use nusb::MaybeFuture;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+const VENDORS: &[(u16, &str)] = &[
+    (0x03f0, "HP"), (0x0403, "FTDI"), (0x0424, "Microchip (SMSC)"), (0x045e, "Microsoft"), (0x046d, "Logitech"), (0x0483, "STMicroelectronics"),
+    (0x04a9, "Canon"), (0x04b8, "Seiko Epson"), (0x04d8, "Microchip"), (0x04e8, "Samsung"), (0x04f9, "Brother"), (0x058f, "Alcor Micro"),
+    (0x05ac, "Apple"), (0x05e3, "Genesys Logic"), (0x067b, "Prolific"), (0x0781, "SanDisk"), (0x0951, "Kingston"), (0x0a12, "Cambridge Silicon Radio"),
+    (0x0a5c, "Broadcom"), (0x0b05, "ASUS"), (0x0bda, "Realtek"), (0x0c45, "Microdia"), (0x0fd9, "Elgato"), (0x10c4, "Silicon Labs"),
+    (0x1209, "pid.codes"), (0x1366, "SEGGER"), (0x1050, "Yubico"), (0x16c0, "Van Ooijen Technische Informatica"), (0x17ef, "Lenovo"), (0x18d1, "Google"),
+    (0x1a40, "Terminus Technology"), (0x1a86, "QinHeng (CH340)"), (0x1d6b, "Linux Foundation"), (0x2109, "VIA Labs"), (0x2341, "Arduino"), (0x239a, "Adafruit"),
+    (0x2e8a, "Raspberry Pi"), (0x303a, "Espressif"), (0x413c, "Dell"), (0x8086, "Intel"),
+];
+
+fn class_name(c: u8) -> &'static str {
+    match c {
+        0x00 => "defined by each interface",
+        0x01 => "audio",
+        0x02 => "communications",
+        0x03 => "human interface",
+        0x05 => "physical",
+        0x06 => "image",
+        0x07 => "printer",
+        0x08 => "mass storage",
+        0x09 => "hub",
+        0x0a => "CDC data",
+        0x0b => "smart card",
+        0x0d => "content security",
+        0x0e => "video",
+        0x0f => "personal healthcare",
+        0x10 => "audio/video",
+        0x11 => "billboard",
+        0x12 => "USB Type-C bridge",
+        0xdc => "diagnostic",
+        0xe0 => "wireless",
+        0xef => "miscellaneous",
+        0xfe => "application specific",
+        0xff => "vendor specific",
+        _ => "unknown",
+    }
+}
+
+fn vendor(id: u16) -> Option<&'static str> {
+    VENDORS.iter().find(|v| v.0 == id).map(|v| v.1)
+}
+
+fn id_of(s: &str) -> Result<u16, String> {
+    u16::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("`{}` is not a USB id: four hex digits", s))
+}
+
+struct Filter {
+    vendor: Option<u16>,
+    product: Option<u16>,
+    serial: Option<String>,
+    class: Option<u8>,
+}
+
+impl Filter {
+    fn name(&self) -> String {
+        let id = |x: Option<u16>| x.map_or("*".to_string(), |v| format!("{:04x}", v));
+        let mut t = format!("{}:{}", id(self.vendor), id(self.product));
+        if let Some(s) = &self.serial {
+            t.push_str(&format!(" serial {}", s));
+        }
+        t
+    }
+}
+
+// "1a86:7523", or a map { vendor, product, serial, class }, or null for all of them.
+fn filter_of(v: &Value) -> Result<Filter, String> {
+    let mut f = Filter { vendor: None, product: None, serial: None, class: None };
+    match v {
+        Value::Null => {}
+        Value::String(s) if s.is_empty() => {}
+        Value::String(s) => {
+            let (a, b) = s.split_once(':').ok_or(format!("`{}` is not vendor:product", s))?;
+            f.vendor = Some(id_of(a)?);
+            f.product = Some(id_of(b)?);
+        }
+        Value::Object(m) => {
+            for k in m.keys() {
+                if !["vendor", "product", "serial", "class"].contains(&k.as_str()) {
+                    return Err(format!("a device filter has no `{}`: it takes vendor, product, serial, class", k));
+                }
+            }
+            let hexish = |k: &str| -> Result<Option<u16>, String> {
+                match m.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => id_of(s).map(Some),
+                    Some(Value::Number(n)) => n.as_u64().filter(|x| *x <= 0xffff).map(|x| Some(x as u16)).ok_or(format!("{} is not a USB id", n)),
+                    Some(x) => Err(format!("{} is not a USB id", x)),
+                }
+            };
+            f.vendor = hexish("vendor")?;
+            f.product = hexish("product")?;
+            f.serial = m.get("serial").and_then(|x| x.as_str()).map(String::from);
+            f.class = m.get("class").and_then(|x| x.as_u64()).map(|x| x as u8);
+        }
+        _ => return Err("give a device as \"vendor:product\" or a map".into()),
+    }
+    Ok(f)
+}
+
+fn matches(d: &nusb::DeviceInfo, f: &Filter) -> bool {
+    f.vendor.map_or(true, |v| v == d.vendor_id())
+        && f.product.map_or(true, |v| v == d.product_id())
+        && f.serial.as_ref().map_or(true, |s| d.serial_number() == Some(s.as_str()))
+        && f.class.map_or(true, |c| c == d.class() || d.interfaces().any(|i| i.class() == c))
+}
+
+fn devices(f: &Filter) -> Result<Vec<nusb::DeviceInfo>, String> {
+    match nusb::list_devices().wait() {
+        Ok(l) => Ok(l.filter(|d| matches(d, f)).collect()),
+        // A machine with no USB at all: containers, mostly.
+        Err(e) if e.kind() == nusb::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(format!("cannot list USB devices: {}", e)),
+    }
+}
+
+fn bcd(v: u16) -> String {
+    format!("{:x}.{:02x}", v >> 8, v & 255)
+}
+
+fn describe(d: &nusb::DeviceInfo) -> Value {
+    let name = d.manufacturer_string().map(String::from).or(vendor(d.vendor_id()).map(String::from));
+    let interfaces: Vec<Value> = d
+        .interfaces()
+        .map(|i| json!({ "number": i.interface_number(), "class": i.class(), "class_name": class_name(i.class()), "subclass": i.subclass(), "protocol": i.protocol(), "name": i.interface_string() }))
+        .collect();
+    json!({
+        "id": format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
+        "vendor_id": format!("{:04x}", d.vendor_id()),
+        "product_id": format!("{:04x}", d.product_id()),
+        "vendor": name,
+        "product": d.product_string(),
+        "serial": d.serial_number(),
+        "class": d.class(),
+        "class_name": class_name(d.class()),
+        "speed": d.speed().map(|s| format!("{:?}", s).to_lowercase()),
+        "usb_version": bcd(d.usb_version()),
+        "device_version": bcd(d.device_version()),
+        "address": d.device_address(),
+        "interfaces": interfaces,
+    })
+}
+
+/// The USB devices plugged in, none being an empty list. `filter` is null, "vendor:product", or `{ vendor, product, serial, class }`. Each has `id`, `vendor`, `product`, `serial`, `class_name`, `speed`, `usb_version` and `interfaces`.
+pub fn usb_list(filter: serde_json::Value) -> Result<Vec<Value>, String> {
+    Ok(devices(&filter_of(&filter)?)?.iter().map(describe).collect())
+}
+
+/// How many devices match, which is often all a program wants to know: is the printer plugged in?
+pub fn usb_count(filter: serde_json::Value) -> Result<i64, String> {
+    Ok(devices(&filter_of(&filter)?)?.len() as i64)
+}
+
+/// The vendor's name from the built-in table, null when it is not there: `usb_vendor_name("0403")` is "FTDI".
+pub fn usb_vendor_name(id: &str) -> Result<Option<String>, String> {
+    Ok(vendor(id_of(id)?).map(String::from))
+}
+
+/// A device or interface class number's name: `usb_class_name(8)` is "mass storage".
+pub fn usb_class_name(class: i64) -> Result<String, String> {
+    u8::try_from(class).map(|c| class_name(c).to_string()).map_err(|_| format!("{} is not a class: 0 to 255", class))
+}
+
+fn config_map(c: &ConfigurationDescriptor<'_>) -> Value {
+    let mut interfaces = vec![];
+    for i in c.interfaces() {
+        for a in i.alt_settings() {
+            let endpoints: Vec<Value> = a
+                .endpoints()
+                .map(|e| {
+                    json!({
+                        "address": e.address(),
+                        "hex": format!("0x{:02x}", e.address()),
+                        "direction": if e.direction() == Direction::In { "in" } else { "out" },
+                        "type": match e.transfer_type() { TransferType::Bulk => "bulk", TransferType::Interrupt => "interrupt", TransferType::Isochronous => "isochronous", TransferType::Control => "control" },
+                        "max_packet": e.max_packet_size(),
+                        "interval": e.interval(),
+                    })
+                })
+                .collect();
+            interfaces.push(json!({
+                "number": a.interface_number(), "alternate": a.alternate_setting(),
+                "class": a.class(), "class_name": class_name(a.class()), "subclass": a.subclass(), "protocol": a.protocol(),
+                "endpoints": endpoints,
+            }));
+        }
+    }
+    json!({
+        "value": c.configuration_value(),
+        "self_powered": c.attributes() & 0x40 != 0,
+        "remote_wakeup": c.attributes() & 0x20 != 0,
+        "max_power_ma": c.max_power() as u32 * 2,
+        "interfaces": interfaces,
+    })
+}
+
+/// Reads a configuration descriptor from its bytes (hex): interfaces, alternate settings and endpoints with their direction, type and packet size. What `usb_descriptors` gives, from a dump.
+pub fn usb_parse_config(data: &str) -> Result<Value, String> {
+    let b = hex::decode(data.replace(' ', "")).map_err(|_| "not hex")?;
+    let c = ConfigurationDescriptor::new(&b).ok_or("not a configuration descriptor: too short, or the wrong type or length")?;
+    Ok(config_map(&c))
+}
+
+fn open(selector: &Value) -> Result<nusb::Device, String> {
+    let f = filter_of(selector)?;
+    if f.vendor.is_none() && f.serial.is_none() {
+        return Err("name a device: \"vendor:product\", or a map with `vendor` or `serial`".into());
+    }
+    let list = devices(&f)?;
+    let d = list.first().ok_or(format!("no USB device matches {}", f.name()))?;
+    d.open().wait().map_err(|e| match e.kind() {
+        nusb::ErrorKind::PermissionDenied => format!("{}: no permission to open it (on Linux, a udev rule; on macOS, a driver may hold it)", f.name()),
+        nusb::ErrorKind::Busy => format!("{}: in use by another program or driver", f.name()),
+        _ => format!("{}: {}", f.name(), e),
+    })
+}
+
+/// A device's descriptors, as the device itself gives them: its configurations, interfaces and endpoints. Needs permission to open it.
+pub fn usb_descriptors(device: serde_json::Value) -> Result<Value, String> {
+    let d = open(&device)?;
+    let dd = d.device_descriptor();
+    let configs: Vec<Value> = d.configurations().map(|c| config_map(&c)).collect();
+    Ok(json!({
+        "vendor_id": format!("{:04x}", dd.vendor_id()), "product_id": format!("{:04x}", dd.product_id()),
+        "class": dd.class(), "class_name": class_name(dd.class()), "max_packet_0": dd.max_packet_size_0(),
+        "configurations": configs,
+    }))
+}
+
+fn transfer_problem(e: nusb::transfer::TransferError, what: &str) -> String {
+    use nusb::transfer::TransferError as T;
+    match e {
+        T::Stall => format!("{}: the device stalled the endpoint", what),
+        T::Disconnected => format!("{}: the device was unplugged", what),
+        T::Cancelled => format!("{}: timed out", what),
+        other => format!("{}: {}", what, other),
+    }
+}
+
+fn claim(device: &Value, interface: i64) -> Result<nusb::Interface, String> {
+    let d = open(device)?;
+    let n = u8::try_from(interface).map_err(|_| "an interface is 0 to 255")?;
+    d.detach_and_claim_interface(n).wait().map_err(|e| format!("cannot claim interface {}: {}", n, e))
+}
+
+/// Reads from a bulk IN endpoint (0x81 is 129): up to `length` bytes within `timeout_ms`, as a list of numbers. It claims the interface for the call.
+pub fn usb_bulk_read(device: serde_json::Value, interface: i64, endpoint: i64, length: i64, timeout_ms: i64) -> Result<Vec<u8>, String> {
+    if !(1..=1 << 24).contains(&length) {
+        return Err("length must be from 1 to 16777216".into());
+    }
+    let ep = u8::try_from(endpoint).ok().filter(|e| e & 0x80 != 0).ok_or(format!("{} is not an IN endpoint: 129 (0x81) and up", endpoint))?;
+    let i = claim(&device, interface)?;
+    let mut e = i.endpoint::<Bulk, In>(ep).map_err(|x| format!("endpoint 0x{:02x}: {}", ep, x))?;
+    let size = (length as usize).div_ceil(e.max_packet_size()) * e.max_packet_size();
+    let c = e.transfer_blocking(Buffer::new(size), Duration::from_millis(timeout_ms.max(1) as u64));
+    let n = c.actual_len;
+    match c.status {
+        Ok(()) => {}
+        Err(nusb::transfer::TransferError::Cancelled) if n > 0 => {}
+        Err(x) => return Err(transfer_problem(x, &format!("bulk read on 0x{:02x}", ep))),
+    }
+    let mut v = c.buffer.into_vec();
+    v.truncate(n);
+    Ok(v)
+}
+
+/// Writes bytes (a list of numbers) to a bulk OUT endpoint within `timeout_ms`; answers the bytes that went.
+pub fn usb_bulk_write(device: serde_json::Value, interface: i64, endpoint: i64, data: Vec<i64>, timeout_ms: i64) -> Result<i64, String> {
+    let ep = u8::try_from(endpoint).ok().filter(|e| e & 0x80 == 0).ok_or(format!("{} is not an OUT endpoint: 1 to 15", endpoint))?;
+    let bytes: Vec<u8> = data.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte", x))).collect::<Result<_, _>>()?;
+    let i = claim(&device, interface)?;
+    let mut e = i.endpoint::<Bulk, Out>(ep).map_err(|x| format!("endpoint 0x{:02x}: {}", ep, x))?;
+    let c = e.transfer_blocking(Buffer::from(bytes), Duration::from_millis(timeout_ms.max(1) as u64));
+    let n = c.actual_len as i64;
+    c.status.map_err(|x| transfer_problem(x, &format!("bulk write on 0x{:02x}", ep)))?;
+    Ok(n)
+}
+
+fn control_kinds(o: &Value) -> Result<(ControlType, Recipient), String> {
+    let t = match o.get("type").and_then(|v| v.as_str()).unwrap_or("vendor") {
+        "standard" => ControlType::Standard,
+        "class" => ControlType::Class,
+        "vendor" => ControlType::Vendor,
+        x => return Err(format!("`{}` is not a control type: standard, class or vendor", x)),
+    };
+    let r = match o.get("recipient").and_then(|v| v.as_str()).unwrap_or("device") {
+        "device" => Recipient::Device,
+        "interface" => Recipient::Interface,
+        "endpoint" => Recipient::Endpoint,
+        "other" => Recipient::Other,
+        x => return Err(format!("`{}` is not a recipient: device, interface, endpoint or other", x)),
+    };
+    Ok((t, r))
+}
+
+/// A control transfer in: `request` is `{ type, recipient, request, value, index, length }`, with `timeout_ms`. Answers bytes as a list of numbers.
+pub fn usb_control_read(device: serde_json::Value, request: serde_json::Value) -> Result<Vec<u8>, String> {
+    let (control_type, recipient) = control_kinds(&request)?;
+    let n = |k: &str| request.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let d = open(&device)?;
+    let timeout = Duration::from_millis(request.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(1000));
+    let r = d.control_in(ControlIn { control_type, recipient, request: n("request") as u8, value: n("value") as u16, index: n("index") as u16, length: n("length") as u16 }, timeout).wait();
+    r.map_err(|x| transfer_problem(x, "control read"))
+}
+
+/// A control transfer out: `request` as for `usb_control_read`, and `data`, a list of numbers.
+pub fn usb_control_write(device: serde_json::Value, request: serde_json::Value, data: Vec<i64>) -> Result<bool, String> {
+    let (control_type, recipient) = control_kinds(&request)?;
+    let n = |k: &str| request.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let bytes: Vec<u8> = data.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte", x))).collect::<Result<_, _>>()?;
+    let d = open(&device)?;
+    let timeout = Duration::from_millis(request.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(1000));
+    d.control_out(ControlOut { control_type, recipient, request: n("request") as u8, value: n("value") as u16, index: n("index") as u16, data: &bytes }, timeout).wait().map_err(|x| transfer_problem(x, "control write"))?;
+    Ok(true)
+}

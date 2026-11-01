@@ -1,0 +1,312 @@
+//! Mastodon's API: post statuses with idempotency keys and Mastodon's own way of counting length, upload media and wait for it to process, read timelines with HTML turned to text, and page by the Link header.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct Conf {
+    base: String,
+    token: Option<String>,
+}
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn conf(o: &Value) -> Result<Conf, String> {
+    Ok(Conf {
+        base: opt(o, "instance", "MASTODON_API_URL").ok_or("no instance: set MASTODON_API_URL (like https://mastodon.social), or give the option instance")?.trim_end_matches('/').to_string(),
+        token: opt(o, "token", "MASTODON_TOKEN"),
+    })
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let msg = v["error"].as_str().map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let more = v["error_description"].as_str().map(|d| format!(" ({})", d)).unwrap_or_default();
+    let hint = match status {
+        401 => " (check MASTODON_TOKEN)",
+        403 => " (the token lacks the scope this needs)",
+        _ => "",
+    };
+    format!("Mastodon {}: {}{}{}", status, msg, more, hint)
+}
+
+// `2026-11-01T10:05:00.000Z` as seconds since 1970.
+fn parse_time(t: &str) -> Option<i64> {
+    let n = |r: std::ops::Range<usize>| t.get(r)?.parse::<i64>().ok();
+    let (y, m, d, h, min, s) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let (y2, m2) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let days = 365 * y2 + y2 / 4 - y2 / 100 + y2 / 400 + (153 * (m2 - 3) + 2) / 5 + d - 719469;
+    Some(days * 86400 + h * 3600 + min * 60 + s)
+}
+
+// A 429 says when the window ends, in Retry-After or X-RateLimit-Reset.
+fn wait_of(r: &ureq::Response) -> Option<u64> {
+    if let Some(s) = r.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()) {
+        return Some(s);
+    }
+    let reset = parse_time(r.header("x-ratelimit-reset")?)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some((reset - now).max(0) as u64)
+}
+
+fn exec(c: &Conf, method: &str, url: &str, ctype: Option<&str>, body: Option<&[u8]>, key: Option<&str>) -> Result<ureq::Response, String> {
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let mut r = agent.request(method, url).set("User-Agent", "quillo-mastodon/1.0");
+        if let Some(t) = &c.token { r = r.set("Authorization", &format!("Bearer {}", t)); }
+        if let Some(t) = ctype { r = r.set("Content-Type", t); }
+        if let Some(k) = key { r = r.set("Idempotency-Key", k); }
+        let res = match body {
+            Some(b) => r.send_bytes(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(429, resp)) => {
+                let wait = wait_of(&resp);
+                let t = resp.into_string().unwrap_or_default();
+                match wait {
+                    Some(w) if w <= 30 && tries < 2 => {
+                        std::thread::sleep(Duration::from_secs(w));
+                        tries += 1;
+                    }
+                    _ => return Err(error_text(429, &t)),
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => return Err(error_text(code, &resp.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach {}: {}", c.base, e)),
+        }
+    }
+}
+
+fn json_of(resp: ureq::Response) -> Result<Value, String> {
+    let t = resp.into_string().map_err(|e| e.to_string())?;
+    serde_json::from_str(&t).map_err(|_| format!("the answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+}
+
+fn api(c: &Conf, method: &str, path: &str, body: Option<&Value>, key: Option<&str>) -> Result<Value, String> {
+    let url = format!("{}{}", c.base, path);
+    let text = body.map(|b| b.to_string());
+    json_of(exec(c, method, &url, body.map(|_| "application/json"), text.as_deref().map(str::as_bytes), key)?)
+}
+
+// `Link: <url>; rel="next", <url>; rel="prev"`
+fn link(header: &str, rel: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        let want = format!("rel=\"{}\"", rel);
+        if params.split(';').any(|p| p.trim() == want) { Some(url.trim().trim_matches(['<', '>']).to_string()) } else { None }
+    })
+}
+
+/// Text from a status's HTML: paragraphs and <br> become line breaks, tags go, and entities are decoded.
+pub fn mastodon_text(html: &str) -> String {
+    let t = html.replace("</p><p>", "\n\n").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n");
+    let mut out = String::new();
+    let mut tag = false;
+    for c in t.chars() {
+        match c {
+            '<' => tag = true,
+            '>' if tag => tag = false,
+            c if !tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn status(s: &Value) -> Value {
+    let inner = if s["reblog"].is_object() { &s["reblog"] } else { s };
+    json!({
+        "id": s["id"], "url": inner["url"], "created_at": inner["created_at"], "text": mastodon_text(inner["content"].as_str().unwrap_or("")),
+        "html": inner["content"], "account": inner.pointer("/account/acct"), "visibility": inner["visibility"],
+        "boosted_by": if s["reblog"].is_object() { s.pointer("/account/acct").cloned().unwrap_or(Value::Null) } else { Value::Null },
+        "media": inner["media_attachments"], "replies": inner["replies_count"], "boosts": inner["reblogs_count"], "favourites": inner["favourites_count"],
+    })
+}
+
+/// A status's length as Mastodon counts it: any link is 23 characters, and a mention counts only its @user, not its @domain. Gives { length, limit: 500 unless given, fits }.
+pub fn mastodon_length(text: &str, limit: i64) -> serde_json::Value {
+    let limit = if limit > 0 { limit } else { 500 };
+    let mut n = 0i64;
+    for word in text.split_inclusive(char::is_whitespace) {
+        let w = word.trim_end();
+        let tail = (word.chars().count() - w.chars().count()) as i64;
+        let body = w.trim_end_matches(['.', ',', ':', ';', '!', '?', ')']);
+        let trailing = (w.chars().count() - body.chars().count()) as i64;
+        if body.starts_with("https://") || body.starts_with("http://") {
+            n += 23 + trailing + tail;
+        } else if body.starts_with('@') && body[1..].contains('@') {
+            n += 1 + body[1..].split('@').next().unwrap_or("").chars().count() as i64 + trailing + tail;
+        } else {
+            n += word.chars().count() as i64;
+        }
+    }
+    json!({ "length": n, "limit": limit, "fits": n <= limit })
+}
+
+/// Posts a status. Options: media_ids (from mastodon_media), in_reply_to_id, visibility (public, unlisted, private, direct), spoiler_text, sensitive, language, scheduled_at, poll, idempotency_key (a retry with the same key posts once), limit (the instance's, 500 by default), instance, token. Gives { id, url, text, ... }; a scheduled post gives { id, scheduled_at }.
+pub fn mastodon_post(text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let media = options.get("media_ids").and_then(|m| m.as_array()).map(|m| m.len()).unwrap_or(0);
+    if text.trim().is_empty() && media == 0 {
+        return Err("a status needs text or media".into());
+    }
+    let limit = options.get("limit").and_then(|l| l.as_i64()).unwrap_or(0);
+    let len = mastodon_length(text, limit);
+    if len["fits"] != true {
+        return Err(format!("the status is {} characters as Mastodon counts them; the limit is {}", len["length"], len["limit"]));
+    }
+    let mut b = json!({ "status": text });
+    for k in ["media_ids", "in_reply_to_id", "visibility", "spoiler_text", "sensitive", "language", "scheduled_at", "poll"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    let r = api(&c, "POST", "/api/v1/statuses", Some(&b), options.get("idempotency_key").and_then(|k| k.as_str()))?;
+    if r.get("scheduled_at").is_some() {
+        return Ok(json!({ "id": r["id"], "scheduled_at": r["scheduled_at"] }));
+    }
+    Ok(status(&r))
+}
+
+/// Uploads a picture, video or sound from a file, with `description` as its alt text, and waits (up to `wait_s`) until it has been processed, as a status naming unfinished media is refused. Gives the attachment: { id, type, url, preview_url, description }.
+pub fn mastodon_media(path: &str, description: &str, wait_s: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let mime = match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        e => return Err(format!("Mastodon takes no .{} files", e)),
+    };
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("upload").replace('"', "");
+    let boundary = format!("quillo{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1));
+    let mut body = vec![];
+    if !description.is_empty() {
+        body.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n{}\r\n", boundary, description).as_bytes());
+    }
+    body.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", boundary, name, mime).as_bytes());
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+    let url = format!("{}/api/v2/media", c.base);
+    let resp = exec(&c, "POST", &url, Some(&format!("multipart/form-data; boundary={}", boundary)), Some(&body), None)?;
+    let first = resp.status();
+    let m = json_of(resp)?;
+    if first == 200 {
+        return Ok(m);
+    }
+    // 202: still processing. The same URL then answers 206 until it is done.
+    let id = m["id"].as_str().ok_or("the upload has no id")?.to_string();
+    let until = std::time::Instant::now() + Duration::from_secs(wait_s.clamp(0, 300) as u64);
+    loop {
+        let r = exec(&c, "GET", &format!("{}/api/v1/media/{}", c.base, enc(&id)), None, None, None)?;
+        if r.status() == 200 {
+            return json_of(r);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(format!("the media {} was still processing after {} s", id, wait_s));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn page(c: &Conf, url: &str) -> Result<Value, String> {
+    let resp = exec(c, "GET", url, None, None, None)?;
+    let h = resp.header("link").unwrap_or("").to_string();
+    let rate = json!({ "limit": resp.header("x-ratelimit-limit"), "remaining": resp.header("x-ratelimit-remaining"), "reset": resp.header("x-ratelimit-reset") });
+    let v = json_of(resp)?;
+    Ok(json!({ "items": v, "next": link(&h, "next"), "prev": link(&h, "prev"), "rate": rate }))
+}
+
+fn statuses(p: Value) -> Value {
+    let list: Vec<Value> = p["items"].as_array().map(|l| l.iter().map(status).collect()).unwrap_or_default();
+    json!({ "statuses": list, "next": p["next"], "prev": p["prev"], "rate": p["rate"] })
+}
+
+/// A timeline: `which` is "home", "public", "local", "tag/<name>" or "list/<id>". Options: limit, max_id, since_id, min_id. Gives { statuses, next, prev, rate }: `next` is a URL for older posts and `prev` for newer ones, from the Link header, to give to mastodon_page.
+pub fn mastodon_timeline(which: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let (path, mut q) = match which {
+        "home" => ("home".to_string(), vec![]),
+        "public" => ("public".to_string(), vec![]),
+        "local" => ("public".to_string(), vec!["local=true".to_string()]),
+        o if o.starts_with("tag/") => (format!("tag/{}", enc(o[4..].trim_start_matches('#'))), vec![]),
+        o if o.starts_with("list/") => (format!("list/{}", enc(&o[5..])), vec![]),
+        o => return Err(format!("{:?} is not a timeline: home, public, local, tag/<name> or list/<id>", o)),
+    };
+    for k in ["limit", "max_id", "since_id", "min_id"] {
+        match options.get(k) {
+            Some(Value::String(s)) => q.push(format!("{}={}", k, enc(s))),
+            Some(Value::Number(n)) => q.push(format!("{}={}", k, n)),
+            _ => {}
+        }
+    }
+    let url = format!("{}/api/v1/timelines/{}{}{}", c.base, path, if q.is_empty() { "" } else { "?" }, q.join("&"));
+    Ok(statuses(page(&c, &url)?))
+}
+
+/// The page at a `next` or `prev` URL from mastodon_timeline. Only a URL on the instance is followed, so the token cannot be sent elsewhere.
+pub fn mastodon_page(url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    if !url.starts_with(&format!("{}/", c.base)) {
+        return Err(format!("{} is not on {}", url, c.base));
+    }
+    Ok(statuses(page(&c, url)?))
+}
+
+/// Every status of a timeline back to at most `max` of them, following the Link header.
+pub fn mastodon_all(which: &str, max: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut r = mastodon_timeline(which, options.clone())?;
+    let mut out = vec![];
+    loop {
+        out.extend(r["statuses"].as_array().cloned().unwrap_or_default());
+        match r["next"].as_str() {
+            Some(u) if (out.len() as i64) < max => {
+                let u = u.to_string();
+                r = mastodon_page(&u, options.clone())?;
+                if r["statuses"].as_array().map(|l| l.is_empty()).unwrap_or(true) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    out.truncate(max.max(0) as usize);
+    Ok(out)
+}
+
+/// One status by id, read into the same shape as a timeline's.
+pub fn mastodon_status(id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    Ok(status(&api(&c, "GET", &format!("/api/v1/statuses/{}", enc(id)), None, None)?))
+}
+
+/// Deletes a status of yours. Gives its source text, for editing and posting again.
+pub fn mastodon_delete(id: &str, options: serde_json::Value) -> Result<String, String> {
+    let c = conf(&options)?;
+    let r = api(&c, "DELETE", &format!("/api/v1/statuses/{}", enc(id)), None, None)?;
+    Ok(r["text"].as_str().unwrap_or("").to_string())
+}
+
+/// The account behind the token: { id, acct, display_name, followers_count, ... }.
+pub fn mastodon_me(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    api(&c, "GET", "/api/v1/accounts/verify_credentials", None, None)
+}

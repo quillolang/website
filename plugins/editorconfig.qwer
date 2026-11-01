@@ -1,0 +1,516 @@
+//! .editorconfig files found up a tree and resolved for a path, sections with their glob language, and code that checks a file's text against the result or fixes it.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+const KNOWN: [&str; 8] = ["indent_style", "indent_size", "tab_width", "end_of_line", "charset", "trim_trailing_whitespace", "insert_final_newline", "max_line_length"];
+
+struct Section {
+    glob: String,
+    line: usize,
+    props: Vec<(String, String)>,
+}
+
+struct Config {
+    root: bool,
+    sections: Vec<Section>,
+    problems: Vec<String>,
+}
+
+fn parse(text: &str) -> Config {
+    let mut c = Config { root: false, sections: vec![], problems: vec![] };
+    for (i, raw) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        if t.starts_with('[') && t.ends_with(']') && t.len() > 2 {
+            c.sections.push(Section { glob: t[1..t.len() - 1].to_string(), line: i + 1, props: vec![] });
+            continue;
+        }
+        let Some((k, v)) = t.split_once(['=', ':']) else {
+            c.problems.push(format!("line {}: `{}` is neither a section nor a property", i + 1, t));
+            continue;
+        };
+        let k = k.trim().to_lowercase();
+        let v = v.trim();
+        match c.sections.last_mut() {
+            Some(s) => {
+                // Known properties are case-insensitive; a plugin's own keep their value's case.
+                let v = if KNOWN.contains(&k.as_str()) || v.eq_ignore_ascii_case("unset") { v.to_lowercase() } else { v.to_string() };
+                s.props.push((k, v));
+            }
+            None if k == "root" => c.root = v.eq_ignore_ascii_case("true"),
+            None => c.problems.push(format!("line {}: `{}` comes before any section", i + 1, k)),
+        }
+    }
+    c
+}
+
+/// A compiled glob: a small tree, for braces nest.
+#[derive(Debug, Clone)]
+enum G {
+    Lit(char),
+    Star,
+    StarStar,
+    Any,
+    Set(bool, Vec<(char, char)>),
+    Alt(Vec<Vec<G>>),
+    Range(i64, i64),
+}
+
+/// Finds the `}` for a `{` at `i`, or None: an unmatched brace is a literal.
+fn close_brace(c: &[char], i: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut j = i;
+    while j < c.len() {
+        match c[j] {
+            '\\' => j += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+fn compile(c: &[char], depth: usize) -> Vec<G> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' if i + 1 < c.len() => {
+                out.push(G::Lit(c[i + 1]));
+                i += 2;
+            }
+            '*' if c.get(i + 1) == Some(&'*') => {
+                out.push(G::StarStar);
+                i += 2;
+            }
+            '*' => {
+                out.push(G::Star);
+                i += 1;
+            }
+            '?' => {
+                out.push(G::Any);
+                i += 1;
+            }
+            '[' => {
+                let mut j = i + 1;
+                let neg = c.get(j) == Some(&'!');
+                if neg {
+                    j += 1;
+                }
+                let start = j;
+                while j < c.len() && (c[j] != ']' || j == start) && c[j] != '/' {
+                    j += 1;
+                }
+                if j >= c.len() || c[j] != ']' {
+                    out.push(G::Lit('['));
+                    i += 1;
+                    continue;
+                }
+                let body = &c[start..j];
+                let mut set = vec![];
+                let mut k = 0;
+                while k < body.len() {
+                    if k + 2 < body.len() && body[k + 1] == '-' {
+                        set.push((body[k], body[k + 2]));
+                        k += 3;
+                    } else {
+                        set.push((body[k], body[k]));
+                        k += 1;
+                    }
+                }
+                out.push(G::Set(neg, set));
+                i = j + 1;
+            }
+            '{' if depth < 16 => {
+                let Some(end) = close_brace(c, i) else {
+                    out.push(G::Lit('{'));
+                    i += 1;
+                    continue;
+                };
+                let inner = &c[i + 1..end];
+                let text: String = inner.iter().collect();
+                if let Some((a, b)) = text.split_once("..") {
+                    if let (Ok(x), Ok(y)) = (a.parse::<i64>(), b.parse::<i64>()) {
+                        out.push(G::Range(x.min(y), x.max(y)));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                // Top-level commas split it; `{single}` with no comma is literal braces.
+                let mut parts = vec![];
+                let mut d = 0;
+                let mut from = 0;
+                let mut k = 0;
+                while k < inner.len() {
+                    match inner[k] {
+                        '\\' => k += 1,
+                        '{' => d += 1,
+                        '}' => d -= 1,
+                        ',' if d == 0 => {
+                            parts.push(&inner[from..k]);
+                            from = k + 1;
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                parts.push(&inner[from..]);
+                if parts.len() == 1 {
+                    out.push(G::Lit('{'));
+                    out.extend(compile(inner, depth + 1));
+                    out.push(G::Lit('}'));
+                } else {
+                    out.push(G::Alt(parts.into_iter().map(|p| compile(p, depth + 1)).collect()));
+                }
+                i = end + 1;
+            }
+            x => {
+                out.push(G::Lit(x));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn run(g: &[G], t: &[char], steps: &mut usize) -> bool {
+    *steps += 1;
+    if *steps > 2_000_000 {
+        return false;
+    }
+    match g.first() {
+        None => t.is_empty(),
+        Some(G::Lit(c)) => t.first() == Some(c) && run(&g[1..], &t[1..], steps),
+        Some(G::Any) => t.first().map_or(false, |c| *c != '/') && run(&g[1..], &t[1..], steps),
+        Some(G::Set(neg, set)) => t.first().map_or(false, |c| *c != '/' && set.iter().any(|(a, b)| a <= c && c <= b) != *neg) && run(&g[1..], &t[1..], steps),
+        Some(G::Star) => {
+            let mut i = 0;
+            loop {
+                if run(&g[1..], &t[i..], steps) {
+                    return true;
+                }
+                if i >= t.len() || t[i] == '/' {
+                    return false;
+                }
+                i += 1;
+            }
+        }
+        Some(G::StarStar) => (0..=t.len()).any(|i| run(&g[1..], &t[i..], steps)),
+        Some(G::Alt(list)) => list.iter().any(|a| {
+            let mut joined = a.clone();
+            joined.extend_from_slice(&g[1..]);
+            run(&joined, t, steps)
+        }),
+        Some(G::Range(a, b)) => {
+            let mut i = 0;
+            if t.first() == Some(&'-') {
+                i = 1;
+            }
+            let start = i;
+            while i < t.len() && t[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Try each length of number, for `{1..3}4`.
+            (start + 1..=i).rev().any(|e| {
+                let s: String = t[..e].iter().collect();
+                // A leading zero is not the number the range holds.
+                let plain = !(s.trim_start_matches('-').len() > 1 && s.trim_start_matches('-').starts_with('0'));
+                plain && s.parse::<i64>().map_or(false, |n| *a <= n && n <= *b) && run(&g[1..], &t[e..], steps)
+            })
+        }
+    }
+}
+
+/// Does a section's glob take a path relative to the file's folder? A glob with no `/` matches a name at any depth.
+fn section_matches(glob: &str, rel: &str) -> bool {
+    let full = if glob.contains('/') { glob.strip_prefix('/').unwrap_or(glob).to_string() } else { format!("**/{}", glob) };
+    let c: Vec<char> = full.chars().collect();
+    let t: Vec<char> = rel.chars().collect();
+    let mut steps = 0;
+    if !glob.contains('/') {
+        // `**/x` must also take `x` at the top.
+        let plain: Vec<char> = glob.chars().collect();
+        if run(&compile(&plain, 0), &t, &mut steps) {
+            return true;
+        }
+    }
+    run(&compile(&c, 0), &t, &mut steps)
+}
+
+fn finish(mut p: BTreeMap<String, String>) -> Map<String, Value> {
+    p.retain(|_, v| v != "unset");
+    let style_tab = p.get("indent_style").map(String::as_str) == Some("tab");
+    if style_tab && !p.contains_key("indent_size") {
+        p.insert("indent_size".into(), "tab".into());
+    }
+    let size = p.get("indent_size").cloned();
+    match (size.as_deref(), p.get("tab_width").cloned()) {
+        (Some("tab"), Some(w)) => {
+            p.insert("indent_size".into(), w);
+        }
+        (Some(s), None) if s != "tab" => {
+            p.insert("tab_width".into(), s.to_string());
+        }
+        _ => {}
+    }
+    p.into_iter().map(|(k, v)| (k, json!(v))).collect()
+}
+
+fn apply(c: &Config, rel: &str, into: &mut BTreeMap<String, String>) -> Vec<String> {
+    let mut used = vec![];
+    for s in &c.sections {
+        if section_matches(&s.glob, rel) {
+            used.push(s.glob.clone());
+            for (k, v) in &s.props {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    used
+}
+
+/// Reads one file: `{ root, sections: [{ glob, line, properties }], problems }`.
+pub fn editorconfig_parse(text: &str) -> Value {
+    let c = parse(text);
+    let sections: Vec<Value> = c.sections.iter().map(|s| {
+        let props: Map<String, Value> = s.props.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+        json!({ "glob": s.glob, "line": s.line, "properties": props })
+    }).collect();
+    json!({ "root": c.root, "sections": sections, "problems": c.problems })
+}
+
+/// Tests a section's glob against a path relative to the file: `*`, `**`, `?`, `[a-z]`, `[!x]`, `{a,b}` and `{1..9}`.
+pub fn editorconfig_glob(glob: &str, path: &str) -> bool {
+    section_matches(glob, path.trim_start_matches("./"))
+}
+
+/// The properties for a path from one file's text, as a plugin would have them: `unset` gone, `indent_size` and `tab_width` filled in from each other.
+pub fn editorconfig_resolve(text: &str, path: &str) -> Value {
+    let c = parse(text);
+    let mut p = BTreeMap::new();
+    apply(&c, path.trim_start_matches("./"), &mut p);
+    Value::Object(finish(p))
+}
+
+/// The same across several files, given as a map from path to text: folders nearest the file win, and `root = true` stops the climb.
+pub fn editorconfig_resolve_nested(files: serde_json::Value, path: &str) -> Result<Value, String> {
+    let map = files.as_object().ok_or("`files` must be a map of path to text")?;
+    let path = path.trim_start_matches("./");
+    let mut dirs: Vec<(String, Config)> = vec![];
+    for (k, v) in map {
+        let dir = k.strip_suffix(".editorconfig").ok_or(format!("{} is not an .editorconfig", k))?;
+        if !path.starts_with(dir) {
+            continue;
+        }
+        dirs.push((dir.to_string(), parse(v.as_str().ok_or(format!("{} must be text", k))?)));
+    }
+    dirs.sort_by_key(|(d, _)| std::cmp::Reverse(d.len()));
+    if let Some(at) = dirs.iter().position(|(_, c)| c.root) {
+        dirs.truncate(at + 1);
+    }
+    let mut p = BTreeMap::new();
+    let mut used = vec![];
+    for (d, c) in dirs.iter().rev() {
+        for g in apply(c, &path[d.len()..], &mut p) {
+            used.push(format!("{}.editorconfig [{}]", d, g));
+        }
+    }
+    Ok(json!({ "properties": finish(p), "sections": used }))
+}
+
+/// Finds the `.editorconfig` files above a real file, stopping at `root = true`, and resolves its properties: `{ properties, files }`.
+pub fn editorconfig_find(path: &str) -> Result<Value, String> {
+    let (props, files) = find(path)?;
+    Ok(json!({ "properties": props, "files": files }))
+}
+
+fn find(path: &str) -> Result<(Map<String, Value>, Vec<String>), String> {
+    let full: PathBuf = if Path::new(path).is_absolute() { PathBuf::from(path) } else { std::env::current_dir().map_err(|e| e.to_string())?.join(path) };
+    let mut found: Vec<(PathBuf, Config)> = vec![];
+    let mut dir = full.parent();
+    while let Some(d) = dir {
+        let f = d.join(".editorconfig");
+        if f.is_file() {
+            let t = std::fs::read_to_string(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+            let c = parse(&t);
+            let stop = c.root;
+            found.push((d.to_path_buf(), c));
+            if stop {
+                break;
+            }
+        }
+        dir = d.parent();
+    }
+    let mut p = BTreeMap::new();
+    let mut files = vec![];
+    for (d, c) in found.iter().rev() {
+        let rel = full.strip_prefix(d).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        apply(c, &rel, &mut p);
+        files.push(d.join(".editorconfig").to_string_lossy().into_owned());
+    }
+    Ok((finish(p), files))
+}
+
+fn width(line: &str, tab: usize) -> usize {
+    let mut w = 0;
+    for c in line.chars() {
+        w = if c == '\t' { (w / tab + 1) * tab } else { w + 1 };
+    }
+    w
+}
+
+fn get<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
+    p.get(k).and_then(Value::as_str)
+}
+
+fn check(text: &str, bytes_bom: Option<&str>, p: &Value) -> Vec<Value> {
+    let mut out = vec![];
+    let mut note = |line: usize, rule: &str, msg: String| out.push(json!({ "line": line, "rule": rule, "message": msg }));
+    if let Some(cs) = get(p, "charset") {
+        let has = bytes_bom;
+        if cs == "utf-8-bom" && has != Some("utf-8") {
+            note(1, "charset", "charset is utf-8-bom and the file has no BOM".to_string());
+        }
+        if cs == "utf-8" && has == Some("utf-8") {
+            note(1, "charset", "charset is utf-8 and the file starts with a BOM".to_string());
+        }
+    }
+    let tab = get(p, "tab_width").and_then(|t| t.parse::<usize>().ok()).filter(|t| *t > 0).unwrap_or(8);
+    let size = get(p, "indent_size").and_then(|t| t.parse::<usize>().ok()).filter(|t| *t > 0);
+    let style = get(p, "indent_style");
+    let eol = get(p, "end_of_line");
+    let trim = get(p, "trim_trailing_whitespace") == Some("true");
+    let max = get(p, "max_line_length").filter(|m| *m != "off").and_then(|t| t.parse::<usize>().ok());
+    let mut bad_eol = 0;
+    let mut first_eol = 0;
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut n = 0;
+    for piece in body.split_inclusive('\n') {
+        n += 1;
+        let (line, ending) = match piece.strip_suffix("\r\n") {
+            Some(l) => (l, "crlf"),
+            None => match piece.strip_suffix('\n') {
+                Some(l) => (l, "lf"),
+                None => (piece, ""),
+            },
+        };
+        let (line, ending) = if ending == "" && line.ends_with('\r') { (&line[..line.len() - 1], "cr") } else { (line, ending) };
+        if let Some(want) = eol {
+            if !ending.is_empty() && ending != want {
+                bad_eol += 1;
+                if first_eol == 0 {
+                    first_eol = n;
+                }
+            }
+        }
+        if trim && line.ends_with([' ', '\t']) {
+            note(n, "trim_trailing_whitespace", "trailing whitespace".to_string());
+        }
+        let lead: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        if !lead.is_empty() && lead.len() < line.len() {
+            match style {
+                Some("space") if lead.contains('\t') => note(n, "indent_style", "a tab in the indent, and indent_style is space".to_string()),
+                Some("tab") if lead.contains(' ') && !line.trim_start().starts_with('*') => {
+                    // Spaces after the tabs line a thing up: only spaces before them, or a whole indent, are wrong.
+                    let tabs = lead.chars().take_while(|c| *c == '\t').count();
+                    if lead[tabs..].contains('\t') || lead.len() - tabs >= size.unwrap_or(tab) {
+                        note(n, "indent_style", "spaces in the indent, and indent_style is tab".to_string());
+                    }
+                }
+                Some("space") => if let Some(s) = size {
+                    if lead.len() % s != 0 && !line.trim_start().starts_with('*') {
+                        note(n, "indent_size", format!("an indent of {} is not a multiple of {}", lead.len(), s));
+                    }
+                },
+                _ => {}
+            }
+        }
+        if let Some(m) = max {
+            let w = width(line, tab);
+            if w > m {
+                note(n, "max_line_length", format!("{} columns, and the limit is {}", w, m));
+            }
+        }
+    }
+    if bad_eol > 0 {
+        note(first_eol, "end_of_line", format!("{} lines do not end in {}", bad_eol, eol.unwrap_or("")));
+    }
+    match get(p, "insert_final_newline") {
+        Some("true") if !body.is_empty() && !body.ends_with('\n') => note(n, "insert_final_newline", "no newline at the end of the file".to_string()),
+        Some("false") if body.ends_with('\n') => note(n, "insert_final_newline", "a newline at the end of the file, and insert_final_newline is false".to_string()),
+        _ => {}
+    }
+    drop(note);
+    out.sort_by_key(|x| x["line"].as_i64().unwrap_or(0));
+    out
+}
+
+/// Checks text against properties: `[{ line, rule, message }]`, for indents, line ends, trailing spaces, the final newline, line length and BOM.
+pub fn editorconfig_check(text: &str, properties: serde_json::Value) -> Vec<Value> {
+    check(text, if text.starts_with('\u{feff}') { Some("utf-8") } else { None }, &properties)
+}
+
+/// Checks a real file against the `.editorconfig` files above it.
+pub fn editorconfig_check_file(path: &str) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let (p, files) = find(path)?;
+    let bom = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { Some("utf-8") } else if bytes.starts_with(&[0xFF, 0xFE]) { Some("utf-16le") } else if bytes.starts_with(&[0xFE, 0xFF]) { Some("utf-16be") } else { None };
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(json!({ "file": path, "configs": files, "properties": p.clone(), "problems": check(&text, bom, &Value::Object(p)) }))
+}
+
+/// What a saving editor would do: line ends made one, trailing spaces gone, the final newline set. Indents are left alone: that is a formatter's work.
+pub fn editorconfig_fix(text: &str, properties: serde_json::Value) -> String {
+    let eol = match get(&properties, "end_of_line") {
+        Some("crlf") => Some("\r\n"),
+        Some("lf") => Some("\n"),
+        Some("cr") => Some("\r"),
+        _ => None,
+    };
+    let trim = get(&properties, "trim_trailing_whitespace") == Some("true");
+    let mut out = String::with_capacity(text.len());
+    let pieces: Vec<&str> = text.split_inclusive('\n').collect();
+    for piece in &pieces {
+        let (line, ending) = match piece.strip_suffix("\r\n") {
+            Some(l) => (l, "\r\n"),
+            None => match piece.strip_suffix('\n') {
+                Some(l) => (l, "\n"),
+                None => (*piece, ""),
+            },
+        };
+        out.push_str(if trim { line.trim_end_matches([' ', '\t']) } else { line });
+        if !ending.is_empty() {
+            out.push_str(eol.unwrap_or(ending));
+        }
+    }
+    match get(&properties, "insert_final_newline") {
+        Some("true") if !out.is_empty() && !out.ends_with('\n') && !out.ends_with('\r') => out.push_str(eol.unwrap_or("\n")),
+        Some("false") => {
+            while out.ends_with('\n') || out.ends_with('\r') {
+                out.pop();
+            }
+        }
+        _ => {}
+    }
+    match get(&properties, "charset") {
+        Some("utf-8-bom") if !out.starts_with('\u{feff}') => out.insert(0, '\u{feff}'),
+        Some("utf-8") if out.starts_with('\u{feff}') => { out.remove(0); }
+        _ => {}
+    }
+    out
+}

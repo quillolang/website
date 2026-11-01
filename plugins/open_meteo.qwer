@@ -1,0 +1,265 @@
+//! Open-Meteo without a key: forecasts and historical weather, with hourly and daily series zipped into rows, weather codes named, units carried along, places geocoded, air quality, several places at once, and a 429 waited out.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::thread::sleep;
+use std::time::Duration;
+
+fn base(var: &str, public: &str) -> String {
+    let b = std::env::var(var).ok().filter(|v| !v.is_empty());
+    let u = match (b, std::env::var("OPEN_METEO_API_KEY").ok().filter(|k| !k.is_empty())) {
+        (Some(u), _) => u,
+        (None, Some(_)) => format!("https://customer-{}", public),
+        (None, None) => format!("https://{}", public),
+    };
+    u.trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~,".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn get(url: &str, params: &[(String, String)]) -> Result<Value, String> {
+    let mut q: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect();
+    if let Ok(k) = std::env::var("OPEN_METEO_API_KEY") {
+        if !k.is_empty() {
+            q.push(format!("apikey={}", enc(&k)));
+        }
+    }
+    let full = format!("{}?{}", url, q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..3 {
+        match agent.get(&full).call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Open-Meteo's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(429, r)) if attempt < 2 => {
+                // The free tier counts by the minute; a short wait is all a request should spend.
+                let wait = r.header("retry-after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(2).min(10);
+                sleep(Duration::from_secs(wait));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let why = serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("reason").and_then(|x| x.as_str()).map(String::from)).unwrap_or(t);
+                return Err(format!("Open-Meteo answered {}: {}", code, why));
+            }
+            // ureq's error text holds the URL, and the URL may hold a key.
+            Err(ureq::Error::Transport(e)) => return Err(format!("cannot reach Open-Meteo: {}", e.message().unwrap_or("connection failed"))),
+        }
+    }
+    Err("Open-Meteo kept answering 429: the limit is 600 calls a minute without a key".into())
+}
+
+const CODES: &[(i64, &str, &str)] = &[
+    (0, "Clear sky", "clear"), (1, "Mainly clear", "clear"), (2, "Partly cloudy", "cloudy"), (3, "Overcast", "cloudy"), (45, "Fog", "fog"), (48, "Depositing rime fog", "fog"),
+    (51, "Light drizzle", "drizzle"), (53, "Moderate drizzle", "drizzle"), (55, "Dense drizzle", "drizzle"), (56, "Light freezing drizzle", "drizzle"), (57, "Dense freezing drizzle", "drizzle"),
+    (61, "Slight rain", "rain"), (63, "Moderate rain", "rain"), (65, "Heavy rain", "rain"), (66, "Light freezing rain", "rain"), (67, "Heavy freezing rain", "rain"),
+    (71, "Slight snow fall", "snow"), (73, "Moderate snow fall", "snow"), (75, "Heavy snow fall", "snow"), (77, "Snow grains", "snow"),
+    (80, "Slight rain showers", "rain"), (81, "Moderate rain showers", "rain"), (82, "Violent rain showers", "rain"), (85, "Slight snow showers", "snow"), (86, "Heavy snow showers", "snow"),
+    (95, "Thunderstorm", "thunder"), (96, "Thunderstorm with slight hail", "thunder"), (99, "Thunderstorm with heavy hail", "thunder"),
+];
+
+/// A WMO weather code as words: { code, text, group }. `group` is clear, cloudy, fog, drizzle, rain, snow or thunder, for choosing an icon. A code the table lacks gives `Unknown`.
+pub fn meteo_weather_code(code: i64) -> Value {
+    match CODES.iter().find(|c| c.0 == code) {
+        Some(c) => json!({ "code": code, "text": c.1, "group": c.2 }),
+        None => json!({ "code": code, "text": "Unknown", "group": "unknown" }),
+    }
+}
+
+// Parallel arrays into one map per time; a weather code gains its words.
+fn rows(block: Option<&Value>) -> Value {
+    let Some(b) = block.and_then(|v| v.as_object()) else { return Value::Null };
+    let n = b.get("time").and_then(|t| t.as_array()).map(|t| t.len()).unwrap_or(0);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row = Map::new();
+        for (k, v) in b {
+            row.insert(k.clone(), v.get(i).cloned().unwrap_or(Value::Null));
+        }
+        named(&mut row);
+        out.push(Value::Object(row));
+    }
+    Value::Array(out)
+}
+
+fn named(row: &mut Map<String, Value>) {
+    if let Some(c) = row.get("weather_code").and_then(|v| v.as_i64()) {
+        row.insert("weather".into(), meteo_weather_code(c)["text"].clone());
+    }
+}
+
+fn tidy(v: &Value) -> Value {
+    let mut o = Map::new();
+    for k in ["latitude", "longitude", "elevation", "timezone", "timezone_abbreviation", "utc_offset_seconds"] {
+        o.insert(k.to_string(), v.get(k).cloned().unwrap_or(Value::Null));
+    }
+    let mut units = Map::new();
+    for k in ["current_units", "hourly_units", "daily_units"] {
+        if let Some(u) = v.get(k).and_then(|x| x.as_object()) {
+            for (name, unit) in u {
+                if name != "time" && name != "interval" {
+                    units.insert(name.clone(), unit.clone());
+                }
+            }
+        }
+    }
+    o.insert("units".into(), Value::Object(units));
+    if let Some(c) = v.get("current").and_then(|x| x.as_object()) {
+        let mut row = c.clone();
+        named(&mut row);
+        o.insert("current".into(), Value::Object(row));
+    }
+    o.insert("hourly".into(), rows(v.get("hourly")));
+    o.insert("daily".into(), rows(v.get("daily")));
+    Value::Object(o)
+}
+
+const PASS: &[&str] = &[
+    "timezone", "forecast_days", "past_days", "forecast_hours", "past_hours", "start_hour", "end_hour", "temperature_unit", "wind_speed_unit", "precipitation_unit", "timeformat", "models", "cell_selection", "elevation", "domains",
+];
+
+fn params(places: (&str, &str), options: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut p = vec![("latitude".to_string(), places.0.to_string()), ("longitude".to_string(), places.1.to_string())];
+    let opts = options.as_object().ok_or("options must be a map")?;
+    for (k, v) in opts {
+        let text = |x: &Value| x.as_str().map(String::from).unwrap_or(x.to_string());
+        if matches!(k.as_str(), "hourly" | "daily" | "current" | "minutely_15") {
+            let list = match v {
+                Value::Array(a) => a.iter().map(text).collect::<Vec<_>>().join(","),
+                x => text(x),
+            };
+            p.push((k.clone(), list));
+        } else if PASS.contains(&k.as_str()) {
+            p.push((k.clone(), text(v)));
+        } else {
+            return Err(format!("no option `{}`; there are hourly, daily, current, minutely_15, {}", k, PASS.join(", ")));
+        }
+    }
+    // Days only mean something in a time zone.
+    if opts.contains_key("daily") && !opts.contains_key("timezone") {
+        p.push(("timezone".into(), "auto".into()));
+    }
+    Ok(p)
+}
+
+fn check(lat: f64, lon: f64) -> Result<(), String> {
+    if !(-90.0..=90.0).contains(&lat) {
+        return Err(format!("latitude is -90 to 90, not {}", lat));
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        return Err(format!("longitude is -180 to 180, not {}", lon));
+    }
+    Ok(())
+}
+
+/// A forecast: { latitude, longitude, elevation, timezone, utc_offset_seconds, units, current, hourly, daily }, `hourly` and `daily` being lists of rows { time, temperature_2m, ... }, a `weather` in words beside each `weather_code`. `options`: { hourly: [...], daily: [...], current: [...], timezone, forecast_days, past_days, temperature_unit, wind_speed_unit, precipitation_unit, models }. Daily data without a timezone asks for `auto`. Times are local, written without an offset.
+pub fn meteo_forecast(lat: f64, lon: f64, options: serde_json::Value) -> Result<Value, String> {
+    check(lat, lon)?;
+    let u = format!("{}/v1/forecast", base("OPEN_METEO_API_URL", "api.open-meteo.com"));
+    let p = params((&lat.to_string(), &lon.to_string()), &options)?;
+    Ok(tidy(&get(&u, &p)?))
+}
+
+/// One forecast for each of several places, in one call: `places` is a list of [lat, lon]. Gives a list, in order.
+pub fn meteo_forecast_many(places: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let list = places.as_array().ok_or("give the places as a list of [lat, lon]")?;
+    if list.is_empty() {
+        return Err("no places given".into());
+    }
+    let (mut lats, mut lons) = (vec![], vec![]);
+    for p in list {
+        let (a, b) = (p.get(0).and_then(|v| v.as_f64()).ok_or("a place is [lat, lon]")?, p.get(1).and_then(|v| v.as_f64()).ok_or("a place is [lat, lon]")?);
+        check(a, b)?;
+        lats.push(a.to_string());
+        lons.push(b.to_string());
+    }
+    let u = format!("{}/v1/forecast", base("OPEN_METEO_API_URL", "api.open-meteo.com"));
+    let p = params((&lats.join(","), &lons.join(",")), &options)?;
+    let v = get(&u, &p)?;
+    Ok(match v {
+        Value::Array(a) => Value::Array(a.iter().map(tidy).collect()),
+        one => json!([tidy(&one)]),
+    })
+}
+
+fn date_ok(d: &str) -> bool {
+    let b = d.as_bytes();
+    b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// Weather that happened, from 1940 on: the same answer as meteo_forecast, between `start` and `end`, both `YYYY-MM-DD`. The last few days are not there yet.
+pub fn meteo_history(lat: f64, lon: f64, start: &str, end: &str, options: serde_json::Value) -> Result<Value, String> {
+    check(lat, lon)?;
+    if !date_ok(start) || !date_ok(end) {
+        return Err(format!("dates are YYYY-MM-DD, not `{}` and `{}`", start, end));
+    }
+    if start > end {
+        return Err(format!("{} is after {}", start, end));
+    }
+    let u = format!("{}/v1/archive", base("OPEN_METEO_ARCHIVE_URL", "archive-api.open-meteo.com"));
+    let mut p = params((&lat.to_string(), &lon.to_string()), &options)?;
+    p.push(("start_date".into(), start.into()));
+    p.push(("end_date".into(), end.into()));
+    Ok(tidy(&get(&u, &p)?))
+}
+
+/// Air quality, by the same rows: `options` as for a forecast, with `hourly` like ["pm10", "pm2_5"].
+pub fn meteo_air_quality(lat: f64, lon: f64, options: serde_json::Value) -> Result<Value, String> {
+    check(lat, lon)?;
+    let u = format!("{}/v1/air-quality", base("OPEN_METEO_AIR_URL", "air-quality-api.open-meteo.com"));
+    Ok(tidy(&get(&u, &params((&lat.to_string(), &lon.to_string()), &options)?)?))
+}
+
+/// Places by name: [{ name, country, country_code, admin1, latitude, longitude, timezone, elevation, population }]. `options`: { count, language, country_code }. No match is an empty list; a name of one letter is too short to look for.
+pub fn meteo_geocode(name: &str, options: serde_json::Value) -> Result<Value, String> {
+    let n = name.trim();
+    if n.chars().count() < 2 {
+        return Err("a place name needs at least two letters".into());
+    }
+    let mut p = vec![("name".to_string(), n.to_string()), ("format".to_string(), "json".to_string())];
+    p.push(("count".to_string(), options.get("count").and_then(|v| v.as_i64()).unwrap_or(10).to_string()));
+    if let Some(l) = options.get("language").and_then(|v| v.as_str()) {
+        p.push(("language".into(), l.into()));
+    }
+    let code = options.get("country_code").and_then(|v| v.as_str()).map(|c| c.to_uppercase());
+    let u = format!("{}/v1/search", base("OPEN_METEO_GEOCODING_URL", "geocoding-api.open-meteo.com"));
+    let v = get(&u, &p)?;
+    let list: Vec<Value> = v.get("results").and_then(|r| r.as_array()).into_iter().flatten().filter(|r| code.as_ref().map(|c| r.get("country_code").and_then(|x| x.as_str()) == Some(c.as_str())).unwrap_or(true)).map(|r| {
+        json!({
+            "name": r["name"], "country": r["country"], "country_code": r["country_code"], "admin1": r["admin1"], "latitude": r["latitude"], "longitude": r["longitude"],
+            "timezone": r["timezone"], "elevation": r["elevation"], "population": r["population"],
+        })
+    }).collect();
+    Ok(json!(list))
+}
+
+/// One number per day from hourly rows, for a chart of a long archive: [{ date, min, max, mean, sum, hours }] of `field`. Rows with a null value do not count.
+pub fn meteo_daily_summary(rows: serde_json::Value, field: &str) -> Result<Value, String> {
+    let list = rows.as_array().ok_or("give the rows of `hourly`")?;
+    let mut out: Vec<(String, f64, f64, f64, u64)> = vec![];
+    for r in list {
+        let t = r.get("time").and_then(|v| v.as_str()).ok_or("a row has `time`")?;
+        if r.get(field).is_none() {
+            return Err(format!("the rows have no `{}`", field));
+        }
+        let Some(v) = r[field].as_f64() else { continue };
+        let d = t.get(..10).unwrap_or(t);
+        match out.last_mut() {
+            Some(l) if l.0 == d => {
+                l.1 = l.1.min(v);
+                l.2 = l.2.max(v);
+                l.3 += v;
+                l.4 += 1;
+            }
+            _ => out.push((d.to_string(), v, v, v, 1)),
+        }
+    }
+    let r = |x: f64| (x * 100.0).round() / 100.0;
+    Ok(json!(out.iter().map(|(d, lo, hi, sum, n)| json!({ "date": d, "min": lo, "max": hi, "mean": r(sum / *n as f64), "sum": r(*sum), "hours": n })).collect::<Vec<_>>()))
+}

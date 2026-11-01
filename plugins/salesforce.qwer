@@ -1,0 +1,356 @@
+//! Salesforce's REST API without an SDK: sign-in by the OAuth client-credentials flow or a JWT bearer, renewed when a session dies, SOQL with values quoted and nextRecordsUrl followed, sObjects created, read, updated, upserted by external id and deleted, composite and collection calls with their per-item results, Salesforce's lists of errors read, and the API limit reported.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// SALESFORCE_LOGIN_URL is where to sign in: your My Domain for client credentials,
+// https://login.salesforce.com or https://test.salesforce.com for a JWT. SALESFORCE_CLIENT_ID is the
+// connected app's key. With SALESFORCE_CLIENT_SECRET it signs in by client credentials; with
+// SALESFORCE_USERNAME and SALESFORCE_PRIVATE_KEY (PEM) or SALESFORCE_PRIVATE_KEY_FILE, by a JWT.
+// SALESFORCE_API_VERSION is the version (v62.0 when not set).
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn login_url() -> String {
+    setting("SALESFORCE_LOGIN_URL").unwrap_or_else(|| "https://login.salesforce.com".into()).trim_end_matches('/').to_string()
+}
+
+fn version() -> String {
+    setting("SALESFORCE_API_VERSION").unwrap_or_else(|| "v62.0".into())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+struct Session {
+    token: String,
+    instance: String,
+    flow: String,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+static USAGE: Mutex<Option<Value>> = Mutex::new(None);
+
+fn jwt_assertion(client_id: &str, user: &str) -> Result<String, String> {
+    let pem = match (setting("SALESFORCE_PRIVATE_KEY"), setting("SALESFORCE_PRIVATE_KEY_FILE")) {
+        (Some(k), _) => k,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("a JWT sign-in needs SALESFORCE_PRIVATE_KEY or SALESFORCE_PRIVATE_KEY_FILE".into()),
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| format!("the private key: {}", e))?;
+    let exp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) + 170;
+    let claims = json!({ "iss": client_id, "sub": user, "aud": login_url(), "exp": exp });
+    jsonwebtoken::encode(&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256), &claims, &key).map_err(|e| e.to_string())
+}
+
+fn sign_in(flow: &str) -> Result<Session, String> {
+    let id = setting("SALESFORCE_CLIENT_ID").ok_or("SALESFORCE_CLIENT_ID is not set")?;
+    let which = if !flow.is_empty() {
+        flow.to_string()
+    } else if setting("SALESFORCE_USERNAME").is_some() {
+        "jwt".to_string()
+    } else {
+        "client_credentials".to_string()
+    };
+    let url = format!("{}/services/oauth2/token", login_url());
+    let req = ureq::post(&url).timeout(Duration::from_secs(20));
+    let res = match which.as_str() {
+        "jwt" => {
+            let user = setting("SALESFORCE_USERNAME").ok_or("a JWT sign-in needs SALESFORCE_USERNAME")?;
+            req.send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt_assertion(&id, &user)?)])
+        }
+        "client_credentials" => {
+            let secret = setting("SALESFORCE_CLIENT_SECRET").ok_or("client credentials need SALESFORCE_CLIENT_SECRET")?;
+            req.send_form(&[("grant_type", "client_credentials"), ("client_id", &id), ("client_secret", &secret)])
+        }
+        o => return Err(format!("`{}` is not a sign-in: \"jwt\" or \"client_credentials\"", o)),
+    };
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("Salesforce refused the sign-in, {}: {}: {}", c, v["error"].as_str().unwrap_or(&b), v["error_description"].as_str().unwrap_or("")));
+        }
+        Err(e) => return Err(format!("cannot reach Salesforce at {}: {}", url, e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(Session { token: v["access_token"].as_str().ok_or("Salesforce gave no access_token")?.to_string(), instance: v["instance_url"].as_str().ok_or("Salesforce gave no instance_url")?.trim_end_matches('/').to_string(), flow: which })
+}
+
+/// Signs in now, by `flow`: "jwt", "client_credentials", or "" for what the settings say. Gives { flow, instance_url }. Other calls do this by themselves; it tells you early that the settings are right.
+pub fn salesforce_sign_in(flow: &str) -> Result<serde_json::Value, String> {
+    let s = sign_in(flow)?;
+    let out = json!({ "flow": s.flow, "instance_url": s.instance });
+    *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    Ok(out)
+}
+
+fn session(force: bool) -> Result<(String, String), String> {
+    let mut g = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if force {
+        let flow = g.as_ref().map_or(String::new(), |s| s.flow.clone());
+        *g = Some(sign_in(&flow)?);
+    } else if g.is_none() {
+        *g = Some(sign_in("")?);
+    }
+    let s = g.as_ref().expect("just signed in");
+    Ok((s.token.clone(), s.instance.clone()))
+}
+
+fn note(r: &ureq::Response) {
+    // Sforce-Limit-Info: api-usage=25/15000
+    if let Some(h) = r.header("Sforce-Limit-Info") {
+        if let Some((used, of)) = h.split_once("api-usage=").and_then(|(_, t)| t.split(|c| c == ',' || c == ';').next()).and_then(|t| t.split_once('/')) {
+            *USAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({ "used": used.trim().parse::<i64>().ok(), "limit": of.trim().parse::<i64>().ok() }));
+        }
+    }
+}
+
+/// What the last answer said of the day's API calls: { used, limit }, or null before one.
+pub fn salesforce_api_usage() -> serde_json::Value {
+    USAGE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Value::Null)
+}
+
+// Errors come as a list: [{ message, errorCode, fields }].
+fn errors_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let Some(list) = v.as_array().filter(|l| !l.is_empty()) else {
+        return format!("Salesforce {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    };
+    let parts: Vec<String> = list.iter().map(error_one).collect();
+    format!("Salesforce {}: {}", status, parts.join("; "))
+}
+
+fn error_one(e: &Value) -> String {
+    let code = e["errorCode"].as_str().or(e["statusCode"].as_str()).unwrap_or("ERROR");
+    let mut t = format!("{}: {}", code, e["message"].as_str().unwrap_or(""));
+    let fields: Vec<&str> = e["fields"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).collect();
+    if !fields.is_empty() {
+        t.push_str(&format!(" (fields {})", fields.join(", ")));
+    }
+    t
+}
+
+// `path` is under the instance, as a nextRecordsUrl is.
+fn fetch(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let mut renewed = false;
+    let mut busy = 0u32;
+    loop {
+        let (token, instance) = session(false)?;
+        let req = agent.request(method, &format!("{}{}", instance, path)).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                note(&r);
+                let code = r.status();
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                if code == 204 || t.trim().is_empty() {
+                    return Ok(json!({ "_status": code }));
+                }
+                let mut v: Value = serde_json::from_str(&t).map_err(|_| format!("Salesforce's answer is not JSON: {}", t.chars().take(200).collect::<String>()))?;
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("_status".into(), json!(code));
+                }
+                return Ok(v);
+            }
+            // The session was ended or timed out.
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                session(true)?;
+            }
+            Err(ureq::Error::Status(503, _)) if method == "GET" && busy < 3 => {
+                std::thread::sleep(Duration::from_millis(500u64 << busy));
+                busy += 1;
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                note(&r);
+                return Err(errors_text(c, &r.into_string().unwrap_or_default()));
+            }
+            Err(e) => return Err(format!("cannot reach Salesforce: {}", e)),
+        }
+    }
+}
+
+fn data(path: &str) -> String {
+    format!("/services/data/{}{}", version(), path)
+}
+
+fn name_ok(n: &str) -> Result<(), String> {
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(format!("`{}` is not an API name", n));
+    }
+    Ok(())
+}
+
+/// A text quoted for SOQL, quotes included: `salesforce_quote("O'Brien")` is `'O\'Brien'`.
+pub fn salesforce_quote(value: &str) -> String {
+    let mut o = String::from("'");
+    for c in value.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\'' => o.push_str("\\'"),
+            '"' => o.push_str("\\\""),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c => o.push(c),
+        }
+    }
+    o.push('\'');
+    o
+}
+
+fn strip(mut r: Value) -> Value {
+    if let Some(m) = r.as_object_mut() {
+        // `remove` would swap the last field into its place.
+        m.shift_remove("attributes");
+        for v in m.values_mut() {
+            if v.get("attributes").is_some() {
+                *v = strip(v.take());
+            } else if v.get("records").is_some() {
+                if let Some(a) = v["records"].as_array_mut() {
+                    for x in a.iter_mut() {
+                        *x = strip(x.take());
+                    }
+                }
+            }
+        }
+    }
+    r
+}
+
+/// Runs a SOQL query and follows nextRecordsUrl to the end. `options` takes `all` (true also sees deleted and archived rows) and `max_items`. Gives { total, records }, each record without its `attributes`.
+pub fn salesforce_query(soql: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let endpoint = if options["all"] == json!(true) { "/queryAll" } else { "/query" };
+    let max_items = options["max_items"].as_i64().unwrap_or(0);
+    let mut v = fetch("GET", &format!("{}?q={}", data(endpoint), enc(soql)), None)?;
+    let total = v["totalSize"].clone();
+    let mut out = vec![];
+    loop {
+        out.extend(v["records"].as_array().cloned().unwrap_or_default().into_iter().map(strip));
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            break;
+        }
+        match (v["done"].as_bool(), v["nextRecordsUrl"].as_str().map(str::to_string)) {
+            (Some(false), Some(n)) => v = fetch("GET", &n, None)?,
+            _ => break,
+        }
+    }
+    Ok(json!({ "total": total, "records": out }))
+}
+
+/// Makes a record of `object` ("Account", "Invoice__c"...). Gives its id.
+pub fn salesforce_create(object: &str, fields: serde_json::Value) -> Result<String, String> {
+    name_ok(object)?;
+    let v = fetch("POST", &data(&format!("/sobjects/{}", object)), Some(&fields))?;
+    v["id"].as_str().map(str::to_string).ok_or("Salesforce gave no id".to_string())
+}
+
+/// One record by id; `fields` is a list of names, or an empty list for all. Gives it without `attributes`.
+pub fn salesforce_get(object: &str, id: &str, fields: Vec<String>) -> Result<serde_json::Value, String> {
+    name_ok(object)?;
+    let q = if fields.is_empty() { String::new() } else { format!("?fields={}", enc(&fields.join(","))) };
+    let mut v = strip(fetch("GET", &data(&format!("/sobjects/{}/{}{}", object, enc(id), q)), None)?);
+    if let Some(m) = v.as_object_mut() {
+        m.shift_remove("_status");
+    }
+    Ok(v)
+}
+
+/// Changes fields of a record.
+pub fn salesforce_update(object: &str, id: &str, fields: serde_json::Value) -> Result<bool, String> {
+    name_ok(object)?;
+    fetch("PATCH", &data(&format!("/sobjects/{}/{}", object, enc(id))), Some(&fields))?;
+    Ok(true)
+}
+
+/// Makes or changes a record by an external id field. Gives { id, created }.
+pub fn salesforce_upsert(object: &str, id_field: &str, id_value: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    name_ok(object)?;
+    name_ok(id_field)?;
+    let v = fetch("PATCH", &data(&format!("/sobjects/{}/{}/{}", object, id_field, enc(id_value))), Some(&fields))?;
+    Ok(json!({ "id": v["id"], "created": v["_status"] == 201 }))
+}
+
+/// Deletes a record.
+pub fn salesforce_delete(object: &str, id: &str) -> Result<bool, String> {
+    name_ok(object)?;
+    fetch("DELETE", &data(&format!("/sobjects/{}/{}", object, enc(id))), None)?;
+    Ok(true)
+}
+
+/// Runs up to 25 steps as one composite call. Each step is { ref, method, object, id, body }, or { ref, method, url } for another URL; a later body may say `@{ref.id}`. With `all_or_none` one failure undoes all. Gives { ok, steps: [{ ref, status, ok, body, error }] }; only a failure of the call itself is an error.
+pub fn salesforce_composite(steps: Vec<serde_json::Value>, all_or_none: bool) -> Result<serde_json::Value, String> {
+    if steps.is_empty() || steps.len() > 25 {
+        return Err(format!("a composite call holds 1 to 25 steps, not {}", steps.len()));
+    }
+    let mut reqs = vec![];
+    for s in &steps {
+        let r = s["ref"].as_str().ok_or("each step needs a `ref`")?;
+        let url = match (s["url"].as_str(), s["object"].as_str()) {
+            (Some(u), _) => u.to_string(),
+            (None, Some(o)) => {
+                name_ok(o)?;
+                match s["id"].as_str() {
+                    Some(i) => data(&format!("/sobjects/{}/{}", o, i)),
+                    None => data(&format!("/sobjects/{}", o)),
+                }
+            }
+            _ => return Err(format!("step {} needs an `object` or a `url`", r)),
+        };
+        let mut q = json!({ "method": s["method"].as_str().unwrap_or("POST").to_uppercase(), "url": url, "referenceId": r });
+        if !s["body"].is_null() {
+            q["body"] = s["body"].clone();
+        }
+        reqs.push(q);
+    }
+    let v = fetch("POST", &data("/composite"), Some(&json!({ "allOrNone": all_or_none, "compositeRequest": reqs })))?;
+    let mut out = vec![];
+    let mut ok = true;
+    for r in v["compositeResponse"].as_array().into_iter().flatten() {
+        let code = r["httpStatusCode"].as_i64().unwrap_or(0);
+        let good = (200..300).contains(&code);
+        ok &= good;
+        let error = if good { Value::Null } else { json!(r["body"].as_array().map(|l| l.iter().map(error_one).collect::<Vec<_>>().join("; "))) };
+        out.push(json!({ "ref": r["referenceId"], "status": code, "ok": good, "body": r["body"], "error": error }));
+    }
+    Ok(json!({ "ok": ok, "steps": out }))
+}
+
+/// Makes many records of one object through sObject Collections, 200 at a time. With `all_or_none` each group stands or falls together. Gives { ids, failed: [{ index, error }] }.
+pub fn salesforce_create_many(object: &str, records: Vec<serde_json::Value>, all_or_none: bool) -> Result<serde_json::Value, String> {
+    name_ok(object)?;
+    let mut ids = vec![];
+    let mut failed = vec![];
+    let mut index = 0;
+    for chunk in records.chunks(200) {
+        let list: Vec<Value> = chunk.iter().map(|r| { let mut x = r.clone(); x["attributes"] = json!({ "type": object }); x }).collect();
+        let v = fetch("POST", &data("/composite/sobjects"), Some(&json!({ "allOrNone": all_or_none, "records": list })))?;
+        // The whole answer is a list, so `fetch` left it as it was.
+        for r in v.as_array().into_iter().flatten() {
+            if r["success"] == json!(true) {
+                ids.push(r["id"].clone());
+            } else {
+                failed.push(json!({ "index": index, "error": r["errors"].as_array().map(|l| l.iter().map(error_one).collect::<Vec<_>>().join("; ")) }));
+            }
+            index += 1;
+        }
+    }
+    Ok(json!({ "ids": ids, "failed": failed }))
+}

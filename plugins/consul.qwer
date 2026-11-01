@@ -1,0 +1,297 @@
+//! HashiCorp Consul's HTTP API: the KV store with its base64 values read back, check-and-set writes, blocking queries that wait for a change and handle a reset index, services registered and read with their health, sessions, and locks built on them.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// CONSUL_API_URL is an agent (http://localhost:8500 when not set), CONSUL_TOKEN the ACL token,
+// sent as X-Consul-Token, CONSUL_DATACENTER the datacenter when it is not the agent's own.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("CONSUL_API_URL").unwrap_or_else(|| "http://localhost:8500".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// A key in a URL: slashes stay.
+fn key_path(k: &str) -> Result<String, String> {
+    if k.is_empty() {
+        return Err("no key given".into());
+    }
+    if k.starts_with('/') {
+        return Err(format!("{:?}: Consul keys do not start with a /", k));
+    }
+    Ok(k.split('/').map(enc).collect::<Vec<_>>().join("/"))
+}
+
+struct Reply {
+    status: u16,
+    index: Option<u64>,
+    text: String,
+}
+
+fn send(method: &str, path: &str, query: &[(&str, String)], body: Option<String>, wait: Duration) -> Result<Reply, String> {
+    let mut pairs: Vec<String> = query.iter().map(|(k, v)| if v.is_empty() { k.to_string() } else { format!("{}={}", k, enc(v)) }).collect();
+    if let Some(dc) = env("CONSUL_DATACENTER") {
+        pairs.push(format!("dc={}", enc(&dc)));
+    }
+    let url = format!("{}{}{}{}", base(), path, if pairs.is_empty() { "" } else { "?" }, pairs.join("&"));
+    let mut req = ureq::request(method, &url).timeout(wait);
+    if let Some(t) = env("CONSUL_TOKEN") {
+        req = req.set("X-Consul-Token", &t);
+    }
+    let res = match body {
+        Some(b) => req.send_string(&b),
+        None if method == "PUT" => req.send_string(""),
+        None => req.call(),
+    };
+    match res {
+        Ok(r) => {
+            let index = r.header("X-Consul-Index").and_then(|s| s.parse().ok());
+            Ok(Reply { status: r.status(), index, text: r.into_string().map_err(|e| e.to_string())? })
+        }
+        Err(ureq::Error::Status(c, r)) => {
+            let index = r.header("X-Consul-Index").and_then(|s| s.parse().ok());
+            Ok(Reply { status: c, index, text: r.into_string().unwrap_or_default() })
+        }
+        Err(e) => Err(format!("cannot reach Consul at {}: {}", base(), e)),
+    }
+}
+
+fn short() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn refused(r: &Reply) -> String {
+    let hint = if r.status == 403 { " (check CONSUL_TOKEN and its policy)" } else { "" };
+    format!("Consul answered {}: {}{}", r.status, r.text.trim(), hint)
+}
+
+fn ok_json(r: Reply) -> Result<Value, String> {
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    if r.text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&r.text).map_err(|_| format!("Consul's answer is not JSON: {}", r.text.chars().take(200).collect::<String>()))
+}
+
+fn kv(e: &Value) -> Value {
+    let value = e["Value"].as_str().map(|s| base64::engine::general_purpose::STANDARD.decode(s).map_or(Value::Null, |b| json!(String::from_utf8_lossy(&b))));
+    json!({ "key": e["Key"], "value": value, "flags": e["Flags"], "modify_index": e["ModifyIndex"], "create_index": e["CreateIndex"], "lock_index": e["LockIndex"], "session": e["Session"] })
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        o => o.to_string(),
+    }
+}
+
+/// The index to use next, and what the docs say about it: an index that goes backwards means the store was reset, and the watch starts from 0; none at all is a broken answer.
+fn next_index(seen: Option<u64>, had: u64) -> Result<u64, String> {
+    let i = seen.ok_or("Consul gave no X-Consul-Index")?;
+    if i == 0 {
+        return Err("Consul gave an index of 0".into());
+    }
+    Ok(if i < had { 0 } else { i })
+}
+
+/// A key: `{ key, value, flags, modify_index, create_index, lock_index, session }`, `value` as text and null for a key with none, or null when there is no such key.
+pub fn consul_get(key: &str) -> Result<Value, String> {
+    let r = send("GET", &format!("/v1/kv/{}", key_path(key)?), &[], None, short())?;
+    if r.status == 404 {
+        return Ok(Value::Null);
+    }
+    let v = ok_json(r)?;
+    Ok(v.get(0).map_or(Value::Null, kv))
+}
+
+/// All keys under a prefix, each as `consul_get` gives it. None is an empty list.
+pub fn consul_list(prefix: &str) -> Result<Vec<Value>, String> {
+    let r = send("GET", &format!("/v1/kv/{}", prefix.split('/').map(enc).collect::<Vec<_>>().join("/")), &[("recurse", String::new())], None, short())?;
+    if r.status == 404 {
+        return Ok(vec![]);
+    }
+    Ok(ok_json(r)?.as_array().into_iter().flatten().map(kv).collect())
+}
+
+/// Only the names under a prefix; a `separator` like "/" stops at the next level, as folders.
+pub fn consul_keys(prefix: &str, separator: &str) -> Result<Vec<Value>, String> {
+    let mut q = vec![("keys", String::new())];
+    if !separator.is_empty() {
+        q.push(("separator", separator.to_string()));
+    }
+    let r = send("GET", &format!("/v1/kv/{}", prefix.split('/').map(enc).collect::<Vec<_>>().join("/")), &q, None, short())?;
+    if r.status == 404 {
+        return Ok(vec![]);
+    }
+    Ok(ok_json(r)?.as_array().cloned().unwrap_or_default())
+}
+
+/// Stores a value (a text as it is, anything else as JSON; at most 512 KB). `flags` is any number for the program's own use, 0 otherwise. Gives true.
+pub fn consul_put(key: &str, value: serde_json::Value, flags: i64) -> Result<bool, String> {
+    let body = text_of(&value);
+    if body.len() > 512 * 1024 {
+        return Err(format!("the value is {} bytes; Consul keeps at most 512 KB", body.len()));
+    }
+    let q = if flags != 0 { vec![("flags", flags.to_string())] } else { vec![] };
+    Ok(ok_json(send("PUT", &format!("/v1/kv/{}", key_path(key)?), &q, Some(body), short())?)? == true)
+}
+
+/// Stores a value only if the key's `modify_index` is still `index`, 0 meaning only if the key does not exist. False when something else wrote first: read again.
+pub fn consul_cas(key: &str, value: serde_json::Value, index: i64) -> Result<bool, String> {
+    Ok(ok_json(send("PUT", &format!("/v1/kv/{}", key_path(key)?), &[("cas", index.to_string())], Some(text_of(&value)), short())?)? == true)
+}
+
+/// Deletes a key, or with `recurse` everything under it. Consul says true whether it was there or not.
+pub fn consul_delete(key: &str, recurse: bool) -> Result<bool, String> {
+    let q = if recurse { vec![("recurse", String::new())] } else { vec![] };
+    Ok(ok_json(send("DELETE", &format!("/v1/kv/{}", key_path(key)?), &q, None, short())?)? == true)
+}
+
+/// Waits for a key to change: a blocking query from `index` (0 answers at once), for up to `wait_seconds`. Gives `{ changed, index, entry }`; pass `index` to the next call. A wait that ran out gives `changed` false. `entry` is null when the key has gone.
+pub fn consul_watch(key: &str, index: i64, wait_seconds: i64) -> Result<Value, String> {
+    let wait = wait_seconds.clamp(1, 600);
+    let q = vec![("index", index.to_string()), ("wait", format!("{}s", wait))];
+    // Consul adds up to 1/16 of the wait, at random, to spread the answers.
+    let r = send("GET", &format!("/v1/kv/{}", key_path(key)?), &q, None, Duration::from_secs((wait + wait / 16 + 10) as u64))?;
+    let had = index.max(0) as u64;
+    let seen = r.index;
+    if r.status == 404 {
+        let next = next_index(seen, had)?;
+        return Ok(json!({ "changed": seen != Some(had), "index": next, "entry": null }));
+    }
+    let v = ok_json(r)?;
+    let next = next_index(seen, had)?;
+    Ok(json!({ "changed": seen != Some(had), "index": next, "entry": v.get(0).map_or(Value::Null, kv) }))
+}
+
+/// Registers a service with this agent: `{ name, id, address, port, tags, meta, check }`, `check` being `{ http, interval }`, `{ tcp, interval }` or `{ ttl }`.
+pub fn consul_register(service: serde_json::Value) -> Result<bool, String> {
+    let name = service["name"].as_str().ok_or("a service needs a `name`")?;
+    let mut b = json!({ "Name": name });
+    for (k, n) in [("id", "ID"), ("address", "Address"), ("port", "Port"), ("tags", "Tags"), ("meta", "Meta")] {
+        if let Some(v) = service.get(k) {
+            b[n] = v.clone();
+        }
+    }
+    if let Some(c) = service.get("check") {
+        let mut chk = json!({});
+        for (k, n) in [("http", "HTTP"), ("tcp", "TCP"), ("ttl", "TTL"), ("interval", "Interval"), ("timeout", "Timeout"), ("deregister_after", "DeregisterCriticalServiceAfter")] {
+            if let Some(v) = c.get(k) {
+                chk[n] = v.clone();
+            }
+        }
+        b["Check"] = chk;
+    }
+    ok_json(send("PUT", "/v1/agent/service/register", &[], Some(b.to_string()), short())?)?;
+    Ok(true)
+}
+
+/// Takes a service off this agent, by its id.
+pub fn consul_deregister(id: &str) -> Result<bool, String> {
+    ok_json(send("PUT", &format!("/v1/agent/service/deregister/{}", enc(id)), &[], None, short())?)?;
+    Ok(true)
+}
+
+/// Passes a TTL check, as a service must before its TTL runs out. `status` is "pass", "warn" or "fail".
+pub fn consul_check(check_id: &str, status: &str, note: &str) -> Result<bool, String> {
+    if !["pass", "warn", "fail"].contains(&status) {
+        return Err(format!("{:?} is not a check status: pass, warn or fail", status));
+    }
+    ok_json(send("PUT", &format!("/v1/agent/check/{}/{}", status, enc(check_id)), &[("note", note.to_string())], None, short())?)?;
+    Ok(true)
+}
+
+/// All services in the catalog: a map of name to its tags.
+pub fn consul_services() -> Result<Value, String> {
+    ok_json(send("GET", "/v1/catalog/services", &[], None, short())?)
+}
+
+fn instance(e: &Value) -> Value {
+    let checks = e["Checks"].as_array().cloned().unwrap_or_default();
+    let worst = if checks.iter().any(|c| c["Status"] == "critical") { "critical" } else if checks.iter().any(|c| c["Status"] == "warning") { "warning" } else { "passing" };
+    // A service with no address of its own is at its node's.
+    let address = e["Service"]["Address"].as_str().filter(|a| !a.is_empty()).map_or(e["Node"]["Address"].clone(), |a| json!(a));
+    json!({ "id": e["Service"]["ID"], "service": e["Service"]["Service"], "node": e["Node"]["Node"], "address": address, "port": e["Service"]["Port"], "tags": e["Service"]["Tags"], "meta": e["Service"]["Meta"], "status": worst })
+}
+
+/// The instances of a service, each `{ id, service, node, address, port, tags, meta, status }`, `status` the worst of its checks. `options`: `passing` (true leaves out the unhealthy), `tag`, `index` and `wait_seconds` to block for a change. Gives `{ instances, index, changed }`.
+pub fn consul_health(service: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut q = vec![];
+    if options["passing"] == true {
+        q.push(("passing", String::new()));
+    }
+    if let Some(t) = options["tag"].as_str() {
+        q.push(("tag", t.to_string()));
+    }
+    let had = options["index"].as_i64().unwrap_or(0).max(0) as u64;
+    let mut wait = short();
+    if let Some(w) = options["wait_seconds"].as_i64() {
+        q.push(("index", had.to_string()));
+        q.push(("wait", format!("{}s", w)));
+        wait = Duration::from_secs((w + w / 16 + 10) as u64);
+    }
+    let r = send("GET", &format!("/v1/health/service/{}", enc(service)), &q, None, wait)?;
+    let seen = r.index;
+    let v = ok_json(r)?;
+    let list: Vec<Value> = v.as_array().into_iter().flatten().map(instance).collect();
+    Ok(json!({ "instances": list, "index": next_index(seen, had)?, "changed": seen != Some(had) }))
+}
+
+/// Makes a session: `options` `name`, `ttl` ("15s" to "86400s"; renew it within that, or it ends), `behavior` ("release" or "delete": what happens to its locks), `lock_delay`, `checks`. Gives its id.
+pub fn consul_session_create(options: serde_json::Value) -> Result<String, String> {
+    let mut b = json!({});
+    for (k, n) in [("name", "Name"), ("ttl", "TTL"), ("behavior", "Behavior"), ("lock_delay", "LockDelay"), ("checks", "Checks"), ("node", "Node")] {
+        if let Some(v) = options.get(k) {
+            b[n] = v.clone();
+        }
+    }
+    let r = ok_json(send("PUT", "/v1/session/create", &[], Some(b.to_string()), short())?)?;
+    r["ID"].as_str().map(str::to_string).ok_or("Consul gave no session id".to_string())
+}
+
+/// Renews a session. False when it has ended, and its locks with it.
+pub fn consul_session_renew(id: &str) -> Result<bool, String> {
+    let r = send("PUT", &format!("/v1/session/renew/{}", enc(id)), &[], None, short())?;
+    if r.status == 404 {
+        return Ok(false);
+    }
+    ok_json(r)?;
+    Ok(true)
+}
+
+/// Ends a session, which releases or deletes its locks as its behavior says.
+pub fn consul_session_destroy(id: &str) -> Result<bool, String> {
+    Ok(ok_json(send("PUT", &format!("/v1/session/destroy/{}", enc(id)), &[], None, short())?)? == true)
+}
+
+/// Tries for a lock on `key` for a session, storing `value` there if it gets it. True when held; false when another session has it. A failed try is not an error: wait with `consul_watch`.
+pub fn consul_lock(key: &str, session: &str, value: serde_json::Value) -> Result<bool, String> {
+    Ok(ok_json(send("PUT", &format!("/v1/kv/{}", key_path(key)?), &[("acquire", session.to_string())], Some(text_of(&value)), short())?)? == true)
+}
+
+/// Gives a lock up; false when this session did not hold it.
+pub fn consul_unlock(key: &str, session: &str, value: serde_json::Value) -> Result<bool, String> {
+    Ok(ok_json(send("PUT", &format!("/v1/kv/{}", key_path(key)?), &[("release", session.to_string())], Some(text_of(&value)), short())?)? == true)
+}
+
+/// The session holding a lock, or null when free.
+pub fn consul_lock_holder(key: &str) -> Result<Value, String> {
+    let e = consul_get(key)?;
+    Ok(if e.is_null() { Value::Null } else { e["session"].clone() })
+}

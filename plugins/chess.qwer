@@ -1,0 +1,347 @@
+//! Chess rules through shakmaty: FEN read and written, legal moves in SAN and UCI, moves played and checked, PGN games read with their tags, comments and final positions, game state, perft, and Chess960 start positions.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! shakmaty = "=0.30.2"
+//! pgn-reader = "=0.29.1"
+
+use pgn_reader::{Outcome as PgnOutcome, RawComment, RawTag, Reader, SanPlus, Skip, Visitor};
+use serde_json::{json, Map, Value};
+use shakmaty::fen::Fen;
+use shakmaty::san::San;
+use shakmaty::uci::UciMove;
+use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, KnownOutcome, Move, Outcome, Position, Rank, Role, Square};
+use std::ops::ControlFlow;
+
+const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+fn fen_of(p: &Chess) -> String {
+    Fen::from_position(p, EnPassantMode::Legal).to_string()
+}
+
+/// A position from FEN, empty for the start. Standard castling first, then Chess960's.
+fn load(fen: &str) -> Result<(Chess, CastlingMode), String> {
+    let t = if fen.trim().is_empty() { START } else { fen.trim() };
+    let f: Fen = t.parse().map_err(|e| format!("`{}` is not FEN: {}", t, e))?;
+    if let Ok(p) = f.clone().into_position::<Chess>(CastlingMode::Standard) {
+        return Ok((p, CastlingMode::Standard));
+    }
+    match f.into_position::<Chess>(CastlingMode::Chess960) {
+        Ok(p) => Ok((p, CastlingMode::Chess960)),
+        Err(e) => Err(format!("that position cannot arise: {}", e)),
+    }
+}
+
+fn outcome(p: &Chess) -> Value {
+    match p.outcome() {
+        Outcome::Known(KnownOutcome::Decisive { winner: Color::White }) => json!("1-0"),
+        Outcome::Known(KnownOutcome::Decisive { winner: Color::Black }) => json!("0-1"),
+        Outcome::Known(KnownOutcome::Draw) => json!("1/2-1/2"),
+        Outcome::Unknown => Value::Null,
+    }
+}
+
+fn state(p: &Chess) -> Value {
+    let reason = if p.is_checkmate() { "checkmate" } else if p.is_stalemate() { "stalemate" } else if p.is_insufficient_material() { "insufficient material" } else if p.halfmoves() >= 150 { "seventy-five moves" } else { "" };
+    json!({
+        "fen": fen_of(p),
+        "turn": if p.turn() == Color::White { "white" } else { "black" },
+        "check": p.is_check(), "checkmate": p.is_checkmate(), "stalemate": p.is_stalemate(), "insufficient_material": p.is_insufficient_material(),
+        "game_over": p.is_game_over(), "result": outcome(p), "reason": reason,
+        "halfmove_clock": p.halfmoves(), "fullmove": p.fullmoves().get(), "fifty_move_claim": p.halfmoves() >= 100,
+        "legal_moves": p.legal_moves().len(),
+        "en_passant": p.legal_ep_square().map(|s| s.to_string()),
+    })
+}
+
+/// A position's state from FEN (empty for the start): `{ fen, turn, check, checkmate, stalemate, insufficient_material, game_over, result, reason, halfmove_clock, fullmove, fifty_move_claim, legal_moves, en_passant }`. FEN that cannot be or a position that cannot arise is an error.
+pub fn chess_position(fen: &str) -> Result<Value, String> {
+    Ok(state(&load(fen)?.0))
+}
+
+fn role_name(r: Role) -> &'static str {
+    match r {
+        Role::Pawn => "pawn",
+        Role::Knight => "knight",
+        Role::Bishop => "bishop",
+        Role::Rook => "rook",
+        Role::Queen => "queen",
+        Role::King => "king",
+    }
+}
+
+fn san_with_suffix(p: &Chess, m: Move) -> String {
+    let mut after = p.clone();
+    SanPlus::from_move_and_play_unchecked(&mut after, m).to_string()
+}
+
+fn move_json(p: &Chess, m: Move, mode: CastlingMode) -> Value {
+    let promotion = m.promotion().map(role_name);
+    json!({
+        "san": san_with_suffix(p, m), "uci": UciMove::from_move(m, mode).to_string(),
+        "from": m.from().map(|s| s.to_string()), "to": m.to().to_string(), "piece": role_name(m.role()),
+        "capture": m.capture().map(role_name).or(if m.is_en_passant() { Some("pawn") } else { None }), "promotion": promotion, "castle": m.castling_side().map(|c| if c.is_king_side() { "king" } else { "queen" }),
+        "en_passant": m.is_en_passant(),
+    })
+}
+
+/// Every legal move: `[{ san, uci, from, to, piece, capture, promotion, castle, en_passant }]`. `chess_moves("")` lists the 20 of the start.
+pub fn chess_moves(fen: &str) -> Result<Vec<Value>, String> {
+    let (p, mode) = load(fen)?;
+    Ok(p.legal_moves().iter().map(|m| move_json(&p, *m, mode)).collect())
+}
+
+/// A move written either way, checked against the position.
+fn read_move(p: &Chess, mv: &str) -> Result<Move, String> {
+    let t = mv.trim();
+    if let Ok(u) = t.parse::<UciMove>() {
+        if let Ok(m) = u.to_move(p) {
+            return Ok(m);
+        }
+    }
+    let clean = t.trim_end_matches(['+', '#', '!', '?']);
+    match clean.parse::<San>() {
+        Ok(s) => s.to_move(p).map_err(|e| format!("`{}` cannot be played here: {}", t, e)),
+        Err(_) => Err(format!("`{}` is not a move in SAN or UCI", t)),
+    }
+}
+
+/// Plays a move, SAN (`Nf3`) or UCI (`g1f3`): `{ san, uci, ..., position }`. An illegal move is an error saying so.
+pub fn chess_play(fen: &str, mv: &str) -> Result<Value, String> {
+    let (p, mode) = load(fen)?;
+    let m = read_move(&p, mv)?;
+    let mut v = move_json(&p, m, mode);
+    let after = p.play(m).map_err(|e| e.to_string())?;
+    v["position"] = state(&after);
+    Ok(v)
+}
+
+/// Plays a list of moves from `fen`: `{ san, uci, position }`, the moves as both notations. An illegal one is an error naming its number, such as "move 3 (white)".
+pub fn chess_line(fen: &str, moves: Vec<String>) -> Result<Value, String> {
+    let (mut p, mode) = load(fen)?;
+    let (mut san, mut uci) = (vec![], vec![]);
+    for mv in &moves {
+        let side = if p.turn() == Color::White { "white" } else { "black" };
+        let m = read_move(&p, mv).map_err(|e| format!("move {} ({}): {}", p.fullmoves().get(), side, e))?;
+        san.push(san_with_suffix(&p, m));
+        uci.push(UciMove::from_move(m, mode).to_string());
+        p = p.play(m).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "san": san, "uci": uci, "position": state(&p) }))
+}
+
+/// Nodes of a move tree `depth` plies deep, the standard test of a move generator: from the start, depth 4 is 197281.
+pub fn chess_perft(fen: &str, depth: i64) -> Result<i64, String> {
+    if !(0..=6).contains(&depth) {
+        return Err("depth should be 0 to 6: it grows thirtyfold with each".into());
+    }
+    Ok(shakmaty::perft(&load(fen)?.0, depth as u32) as i64)
+}
+
+/// A position as text, rank 8 first, for logs and terminals.
+pub fn chess_board(fen: &str) -> Result<String, String> {
+    let (p, _) = load(fen)?;
+    let mut out = String::new();
+    for r in (0..8).rev() {
+        out.push_str(&format!("{} ", r + 1));
+        for f in 0..8 {
+            let s = Square::from_coords(shakmaty::File::new(f), Rank::new(r));
+            out.push(' ');
+            out.push(p.board().piece_at(s).map_or('.', |x| x.char()));
+        }
+        out.push('\n');
+    }
+    out.push_str("   a b c d e f g h\n");
+    Ok(out)
+}
+
+/// The FEN of a Chess960 start position, 0 to 959, by Scharnagl's numbering: 518 is the usual start. Its castling is written X-FEN style, with `KQkq`.
+pub fn chess_960(number: i64) -> Result<Value, String> {
+    if !(0..960).contains(&number) {
+        return Err(format!("{} is not a Chess960 position: they are numbered 0 to 959", number));
+    }
+    let mut rank = ['.'; 8];
+    let mut n = number as usize;
+    rank[n % 4 * 2 + 1] = 'B';
+    n /= 4;
+    rank[n % 4 * 2] = 'B';
+    n /= 4;
+    let free = |rank: &[char; 8]| -> Vec<usize> { (0..8).filter(|i| rank[*i] == '.').collect() };
+    let q = free(&rank)[n % 6];
+    rank[q] = 'Q';
+    n /= 6;
+    const KNIGHTS: [(usize, usize); 10] = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)];
+    let (a, b) = KNIGHTS[n];
+    let f = free(&rank);
+    rank[f[a]] = 'N';
+    rank[f[b]] = 'N';
+    let f = free(&rank);
+    rank[f[0]] = 'R';
+    rank[f[1]] = 'K';
+    rank[f[2]] = 'R';
+    let white: String = rank.iter().collect();
+    let fen = format!("{}/pppppppp/8/8/8/8/PPPPPPPP/{} w KQkq - 0 1", white.to_lowercase(), white);
+    let (p, mode) = load(&fen)?;
+    Ok(json!({ "number": number, "pieces": white, "fen": fen, "chess960": mode == CastlingMode::Chess960 || number != 518, "legal_moves": p.legal_moves().len() }))
+}
+
+#[derive(Default)]
+struct Game {
+    tags: Map<String, Value>,
+    moves: Vec<Value>,
+    comments: Vec<Value>,
+    variations: usize,
+    outcome: Option<String>,
+    start: Option<(Chess, CastlingMode)>,
+    pos: Option<Chess>,
+    error: Option<String>,
+    prologue: Vec<String>,
+}
+
+struct Games;
+
+impl Visitor for Games {
+    type Tags = Game;
+    type Movetext = Game;
+    type Output = Game;
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(Game::default())
+    }
+
+    fn tag(&mut self, g: &mut Self::Tags, name: &[u8], value: RawTag<'_>) -> ControlFlow<Self::Output> {
+        g.tags.insert(String::from_utf8_lossy(name).into_owned(), json!(value.decode_utf8_lossy()));
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, mut g: Self::Tags) -> ControlFlow<Self::Output, Self::Movetext> {
+        let fen = g.tags.get("FEN").and_then(Value::as_str).unwrap_or("").to_string();
+        match load(&fen) {
+            Ok((p, mode)) => {
+                g.pos = Some(p.clone());
+                g.start = Some((p, mode));
+                ControlFlow::Continue(g)
+            }
+            Err(e) => {
+                g.error = Some(format!("tag FEN: {}", e));
+                ControlFlow::Break(g)
+            }
+        }
+    }
+
+    fn san(&mut self, g: &mut Self::Movetext, san: SanPlus) -> ControlFlow<Self::Output> {
+        let pos = g.pos.as_mut().unwrap();
+        let number = pos.fullmoves().get();
+        let side = if pos.turn() == Color::White { "white" } else { "black" };
+        match san.san.to_move(pos) {
+            Ok(m) => {
+                let mode = g.start.as_ref().unwrap().1;
+                g.moves.push(json!({ "number": number, "color": side, "san": san_with_suffix(pos, m), "uci": UciMove::from_move(m, mode).to_string() }));
+                pos.play_unchecked(m);
+                ControlFlow::Continue(())
+            }
+            Err(e) => {
+                g.error = Some(format!("move {} ({}): `{}` cannot be played: {}", number, side, san, e));
+                ControlFlow::Break(std::mem::take(g))
+            }
+        }
+    }
+
+    fn comment(&mut self, g: &mut Self::Movetext, comment: RawComment<'_>) -> ControlFlow<Self::Output> {
+        let t = String::from_utf8_lossy(comment.as_bytes()).trim().to_string();
+        if g.moves.is_empty() {
+            g.prologue.push(t);
+        } else {
+            g.comments.push(json!({ "after": g.moves.len(), "text": t }));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn begin_variation(&mut self, g: &mut Self::Movetext) -> ControlFlow<Self::Output, Skip> {
+        g.variations += 1;
+        ControlFlow::Continue(Skip(true))
+    }
+
+    fn outcome(&mut self, g: &mut Self::Movetext, outcome: PgnOutcome) -> ControlFlow<Self::Output> {
+        g.outcome = Some(outcome.to_string());
+        ControlFlow::Continue(())
+    }
+
+    fn end_game(&mut self, g: Self::Movetext) -> Self::Output {
+        g
+    }
+}
+
+/// Reads games from PGN text: `[{ tags, moves: [{ number, color, san, uci }], comments, variations, result, fen, position, error }]`. Each move is checked against the rules, from the `FEN` tag where there is one. A game with an illegal move stops there, with `error` naming the move, and the rest are still read. Side lines are counted and skipped.
+pub fn chess_pgn(text: &str) -> Result<Vec<Value>, String> {
+    let mut r = Reader::new(std::io::Cursor::new(text.as_bytes()));
+    let mut out = vec![];
+    while let Some(g) = r.read_game(&mut Games).map_err(|e| e.to_string())? {
+        let position = g.pos.as_ref().map(state).unwrap_or(Value::Null);
+        out.push(json!({
+            "tags": g.tags, "moves": g.moves, "comments": g.comments, "intro": g.prologue, "variations": g.variations,
+            "result": g.outcome.clone().or(g.tags.get("Result").and_then(Value::as_str).map(str::to_string)), "position": position, "error": g.error,
+        }));
+    }
+    Ok(out)
+}
+
+/// PGN text for a game: `tags` a map, `moves` SAN or UCI, `result` `1-0`, `0-1`, `1/2-1/2` or `*`. The seven standard tags come first, moves are checked, lines wrap at 80 columns. A `FEN` tag starts from that position.
+pub fn chess_pgn_write(tags: std::collections::BTreeMap<String, String>, moves: Vec<String>, result: &str) -> Result<String, String> {
+    if !["1-0", "0-1", "1/2-1/2", "*"].contains(&result) {
+        return Err(format!("result `{}` should be 1-0, 0-1, 1/2-1/2 or *", result));
+    }
+    let start = tags.get("FEN").cloned().unwrap_or_default();
+    let (mut p, _) = load(&start)?;
+    let mut out = String::new();
+    let seven = ["Event", "Site", "Date", "Round", "White", "Black"];
+    let tag = |k: &str, v: &str| format!("[{} \"{}\"]\n", k, v.replace('\\', "\\\\").replace('"', "\\\""));
+    for k in seven {
+        out.push_str(&tag(k, tags.get(k).map_or("?", |v| v.as_str())));
+    }
+    out.push_str(&tag("Result", result));
+    for (k, v) in &tags {
+        if !seven.contains(&k.as_str()) && k != "Result" {
+            out.push_str(&tag(k, v));
+        }
+    }
+    out.push('\n');
+    let mut words = vec![];
+    for (i, mv) in moves.iter().enumerate() {
+        let n = p.fullmoves().get();
+        let white = p.turn() == Color::White;
+        let m = read_move(&p, mv).map_err(|e| format!("move {} ({}): {}", n, if white { "white" } else { "black" }, e))?;
+        if white {
+            words.push(format!("{}.", n));
+        } else if i == 0 {
+            words.push(format!("{}...", n));
+        }
+        words.push(san_with_suffix(&p, m));
+        p = p.play(m).map_err(|e| e.to_string())?;
+    }
+    words.push(result.to_string());
+    let mut line = String::new();
+    for w in words {
+        if !line.is_empty() && line.len() + 1 + w.len() > 80 {
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&w);
+    }
+    out.push_str(&line);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Whether a text is FEN that can be played: `{ ok, reason }`.
+pub fn chess_fen_check(fen: &str) -> Value {
+    match load(fen) {
+        Ok(_) => json!({ "ok": true, "reason": null }),
+        Err(e) => json!({ "ok": false, "reason": e }),
+    }
+}

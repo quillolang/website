@@ -1,0 +1,450 @@
+//! Cloud Firestore's REST API: documents read and written with Firestore's typed values encoded and decoded both ways, partial updates with field masks, queries with filters, order and cursors, pages of a collection, batched and atomic writes with increments and server times, and sign-in by a service account's RS256 JWT, kept until it expires, or the emulator.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// FIRESTORE_API_URL is the API (https://firestore.googleapis.com when not set). FIRESTORE_PROJECT
+// names the project, else the service account's own; FIRESTORE_DATABASE the database, (default)
+// when not set. GOOGLE_SERVICE_ACCOUNT_JSON holds the service account's JSON, or
+// GOOGLE_APPLICATION_CREDENTIALS its file. With FIRESTORE_EMULATOR_HOST the emulator is used,
+// and no sign-in.
+//
+// A value that JSON has no type for is written and read as a map of one entry: `{ "$timestamp":
+// "2026-11-01T10:00:00Z" }`, `{ "$ref": "users/ada" }`, `{ "$geo": [59.9, 10.7] }`, `{ "$bytes":
+// base64 }`. In a write, `{ "$increment": 1 }` and `{ "$server_time": true }` are field transforms.
+
+const SCOPE: &str = "https://www.googleapis.com/auth/datastore";
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn credentials() -> Result<Value, String> {
+    let text = match (env("GOOGLE_SERVICE_ACCOUNT_JSON"), env("GOOGLE_APPLICATION_CREDENTIALS")) {
+        (Some(t), _) => t,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS".into()),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+/// An access token: a JWT signed with the account's key, traded at its token_uri, kept until five minutes before it ends.
+fn token() -> Result<String, String> {
+    if env("FIRESTORE_EMULATOR_HOST").is_some() {
+        return Ok("owner".into());
+    }
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    let sa = credentials()?;
+    let uri = sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let claims = json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": uri, "iat": t, "exp": t + 3600 });
+    let jwt = jsonwebtoken::encode(&head, &claims, &key).map_err(|e| e.to_string())?;
+    let res = ureq::post(&uri).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("the token server answered {}: {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach the token server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), t + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(tok)
+}
+
+fn base() -> String {
+    if let Some(h) = env("FIRESTORE_EMULATOR_HOST") {
+        return format!("http://{}", h);
+    }
+    env("FIRESTORE_API_URL").unwrap_or_else(|| "https://firestore.googleapis.com".into()).trim_end_matches('/').to_string()
+}
+
+fn project() -> Result<String, String> {
+    if let Some(p) = env("FIRESTORE_PROJECT") {
+        return Ok(p);
+    }
+    credentials()?["project_id"].as_str().map(str::to_string).ok_or("set FIRESTORE_PROJECT".to_string())
+}
+
+/// The root every document's name starts from.
+fn root() -> Result<String, String> {
+    Ok(format!("projects/{}/databases/{}/documents", project()?, env("FIRESTORE_DATABASE").unwrap_or_else(|| "(default)".into())))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/()".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn check_path(p: &str, want_doc: bool) -> Result<String, String> {
+    let p = p.trim_matches('/');
+    let parts: Vec<&str> = p.split('/').collect();
+    if parts.iter().any(|x| x.is_empty()) {
+        return Err(format!("{:?} is not a path: write collection/document/collection/...", p));
+    }
+    if want_doc && parts.len() % 2 != 0 {
+        return Err(format!("{:?} is a collection: a document's path has an even number of parts", p));
+    }
+    if !want_doc && parts.len() % 2 != 1 {
+        return Err(format!("{:?} is a document: a collection's path has an odd number of parts", p));
+    }
+    Ok(p.to_string())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
+    let tok = token()?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let url = format!("{}/v1/{}", base(), path);
+    for attempt in 0..4 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", tok));
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        let (status, text) = match res {
+            Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(c, _)) if (c == 429 || c == 503) && attempt < 3 => {
+                std::thread::sleep(Duration::from_millis(250 << attempt));
+                continue;
+            }
+            Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+            Err(e) => return Err(format!("cannot reach Firestore at {}: {}", base(), e)),
+        };
+        return Ok((status, serde_json::from_str(&text).unwrap_or(json!({ "error": { "message": text } }))));
+    }
+    Err("Firestore stayed busy through four tries".into())
+}
+
+fn refused(status: u16, v: &Value) -> String {
+    // runQuery wraps its answer in a list.
+    let e = if v.is_array() { &v[0]["error"] } else { &v["error"] };
+    format!("Firestore answered {} {}: {}", status, e["status"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or(""))
+}
+
+fn must(r: (u16, Value)) -> Result<Value, String> {
+    if r.0 >= 300 {
+        return Err(refused(r.0, &r.1));
+    }
+    Ok(r.1)
+}
+
+fn is_transform(v: &Value) -> bool {
+    v.as_object().map_or(false, |m| m.len() == 1 && (m.contains_key("$increment") || m.contains_key("$server_time")))
+}
+
+/// One value in Firestore's typed form.
+fn encode(v: &Value) -> Result<Value, String> {
+    Ok(match v {
+        Value::Null => json!({ "nullValue": null }),
+        Value::Bool(b) => json!({ "booleanValue": b }),
+        Value::Number(n) => match n.as_i64() {
+            // Firestore keeps 64-bit integers in text.
+            Some(i) => json!({ "integerValue": i.to_string() }),
+            None => json!({ "doubleValue": n.as_f64() }),
+        },
+        Value::String(s) => json!({ "stringValue": s }),
+        Value::Array(a) => json!({ "arrayValue": { "values": a.iter().map(encode).collect::<Result<Vec<_>, _>>()? } }),
+        Value::Object(m) => {
+            if m.len() == 1 {
+                let (k, x) = m.iter().next().unwrap();
+                match k.as_str() {
+                    "$timestamp" => return Ok(json!({ "timestampValue": x })),
+                    "$bytes" => return Ok(json!({ "bytesValue": x })),
+                    "$ref" => return Ok(json!({ "referenceValue": format!("{}/{}", root()?, check_path(x.as_str().ok_or("$ref is a path")?, true)?) })),
+                    "$geo" => return Ok(json!({ "geoPointValue": { "latitude": x[0], "longitude": x[1] } })),
+                    _ => {}
+                }
+            }
+            json!({ "mapValue": { "fields": fields_of(m)? } })
+        }
+    })
+}
+
+fn fields_of(m: &Map<String, Value>) -> Result<Value, String> {
+    let mut f = Map::new();
+    for (k, v) in m {
+        if !is_transform(v) {
+            f.insert(k.clone(), encode(v)?);
+        }
+    }
+    Ok(Value::Object(f))
+}
+
+/// A typed value back to a plain one.
+fn decode(v: &Value) -> Value {
+    let Some((k, x)) = v.as_object().and_then(|m| m.iter().next()) else { return Value::Null };
+    match k.as_str() {
+        "nullValue" => Value::Null,
+        "booleanValue" | "stringValue" => x.clone(),
+        "integerValue" => x.as_str().and_then(|s| s.parse::<i64>().ok()).map_or(x.clone(), |n| json!(n)),
+        // NaN and the infinities arrive as text, and stay so.
+        "doubleValue" => x.clone(),
+        "timestampValue" => json!({ "$timestamp": x }),
+        "bytesValue" => json!({ "$bytes": x }),
+        "referenceValue" => json!({ "$ref": x.as_str().and_then(|s| s.split_once("/documents/")).map_or(x.clone(), |p| json!(p.1)) }),
+        "geoPointValue" => json!({ "$geo": [x["latitude"].clone(), x["longitude"].clone()] }),
+        "arrayValue" => Value::Array(x["values"].as_array().into_iter().flatten().map(decode).collect()),
+        "mapValue" => decode_fields(&x["fields"], Map::new()),
+        _ => v.clone(),
+    }
+}
+
+fn decode_fields(fields: &Value, start: Map<String, Value>) -> Value {
+    let mut o = start;
+    for (k, v) in fields.as_object().into_iter().flatten() {
+        o.insert(k.clone(), decode(v));
+    }
+    Value::Object(o)
+}
+
+fn document(d: &Value) -> Value {
+    let name = d["name"].as_str().unwrap_or("");
+    let path = name.split_once("/documents/").map_or(name, |p| p.1);
+    let mut o = Map::new();
+    o.insert("_id".into(), json!(path.rsplit('/').next().unwrap_or("")));
+    o.insert("_path".into(), json!(path));
+    o.insert("_created".into(), d["createTime"].clone());
+    o.insert("_updated".into(), d["updateTime"].clone());
+    decode_fields(&d["fields"], o)
+}
+
+/// A field name in a field path: a plain one as it is, others in backticks.
+fn field_path(k: &str) -> String {
+    let plain = k.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    if plain { k.to_string() } else { format!("`{}`", k.replace('\\', "\\\\").replace('`', "\\`")) }
+}
+
+/// A value in Firestore's typed form, `{ "stringValue": "x" }` and so on, for a call this plugin has no function for.
+pub fn firestore_encode(value: serde_json::Value) -> Result<Value, String> {
+    encode(&value)
+}
+
+/// A typed value, or a document's `fields`, back to plain values.
+pub fn firestore_decode(value: serde_json::Value) -> Value {
+    if value.as_object().map_or(false, |m| m.len() == 1 && m.keys().all(|k| k.ends_with("Value"))) {
+        return decode(&value);
+    }
+    decode_fields(&value, Map::new())
+}
+
+/// A document by its path (`users/ada`, `users/ada/orders/1`): its fields, with `_id`, `_path`, `_created` and `_updated`, or null when there is none.
+pub fn firestore_get(path: &str) -> Result<Value, String> {
+    let r = call("GET", &format!("{}/{}", root()?, enc(&check_path(path, true)?)), None)?;
+    if r.0 == 404 {
+        return Ok(Value::Null);
+    }
+    Ok(document(&must(r)?))
+}
+
+/// Makes a document in a collection, under `id` ("" lets Firestore pick). An id in use is an error. Gives the document.
+pub fn firestore_create(collection: &str, id: &str, data: serde_json::Value) -> Result<Value, String> {
+    let c = check_path(collection, false)?;
+    let q = if id.is_empty() { String::new() } else { format!("?documentId={}", enc(id)) };
+    let body = json!({ "fields": fields_of(data.as_object().ok_or("a document is a map")?)? });
+    Ok(document(&must(call("POST", &format!("{}/{}{}", root()?, enc(&c), q), Some(&body))?)?))
+}
+
+/// Writes a whole document, replacing what is there or making it.
+pub fn firestore_set(path: &str, data: serde_json::Value) -> Result<Value, String> {
+    let p = check_path(path, true)?;
+    let body = json!({ "fields": fields_of(data.as_object().ok_or("a document is a map")?)? });
+    Ok(document(&must(call("PATCH", &format!("{}/{}", root()?, enc(&p)), Some(&body))?)?))
+}
+
+/// Changes only the fields named in `data`, by a field mask, the others staying as they are: a name with dots reaches into a map, and a field given as null becomes null. An error when the document does not exist.
+pub fn firestore_update(path: &str, data: serde_json::Value) -> Result<Value, String> {
+    let p = check_path(path, true)?;
+    let m = data.as_object().ok_or("changes are a map")?;
+    let mask: Vec<String> = m.keys().map(|k| format!("updateMask.fieldPaths={}", enc(&field_path(k)).replace('/', "%2F"))).collect();
+    let mut nested = Map::new();
+    for (k, v) in m {
+        // In `fields` a dotted name is nested maps; the mask is what names it.
+        let parts: Vec<&str> = k.split('.').collect();
+        let mut value = v.clone();
+        for part in parts[1..].iter().rev() {
+            value = json!({ *part: value });
+        }
+        nested.insert(parts[0].to_string(), value);
+    }
+    let body = json!({ "fields": fields_of(&nested)? });
+    Ok(document(&must(call("PATCH", &format!("{}/{}?{}&currentDocument.exists=true", root()?, enc(&p), mask.join("&")), Some(&body))?)?))
+}
+
+/// Deletes a document. Firestore does not say whether it was there.
+pub fn firestore_delete(path: &str) -> Result<bool, String> {
+    must(call("DELETE", &format!("{}/{}", root()?, enc(&check_path(path, true)?)), None)?)?;
+    Ok(true)
+}
+
+/// One page of a collection, `page_size` long, from `page_token` ("" at first). Gives `{ documents, next }`, `next` "" or null at the end.
+pub fn firestore_list(collection: &str, page_size: i64, page_token: &str) -> Result<Value, String> {
+    let mut q = format!("?pageSize={}", page_size.clamp(1, 1000));
+    if !page_token.is_empty() {
+        q.push_str(&format!("&pageToken={}", enc(page_token).replace('/', "%2F")));
+    }
+    let r = must(call("GET", &format!("{}/{}{}", root()?, enc(&check_path(collection, false)?), q), None)?)?;
+    let docs: Vec<Value> = r["documents"].as_array().into_iter().flatten().map(document).collect();
+    Ok(json!({ "documents": docs, "next": r["nextPageToken"] }))
+}
+
+fn filter(w: &Value) -> Result<Value, String> {
+    let a = w.as_array().filter(|a| a.len() == 3).ok_or("a filter is [field, operator, value], like [\"age\", \">=\", 18]")?;
+    let (field, op) = (a[0].as_str().ok_or("a filter's field is a text")?, a[1].as_str().ok_or("a filter's operator is a text")?);
+    let path = json!({ "fieldPath": field_path(field) });
+    if a[2].is_null() && (op == "==" || op == "!=") {
+        return Ok(json!({ "unaryFilter": { "op": if op == "==" { "IS_NULL" } else { "IS_NOT_NULL" }, "field": path } }));
+    }
+    let name = match op {
+        "==" => "EQUAL",
+        "!=" => "NOT_EQUAL",
+        "<" => "LESS_THAN",
+        "<=" => "LESS_THAN_OR_EQUAL",
+        ">" => "GREATER_THAN",
+        ">=" => "GREATER_THAN_OR_EQUAL",
+        "in" => "IN",
+        "not-in" => "NOT_IN",
+        "array-contains" => "ARRAY_CONTAINS",
+        "array-contains-any" => "ARRAY_CONTAINS_ANY",
+        o => return Err(format!("{:?} is not a Firestore operator: ==, !=, <, <=, >, >=, in, not-in, array-contains, array-contains-any", o)),
+    };
+    Ok(json!({ "fieldFilter": { "field": path, "op": name, "value": encode(&a[2])? } }))
+}
+
+/// A query on a collection (or, with `all_descendants`, every collection of that name under it). `query`: `where` (a list of `[field, op, value]`, all of which must hold), `order` (a list of field names, or of `[field, "desc"]`), `limit`, `offset`, `select` (field names), `start_after` (the order fields' values of the last row). Gives the documents.
+pub fn firestore_query(collection: &str, query: serde_json::Value) -> Result<Vec<Value>, String> {
+    let c = check_path(collection, false)?;
+    let (parent, id) = c.rsplit_once('/').map_or((None, c.as_str()), |(p, i)| (Some(p), i));
+    let mut q = json!({ "from": [{ "collectionId": id, "allDescendants": query["all_descendants"] == true }] });
+    if let Some(ws) = query["where"].as_array() {
+        let fs = ws.iter().map(filter).collect::<Result<Vec<_>, _>>()?;
+        q["where"] = match fs.len() {
+            0 => Value::Null,
+            1 => fs[0].clone(),
+            _ => json!({ "compositeFilter": { "op": "AND", "filters": fs } }),
+        };
+        if q["where"].is_null() {
+            q.as_object_mut().unwrap().remove("where");
+        }
+    }
+    if let Some(os) = query["order"].as_array() {
+        let mut list = vec![];
+        for o in os {
+            let (f, dir) = match o {
+                Value::String(s) => (s.clone(), "ASCENDING"),
+                Value::Array(a) => (a[0].as_str().unwrap_or("").to_string(), if a.get(1).and_then(|d| d.as_str()).map_or(false, |d| d.eq_ignore_ascii_case("desc")) { "DESCENDING" } else { "ASCENDING" }),
+                _ => return Err("an order is a field name, or [field, \"desc\"]".into()),
+            };
+            list.push(json!({ "field": { "fieldPath": field_path(&f) }, "direction": dir }));
+        }
+        q["orderBy"] = Value::Array(list);
+    }
+    if let Some(l) = query["limit"].as_i64() {
+        q["limit"] = json!(l);
+    }
+    if let Some(l) = query["offset"].as_i64() {
+        q["offset"] = json!(l);
+    }
+    if let Some(s) = query["select"].as_array() {
+        q["select"] = json!({ "fields": s.iter().filter_map(|f| f.as_str()).map(|f| json!({ "fieldPath": field_path(f) })).collect::<Vec<_>>() });
+    }
+    if let Some(s) = query["start_after"].as_array() {
+        q["startAt"] = json!({ "values": s.iter().map(encode).collect::<Result<Vec<_>, _>>()?, "before": false });
+    }
+    let path = match parent {
+        Some(p) => format!("{}/{}:runQuery", root()?, enc(p)),
+        None => format!("{}:runQuery", root()?),
+    };
+    let r = must(call("POST", &path, Some(&json!({ "structuredQuery": q })))?)?;
+    // A stream as one list: rows have `document`, and the last may only carry `readTime`.
+    if let Some(e) = r.as_array().and_then(|a| a.iter().find(|x| x.get("error").is_some())) {
+        return Err(format!("Firestore refused the query: {}", e["error"]["message"].as_str().unwrap_or("")));
+    }
+    Ok(r.as_array().into_iter().flatten().filter(|x| x.get("document").is_some()).map(|x| document(&x["document"])).collect())
+}
+
+fn write_of(w: &Value) -> Result<Value, String> {
+    let p = check_path(w["path"].as_str().ok_or("a write needs a `path`")?, true)?;
+    let name = format!("{}/{}", root()?, p);
+    let op = w["op"].as_str().unwrap_or("set");
+    if op == "delete" {
+        return Ok(json!({ "delete": name }));
+    }
+    let data = w["data"].as_object().ok_or("a write needs `data`, a map")?;
+    let mut out = json!({ "update": { "name": name, "fields": fields_of(data)? } });
+    let mut transforms = vec![];
+    for (k, v) in data {
+        if is_transform(v) {
+            if let Some(n) = v.get("$increment") {
+                transforms.push(json!({ "fieldPath": field_path(k), "increment": encode(n)? }));
+            } else {
+                transforms.push(json!({ "fieldPath": field_path(k), "setToServerValue": "REQUEST_TIME" }));
+            }
+        }
+    }
+    if !transforms.is_empty() {
+        out["updateTransforms"] = Value::Array(transforms);
+    }
+    match op {
+        "set" => {}
+        "create" => out["currentDocument"] = json!({ "exists": false }),
+        "update" => {
+            out["currentDocument"] = json!({ "exists": true });
+            out["updateMask"] = json!({ "fieldPaths": data.iter().filter(|(_, v)| !is_transform(v)).map(|(k, _)| field_path(k)).collect::<Vec<_>>() });
+        }
+        o => return Err(format!("{:?} is not a write: set, create, update or delete", o)),
+    }
+    Ok(out)
+}
+
+/// Up to 500 writes, each `{ op, path, data }`, `op` being "set" (the default), "create", "update" or "delete". Not atomic: each stands alone, and the answer says how each went: `{ ok, failed: [{ position, path, code, message }] }`.
+pub fn firestore_batch(writes: Vec<serde_json::Value>) -> Result<Value, String> {
+    if writes.len() > 500 {
+        return Err(format!("{} writes: a batch takes at most 500", writes.len()));
+    }
+    let list = writes.iter().map(write_of).collect::<Result<Vec<_>, _>>()?;
+    let r = must(call("POST", &format!("{}:batchWrite", root()?), Some(&json!({ "writes": list })))?)?;
+    let (mut ok, mut failed) = (0, vec![]);
+    for (i, s) in r["status"].as_array().into_iter().flatten().enumerate() {
+        if s["code"].as_i64().unwrap_or(0) == 0 {
+            ok += 1;
+        } else {
+            failed.push(json!({ "position": i, "path": writes[i]["path"], "code": s["code"], "message": s["message"] }));
+        }
+    }
+    Ok(json!({ "ok": ok, "failed": failed }))
+}
+
+/// The same writes as one transaction: all or none. Gives `{ time, results }`, or an error if any one failed.
+pub fn firestore_commit(writes: Vec<serde_json::Value>) -> Result<Value, String> {
+    let list = writes.iter().map(write_of).collect::<Result<Vec<_>, _>>()?;
+    let r = must(call("POST", &format!("{}:commit", root()?), Some(&json!({ "writes": list })))?)?;
+    Ok(json!({ "time": r["commitTime"], "results": r["writeResults"].as_array().map_or(0, |a| a.len()) }))
+}

@@ -1,0 +1,317 @@
+//! Microsoft SQL Server over TDS with tiberius and rustls (no OpenSSL): queries and statements with `@P1` parameters, rows as maps by each column's type (decimals as text, dates as ISO times, GUIDs, binary), several result sets, transactions held on a connection or run as one, Azure's redirects followed, and server errors with their numbers.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! tiberius = { version = "=0.12.3", default-features = false, features = ["tds73", "rustls"] }
+//! tokio = { version = "1", features = ["rt", "net", "time"] }
+//! tokio-util = { version = "0.7", features = ["compat"] }
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row, ToSql};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+type Sql = Client<Compat<TcpStream>>;
+type Slot = Arc<Mutex<Option<Sql>>>;
+
+static CONNS: Mutex<Option<HashMap<String, (Value, Slot)>>> = Mutex::new(None);
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a Tokio runtime"))
+}
+
+fn var(n: &str) -> Option<String> {
+    std::env::var(n).ok().filter(|v| !v.is_empty())
+}
+
+fn opt(o: &Value, k: &str, v: &str) -> Option<String> {
+    o.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| var(v))
+}
+
+fn say(e: tiberius::error::Error) -> String {
+    match e {
+        tiberius::error::Error::Server(t) => format!("SQL Server error {} (state {}, class {}): {}", t.code(), t.state(), t.class(), t.message()),
+        other => format!("SQL Server: {}", other),
+    }
+}
+
+fn config_of(o: &Value) -> Result<Config, String> {
+    let mut c = Config::new();
+    let host = opt(o, "host", "MSSQL_HOST").unwrap_or("127.0.0.1".into());
+    let (name, port) = match host.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse::<u16>().map_err(|_| format!("`{}`: the port is not a number", host))?),
+        _ => (host.clone(), o.get("port").and_then(|p| p.as_u64()).unwrap_or(1433) as u16),
+    };
+    c.host(name);
+    c.port(port);
+    if let Some(d) = opt(o, "database", "MSSQL_DATABASE") {
+        c.database(d);
+    }
+    let user = var("MSSQL_USER").ok_or("no login: set MSSQL_USER and MSSQL_PASSWORD")?;
+    c.authentication(AuthMethod::sql_server(user, var("MSSQL_PASSWORD").unwrap_or_default()));
+    let level = opt(o, "encrypt", "MSSQL_ENCRYPT").unwrap_or("required".into());
+    c.encryption(match level.as_str() {
+        "required" => EncryptionLevel::Required,
+        "on" => EncryptionLevel::On,
+        "off" => EncryptionLevel::Off,
+        "none" => EncryptionLevel::NotSupported,
+        x => return Err(format!("`{}` is not an encryption level: required, on, off or none", x)),
+    });
+    if o.get("trust_cert") == Some(&Value::Bool(true)) {
+        c.trust_cert();
+    }
+    if let Some(ca) = opt(o, "ca", "MSSQL_CA") {
+        c.trust_cert_ca(ca);
+    }
+    c.application_name("quillo");
+    Ok(c)
+}
+
+async fn dial(addr: String, ms: u64) -> Result<Compat<TcpStream>, String> {
+    let s = tokio::time::timeout(Duration::from_millis(ms), TcpStream::connect(&addr)).await.map_err(|_| format!("no answer from {} in {} ms", addr, ms))?.map_err(|e| format!("cannot reach SQL Server at {}: {}", addr, e))?;
+    s.set_nodelay(true).map_err(|e| e.to_string())?;
+    Ok(s.compat_write())
+}
+
+/// Logs in, following the redirect Azure SQL gives to the node that holds the database.
+async fn open(o: &Value) -> Result<Sql, String> {
+    let ms = o.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(15_000);
+    let c = config_of(o)?;
+    let tcp = dial(c.get_addr(), ms).await?;
+    match Client::connect(c.clone(), tcp).await {
+        Ok(x) => Ok(x),
+        Err(tiberius::error::Error::Routing { host, port }) => {
+            let mut c2 = c;
+            c2.host(&host);
+            c2.port(port);
+            let tcp = dial(format!("{}:{}", host, port), ms).await?;
+            Client::connect(c2, tcp).await.map_err(say)
+        }
+        Err(e) => Err(say(e)),
+    }
+}
+
+fn slot(name: &str) -> Result<(Value, Slot), String> {
+    let g = CONNS.lock().map_err(|e| e.to_string())?;
+    g.as_ref().and_then(|m| m.get(name)).cloned().ok_or(format!("no connection called `{}`: call mssql_connect first", name))
+}
+
+/// Connects and logs in: `options` is { host (else MSSQL_HOST, host or host:port), port, database (else MSSQL_DATABASE), encrypt (required by default; MSSQL_ENCRYPT; none only on a test bench), trust_cert, ca, timeout_ms }. The login comes from MSSQL_USER and MSSQL_PASSWORD. Gives the server's version line.
+pub fn mssql_connect(name: &str, options: serde_json::Value) -> Result<String, String> {
+    let (client, version) = rt().block_on(async {
+        let mut c = open(&options).await?;
+        let rows = c.simple_query("SELECT @@VERSION AS version").await.map_err(say)?.into_results().await.map_err(say)?;
+        let v = rows.first().and_then(|r| r.first()).and_then(|r| r.get::<&str, _>(0)).unwrap_or("").to_string();
+        Ok::<_, String>((c, v))
+    })?;
+    let mut g = CONNS.lock().map_err(|e| e.to_string())?;
+    g.get_or_insert_with(HashMap::new).insert(name.to_string(), (options, Arc::new(Mutex::new(Some(client)))));
+    Ok(version)
+}
+
+/// Closes a connection.
+pub fn mssql_close(name: &str) -> Result<bool, String> {
+    let mut g = CONNS.lock().map_err(|e| e.to_string())?;
+    let Some((_, s)) = g.as_mut().and_then(|m| m.remove(name)) else { return Ok(false) };
+    if let Some(c) = s.lock().map_err(|e| e.to_string())?.take() {
+        let _ = rt().block_on(c.close());
+    }
+    Ok(true)
+}
+
+// ---- Values ----
+
+struct P(ColumnData<'static>);
+
+impl ToSql for P {
+    fn to_sql(&self) -> ColumnData<'_> {
+        self.0.clone()
+    }
+}
+
+fn params_of(v: &Value) -> Result<Vec<P>, String> {
+    let list = match v {
+        Value::Null => return Ok(vec![]),
+        Value::Array(a) => a,
+        other => return Err(format!("parameters are a list, not {}", other)),
+    };
+    list.iter().map(|x| Ok(P(match x {
+        Value::Null => ColumnData::String(None),
+        Value::Bool(b) => ColumnData::Bit(Some(*b)),
+        Value::Number(n) if n.is_f64() => ColumnData::F64(n.as_f64()),
+        Value::Number(n) => ColumnData::I64(n.as_i64()),
+        Value::String(s) => ColumnData::String(Some(s.clone().into())),
+        Value::Object(m) if m.contains_key("$binary") => {
+            let t = m["$binary"].as_str().ok_or("$binary takes hex text")?.trim_start_matches("0x");
+            ColumnData::Binary(Some(hex::decode(t).map_err(|_| "$binary is not hex".to_string())?.into()))
+        }
+        other => return Err(format!("{} cannot be a parameter: text, a number, a boolean, null or {{ $binary: hex }}", other)),
+    }))).collect()
+}
+
+fn civil(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+// Days from 0001-01-01 and from 1900-01-01 to 1970-01-01.
+const DAYS_0001: i64 = 719162;
+const DAYS_1900: i64 = 25567;
+
+fn clock(t: &tiberius::time::Time) -> String {
+    let scale = t.scale() as u32;
+    let per = 10u64.pow(scale);
+    let (secs, frac) = (t.increments() / per, t.increments() % per);
+    let base = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    if scale == 0 { base } else { format!("{}.{:0w$}", base, frac, w = scale as usize) }
+}
+
+/// By hand: tiberius 0.12's Display writes -123.45 as `-123.-45`.
+fn decimal(value: i128, scale: u8) -> String {
+    let digits = format!("{:0>w$}", value.unsigned_abs(), w = scale as usize + 1);
+    let (a, b) = digits.split_at(digits.len() - scale as usize);
+    format!("{}{}{}{}", if value < 0 { "-" } else { "" }, a, if scale > 0 { "." } else { "" }, b)
+}
+
+fn cell(d: ColumnData<'_>) -> Value {
+    match d {
+        ColumnData::U8(v) => json!(v),
+        ColumnData::I16(v) => json!(v),
+        ColumnData::I32(v) => json!(v),
+        ColumnData::I64(v) => json!(v),
+        ColumnData::F32(v) => json!(v.map(|x| x as f64)),
+        ColumnData::F64(v) => json!(v),
+        ColumnData::Bit(v) => json!(v),
+        ColumnData::String(v) => json!(v),
+        ColumnData::Guid(v) => json!(v.map(|g| g.to_string())),
+        ColumnData::Binary(v) => json!(v.map(|b| format!("0x{}", hex::encode(b.as_ref())))),
+        ColumnData::Numeric(v) => json!(v.map(|n| decimal(n.value(), n.scale()))),
+        ColumnData::Xml(v) => json!(v.map(|x| x.to_string())),
+        ColumnData::DateTime(v) => json!(v.map(|t| {
+            let (days, frag) = (t.days() as i64 - DAYS_1900, t.seconds_fragments() as u64);
+            let ms = (frag * 1000 + 150) / 300;
+            format!("{}T{:02}:{:02}:{:02}.{:03}", civil(days), ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+        })),
+        ColumnData::SmallDateTime(v) => json!(v.map(|t| format!("{}T{:02}:{:02}:00", civil(t.days() as i64 - DAYS_1900), t.seconds_fragments() / 60, t.seconds_fragments() % 60))),
+        ColumnData::Time(v) => json!(v.as_ref().map(clock)),
+        ColumnData::Date(v) => json!(v.map(|t| civil(t.days() as i64 - DAYS_0001))),
+        ColumnData::DateTime2(v) => json!(v.map(|t| format!("{}T{}", civil(t.date().days() as i64 - DAYS_0001), clock(&t.time())))),
+        ColumnData::DateTimeOffset(v) => json!(v.map(|t| {
+            let o = t.offset();
+            let d = t.datetime2();
+            format!("{}T{}{}{:02}:{:02}", civil(d.date().days() as i64 - DAYS_0001), clock(&d.time()), if o < 0 { '-' } else { '+' }, o.abs() / 60, o.abs() % 60)
+        })),
+    }
+}
+
+fn row_of(r: Row) -> Value {
+    let names: Vec<String> = r.columns().iter().map(|c| c.name().to_string()).collect();
+    let mut m = Map::new();
+    for (n, d) in names.into_iter().zip(r.into_iter()) {
+        m.insert(n, cell(d));
+    }
+    Value::Object(m)
+}
+
+fn with<T>(name: &str, f: impl AsyncFnOnce(&mut Sql) -> Result<T, String>) -> Result<T, String> {
+    let (_, s) = slot(name)?;
+    let mut g = s.lock().map_err(|e| e.to_string())?;
+    let c = g.as_mut().ok_or("the connection is closed")?;
+    rt().block_on(f(c))
+}
+
+async fn results(c: &mut Sql, sql: &str, p: &[P]) -> Result<Vec<Vec<Value>>, String> {
+    let refs: Vec<&dyn ToSql> = p.iter().map(|x| x as &dyn ToSql).collect();
+    let sets = c.query(sql, &refs).await.map_err(say)?.into_results().await.map_err(say)?;
+    Ok(sets.into_iter().map(|s| s.into_iter().map(row_of).collect()).collect())
+}
+
+/// The rows of a query, as maps: `sql` uses @P1, @P2..., `params` a list or null (`{ $binary: hex }` for bytes). bigint is an int, decimal and money text, datetime an ISO time, binary `0x...`.
+pub fn mssql_query(name: &str, sql: &str, params: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let p = params_of(&params)?;
+    with(name, async |c| Ok(results(c, sql, &p).await?.into_iter().next().unwrap_or_default()))
+}
+
+/// All result sets of a batch: a list of lists of rows.
+pub fn mssql_query_many(name: &str, sql: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = params_of(&params)?;
+    with(name, async |c| Ok(json!(results(c, sql, &p).await?)))
+}
+
+/// One row, or null.
+pub fn mssql_one(name: &str, sql: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(mssql_query(name, sql, params)?.into_iter().next().unwrap_or(Value::Null))
+}
+
+async fn run(c: &mut Sql, sql: &str, p: &[P]) -> Result<Vec<u64>, String> {
+    let refs: Vec<&dyn ToSql> = p.iter().map(|x| x as &dyn ToSql).collect();
+    Ok(c.execute(sql, &refs).await.map_err(say)?.rows_affected().to_vec())
+}
+
+/// Runs a statement that changes rows: gives { rows_affected, counts }, a count for each statement it held.
+pub fn mssql_execute(name: &str, sql: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = params_of(&params)?;
+    with(name, async |c| {
+        let counts = run(c, sql, &p).await?;
+        Ok(json!({ "rows_affected": counts.iter().sum::<u64>(), "counts": counts }))
+    })
+}
+
+/// Sends text with no parameters, as a batch: for CREATE TABLE and such.
+pub fn mssql_batch(name: &str, sql: &str) -> Result<bool, String> {
+    with(name, async |c| {
+        c.simple_query(sql).await.map_err(say)?.into_results().await.map_err(say)?;
+        Ok(true)
+    })
+}
+
+/// Starts a transaction on the connection, kept until `mssql_commit` or `mssql_rollback`. Option-free. While it is open the connection is this program's: use one per unit of work.
+pub fn mssql_begin(name: &str) -> Result<bool, String> {
+    mssql_batch(name, "BEGIN TRANSACTION")
+}
+
+/// Commits the open transaction.
+pub fn mssql_commit(name: &str) -> Result<bool, String> {
+    mssql_batch(name, "COMMIT TRANSACTION")
+}
+
+/// Rolls the open transaction back.
+pub fn mssql_rollback(name: &str) -> Result<bool, String> {
+    mssql_batch(name, "ROLLBACK TRANSACTION")
+}
+
+/// Runs statements as one transaction: `statements` is [{ sql, params }]. All of them, or on the first failure none, whose error comes back saying which it was. Gives the counts.
+pub fn mssql_transaction(name: &str, statements: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>, String> {
+    let mut list = vec![];
+    for s in &statements {
+        list.push((s["sql"].as_str().ok_or("a statement needs `sql`")?.to_string(), params_of(s.get("params").unwrap_or(&Value::Null))?));
+    }
+    with(name, async |c| {
+        c.simple_query("BEGIN TRANSACTION").await.map_err(say)?.into_results().await.map_err(say)?;
+        let mut out = vec![];
+        for (i, (sql, p)) in list.iter().enumerate() {
+            match run(c, sql, p).await {
+                Ok(n) => out.push(json!(n.iter().sum::<u64>())),
+                Err(e) => {
+                    let undone = c.simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await.map_err(say)?.into_results().await.map_err(say);
+                    return Err(format!("statement {}: {}{}", i + 1, e, undone.err().map(|x| format!(", and the rollback failed: {}", x)).unwrap_or_default()));
+                }
+            }
+        }
+        c.simple_query("COMMIT TRANSACTION").await.map_err(say)?.into_results().await.map_err(say)?;
+        Ok(out)
+    })
+}

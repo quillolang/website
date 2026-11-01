@@ -1,0 +1,310 @@
+//! Algolia's Search API without a client: objects saved, batched in thousands and partly updated, searches with facets, facet search, whole indexes browsed by cursor, tasks waited on, secured API keys made from a search key with filters and an expiry, and the host list walked in order, a host that fails left alone for two minutes.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ALGOLIA_APP_ID and ALGOLIA_API_KEY sign in. ALGOLIA_HOSTS, comma-separated, replaces the hosts: left
+// out, reads go to <APP>-dsn.algolia.net and writes to <APP>.algolia.net, then both to
+// <APP>-1, -2 and -3.algolianet.com.
+
+const BATCH: usize = 1000;
+const DOWN_FOR: Duration = Duration::from_secs(120);
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn hosts(write: bool) -> Result<Vec<String>, String> {
+    if let Some(h) = setting("ALGOLIA_HOSTS") {
+        return Ok(h.split(',').map(|x| x.trim().trim_end_matches('/').to_string()).filter(|x| !x.is_empty()).collect());
+    }
+    let app = setting("ALGOLIA_APP_ID").ok_or("ALGOLIA_APP_ID is not set")?.to_lowercase();
+    let first = if write { format!("https://{}.algolia.net", app) } else { format!("https://{}-dsn.algolia.net", app) };
+    let mut all = vec![first];
+    for i in 1..=3 {
+        all.push(format!("https://{}-{}.algolianet.com", app, i));
+    }
+    Ok(all)
+}
+
+static DOWN: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+fn is_down(h: &str) -> bool {
+    DOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(h).map_or(false, |t| t.elapsed() < DOWN_FOR)
+}
+
+fn mark_down(h: &str) {
+    DOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(h.to_string(), Instant::now());
+}
+
+/// The hosts this process is leaving alone for now, after they failed.
+pub fn algolia_hosts_down() -> Vec<String> {
+    let mut g = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut l: Vec<String> = g.get_or_insert_with(HashMap::new).iter().filter(|(_, t)| t.elapsed() < DOWN_FOR).map(|(h, _)| h.clone()).collect();
+    l.sort();
+    l
+}
+
+// A 4xx is an answer: only a host that cannot be reached, times out or breaks is passed over.
+fn call(method: &str, path: &str, body: Option<&Value>, write: bool) -> Result<Value, String> {
+    let app = setting("ALGOLIA_APP_ID").ok_or("ALGOLIA_APP_ID is not set")?;
+    let key = setting("ALGOLIA_API_KEY").ok_or("ALGOLIA_API_KEY is not set")?;
+    let all = hosts(write)?;
+    let mut order: Vec<&String> = all.iter().filter(|h| !is_down(h)).collect();
+    // All down: try them anyway, rather than fail without asking.
+    if order.is_empty() {
+        order = all.iter().collect();
+    }
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(2)).timeout(Duration::from_secs(if write { 30 } else { 5 })).build();
+    let mut tried = vec![];
+    for h in order {
+        let req = agent.request(method, &format!("{}{}", h, path)).set("X-Algolia-Application-Id", &app).set("X-Algolia-API-Key", &key).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Algolia's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(c, r)) if c < 500 => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let m = v["message"].as_str().map(str::to_string).unwrap_or_else(|| t.trim().chars().take(300).collect());
+                return Err(format!("Algolia {}: {}", c, m));
+            }
+            Err(ureq::Error::Status(c, _)) => {
+                mark_down(h);
+                tried.push(format!("{} answered {}", h, c));
+            }
+            Err(e) => {
+                mark_down(h);
+                tried.push(format!("{}: {}", h, e));
+            }
+        }
+    }
+    Err(format!("no Algolia host answered: {}", tried.join("; ")))
+}
+
+fn idx(index: &str) -> Result<String, String> {
+    if index.is_empty() {
+        return Err("an index needs a name".into());
+    }
+    Ok(enc(index))
+}
+
+/// Saves an object: with an `objectID` it replaces that one, without one Algolia makes an id. Gives { objectID, taskID }.
+pub fn algolia_save(index: &str, object: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !object.is_object() {
+        return Err("an object must be a map".into());
+    }
+    let i = idx(index)?;
+    match object["objectID"].as_str() {
+        Some(id) => call("PUT", &format!("/1/indexes/{}/{}", i, enc(id)), Some(&object), true),
+        None => call("POST", &format!("/1/indexes/{}", i), Some(&object), true),
+    }
+}
+
+/// Saves many objects, 1000 at a time. Gives { saved, tasks }: wait on the last task to see them all.
+pub fn algolia_save_many(index: &str, objects: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let list: Vec<Value> = objects.iter().map(|o| json!({ "action": if o["objectID"].is_string() { "updateObject" } else { "addObject" }, "body": o })).collect();
+    batches(index, list)
+}
+
+fn batches(index: &str, requests: Vec<Value>) -> Result<Value, String> {
+    let path = format!("/1/indexes/{}/batch", idx(index)?);
+    let mut tasks = vec![];
+    for chunk in requests.chunks(BATCH) {
+        let v = call("POST", &path, Some(&json!({ "requests": chunk })), true)?;
+        tasks.push(v["taskID"].clone());
+    }
+    Ok(json!({ "saved": requests.len(), "tasks": tasks }))
+}
+
+/// Changes some attributes of an object, leaving the rest. A value may be an operation, from algolia_op. `create` makes it when missing; Algolia does so by default, which hides a wrong id, so say which you mean.
+pub fn algolia_partial(index: &str, id: &str, fields: serde_json::Value, create: bool) -> Result<serde_json::Value, String> {
+    call("POST", &format!("/1/indexes/{}/{}/partial?createIfNotExists={}", idx(index)?, enc(id), create), Some(&fields), true)
+}
+
+/// Partly updates many objects, each with its `objectID`, 1000 at a time. `create` as for algolia_partial.
+pub fn algolia_partial_many(index: &str, objects: Vec<serde_json::Value>, create: bool) -> Result<serde_json::Value, String> {
+    let action = if create { "partialUpdateObject" } else { "partialUpdateObjectNoCreate" };
+    let mut list = vec![];
+    for (i, o) in objects.iter().enumerate() {
+        if !o["objectID"].is_string() {
+            return Err(format!("object {} has no objectID", i));
+        }
+        list.push(json!({ "action": action, "body": o }));
+    }
+    batches(index, list)
+}
+
+/// A built-in operation for a partial update: `algolia_op("Increment", 1)`, or "Decrement", "Add", "Remove", "AddUnique", "IncrementFrom", "IncrementSet".
+pub fn algolia_op(name: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !["Increment", "Decrement", "Add", "Remove", "AddUnique", "IncrementFrom", "IncrementSet"].contains(&name) {
+        return Err(format!("`{}` is not one of Algolia's operations", name));
+    }
+    Ok(json!({ "_operation": name, "value": value }))
+}
+
+/// One object by id; `attributes` is a list to fetch, or empty for all.
+pub fn algolia_get(index: &str, id: &str, attributes: Vec<String>) -> Result<serde_json::Value, String> {
+    let q = if attributes.is_empty() { String::new() } else { format!("?attributesToRetrieve={}", enc(&attributes.join(","))) };
+    call("GET", &format!("/1/indexes/{}/{}{}", idx(index)?, enc(id), q), None, false)
+}
+
+/// Deletes an object.
+pub fn algolia_delete(index: &str, id: &str) -> Result<serde_json::Value, String> {
+    call("DELETE", &format!("/1/indexes/{}/{}", idx(index)?, enc(id)), None, true)
+}
+
+/// Searches: `params` is Algolia's (`filters`, `facets`, `hitsPerPage`, `page`, `attributesToRetrieve`...). Gives its answer: `hits`, `nbHits`, `page`, `nbPages`, `facets`, `facets_stats`.
+pub fn algolia_search(index: &str, query: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["query"] = json!(query);
+    call("POST", &format!("/1/indexes/{}/query", idx(index)?), Some(&b), false)
+}
+
+/// A filter clause with its value quoted: `algolia_filter("brand", "Acme & Co")` is `brand:"Acme & Co"`, a number `price=10`, true `visible:true`.
+pub fn algolia_filter(attribute: &str, value: serde_json::Value) -> Result<String, String> {
+    match &value {
+        Value::String(s) => Ok(format!("{}:\"{}\"", attribute, s.replace('\\', "\\\\").replace('"', "\\\""))),
+        Value::Number(n) => Ok(format!("{}={}", attribute, n)),
+        Value::Bool(b) => Ok(format!("{}:{}", attribute, b)),
+        _ => Err("a filter's value is text, a number or true or false".into()),
+    }
+}
+
+/// Searches within a facet's values, for "as you type" filters: needs `searchable(attribute)` in the index's `attributesForFaceting`. `params` adds `filters`. Gives [{ value, highlighted, count }].
+pub fn algolia_facet_search(index: &str, facet: &str, query: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "facetQuery": query });
+    if let Some(m) = params.as_object() {
+        let p: Vec<String> = m.iter().map(|(k, v)| format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect();
+        b["params"] = json!(p.join("&"));
+    }
+    Ok(call("POST", &format!("/1/indexes/{}/facets/{}/query", idx(index)?, enc(facet)), Some(&b), false)?["facetHits"].clone())
+}
+
+/// Every object of an index by cursor, past the 1000 hits a search stops at: `params` adds `filters`, `attributesToRetrieve`; `max_items` caps them (0: all).
+pub fn algolia_browse(index: &str, params: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/1/indexes/{}/browse", idx(index)?);
+    let mut b = if params.is_object() { params } else { json!({}) };
+    if b.get("hitsPerPage").is_none() {
+        b["hitsPerPage"] = json!(1000);
+    }
+    let mut out = vec![];
+    loop {
+        let v = call("POST", &path, Some(&b), false)?;
+        out.extend(v["hits"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["cursor"].as_str() {
+            Some(c) => b = json!({ "cursor": c }),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// An index's settings.
+pub fn algolia_settings(index: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/1/indexes/{}/settings", idx(index)?), None, false)
+}
+
+/// Changes an index's settings (`searchableAttributes`, `attributesForFaceting`, `customRanking`...). Gives { taskID, updatedAt }.
+pub fn algolia_settings_set(index: &str, settings: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/1/indexes/{}/settings", idx(index)?), Some(&settings), true)
+}
+
+/// Waits until a write is searchable, asking less and less often: `task_id` from a write, `timeout_ms` how long to wait. An error if it is still not published.
+pub fn algolia_wait(index: &str, task_id: i64, timeout_ms: i64) -> Result<bool, String> {
+    let start = Instant::now();
+    let path = format!("/1/indexes/{}/task/{}", idx(index)?, task_id);
+    let mut pause = 100u64;
+    loop {
+        let v = call("GET", &path, None, false)?;
+        if v["status"] == "published" {
+            return Ok(true);
+        }
+        if start.elapsed().as_millis() as i64 >= timeout_ms {
+            return Err(format!("task {} was not published in {} ms", task_id, timeout_ms));
+        }
+        std::thread::sleep(Duration::from_millis(pause));
+        pause = (pause * 3 / 2).min(2000);
+    }
+}
+
+fn restriction_text(restrictions: &Value) -> Result<String, String> {
+    let m = restrictions.as_object().ok_or("restrictions must be a map, like { filters, validUntil, restrictIndices }")?;
+    let mut parts = vec![];
+    for (k, v) in m {
+        let t = match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) if a.iter().all(|x| x.is_string()) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","),
+            o => o.to_string(),
+        };
+        parts.push(format!("{}={}", enc(k), enc(&t)));
+    }
+    Ok(parts.join("&"))
+}
+
+/// A secured key to hand to one browser, made here with no call to Algolia: `parent_key` a search-only key (never the admin key), `restrictions` like { filters: "user_id:42", validUntil: unix seconds, restrictIndices: ["orders"] }. The browser cannot widen these: base64 of the hex HMAC-SHA256 of the query text, followed by that text.
+pub fn algolia_secured_key(parent_key: &str, restrictions: serde_json::Value) -> Result<String, String> {
+    if restrictions.get("validUntil").is_some() && !restrictions["validUntil"].is_i64() {
+        return Err("validUntil is unix seconds".into());
+    }
+    let q = restriction_text(&restrictions)?;
+    if q.is_empty() {
+        return Err("a secured key with no restrictions is only the parent key".into());
+    }
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(parent_key.as_bytes()).expect("HMAC takes any key");
+    m.update(q.as_bytes());
+    Ok(STANDARD.encode(format!("{}{}", hex::encode(m.finalize().into_bytes()), q)))
+}
+
+/// Reads a secured key back: { restrictions, seconds_left }, `seconds_left` null when it has no validUntil, negative when it is over.
+pub fn algolia_secured_key_read(key: &str) -> Result<serde_json::Value, String> {
+    let raw = STANDARD.decode(key.trim()).map_err(|_| "not a secured key: it is not base64".to_string())?;
+    let text = String::from_utf8(raw).map_err(|_| "not a secured key".to_string())?;
+    let q = text.get(64..).ok_or("not a secured key: too short")?;
+    let mut map = serde_json::Map::new();
+    for pair in q.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let mut bytes = vec![];
+        let b = v.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let pair = if b[i] == b'%' { b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()) } else { None };
+            if let Some(x) = pair.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                bytes.push(x);
+                i += 3;
+                continue;
+            }
+            bytes.push(b[i]);
+            i += 1;
+        }
+        map.insert(k.to_string(), json!(String::from_utf8_lossy(&bytes)));
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let left = map.get("validUntil").and_then(|v| v.as_str()).and_then(|t| t.parse::<i64>().ok()).map(|t| t - now);
+    Ok(json!({ "restrictions": map, "seconds_left": left }))
+}

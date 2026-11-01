@@ -1,0 +1,291 @@
+//! WooCommerce's REST API without an SDK: orders, products and customers, pages counted by the X-WP-Total headers, batches split into hundreds, refunds, Basic auth over HTTPS and the OAuth 1.0a signature WooCommerce wants over plain HTTP, its error objects read, and webhook signatures checked, the first unsigned ping told apart.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// WOOCOMMERCE_API_URL is the API, https://shop.example/wp-json/wc/v3. WOOCOMMERCE_KEY and
+// WOOCOMMERCE_SECRET are the ck_ and cs_ pair. WOOCOMMERCE_AUTH picks how they travel: "basic",
+// "query" (for a server that strips the Authorization header) or "oauth"; left out, HTTPS uses
+// Basic and plain HTTP the signature, since WooCommerce refuses a secret in the clear.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> Result<String, String> {
+    Ok(setting("WOOCOMMERCE_API_URL").ok_or("WOOCOMMERCE_API_URL is not set: https://your-shop/wp-json/wc/v3")?.trim_end_matches('/').to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+static NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// The OAuth 1.0a query WooCommerce wants over plain HTTP, one-legged, HMAC-SHA256: `params` are the query's own pairs, and the secret is signed with a trailing `&`. Give `timestamp` and `nonce` to fix them, for a test; 0 and "" make them.
+pub fn woocommerce_oauth_query(method: &str, url: &str, params: serde_json::Value, timestamp: i64, nonce: &str) -> Result<String, String> {
+    let key = setting("WOOCOMMERCE_KEY").ok_or("WOOCOMMERCE_KEY is not set")?;
+    let secret = setting("WOOCOMMERCE_SECRET").ok_or("WOOCOMMERCE_SECRET is not set")?;
+    let t = if timestamp > 0 { timestamp } else { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) };
+    let n = if nonce.is_empty() { format!("{:x}{:x}", t, NONCE.fetch_add(1, Ordering::Relaxed) + std::process::id() as u64 * 1000) } else { nonce.to_string() };
+    let mut pairs: Vec<(String, String)> = vec![("oauth_consumer_key".into(), key), ("oauth_nonce".into(), n), ("oauth_signature_method".into(), "HMAC-SHA256".into()), ("oauth_timestamp".into(), t.to_string())];
+    if let Some(m) = params.as_object() {
+        for (k, v) in m {
+            pairs.push((k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+        }
+    }
+    let mut enc_pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (enc(k), enc(v))).collect();
+    enc_pairs.sort();
+    let joined = enc_pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    let text = format!("{}&{}&{}", method.to_uppercase(), enc(url), enc(&joined));
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(format!("{}&", secret).as_bytes()).expect("HMAC takes any key");
+    m.update(text.as_bytes());
+    let sig = STANDARD.encode(m.finalize().into_bytes());
+    Ok(format!("{}&oauth_signature={}", joined, enc(&sig)))
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    match (v["code"].as_str(), v["message"].as_str()) {
+        (Some(c), Some(m)) => {
+            let hint = if status == 401 { " (check the key pair and its permissions; over plain HTTP, the server's clock)" } else { "" };
+            format!("WooCommerce {} {}: {}{}", status, c, m, hint)
+        }
+        _ => format!("WooCommerce {}: {}", status, text.trim().chars().take(300).collect::<String>()),
+    }
+}
+
+// Gives the body and the two paging headers.
+fn fetch(method: &str, path: &str, params: &Value, body: Option<&Value>) -> Result<(Value, Option<i64>, Option<i64>), String> {
+    let base = api()?;
+    let url = format!("{}{}", base, path);
+    let mode = setting("WOOCOMMERCE_AUTH").unwrap_or_else(|| if base.starts_with("https://") { "basic".into() } else { "oauth".into() });
+    let key = setting("WOOCOMMERCE_KEY").ok_or("WOOCOMMERCE_KEY is not set")?;
+    let secret = setting("WOOCOMMERCE_SECRET").ok_or("WOOCOMMERCE_SECRET is not set")?;
+    let plain_q = params.as_object().map_or(String::new(), |m| m.iter().map(|(k, v)| format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect::<Vec<_>>().join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let tries = if method == "GET" { 4u32 } else { 1 };
+    for attempt in 0..tries {
+        // A signature holds a nonce, so each try makes its own.
+        let (full, header) = match mode.as_str() {
+            "oauth" => (format!("{}?{}", url, woocommerce_oauth_query(method, &url, params.clone(), 0, "")?), None),
+            "query" => (format!("{}?{}{}consumer_key={}&consumer_secret={}", url, plain_q, if plain_q.is_empty() { "" } else { "&" }, enc(&key), enc(&secret)), None),
+            "basic" => (if plain_q.is_empty() { url.clone() } else { format!("{}?{}", url, plain_q) }, Some(format!("Basic {}", STANDARD.encode(format!("{}:{}", key, secret))))),
+            o => return Err(format!("WOOCOMMERCE_AUTH is `{}`; it takes basic, query or oauth", o)),
+        };
+        let mut req = agent.request(method, &full).set("Accept", "application/json");
+        if let Some(h) = &header {
+            req = req.set("Authorization", h);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let total = r.header("X-WP-Total").and_then(|v| v.parse().ok());
+                let pages = r.header("X-WP-TotalPages").and_then(|v| v.parse().ok());
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                let v = serde_json::from_str(t.trim_start_matches('\u{feff}')).map_err(|_| format!("the shop's answer is not JSON (a plugin printing into it?): {}", t.chars().take(200).collect::<String>()))?;
+                return Ok((v, total, pages));
+            }
+            Err(ureq::Error::Status(429 | 502 | 503 | 504, r)) if attempt + 1 < tries => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(400u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach the shop at {}: {}", base, e)),
+        }
+    }
+    Err("the shop stayed busy through four tries".into())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    Ok(fetch(method, path, &json!({}), body)?.0)
+}
+
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let mut p = if filter.is_object() { filter.clone() } else { json!({}) };
+        p["per_page"] = json!(100);
+        p["page"] = json!(page);
+        let (v, _, pages) = fetch("GET", path, &p, None)?;
+        let items = v.as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        // A cache in front of the shop can strip the headers: then a short page ends it.
+        if pages.map_or(n < 100, |t| page >= t) {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+/// How many match, read from X-WP-Total at the cost of one short request: `path` is "/orders", "/products" or "/customers".
+pub fn woocommerce_count(path: &str, filter: serde_json::Value) -> Result<i64, String> {
+    let mut p = if filter.is_object() { filter } else { json!({}) };
+    p["per_page"] = json!(1);
+    Ok(fetch("GET", path, &p, None)?.1.unwrap_or(0))
+}
+
+/// Any other call: `method`, `path` like "/coupons", `body` or null.
+pub fn woocommerce_call(method: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) })
+}
+
+/// Orders through every page: `filter` is WooCommerce's (`status`, `after`, `customer`...), `max_items` caps them (0: all).
+pub fn woocommerce_orders(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/orders", &filter, max_items)
+}
+
+/// One order by id.
+pub fn woocommerce_order(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/orders/{}", id), None)
+}
+
+/// Makes an order from WooCommerce's fields (`line_items`, `billing`, `payment_method`, `status`...).
+pub fn woocommerce_order_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("POST", "/orders", Some(&fields))
+}
+
+/// Changes an order, as `{ status: "completed" }`.
+pub fn woocommerce_order_update(id: i64, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/orders/{}", id), Some(&fields))
+}
+
+/// Adds a note to an order; `to_customer` true emails it to them.
+pub fn woocommerce_order_note(id: i64, note: &str, to_customer: bool) -> Result<serde_json::Value, String> {
+    call("POST", &format!("/orders/{}/notes", id), Some(&json!({ "note": note, "customer_note": to_customer })))
+}
+
+/// Refunds part of an order, `amount` as text ("10.00"). This records it; `api_refund` true in `params` also tells the payment gateway.
+pub fn woocommerce_refund(id: i64, amount: &str, reason: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if amount.parse::<f64>().map_or(true, |a| a <= 0.0) {
+        return Err(format!("`{}` is not an amount to refund: prices are text, like \"10.00\"", amount));
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["amount"] = json!(amount);
+    b["reason"] = json!(reason);
+    if b.get("api_refund").is_none() {
+        b["api_refund"] = json!(false);
+    }
+    call("POST", &format!("/orders/{}/refunds", id), Some(&b))
+}
+
+/// Products through every page: `filter` is WooCommerce's (`status`, `category`, `sku`, `search`...), `max_items` caps them (0: all).
+pub fn woocommerce_products(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/products", &filter, max_items)
+}
+
+/// One product by id.
+pub fn woocommerce_product(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/products/{}", id), None)
+}
+
+/// The product with this SKU, or null.
+pub fn woocommerce_product_by_sku(sku: &str) -> Result<serde_json::Value, String> {
+    Ok(woocommerce_products(json!({ "sku": sku }), 1)?.into_iter().next().unwrap_or(Value::Null))
+}
+
+/// Makes a product. `regular_price` must be text, which WooCommerce silently drops otherwise.
+pub fn woocommerce_product_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if fields.get("regular_price").map_or(false, |p| !p.is_string()) {
+        return Err("regular_price must be text, like \"12.50\": WooCommerce would drop a number".into());
+    }
+    call("POST", "/products", Some(&fields))
+}
+
+/// Changes a product.
+pub fn woocommerce_product_update(id: i64, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/products/{}", id), Some(&fields))
+}
+
+/// Creates, updates and deletes products in batches: `work` is { create, update, delete }, of any length, sent 100 at a time. Gives { created, updated, deleted, errors }, a refused item being in `errors`.
+pub fn woocommerce_products_batch(work: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut jobs: Vec<(&str, Value)> = vec![];
+    for k in ["create", "update", "delete"] {
+        for x in work[k].as_array().into_iter().flatten() {
+            jobs.push((k, x.clone()));
+        }
+    }
+    let mut counts = json!({ "created": 0, "updated": 0, "deleted": 0, "errors": [] });
+    for chunk in jobs.chunks(100) {
+        let mut body = json!({});
+        for (k, x) in chunk {
+            if body[*k].is_null() {
+                body[*k] = json!([]);
+            }
+            body[*k].as_array_mut().expect("just made").push(x.clone());
+        }
+        let r = call("POST", "/products/batch", Some(&body))?;
+        for (field, name) in [("create", "created"), ("update", "updated"), ("delete", "deleted")] {
+            for x in r[field].as_array().into_iter().flatten() {
+                if x["error"].is_object() {
+                    counts["errors"].as_array_mut().expect("just made").push(x["error"].clone());
+                } else {
+                    counts[name] = json!(counts[name].as_i64().unwrap_or(0) + 1);
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// Customers through every page: `filter` is WooCommerce's (`email`, `role`, `search`...), `max_items` caps them (0: all). The default `role` hides nobody here: it asks for "all".
+pub fn woocommerce_customers(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let mut f = if filter.is_object() { filter } else { json!({}) };
+    if f.get("role").is_none() {
+        f["role"] = json!("all");
+    }
+    walk("/customers", &f, max_items)
+}
+
+/// Makes a customer from `email` and WooCommerce's other fields.
+pub fn woocommerce_customer_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !fields["email"].is_string() {
+        return Err("a customer needs an email".into());
+    }
+    call("POST", "/customers", Some(&fields))
+}
+
+/// One customer by id.
+pub fn woocommerce_customer(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/customers/{}", id), None)
+}
+
+/// Handles a webhook: `headers` are the request's, `body` raw, `secret` the webhook's. When saved, WooCommerce first sends an unsigned ping, `webhook_id=N` as a form: that gives { ping: true, webhook_id }. Otherwise the X-WC-Webhook-Signature is checked, and it gives { ping: false, topic, resource, event, delivery, webhook_id, source, payload }.
+pub fn woocommerce_webhook(headers: std::collections::HashMap<String, serde_json::Value>, body: &str, secret: &str) -> Result<serde_json::Value, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.as_str()).map(str::to_string);
+    let sig = h("x-wc-webhook-signature");
+    if sig.is_none() {
+        if let Some(id) = body.strip_prefix("webhook_id=").filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())) {
+            return Ok(json!({ "ping": true, "webhook_id": id }));
+        }
+        return Err("no X-WC-Webhook-Signature header: this did not come from WooCommerce".into());
+    }
+    let raw = STANDARD.decode(sig.unwrap_or_default()).map_err(|_| "the X-WC-Webhook-Signature header is not base64".to_string())?;
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    if m.verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    let payload: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "ping": false, "topic": h("x-wc-webhook-topic"), "resource": h("x-wc-webhook-resource"), "event": h("x-wc-webhook-event"), "delivery": h("x-wc-webhook-delivery-id"), "webhook_id": h("x-wc-webhook-id"), "source": h("x-wc-webhook-source"), "payload": payload }))
+}

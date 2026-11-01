@@ -1,0 +1,309 @@
+//! Segment's HTTP Tracking API without a library: track, identify, group, page, screen and alias with message ids that keep a retry from counting twice, the 32 KB and 500 KB limits met before Segment refuses, batches cut to fit, and helpers that do a source function's work: a webhook's payload mapped by a table into Segment messages.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// SEGMENT_WRITE_KEY is the source's write key; SEGMENT_API_URL the API
+// (https://api.segment.io/v1 when not set; https://events.eu1.segmentapis.com/v1 in the EU).
+
+const MESSAGE_BYTES: usize = 32 * 1024;
+const BATCH_BYTES: usize = 500 * 1024;
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("SEGMENT_API_URL").unwrap_or_else(|| "https://api.segment.io/v1".into()).trim_end_matches('/').to_string()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn now_text() -> String {
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    let (y, m, d) = civil((t / 1000).div_euclid(86400));
+    let s = (t / 1000).rem_euclid(86400);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, s / 3600, s / 60 % 60, s % 60, t % 1000)
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A new message id. Give the same id to a repeat of the same event (from a stable key of yours, through `options.message_id`) and Segment drops the copy, within its window.
+pub fn segment_message_id() -> String {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let d = Sha256::digest(format!("{}:{}:{}:{:?}", t, n, std::process::id(), std::collections::hash_map::RandomState::new()));
+    format!("quillo-{}", d[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
+fn post(path: &str, body: &Value) -> Result<(), String> {
+    let key = setting("SEGMENT_WRITE_KEY").ok_or("SEGMENT_WRITE_KEY is not set")?;
+    let auth = format!("Basic {}", STANDARD.encode(format!("{}:", key)));
+    let text = body.to_string();
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).build();
+    let url = format!("{}{}", api(), path);
+    // The messages keep their ids, so a repeat of a failed send is safe.
+    for attempt in 0..4u32 {
+        match agent.post(&url).set("Authorization", &auth).set("Content-Type", "application/json").send_string(&text) {
+            Ok(_) => return Ok(()),
+            Err(ureq::Error::Status(429 | 500 | 502 | 503 | 504, r)) if attempt < 3 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(300u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(format!("Segment {}: {}", c, r.into_string().unwrap_or_default().trim().chars().take(300).collect::<String>())),
+            Err(e) => return Err(format!("cannot reach Segment at {}: {}", api(), e)),
+        }
+    }
+    Err("Segment stayed busy through four tries".into())
+}
+
+// `who` is a user id as text, or { userId, anonymousId }.
+fn people(m: &mut Map<String, Value>, who: &Value) -> Result<(), String> {
+    match who {
+        Value::String(s) if !s.is_empty() => {
+            m.insert("userId".into(), json!(s));
+        }
+        Value::Object(o) => {
+            for k in ["userId", "anonymousId"] {
+                if let Some(v) = o.get(k).filter(|v| v.as_str().map_or(false, |s| !s.is_empty())) {
+                    m.insert(k.into(), v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    if m.contains_key("userId") || m.contains_key("anonymousId") {
+        Ok(())
+    } else {
+        Err("a message needs a userId or an anonymousId".into())
+    }
+}
+
+fn finish(mut m: Map<String, Value>, options: &Value) -> Result<Value, String> {
+    let id = options["message_id"].as_str().map(str::to_string).unwrap_or_else(segment_message_id);
+    m.insert("messageId".into(), json!(id));
+    m.insert("timestamp".into(), options.get("timestamp").filter(|t| t.is_string()).cloned().unwrap_or_else(|| json!(now_text())));
+    for (o, k) in [("context", "context"), ("integrations", "integrations")] {
+        if let Some(v) = options.get(o).filter(|v| v.is_object()) {
+            m.insert(k.into(), v.clone());
+        }
+    }
+    let lib = json!({ "name": "quillo-segment", "version": "1.0.0" });
+    match m.get_mut("context").and_then(|c| c.as_object_mut()) {
+        Some(c) => {
+            c.entry("library").or_insert(lib);
+        }
+        None => {
+            m.insert("context".into(), json!({ "library": lib }));
+        }
+    }
+    let v = Value::Object(m);
+    let size = v.to_string().len();
+    if size > MESSAGE_BYTES {
+        return Err(format!("a message is {} bytes; Segment takes at most {}", size, MESSAGE_BYTES));
+    }
+    Ok(v)
+}
+
+fn map_of(v: &Value, what: &str) -> Result<Value, String> {
+    match v {
+        Value::Object(_) => Ok(v.clone()),
+        Value::Null => Ok(json!({})),
+        _ => Err(format!("{} must be a map", what)),
+    }
+}
+
+fn send_one(path: &str, m: Value) -> Result<serde_json::Value, String> {
+    post(path, &m)?;
+    Ok(json!({ "messageId": m["messageId"] }))
+}
+
+/// Records an event: `who` is a user id, or { userId, anonymousId }; `options` may hold `timestamp`, `context`, `integrations`, `message_id`. Gives { messageId }.
+pub fn segment_track(who: serde_json::Value, event: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/track", segment_build("track", who, json!({ "event": event, "properties": properties }), options)?)
+}
+
+/// Says who someone is, with `traits`.
+pub fn segment_identify(who: serde_json::Value, traits: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/identify", segment_build("identify", who, json!({ "traits": traits }), options)?)
+}
+
+/// Ties someone to a group, with the group's `traits`.
+pub fn segment_group(who: serde_json::Value, group_id: &str, traits: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/group", segment_build("group", who, json!({ "groupId": group_id, "traits": traits }), options)?)
+}
+
+/// Records a page view: `name` may be "", and `properties` may hold `url`, `title`, `referrer`...
+pub fn segment_page(who: serde_json::Value, name: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/page", segment_build("page", who, json!({ "name": name, "properties": properties }), options)?)
+}
+
+/// Records a phone app's screen.
+pub fn segment_screen(who: serde_json::Value, name: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/screen", segment_build("screen", who, json!({ "name": name, "properties": properties }), options)?)
+}
+
+/// Joins two ids: `previous_id` was anonymous, `user_id` is who they are now.
+pub fn segment_alias(previous_id: &str, user_id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_one("/alias", segment_build("alias", json!(user_id), json!({ "previousId": previous_id }), options)?)
+}
+
+/// A checked message of `kind` ("track", "identify", "group", "page", "screen", "alias") without sending it, for segment_batch: `fields` holds what that kind has (`event`, `properties`, `traits`, `groupId`, `name`, `previousId`).
+pub fn segment_build(kind: &str, who: serde_json::Value, fields: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut m = Map::new();
+    m.insert("type".into(), json!(kind));
+    people(&mut m, &who)?;
+    match kind {
+        "track" => {
+            let e = fields["event"].as_str().filter(|e| !e.is_empty()).ok_or("a track needs an event name")?;
+            m.insert("event".into(), json!(e));
+            m.insert("properties".into(), map_of(&fields["properties"], "properties")?);
+        }
+        "identify" => {
+            m.insert("traits".into(), map_of(&fields["traits"], "traits")?);
+        }
+        "group" => {
+            let g = fields["groupId"].as_str().filter(|e| !e.is_empty()).ok_or("a group needs a groupId")?;
+            m.insert("groupId".into(), json!(g));
+            m.insert("traits".into(), map_of(&fields["traits"], "traits")?);
+        }
+        "page" | "screen" => {
+            if let Some(n) = fields["name"].as_str().filter(|n| !n.is_empty()) {
+                m.insert("name".into(), json!(n));
+            }
+            m.insert("properties".into(), map_of(&fields["properties"], "properties")?);
+        }
+        "alias" => {
+            let p = fields["previousId"].as_str().filter(|e| !e.is_empty()).ok_or("an alias needs a previousId")?;
+            m.insert("previousId".into(), json!(p));
+        }
+        o => return Err(format!("`{}` is not a message type", o)),
+    }
+    finish(m, &options)
+}
+
+/// Sends messages from segment_build, cut into batches under 500 KB. Gives { sent, batches }.
+pub fn segment_batch(messages: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let mut batches = 0;
+    let mut group: Vec<Value> = vec![];
+    let mut bytes = 0;
+    // Room for the envelope around the list.
+    const ROOM: usize = BATCH_BYTES - 128;
+    for (i, m) in messages.iter().enumerate() {
+        if !m["type"].is_string() || !m["messageId"].is_string() {
+            return Err(format!("message {} was not made by segment_build", i));
+        }
+        let size = m.to_string().len() + 1;
+        if size > MESSAGE_BYTES {
+            return Err(format!("message {} is {} bytes; Segment takes at most {}", i, size, MESSAGE_BYTES));
+        }
+        if bytes + size > ROOM {
+            post("/batch", &json!({ "batch": group, "sentAt": now_text() }))?;
+            batches += 1;
+            group = vec![];
+            bytes = 0;
+        }
+        bytes += size;
+        group.push(m.clone());
+    }
+    if !group.is_empty() {
+        post("/batch", &json!({ "batch": group, "sentAt": now_text() }))?;
+        batches += 1;
+    }
+    Ok(json!({ "sent": messages.len(), "batches": batches }))
+}
+
+fn at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = root;
+    for part in path.split('.') {
+        cur = match cur {
+            Value::Array(a) => a.get(part.parse::<usize>().ok()?)?,
+            _ => cur.get(part)?,
+        };
+    }
+    if cur.is_null() { None } else { Some(cur) }
+}
+
+// In a table, text is a path into the payload; text starting with `=` is itself.
+fn pick(table: &Value, payload: &Value) -> Value {
+    match table {
+        Value::String(s) => match s.strip_prefix('=') {
+            Some(lit) => json!(lit),
+            None => at(payload, s).cloned().unwrap_or(Value::Null),
+        },
+        Value::Object(m) => {
+            let mut out = Map::new();
+            for (k, v) in m {
+                let x = pick(v, payload);
+                if !x.is_null() {
+                    out.insert(k.clone(), x);
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// What a source function does, without one: `tables` is a list, each { when: { path, equals }, type, event, userId, anonymousId, groupId, name, previousId, properties, traits, id, timestamp }. Text in a table is a path into `payload` ("order.items.0.sku"), and text starting with `=` is itself. Each table whose `when` fits makes a message; `id` is a path to a stable key for its messageId, so a webhook delivered twice counts once. Gives the messages, for segment_batch.
+pub fn segment_source_messages(payload: serde_json::Value, tables: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    for (i, t) in tables.iter().enumerate() {
+        if let Some(w) = t.get("when") {
+            let path = w["path"].as_str().ok_or(format!("table {}: `when` needs a path", i))?;
+            if at(&payload, path) != Some(&w["equals"]) {
+                continue;
+            }
+        }
+        let kind = t["type"].as_str().ok_or(format!("table {} has no `type`", i))?;
+        let mut who = Map::new();
+        for k in ["userId", "anonymousId"] {
+            if let Some(s) = t.get(k) {
+                let v = pick(s, &payload);
+                if !v.is_null() {
+                    who.insert(k.into(), json!(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+                }
+            }
+        }
+        let mut fields = Map::new();
+        for k in ["event", "name", "groupId", "previousId", "properties", "traits"] {
+            if let Some(s) = t.get(k) {
+                let v = pick(s, &payload);
+                fields.insert(k.to_string(), if k == "groupId" || k == "previousId" { v.as_str().map(|x| json!(x)).unwrap_or_else(|| if v.is_null() { v.clone() } else { json!(v.to_string()) }) } else { v });
+            }
+        }
+        let mut options = json!({});
+        if let Some(p) = t["id"].as_str() {
+            let key = at(&payload, p).ok_or(format!("table {}: the payload has nothing at `{}` for an id", i, p))?;
+            let d = Sha256::digest(format!("{}:{}:{}", kind, i, key.as_str().map(str::to_string).unwrap_or_else(|| key.to_string())).as_bytes());
+            options["message_id"] = json!(format!("quillo-{}", d[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+        }
+        if let Some(p) = t["timestamp"].as_str() {
+            if let Some(v) = at(&payload, p) {
+                options["timestamp"] = v.clone();
+            }
+        }
+        out.push(segment_build(kind, Value::Object(who), Value::Object(fields), options).map_err(|e| format!("table {}: {}", i, e))?);
+    }
+    Ok(out)
+}

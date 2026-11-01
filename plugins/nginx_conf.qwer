@@ -1,0 +1,713 @@
+//! nginx configuration parsed to a tree and printed back, includes followed, `server` and `location` blocks listed, the block a request lands in worked out, and common mistakes noticed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
+
+const MAX_DEPTH: usize = 64;
+const MAX_INCLUDES: usize = 32;
+
+#[derive(Clone, Debug)]
+enum Tok {
+    Word(String),
+    Semi,
+    Open,
+    Close,
+    Comment(String),
+}
+
+/// As nginx's own ngx_conf_read_token: `{` and `;` end a word, unless the `{` is `${`; `}` only counts alone.
+fn tokens(text: &str) -> Result<Vec<(Tok, usize)>, String> {
+    let c: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut line = 1;
+    let mut out = vec![];
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+        } else if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '#' {
+            let start = i + 1;
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            out.push((Tok::Comment(c[start..i].iter().collect::<String>().trim_end().to_string()), line));
+        } else if ch == ';' {
+            out.push((Tok::Semi, line));
+            i += 1;
+        } else if ch == '{' {
+            out.push((Tok::Open, line));
+            i += 1;
+        } else if ch == '}' {
+            out.push((Tok::Close, line));
+            i += 1;
+        } else if ch == '"' || ch == '\'' {
+            let at = line;
+            i += 1;
+            let mut w = String::new();
+            loop {
+                if i >= c.len() {
+                    return Err(format!("line {}: a quote is never closed", at));
+                }
+                if c[i] == ch {
+                    i += 1;
+                    break;
+                }
+                if c[i] == '\\' && i + 1 < c.len() {
+                    i += esc(&c, i, &mut w);
+                    continue;
+                }
+                if c[i] == '\n' {
+                    line += 1;
+                }
+                w.push(c[i]);
+                i += 1;
+            }
+            if i < c.len() && !c[i].is_whitespace() && c[i] != ';' && c[i] != '{' && c[i] != ')' {
+                return Err(format!("line {}: unexpected `{}` after a closing quote", line, c[i]));
+            }
+            out.push((Tok::Word(w), at));
+        } else {
+            let mut w = String::new();
+            let mut var = false;
+            while i < c.len() {
+                let x = c[i];
+                if x == '{' && var {
+                    // `${name}` is one word.
+                    w.push(x);
+                    i += 1;
+                    while i < c.len() && c[i] != '}' {
+                        w.push(c[i]);
+                        i += 1;
+                    }
+                    if i < c.len() {
+                        w.push('}');
+                        i += 1;
+                    }
+                    var = false;
+                    continue;
+                }
+                var = false;
+                if x.is_whitespace() || x == ';' || x == '{' {
+                    break;
+                }
+                if x == '\\' && i + 1 < c.len() {
+                    i += esc(&c, i, &mut w);
+                    continue;
+                }
+                if x == '$' {
+                    var = true;
+                }
+                w.push(x);
+                i += 1;
+            }
+            out.push((Tok::Word(w), line));
+        }
+    }
+    Ok(out)
+}
+
+/// One backslash escape, as nginx undoes them: only `\"`, `\'`, `\\`, `\t`, `\r` and `\n`; others stay (`\.` in a regex).
+fn esc(c: &[char], i: usize, w: &mut String) -> usize {
+    match c[i + 1] {
+        '"' | '\'' | '\\' => { w.push(c[i + 1]); 2 }
+        't' => { w.push('\t'); 2 }
+        'r' => { w.push('\r'); 2 }
+        'n' => { w.push('\n'); 2 }
+        _ => { w.push('\\'); 1 }
+    }
+}
+
+fn block(toks: &[(Tok, usize)], at: &mut usize, depth: usize, file: Option<&str>) -> Result<Vec<Value>, String> {
+    if depth > MAX_DEPTH {
+        return Err("blocks are nested too deep".to_string());
+    }
+    let mut out = vec![];
+    let mut words: Vec<String> = vec![];
+    let mut first_line = 0;
+    while *at < toks.len() {
+        let (t, line) = &toks[*at];
+        *at += 1;
+        match t {
+            Tok::Comment(c) => {
+                if words.is_empty() {
+                    out.push(json!({ "comment": c, "line": line }));
+                }
+            }
+            Tok::Word(w) => {
+                if words.is_empty() {
+                    first_line = *line;
+                }
+                words.push(w.clone());
+            }
+            Tok::Semi => {
+                if words.is_empty() {
+                    return Err(format!("line {}: unexpected `;`", line));
+                }
+                out.push(node(&mut words, first_line, file, None));
+            }
+            Tok::Open => {
+                if words.is_empty() {
+                    return Err(format!("line {}: unexpected `{{`", line));
+                }
+                let kids = block(toks, at, depth + 1, file)?;
+                out.push(node(&mut words, first_line, file, Some(kids)));
+            }
+            Tok::Close => {
+                if !words.is_empty() {
+                    return Err(format!("line {}: `{}` has no `;`", first_line, words[0]));
+                }
+                if depth == 0 {
+                    return Err(format!("line {}: unexpected `}}`", line));
+                }
+                return Ok(out);
+            }
+        }
+    }
+    if !words.is_empty() {
+        return Err(format!("line {}: `{}` has no `;`", first_line, words[0]));
+    }
+    if depth > 0 {
+        return Err("the file ends inside a block: a `}` is missing".to_string());
+    }
+    Ok(out)
+}
+
+fn node(words: &mut Vec<String>, line: usize, file: Option<&str>, kids: Option<Vec<Value>>) -> Value {
+    let args: Vec<String> = words.drain(1..).collect();
+    let name = words.remove(0);
+    let mut m = Map::new();
+    m.insert("directive".into(), json!(name));
+    m.insert("args".into(), json!(args));
+    m.insert("line".into(), json!(line));
+    if let Some(f) = file {
+        m.insert("file".into(), json!(f));
+    }
+    if let Some(k) = kids {
+        m.insert("block".into(), Value::Array(k));
+    }
+    Value::Object(m)
+}
+
+fn parse(text: &str, file: Option<&str>) -> Result<Vec<Value>, String> {
+    let t = tokens(text.trim_start_matches('\u{feff}'))?;
+    let mut at = 0;
+    block(&t, &mut at, 0, file)
+}
+
+/// Parses configuration text to a tree: each node is `{ directive, args, line, block }` or `{ comment, line }`. Errors name the line, as `nginx -t` does.
+pub fn nginx_conf_parse(text: &str) -> Result<Vec<Value>, String> {
+    parse(text, None)
+}
+
+fn quoted(a: &str) -> String {
+    let plain = !a.is_empty()
+        && !a.chars().any(|c| c.is_whitespace() || c == ';' || c == '"' || c == '\'')
+        && !a.replace("${", "").contains('{')
+        && !a.starts_with('#')
+        && a != "}";
+    let keep_slash = |rest: &str| !matches!(rest.chars().next(), Some('"') | Some('\'') | Some('\\') | Some('t') | Some('r') | Some('n') | None);
+    let body = |q: char| {
+        let mut out = String::new();
+        for (i, c) in a.char_indices() {
+            match c {
+                '\\' if keep_slash(&a[i + 1..]) => out.push('\\'),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if c == q => { out.push('\\'); out.push(c); }
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    if plain {
+        return body('\u{0}');
+    }
+    let q = if a.contains('"') && !a.contains('\'') { '\'' } else { '"' };
+    format!("{}{}{}", q, body(q), q)
+}
+
+fn print(nodes: &[Value], depth: usize, out: &mut String) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err("blocks are nested too deep".to_string());
+    }
+    let pad = "    ".repeat(depth);
+    for (i, n) in nodes.iter().enumerate() {
+        if let Some(c) = n.get("comment").and_then(Value::as_str) {
+            out.push_str(&format!("{}#{}\n", pad, c));
+            continue;
+        }
+        let name = n.get("directive").and_then(Value::as_str).ok_or("a node needs a `directive` or a `comment`")?;
+        // A blank line before a block, unless it opens its parent or a comment sits on it.
+        if n.get("block").is_some() && i > 0 && nodes[i - 1].get("comment").is_none() {
+            out.push('\n');
+        }
+        out.push_str(&pad);
+        // In a `map`, the first word may be anything, even empty.
+        out.push_str(&quoted(name));
+        for a in n.get("args").and_then(Value::as_array).into_iter().flatten() {
+            let t = a.as_str().map(str::to_string).unwrap_or_else(|| a.to_string());
+            out.push(' ');
+            out.push_str(&quoted(&t));
+        }
+        match n.get("block").and_then(Value::as_array) {
+            Some(b) => {
+                out.push_str(" {\n");
+                print(b, depth + 1, out)?;
+                out.push_str(&pad);
+                out.push_str("}\n");
+            }
+            None => out.push_str(";\n"),
+        }
+    }
+    Ok(())
+}
+
+/// Prints a tree back as configuration, four spaces to a level; parsing the output gives the same tree.
+pub fn nginx_conf_print(tree: Vec<serde_json::Value>) -> Result<String, String> {
+    let mut out = String::new();
+    print(&tree, 0, &mut out)?;
+    Ok(out)
+}
+
+/// `*`, `?` and `[a-z]`, enough for `sites-enabled/*` and `conf.d/*.conf`.
+fn glob_match(p: &[char], t: &[char]) -> bool {
+    match p.first() {
+        None => t.is_empty(),
+        Some('*') => (0..=t.len()).any(|i| glob_match(&p[1..], &t[i..])),
+        Some('?') => !t.is_empty() && glob_match(&p[1..], &t[1..]),
+        Some('[') => {
+            let Some(end) = p.iter().position(|c| *c == ']') else { return !t.is_empty() && t[0] == '[' && glob_match(&p[1..], &t[1..]) };
+            if t.is_empty() {
+                return false;
+            }
+            let (neg, set) = if p[1] == '!' || p[1] == '^' { (true, &p[2..end]) } else { (false, &p[1..end]) };
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= t[0] && t[0] <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == t[0];
+                    i += 1;
+                }
+            }
+            hit != neg && glob_match(&p[end + 1..], &t[1..])
+        }
+        Some(c) => !t.is_empty() && *c == t[0] && glob_match(&p[1..], &t[1..]),
+    }
+}
+
+fn expand(pattern: &Path) -> Vec<PathBuf> {
+    let text = pattern.to_string_lossy();
+    if !text.contains(['*', '?', '[']) {
+        return vec![pattern.to_path_buf()];
+    }
+    let mut found: Vec<PathBuf> = vec![PathBuf::new()];
+    for part in pattern.components() {
+        let part = part.as_os_str().to_string_lossy().into_owned();
+        let mut next = vec![];
+        for base in &found {
+            if part.contains(['*', '?', '[']) {
+                let p: Vec<char> = part.chars().collect();
+                if let Ok(rd) = std::fs::read_dir(if base.as_os_str().is_empty() { Path::new(".") } else { base.as_path() }) {
+                    for e in rd.flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        // As glob(3): a dot file needs the dot written.
+                        if (!name.starts_with('.') || part.starts_with('.')) && glob_match(&p, &name.chars().collect::<Vec<_>>()) {
+                            next.push(base.join(name));
+                        }
+                    }
+                }
+            } else {
+                next.push(base.join(&part));
+            }
+        }
+        found = next;
+    }
+    found.sort();
+    found.into_iter().filter(|f| f.is_file()).collect()
+}
+
+struct Load {
+    base: PathBuf,
+    files: Vec<String>,
+    problems: Vec<String>,
+}
+
+fn splice(nodes: Vec<Value>, stack: &mut Vec<PathBuf>, l: &mut Load) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    for mut n in nodes {
+        if let Some(b) = n.get_mut("block").map(Value::take) {
+            let list = serde_json::from_value::<Vec<Value>>(b).unwrap_or_default();
+            n["block"] = Value::Array(splice(list, stack, l)?);
+            out.push(n);
+            continue;
+        }
+        if n.get("directive").and_then(Value::as_str) != Some("include") {
+            out.push(n);
+            continue;
+        }
+        let arg = n["args"][0].as_str().unwrap_or("").to_string();
+        let path = Path::new(&arg);
+        let full = if path.is_absolute() { path.to_path_buf() } else { l.base.join(path) };
+        let matched = expand(&full);
+        let globbed = arg.contains(['*', '?', '[']);
+        if matched.is_empty() && globbed {
+            l.problems.push(format!("include {} matches no file", arg));
+        }
+        let at = format!("{}:{}", n["file"].as_str().unwrap_or(""), n["line"]);
+        for f in matched {
+            out.extend(read_file_tree(&f, stack, l, Some(&at))?);
+        }
+    }
+    Ok(out)
+}
+
+fn read_file_tree(path: &Path, stack: &mut Vec<PathBuf>, l: &mut Load, from: Option<&str>) -> Result<Vec<Value>, String> {
+    if stack.len() >= MAX_INCLUDES {
+        return Err(format!("includes go deeper than {}", MAX_INCLUDES));
+    }
+    let shown = path.to_string_lossy().into_owned();
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canon) {
+        return Err(format!("{} includes itself", shown));
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(match from {
+                Some(f) => format!("{}: cannot read include {}: {}", f, shown, e),
+                None => format!("cannot read {}: {}", shown, e),
+            })
+        }
+    };
+    l.files.push(shown.clone());
+    stack.push(canon);
+    let tree = parse(&text, Some(&shown)).map_err(|e| format!("{}: {}", shown, e))?;
+    let out = splice(tree, stack, l);
+    stack.pop();
+    out
+}
+
+/// Reads a configuration file and follows its `include`s, globs too, relative to that file's folder as nginx does for its main file: `{ tree, files, problems }`, each node saying which file it came from.
+pub fn nginx_conf_load(path: &str) -> Result<Value, String> {
+    let p = Path::new(path);
+    let mut l = Load { base: p.parent().unwrap_or(Path::new(".")).to_path_buf(), files: vec![], problems: vec![] };
+    let tree = read_file_tree(p, &mut vec![], &mut l, None)?;
+    Ok(json!({ "tree": tree, "files": l.files, "problems": l.problems }))
+}
+
+fn dname(n: &Value) -> &str {
+    n.get("directive").and_then(Value::as_str).unwrap_or("")
+}
+
+fn args(n: &Value) -> Vec<&str> {
+    n["args"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+fn kids(n: &Value) -> &[Value] {
+    n.get("block").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+}
+
+fn find_all<'a>(nodes: &'a [Value], name: &str, out: &mut Vec<&'a Value>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for n in nodes {
+        if dname(n) == name {
+            out.push(n);
+        }
+        find_all(kids(n), name, out, depth + 1);
+    }
+}
+
+fn servers_of(tree: &[Value]) -> Vec<&Value> {
+    let mut out = vec![];
+    find_all(tree, "server", &mut out, 0);
+    // `server` inside `upstream` is a backend; those have no block.
+    out.retain(|n| n.get("block").is_some());
+    out
+}
+
+fn first_arg<'a>(block: &'a [Value], name: &str) -> Option<&'a str> {
+    block.iter().find(|n| dname(n) == name).and_then(|n| n["args"][0].as_str())
+}
+
+fn location_parts(n: &Value) -> (String, String) {
+    let a = args(n);
+    match a.as_slice() {
+        [m, p, ..] => (m.to_string(), p.to_string()),
+        [p] => {
+            // Written with no space: `location ~^/x`, `location =/x`, `location ^~/x`.
+            for m in ["^~", "~*", "=", "~"] {
+                if let Some(r) = p.strip_prefix(m) {
+                    return (m.to_string(), r.to_string());
+                }
+            }
+            (String::new(), p.to_string())
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+fn location_list(block: &[Value], out: &mut Vec<Value>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for l in block.iter().filter(|n| dname(n) == "location") {
+        let (m, p) = location_parts(l);
+        let b = kids(l);
+        let kind = match m.as_str() {
+            "=" => "exact",
+            "^~" => "prefix, no regex after",
+            "~" => "regex",
+            "~*" => "regex, any case",
+            _ => "prefix",
+        };
+        out.push(json!({
+            "path": p, "modifier": m, "kind": kind, "line": l["line"],
+            "proxy_pass": first_arg(b, "proxy_pass"), "fastcgi_pass": first_arg(b, "fastcgi_pass"), "root": first_arg(b, "root"), "alias": first_arg(b, "alias"),
+            "try_files": b.iter().find(|n| dname(n) == "try_files").map(args),
+            "return": b.iter().find(|n| dname(n) == "return").map(args),
+        }));
+        location_list(b, out, depth + 1);
+    }
+}
+
+fn listen_of(n: &Value) -> Value {
+    let a = args(n);
+    let addr = a.first().copied().unwrap_or("");
+    let digits = addr.rsplit(':').next().unwrap_or(addr);
+    let port = if addr.starts_with("unix:") { Value::Null } else if digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty() && !addr.ends_with(']') { digits.parse::<i64>().map(Value::from).unwrap_or(Value::Null) } else { json!(80) };
+    json!({ "address": addr, "port": port, "ssl": a.contains(&"ssl"), "http2": a.contains(&"http2"), "default": a.contains(&"default_server") || a.contains(&"default") })
+}
+
+/// Every `server` block: listen addresses, names, TLS, root and its locations; and every `upstream`, with its backends.
+pub fn nginx_conf_servers(tree: Vec<serde_json::Value>) -> Result<Value, String> {
+    let servers: Vec<Value> = servers_of(&tree).into_iter().map(|s| {
+        let b = kids(s);
+        let mut listen: Vec<Value> = b.iter().filter(|n| dname(n) == "listen").map(listen_of).collect();
+        if listen.is_empty() {
+            listen.push(json!({ "address": "*:80", "port": 80, "ssl": false, "http2": false, "default": false }));
+        }
+        let names: Vec<&str> = b.iter().filter(|n| dname(n) == "server_name").flat_map(args).collect();
+        let mut locations = vec![];
+        location_list(b, &mut locations, 0);
+        json!({
+            "line": s["line"], "file": s.get("file"), "listen": listen, "names": names,
+            "tls": listen.iter().any(|l| l["ssl"] == json!(true)), "certificate": first_arg(b, "ssl_certificate"),
+            "root": first_arg(b, "root"), "locations": locations,
+        })
+    }).collect();
+    let mut ups = vec![];
+    find_all(&tree, "upstream", &mut ups, 0);
+    let upstreams: Vec<Value> = ups.into_iter().map(|u| json!({
+        "name": u["args"][0], "line": u["line"],
+        "servers": kids(u).iter().filter(|n| dname(n) == "server").map(|n| json!({ "address": n["args"][0], "options": args(n)[1..].to_vec() })).collect::<Vec<_>>(),
+        "balance": kids(u).iter().find(|n| ["least_conn", "ip_hash", "hash", "random"].contains(&dname(n))).map(dname),
+    })).collect();
+    Ok(json!({ "servers": servers, "upstreams": upstreams }))
+}
+
+fn name_score(pattern: &str, host: &str) -> Option<(u8, usize)> {
+    let host = host.to_lowercase();
+    let p = pattern.to_lowercase();
+    // nginx's order: exact, longest leading wildcard, longest trailing wildcard, regex.
+    if p == host {
+        return Some((4, p.len()));
+    }
+    if let Some(r) = p.strip_prefix("*.") {
+        if host.ends_with(&format!(".{}", r)) {
+            return Some((3, r.len()));
+        }
+    }
+    if let Some(r) = p.strip_prefix('.') {
+        if host == r || host.ends_with(&format!(".{}", r)) {
+            return Some((3, r.len()));
+        }
+    }
+    if let Some(r) = p.strip_suffix(".*") {
+        if host.starts_with(&format!("{}.", r)) {
+            return Some((2, r.len()));
+        }
+    }
+    None
+}
+
+/// Which `server` and `location` a request reaches, by nginx's rules: exact match, then the longest prefix, then regexes in order unless `^~` stopped them. `regex` locations are matched only as far as a plain test allows: see `regex_note`.
+pub fn nginx_conf_match(tree: Vec<serde_json::Value>, port: i64, host: &str, path: &str) -> Result<Value, String> {
+    let servers = servers_of(&tree);
+    let on_port: Vec<&Value> = servers.iter().copied().filter(|s| {
+        let l: Vec<i64> = kids(s).iter().filter(|n| dname(n) == "listen").map(listen_of).filter_map(|x| x["port"].as_i64()).collect();
+        if l.is_empty() { port == 80 } else { l.contains(&port) }
+    }).collect();
+    if on_port.is_empty() {
+        return Err(format!("no server listens on port {}", port));
+    }
+    let mut best: Option<(&Value, (u8, usize))> = None;
+    for s in &on_port {
+        for n in kids(s).iter().filter(|n| dname(n) == "server_name").flat_map(args) {
+            if let Some(score) = name_score(n, host) {
+                if best.as_ref().map_or(true, |b| score > b.1) {
+                    best = Some((s, score));
+                }
+            }
+        }
+    }
+    let default = on_port.iter().copied().find(|s| kids(s).iter().filter(|n| dname(n) == "listen").any(|n| { let l = listen_of(n); l["default"] == json!(true) && l["port"] == json!(port) })).unwrap_or(on_port[0]);
+    let by_default = best.is_none();
+    let server = best.map_or(default, |b| b.0);
+    let block = kids(server);
+    let locs: Vec<&Value> = block.iter().filter(|n| dname(n) == "location").collect();
+    let mut prefix: Option<(&Value, usize, bool)> = None;
+    for l in &locs {
+        let (m, p) = location_parts(l);
+        if m == "=" && p == path {
+            return Ok(answer(server, Some(l), by_default, "exact", false));
+        }
+        if (m.is_empty() || m == "^~") && path.starts_with(p.as_str()) && prefix.map_or(true, |x| p.len() > x.1) {
+            prefix = Some((l, p.len(), m == "^~"));
+        }
+    }
+    let stop = prefix.map_or(false, |p| p.2);
+    let regexes = locs.iter().any(|l| { let m = location_parts(l).0; m == "~" || m == "~*" });
+    Ok(answer(server, prefix.map(|p| p.0), by_default, if prefix.is_some() { "longest prefix" } else { "none" }, regexes && !stop))
+}
+
+fn answer(server: &Value, loc: Option<&Value>, by_default: bool, how: &str, regex_note: bool) -> Value {
+    let names: Vec<&str> = kids(server).iter().filter(|n| dname(n) == "server_name").flat_map(args).collect();
+    json!({
+        "server": names.first().copied().unwrap_or(""), "server_line": server["line"], "default_server": by_default,
+        "location": loc.map(|l| { let (m, p) = location_parts(l); if m.is_empty() { p } else { format!("{} {}", m, p) } }),
+        "how": how,
+        "regex_note": if regex_note { Value::String("regex locations are tried after this and may win; they are not run here".to_string()) } else { Value::Null },
+    })
+}
+
+fn note(out: &mut Vec<Value>, line: &Value, rule: &str, message: String) {
+    out.push(json!({ "line": line, "rule": rule, "message": message }));
+}
+
+fn lint_directive(n: &Value, ctx: &str, siblings: &[Value], out: &mut Vec<Value>) {
+    let a = args(n);
+    let name = dname(n);
+    let line = &n["line"];
+    match name {
+        "ssl_protocols" => for bad in ["SSLv2", "SSLv3", "TLSv1", "TLSv1.1"] {
+            if a.contains(&bad) {
+                note(out, line, "weak-tls", format!("ssl_protocols allows {}: use TLSv1.2 and TLSv1.3", bad));
+            }
+        },
+        "server_tokens" if a.first() == Some(&"on") => note(out, line, "server-tokens", "server_tokens on tells every visitor the version".to_string()),
+        "autoindex" if a.first() == Some(&"on") => note(out, line, "autoindex", "autoindex on lists folders to anyone".to_string()),
+        "return" | "rewrite" => {
+            if a.iter().skip(1).any(|x| x.contains("$uri") || x.contains("$document_uri")) {
+                note(out, line, "crlf-injection", format!("{} uses $uri, which is decoded: a %0d%0a in the path splits the header; use $request_uri", name));
+            }
+        }
+        "proxy_pass" | "fastcgi_pass" | "uwsgi_pass" if ctx == "if" => note(out, line, "if-is-evil", format!("{} inside `if` does not do what it looks like: use a location or map", name)),
+        "proxy_pass" => {
+            let t = a.first().copied().unwrap_or("");
+            let after = t.split_once("://").map_or("", |x| x.1);
+            if ctx.starts_with("location ~") && after.contains('/') && !t.contains('$') {
+                note(out, line, "proxy-pass-regex", "proxy_pass with a URI part cannot be used in a regex location: nginx refuses it".to_string());
+            }
+            if t.contains('$') && after.split_once('/').map_or(false, |x| !x.1.is_empty()) {
+                note(out, line, "proxy-pass-variable", "with variables in proxy_pass, the URI is taken as written: the location part is not replaced".to_string());
+            }
+        }
+        "alias" => {
+            let loc = ctx.strip_prefix("location ").unwrap_or("");
+            let t = a.first().copied().unwrap_or("");
+            if !loc.is_empty() && !loc.starts_with('~') && !loc.ends_with('/') && t.ends_with('/') {
+                note(out, line, "alias-traversal", format!("location {} has no final slash and its alias has one: {}../ walks out of the folder", loc, loc));
+            }
+            if loc.ends_with('/') && !t.ends_with('/') {
+                note(out, line, "alias-slash", format!("location {} ends in a slash and its alias does not: paths run together", loc));
+            }
+        }
+        "root" if ctx.starts_with("location") && matches!(a.first().copied(), Some("/") | Some("/root") | Some("/etc") | Some("/home")) => {
+            note(out, line, "root-too-wide", format!("root {} serves the system's own files", a[0]));
+        }
+        "add_header" => {
+            if ["X-Frame-Options", "Content-Security-Policy", "Strict-Transport-Security"].iter().any(|h| a.first().map_or(false, |x| x.eq_ignore_ascii_case(h))) && a.last() != Some(&"always") {
+                note(out, line, "header-not-always", format!("add_header {} needs `always`, or error pages go without it", a[0]));
+            }
+        }
+        "if" if ctx.starts_with("location") => {
+            if kids(n).iter().filter(|k| k.get("directive").is_some()).any(|k| !["return", "rewrite"].contains(&dname(k))) {
+                note(out, line, "if-is-evil", "`if` in a location is safe only with return or rewrite".to_string());
+            }
+        }
+        "client_max_body_size" if a.first() == Some(&"0") => note(out, line, "no-body-limit", "client_max_body_size 0 takes uploads of any size".to_string()),
+        "server" if n.get("block").is_some() => {
+            let b = kids(n);
+            let tls = b.iter().filter(|x| dname(x) == "listen").any(|x| args(x).contains(&"ssl"));
+            if tls && !b.iter().any(|x| dname(x) == "ssl_certificate") && !siblings.iter().any(|x| dname(x) == "ssl_certificate") {
+                note(out, line, "tls-no-certificate", "this server listens with ssl and has no ssl_certificate".to_string());
+            }
+            if !b.iter().any(|x| dname(x) == "server_name") {
+                note(out, line, "no-server-name", "no server_name: this block answers only as a default".to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lint_block(nodes: &[Value], ctx: &str, headers_above: bool, out: &mut Vec<Value>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let own = nodes.iter().any(|n| dname(n) == "add_header");
+    if own && headers_above {
+        let line = &nodes.iter().find(|n| dname(n) == "add_header").unwrap()["line"];
+        note(out, line, "add-header-replaces", "add_header here drops every add_header of the block above: they do not add up".to_string());
+    }
+    for n in nodes {
+        lint_directive(n, ctx, nodes, out);
+        if n.get("block").is_some() {
+            let inner = match dname(n) {
+                "location" => {
+                    let (m, p) = location_parts(n);
+                    if m.is_empty() { format!("location {}", p) } else { format!("location {} {}", m, p) }
+                }
+                d => d.to_string(),
+            };
+            lint_block(kids(n), &inner, own || headers_above, out, depth + 1);
+        }
+    }
+}
+
+/// Common mistakes: `[{ line, rule, message }]`, for the alias slash trap, `add_header` that drops the parent's, `$uri` in redirects, `if` in a location, old TLS, a TLS server with no certificate, and more. Duplicate server names are found too.
+pub fn nginx_conf_lint(tree: Vec<serde_json::Value>) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    lint_block(&tree, "", false, &mut out, 0);
+    let mut seen: Vec<(i64, String, Value)> = vec![];
+    for s in servers_of(&tree) {
+        let b = kids(s);
+        let mut ports: Vec<i64> = b.iter().filter(|n| dname(n) == "listen").map(listen_of).filter_map(|x| x["port"].as_i64()).collect();
+        if ports.is_empty() {
+            ports.push(80);
+        }
+        for name in b.iter().filter(|n| dname(n) == "server_name").flat_map(args) {
+            for p in &ports {
+                match seen.iter().find(|x| x.0 == *p && x.1 == name) {
+                    Some(x) => out.push(json!({ "line": s["line"], "rule": "duplicate-server", "message": format!("server_name {} on port {} is already on line {}: nginx ignores this one", name, p, x.2) })),
+                    None => seen.push((*p, name.to_string(), s["line"].clone())),
+                }
+            }
+        }
+    }
+    out.sort_by_key(|x| x["line"].as_i64().unwrap_or(0));
+    Ok(out)
+}

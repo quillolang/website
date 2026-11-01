@@ -1,0 +1,629 @@
+//! The OSV.dev vulnerability database: packages asked by name or purl, batches paged and filled in, a vulnerability's affected ranges evaluated with each ecosystem's own version order (semver, PEP 440, Debian, RubyGems, Maven), and CVSS 3 vectors turned into scores.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::cmp::Ordering;
+use std::time::Duration;
+
+fn base() -> String {
+    std::env::var("OSV_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or("https://api.osv.dev".into()).trim_end_matches('/').to_string()
+}
+
+fn call(path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let url = format!("{}{}", base(), path);
+    let mut tries = 0u64;
+    loop {
+        tries += 1;
+        let res = match body {
+            Some(b) => agent.post(&url).set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => agent.get(&url).call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|e| format!("OSV: not JSON: {}", e));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let wait = r.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = r.into_string().unwrap_or_default();
+                if (code == 429 || code >= 500) && tries < 4 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(tries).min(30)));
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                return Err(format!("OSV {}: {}", code, v["message"].as_str().map(str::to_string).unwrap_or_else(|| t.chars().take(200).collect())));
+            }
+            Err(e) => return Err(format!("cannot reach OSV at {}: {}", base(), e)),
+        }
+    }
+}
+
+// ---- Asking ----
+
+/// A query body from { name, ecosystem, version }, { purl, version } or { commit }.
+fn query_of(q: &Value) -> Result<Value, String> {
+    let mut out = json!({});
+    if let Some(c) = q.get("commit").and_then(|c| c.as_str()) {
+        if q.get("version").is_some() {
+            return Err("give a commit or a version, not both".into());
+        }
+        out["commit"] = json!(c);
+        return Ok(out);
+    }
+    if let Some(v) = q.get("version").and_then(|v| v.as_str()) {
+        out["version"] = json!(v);
+    }
+    if let Some(p) = q.get("purl").and_then(|p| p.as_str()) {
+        if p.contains('@') && q.get("version").is_some() {
+            return Err(format!("{} already has a version: leave `version` out", p));
+        }
+        osv_purl(p)?;
+        out["package"] = json!({ "purl": p });
+        return Ok(out);
+    }
+    let name = q.get("name").and_then(|n| n.as_str()).ok_or("a query needs name and ecosystem, purl, or commit")?;
+    let eco = q.get("ecosystem").and_then(|n| n.as_str()).ok_or(format!("{} needs an ecosystem: npm, PyPI, crates.io, Go, Maven...", name))?;
+    out["package"] = json!({ "name": name, "ecosystem": eco });
+    Ok(out)
+}
+
+/// The vulnerabilities of one package: `query` is { name, ecosystem, version }, { purl, version } or { commit }. Leave the version out for all of them. Every page is read. Gives full records.
+pub fn osv_query(query: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut body = query_of(&query)?;
+    let mut out = vec![];
+    loop {
+        let r = call("/v1/query", Some(&body))?;
+        out.extend(r["vulns"].as_array().cloned().unwrap_or_default());
+        match r["next_page_token"].as_str().filter(|t| !t.is_empty()) {
+            Some(t) => body["page_token"] = json!(t),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Many packages at once, 1000 to a request: gives a list in the same order, each of [{ id, modified }], as the batch API gives only those, every query's pages followed. Option `full`: true fetches each record as well, once per id.
+pub fn osv_query_batch(queries: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let bodies = queries.iter().map(query_of).collect::<Result<Vec<_>, _>>()?;
+    let mut hits: Vec<Vec<Value>> = vec![vec![]; bodies.len()];
+    // What each round asks: the place in the list, and the query with its page token.
+    let mut round: Vec<(usize, Value)> = bodies.into_iter().enumerate().collect();
+    while !round.is_empty() {
+        let mut next = vec![];
+        for chunk in round.chunks(1000) {
+            let r = call("/v1/querybatch", Some(&json!({ "queries": chunk.iter().map(|(_, q)| q).collect::<Vec<_>>() })))?;
+            for ((i, q), res) in chunk.iter().zip(r["results"].as_array().cloned().unwrap_or_default()) {
+                hits[*i].extend(res["vulns"].as_array().cloned().unwrap_or_default());
+                if let Some(t) = res["next_page_token"].as_str().filter(|t| !t.is_empty()) {
+                    let mut q2 = q.clone();
+                    q2["page_token"] = json!(t);
+                    next.push((*i, q2));
+                }
+            }
+        }
+        round = next;
+    }
+    if options.get("full") == Some(&Value::Bool(true)) {
+        let mut seen = std::collections::HashMap::new();
+        for list in hits.iter_mut() {
+            for v in list.iter_mut() {
+                let id = v["id"].as_str().unwrap_or("").to_string();
+                if !seen.contains_key(&id) {
+                    seen.insert(id.clone(), osv_vuln(&id)?);
+                }
+                *v = seen[&id].clone();
+            }
+        }
+    }
+    Ok(hits.into_iter().map(|l| json!(l)).collect())
+}
+
+/// One record by id: GHSA-..., CVE-..., PYSEC-...
+pub fn osv_vuln(id: &str) -> Result<serde_json::Value, String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)) {
+        return Err(format!("`{}` is not a vulnerability id", id));
+    }
+    call(&format!("/v1/vulns/{}", id), None)
+}
+
+/// Reads a purl: `pkg:npm/%40angular/core@16.0.0` is { type, namespace, name, version, ecosystem, package }, where `package` is the name OSV knows it by.
+pub fn osv_purl(purl: &str) -> Result<serde_json::Value, String> {
+    let rest = purl.strip_prefix("pkg:").ok_or(format!("`{}` is not a purl: it starts with pkg:", purl))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (path, version) = match rest.rsplit_once('@') {
+        Some((a, b)) if !b.contains('/') => (a, Some(decode(b))),
+        _ => (rest, None),
+    };
+    let parts: Vec<String> = path.split('/').filter(|p| !p.is_empty()).map(decode).collect();
+    if parts.len() < 2 {
+        return Err(format!("`{}` has no package name", purl));
+    }
+    let kind = parts[0].to_lowercase();
+    let name = parts[parts.len() - 1].clone();
+    let ns = parts[1..parts.len() - 1].join("/");
+    let eco = match kind.as_str() {
+        "npm" => "npm", "pypi" => "PyPI", "cargo" => "crates.io", "golang" => "Go", "maven" => "Maven", "gem" => "RubyGems",
+        "nuget" => "NuGet", "composer" => "Packagist", "hex" => "Hex", "pub" => "Pub", "deb" => "Debian", "apk" => "Alpine",
+        _ => "",
+    };
+    let package = match kind.as_str() {
+        "maven" => format!("{}:{}", ns, name),
+        _ if ns.is_empty() => name.clone(),
+        _ => format!("{}/{}", ns, name),
+    };
+    Ok(json!({ "type": kind, "namespace": if ns.is_empty() { Value::Null } else { json!(ns) }, "name": name, "version": version, "ecosystem": eco, "package": package }))
+}
+
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (vec![], 0);
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(x) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(x);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---- Version order ----
+
+fn semver_cmp(a: &str, b: &str) -> Ordering {
+    let part = |v: &str| {
+        let v = v.trim().trim_start_matches(['v', 'V']).split('+').next().unwrap_or("").to_string();
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c.to_string(), Some(p.to_string())),
+            None => (v, None),
+        };
+        let nums: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (nums, pre)
+    };
+    let ((x, xp), (y, yp)) = (part(a), part(b));
+    for i in 0..x.len().max(y.len()).max(3) {
+        match x.get(i).unwrap_or(&0).cmp(y.get(i).unwrap_or(&0)) {
+            Ordering::Equal => {}
+            o => return o,
+        }
+    }
+    match (xp, yp) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(p), Some(q)) => {
+            let (pv, qv): (Vec<&str>, Vec<&str>) = (p.split('.').collect(), q.split('.').collect());
+            for (l, r) in pv.iter().zip(qv.iter()) {
+                let o = match (l.parse::<u64>(), r.parse::<u64>()) {
+                    (Ok(m), Ok(n)) => m.cmp(&n),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    _ => l.cmp(r),
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            pv.len().cmp(&qv.len())
+        }
+    }
+}
+
+/// PEP 440, reduced to a key: epoch, release, then the phase: dev < a < b < rc < final < post.
+fn pep440_key(v: &str) -> (u64, Vec<u64>, (i32, u64), (i32, u64), (i32, u64), String) {
+    let t = v.trim().to_lowercase();
+    let t = t.strip_prefix('v').unwrap_or(&t).to_string();
+    let (t, local) = match t.split_once('+') {
+        Some((a, b)) => (a.to_string(), b.to_string()),
+        None => (t, String::new()),
+    };
+    let (epoch, t) = match t.split_once('!') {
+        Some((e, r)) => (e.parse().unwrap_or(0), r.to_string()),
+        None => (0, t),
+    };
+    let b = t.as_bytes();
+    let mut i = 0;
+    let mut rel = vec![];
+    loop {
+        let s = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        rel.push(t[s..i].parse().unwrap_or(0));
+        if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    while rel.len() > 1 && rel.last() == Some(&0) {
+        rel.pop();
+    }
+    // What follows: separators are optional, words have spellings.
+    let rest: String = t[i..].replace(['-', '_'], ".");
+    let words: Vec<String> = {
+        let mut out = vec![];
+        let (mut cur, mut digit) = (String::new(), false);
+        for c in rest.chars() {
+            if c == '.' {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            if !cur.is_empty() && digit != c.is_ascii_digit() {
+                out.push(std::mem::take(&mut cur));
+            }
+            digit = c.is_ascii_digit();
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    };
+    let (mut pre, mut post, mut dev) = ((3, 0), (-1, 0), (1, 0));
+    let mut k = 0;
+    while k < words.len() {
+        let n = words.get(k + 1).and_then(|x| x.parse::<u64>().ok());
+        match words[k].as_str() {
+            "a" | "alpha" => pre = (0, n.unwrap_or(0)),
+            "b" | "beta" => pre = (1, n.unwrap_or(0)),
+            "c" | "rc" | "pre" | "preview" => pre = (2, n.unwrap_or(0)),
+            "post" | "rev" | "r" => post = (0, n.unwrap_or(0)),
+            "dev" => dev = (0, n.unwrap_or(0)),
+            x if x.parse::<u64>().is_ok() && k == 0 => post = (0, x.parse().unwrap_or(0)),
+            _ => {}
+        }
+        k += if n.is_some() { 2 } else { 1 };
+    }
+    // `1.0.dev1` is before `1.0a1`: a dev release with no phase sorts lowest.
+    if dev.0 == 0 && pre.0 == 3 && post.0 < 0 {
+        pre = (-1, 0);
+    }
+    (epoch, rel, pre, post, dev, local)
+}
+
+/// dpkg's order: `~` before everything, even the end; letters before other characters; digits as numbers.
+fn dpkg_part(a: &str, b: &str) -> Ordering {
+    let order = |c: Option<u8>| -> i32 {
+        match c {
+            Some(b'~') => -1,
+            None => 0,
+            Some(c) if c.is_ascii_alphabetic() => c as i32,
+            Some(c) => c as i32 + 256,
+        }
+    };
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < x.len() || j < y.len() {
+        while (i < x.len() && !x[i].is_ascii_digit()) || (j < y.len() && !y[j].is_ascii_digit()) {
+            let (l, r) = (order(x.get(i).copied().filter(|c| !c.is_ascii_digit())), order(y.get(j).copied().filter(|c| !c.is_ascii_digit())));
+            if l != r {
+                return l.cmp(&r);
+            }
+            if i < x.len() && !x[i].is_ascii_digit() {
+                i += 1;
+            }
+            if j < y.len() && !y[j].is_ascii_digit() {
+                j += 1;
+            }
+        }
+        let (s, t) = (i, j);
+        while i < x.len() && x[i].is_ascii_digit() {
+            i += 1;
+        }
+        while j < y.len() && y[j].is_ascii_digit() {
+            j += 1;
+        }
+        let (l, r) = (a[s..i].trim_start_matches('0'), b[t..j].trim_start_matches('0'));
+        match l.len().cmp(&r.len()).then(l.cmp(r)) {
+            Ordering::Equal => {}
+            o => return o,
+        }
+    }
+    Ordering::Equal
+}
+
+fn debian_cmp(a: &str, b: &str) -> Ordering {
+    let split = |v: &str| {
+        let (e, rest) = match v.split_once(':') {
+            Some((e, r)) if e.bytes().all(|c| c.is_ascii_digit()) => (e.parse::<u64>().unwrap_or(0), r.to_string()),
+            _ => (0, v.to_string()),
+        };
+        let (u, r) = match rest.rsplit_once('-') {
+            Some((u, r)) => (u.to_string(), r.to_string()),
+            None => (rest, String::new()),
+        };
+        (e, u, r)
+    };
+    let ((e1, u1, r1), (e2, u2, r2)) = (split(a), split(b));
+    e1.cmp(&e2).then_with(|| dpkg_part(&u1, &u2)).then_with(|| dpkg_part(&r1, &r2))
+}
+
+/// Gem::Version: dotted pieces, digits and letters apart; any letters make a prerelease, before the same number plain.
+fn gem_cmp(a: &str, b: &str) -> Ordering {
+    let pieces = |v: &str| -> Vec<String> {
+        let mut out = vec![];
+        for p in v.trim().replace('-', ".pre.").split('.') {
+            let mut cur = String::new();
+            let mut digit = false;
+            for c in p.chars() {
+                if !cur.is_empty() && digit != c.is_ascii_digit() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                digit = c.is_ascii_digit();
+                cur.push(c);
+            }
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+        }
+        // Gem::Version's canonical form: zeros go from the end of the release and of what follows.
+        let word = out.iter().position(|x| x.parse::<u64>().is_err()).unwrap_or(out.len());
+        let mut tail = out.split_off(word);
+        while out.last().is_some_and(|x| x.chars().all(|c| c == '0')) {
+            out.pop();
+        }
+        while tail.last().is_some_and(|x| x.chars().all(|c| c == '0')) {
+            tail.pop();
+        }
+        out.extend(tail);
+        out
+    };
+    let (x, y) = (pieces(a), pieces(b));
+    for i in 0..x.len().max(y.len()) {
+        let o = match (x.get(i), y.get(i)) {
+            (Some(l), Some(r)) => match (l.parse::<u64>(), r.parse::<u64>()) {
+                (Ok(m), Ok(n)) => m.cmp(&n),
+                (Ok(_), Err(_)) => Ordering::Greater,
+                (Err(_), Ok(_)) => Ordering::Less,
+                _ => l.cmp(r),
+            },
+            (Some(l), None) => if l.parse::<u64>().is_ok() { Ordering::Greater } else { Ordering::Less },
+            (None, Some(r)) => if r.parse::<u64>().is_ok() { Ordering::Less } else { Ordering::Greater },
+            _ => Ordering::Equal,
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Maven's order: numbers as numbers, qualifiers alpha < beta < milestone < rc < snapshot < (none) < sp, any other word after those.
+fn maven_cmp(a: &str, b: &str) -> Ordering {
+    let rank = |q: &str| -> (i32, String) {
+        match q {
+            "alpha" | "a" => (0, String::new()),
+            "beta" | "b" => (1, String::new()),
+            "milestone" | "m" => (2, String::new()),
+            "rc" | "cr" => (3, String::new()),
+            "snapshot" => (4, String::new()),
+            "" | "ga" | "final" | "release" => (5, String::new()),
+            "sp" => (6, String::new()),
+            other => (7, other.to_string()),
+        }
+    };
+    let pieces = |v: &str| -> Vec<String> {
+        let t = v.trim().to_lowercase();
+        let (mut out, mut cur, mut digit) = (vec![], String::new(), false);
+        for c in t.chars() {
+            if c == '.' || c == '-' {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            if !cur.is_empty() && digit != c.is_ascii_digit() {
+                out.push(std::mem::take(&mut cur));
+            }
+            digit = c.is_ascii_digit();
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        // Maven drops zeros and "final" words at the end, and before a qualifier: 2.0-rc1 is 2-rc-1.
+        let mut kept: Vec<String> = vec![];
+        for p in out {
+            if p.parse::<u64>().is_err() {
+                while kept.last().is_some_and(|x: &String| x.chars().all(|c| c == '0')) {
+                    kept.pop();
+                }
+            }
+            if rank(&p).0 != 5 {
+                kept.push(p);
+            }
+        }
+        while kept.last().is_some_and(|x| x.chars().all(|c| c == '0')) {
+            kept.pop();
+        }
+        kept
+    };
+    let (x, y) = (pieces(a), pieces(b));
+    for i in 0..x.len().max(y.len()) {
+        let (l, r) = (x.get(i).map_or("", |s| s), y.get(i).map_or("", |s| s));
+        let o = match (l.parse::<u64>(), r.parse::<u64>()) {
+            (Ok(m), Ok(n)) => m.cmp(&n),
+            (Ok(_), Err(_)) => Ordering::Greater,
+            (Err(_), Ok(_)) => Ordering::Less,
+            _ => rank(l).cmp(&rank(r)),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_for(ecosystem: &str, a: &str, b: &str) -> Result<Ordering, String> {
+    let base = ecosystem.split(':').next().unwrap_or(ecosystem);
+    Ok(match base {
+        "PyPI" => pep440_key(a).partial_cmp(&pep440_key(b)).unwrap_or(Ordering::Equal),
+        "Debian" | "Ubuntu" => debian_cmp(a, b),
+        "RubyGems" => gem_cmp(a, b),
+        "Maven" => maven_cmp(a, b),
+        "npm" | "crates.io" | "Go" | "Hex" | "Pub" | "NuGet" | "Packagist" | "SEMVER" | "SwiftURL" => semver_cmp(a, b),
+        other => return Err(format!("`{}` has no version order here: PyPI, Debian, Ubuntu, RubyGems, Maven, npm, crates.io, Go, Hex, Pub, NuGet, Packagist", other)),
+    })
+}
+
+/// Compares two versions by an ecosystem's own rules: -1, 0 or 1. `osv_compare("PyPI", "1.0rc1", "1.0")` is -1, `osv_compare("Debian", "1:1.0", "2.0")` is 1.
+pub fn osv_compare(ecosystem: &str, a: &str, b: &str) -> Result<i64, String> {
+    Ok(match cmp_for(ecosystem, a, b)? {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    })
+}
+
+/// Whether a version falls in one range's events, walked in order: introduced opens, fixed and last_affected close.
+fn in_range(eco: &str, events: &[Value], version: &str, range_kind: &str) -> Result<bool, String> {
+    let by = |a: &str, b: &str| if range_kind == "SEMVER" { Ok(semver_cmp(a, b)) } else { cmp_for(eco, a, b) };
+    let mut list: Vec<(String, String)> = vec![];
+    for e in events {
+        for k in ["introduced", "fixed", "last_affected", "limit"] {
+            if let Some(v) = e[k].as_str() {
+                list.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    // An introduced "0" sorts first whatever the order.
+    let key = |a: &(String, String), b: &(String, String)| -> Ordering {
+        if a.1 == "0" && b.1 != "0" { return Ordering::Less; }
+        if b.1 == "0" && a.1 != "0" { return Ordering::Greater; }
+        by(&a.1, &b.1).unwrap_or(Ordering::Equal)
+    };
+    list.sort_by(key);
+    let mut hit = false;
+    for (k, v) in &list {
+        let cmp = if v == "0" { Ordering::Greater } else { by(version, v)? };
+        match k.as_str() {
+            "introduced" if cmp != Ordering::Less => hit = true,
+            "fixed" | "limit" if cmp != Ordering::Less => hit = false,
+            "last_affected" if cmp == Ordering::Greater => hit = false,
+            _ => {}
+        }
+    }
+    Ok(hit)
+}
+
+/// Does a record affect this package at this version? Looks through `affected` for the package, at its `versions` list and then its SEMVER and ECOSYSTEM ranges (GIT ranges name commits, and are passed over). Gives { affected, fixed_in, why }.
+pub fn osv_affects(vuln: serde_json::Value, ecosystem: &str, name: &str, version: &str) -> Result<serde_json::Value, String> {
+    let mut fixed = vec![];
+    let mut why = "no entry names this package".to_string();
+    let mut hit = false;
+    for a in vuln["affected"].as_array().into_iter().flatten() {
+        let eco = a["package"]["ecosystem"].as_str().unwrap_or("");
+        if eco.split(':').next() != ecosystem.split(':').next() || a["package"]["name"].as_str() != Some(name) {
+            continue;
+        }
+        why = "outside every range".to_string();
+        if a["versions"].as_array().is_some_and(|l| l.iter().any(|v| v == version)) {
+            hit = true;
+            why = "listed in `versions`".to_string();
+        }
+        for r in a["ranges"].as_array().into_iter().flatten() {
+            let kind = r["type"].as_str().unwrap_or("");
+            if kind == "GIT" {
+                continue;
+            }
+            let events = r["events"].as_array().cloned().unwrap_or_default();
+            for e in &events {
+                if let Some(f) = e["fixed"].as_str() {
+                    fixed.push(f.to_string());
+                }
+            }
+            if in_range(ecosystem, &events, version, kind)? {
+                hit = true;
+                why = format!("inside a {} range", kind);
+            }
+        }
+    }
+    fixed.sort_by(|a, b| cmp_for(ecosystem, a, b).unwrap_or(Ordering::Equal));
+    fixed.dedup();
+    let next: Vec<&String> = fixed.iter().filter(|f| cmp_for(ecosystem, version, f).map(|o| o == Ordering::Less).unwrap_or(false)).collect();
+    Ok(json!({ "affected": hit, "fixed_in": next.first(), "all_fixes": fixed, "why": why }))
+}
+
+// ---- Severity ----
+
+fn roundup(x: f64) -> f64 {
+    let i = (x * 100000.0).round() as i64;
+    if i % 10000 == 0 { i as f64 / 100000.0 } else { ((i / 10000) + 1) as f64 / 10.0 }
+}
+
+fn cvss3(vector: &str) -> Result<f64, String> {
+    let mut m = std::collections::HashMap::new();
+    for p in vector.split('/').skip(1) {
+        if let Some((k, v)) = p.split_once(':') {
+            m.insert(k, v);
+        }
+    }
+    let get = |k: &str| m.get(k).copied().ok_or(format!("the vector lacks {}", k));
+    let changed = get("S")? == "C";
+    let av = match get("AV")? { "N" => 0.85, "A" => 0.62, "L" => 0.55, "P" => 0.2, x => return Err(format!("AV:{} is not a value", x)) };
+    let ac = match get("AC")? { "L" => 0.77, "H" => 0.44, x => return Err(format!("AC:{} is not a value", x)) };
+    let pr = match (get("PR")?, changed) { ("N", _) => 0.85, ("L", false) => 0.62, ("L", true) => 0.68, ("H", false) => 0.27, ("H", true) => 0.5, (x, _) => return Err(format!("PR:{} is not a value", x)) };
+    let ui = match get("UI")? { "N" => 0.85, "R" => 0.62, x => return Err(format!("UI:{} is not a value", x)) };
+    let cia = |k: &str| -> Result<f64, String> { match get(k)? { "H" => Ok(0.56), "L" => Ok(0.22), "N" => Ok(0.0), x => Err(format!("{}:{} is not a value", k, x)) } };
+    let iss = 1.0 - (1.0 - cia("C")?) * (1.0 - cia("I")?) * (1.0 - cia("A")?);
+    let impact = if changed { 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15) } else { 6.42 * iss };
+    let exploit = 8.22 * av * ac * pr * ui;
+    if impact <= 0.0 {
+        return Ok(0.0);
+    }
+    Ok(roundup(if changed { (1.08 * (impact + exploit)).min(10.0) } else { (impact + exploit).min(10.0) }))
+}
+
+fn rating(score: f64) -> &'static str {
+    match score {
+        s if s == 0.0 => "NONE",
+        s if s < 4.0 => "LOW",
+        s if s < 7.0 => "MEDIUM",
+        s if s < 9.0 => "HIGH",
+        _ => "CRITICAL",
+    }
+}
+
+/// A CVSS 3.0 or 3.1 vector's base score: { score, rating }.
+pub fn osv_cvss(vector: &str) -> Result<serde_json::Value, String> {
+    if !vector.starts_with("CVSS:3.") {
+        return Err(format!("only CVSS 3 vectors are scored here, not `{}`", vector.chars().take(12).collect::<String>()));
+    }
+    let s = cvss3(vector)?;
+    Ok(json!({ "score": s, "rating": rating(s) }))
+}
+
+/// How bad a record is: { score, rating, vector, type, source }. From its CVSS 3 vector when it has one; a CVSS 4 vector alone, unscored, leaves the rating to database_specific.severity, as GitHub writes it; `source` says which it was.
+pub fn osv_severity(vuln: serde_json::Value) -> serde_json::Value {
+    let list = vuln["severity"].as_array().cloned().unwrap_or_default();
+    let v3 = list.iter().find(|s| s["type"].as_str().is_some_and(|t| t.starts_with("CVSS_V3")));
+    if let Some(s) = v3 {
+        if let Ok(o) = osv_cvss(s["score"].as_str().unwrap_or("")) {
+            return json!({ "score": o["score"], "rating": o["rating"], "vector": s["score"], "type": s["type"], "source": "cvss" });
+        }
+    }
+    let other = list.first();
+    let word = vuln["database_specific"]["severity"].as_str().map(|w| w.to_uppercase().replace("MODERATE", "MEDIUM"));
+    json!({ "score": null, "rating": word, "vector": other.map(|s| s["score"].clone()), "type": other.map(|s| s["type"].clone()), "source": if word.is_some() { "database" } else { "none" } })
+}
+
+/// A short line for each record of a list: { id, aliases, summary, published, score, rating }, worst first.
+pub fn osv_summaries(vulns: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut out: Vec<Value> = vulns.into_iter().map(|v| {
+        let s = osv_severity(v.clone());
+        json!({ "id": v["id"], "aliases": v["aliases"], "summary": v["summary"], "published": v["published"], "score": s["score"], "rating": s["rating"] })
+    }).collect();
+    let rank = |v: &Value| (["CRITICAL", "HIGH", "MEDIUM", "LOW"].iter().position(|r| v["rating"] == *r).unwrap_or(4), -(v["score"].as_f64().unwrap_or(0.0) * 10.0) as i64);
+    out.sort_by_key(rank);
+    out
+}

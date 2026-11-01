@@ -1,0 +1,213 @@
+//! Open Policy Agent's Rego, through regorus: a policy evaluated with input and data, a package's rules listed, policies kept compiled by name, and errors with their line numbers.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! regorus = { version = "=0.14.0", default-features = false, features = ["arc", "ast", "full-opa"] }
+
+use regorus::{Engine, Value as RegoValue};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+static NAMED: Mutex<Option<HashMap<String, Engine>>> = Mutex::new(None);
+
+/// regorus writes a mistake as `--> file:line:col`, a picture of the line, and `error: message`. Split up.
+fn placed(e: &str) -> Value {
+    let (mut file, mut line, mut column) = (Value::Null, Value::Null, Value::Null);
+    if let Some(l) = e.lines().find(|l| l.trim_start().starts_with("-->")) {
+        let t = l.trim_start().trim_start_matches("-->").trim();
+        let bits: Vec<&str> = t.rsplitn(3, ':').collect();
+        if bits.len() == 3 {
+            column = json!(bits[0].parse::<u32>().ok());
+            line = json!(bits[1].parse::<u32>().ok());
+            file = json!(bits[2]);
+        }
+    }
+    let last = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let message = last.strip_prefix("error:").unwrap_or(last).trim();
+    json!({ "file": file, "line": line, "column": column, "message": message })
+}
+
+fn one_line(e: &str) -> String {
+    let p = placed(e);
+    match p["line"].as_u64() {
+        Some(l) => format!("{} line {}, column {}: {}", p["file"].as_str().unwrap_or(""), l, p["column"], p["message"].as_str().unwrap_or("")),
+        None => p["message"].as_str().unwrap_or(e).to_string(),
+    }
+}
+
+fn to_rego(v: &Value) -> Result<RegoValue, String> {
+    RegoValue::from_json_str(&v.to_string()).map_err(|e| e.to_string())
+}
+
+fn to_json(v: &RegoValue) -> Result<Value, String> {
+    let t = v.to_json_str().map_err(|e| e.to_string())?;
+    serde_json::from_str(&t).map_err(|e| e.to_string())
+}
+
+/// An engine with `policies`: one text, or a map of file names to texts, or a list of `{ name, text }`.
+fn engine(policies: &Value, data: &Value) -> Result<Engine, String> {
+    let mut e = Engine::new();
+    let mut add = |name: &str, text: &str| e.add_policy(name.to_string(), text.to_string()).map(|_| ()).map_err(|x| one_line(&x.to_string()));
+    match policies {
+        Value::String(t) => add("policy.rego", t)?,
+        Value::Object(m) => {
+            for (k, v) in m {
+                add(k, v.as_str().ok_or(format!("policy {} is not text", k))?)?;
+            }
+        }
+        Value::Array(a) => {
+            for p in a {
+                add(p["name"].as_str().unwrap_or("policy.rego"), p["text"].as_str().ok_or("a policy has no text")?)?;
+            }
+        }
+        _ => return Err("policies should be text, or a map of file names to texts".into()),
+    }
+    if !data.is_null() {
+        if !data.is_object() {
+            return Err("data must be a map".into());
+        }
+        e.add_data(to_rego(data)?).map_err(|x| x.to_string())?;
+    }
+    e.set_gather_prints(true);
+    Ok(e)
+}
+
+fn run_rule(e: &mut Engine, input: &Value, rule: &str) -> Result<Value, String> {
+    e.set_input(to_rego(input)?);
+    let v = e.eval_rule(rule.to_string()).map_err(|x| format!("`{}`: {}", rule, one_line(&x.to_string())))?;
+    let prints = e.take_prints().unwrap_or_default();
+    if v == RegoValue::Undefined {
+        return Ok(json!({ "defined": false, "value": null, "prints": prints }));
+    }
+    Ok(json!({ "defined": true, "value": to_json(&v)?, "prints": prints }))
+}
+
+fn run_query(e: &mut Engine, input: &Value, query: &str) -> Result<Value, String> {
+    e.set_input(to_rego(input)?);
+    let r = e.eval_query(query.to_string(), false).map_err(|x| one_line(&x.to_string()))?;
+    let mut rows = vec![];
+    for row in &r.result {
+        let bindings = to_json(&row.bindings)?;
+        let exprs: Vec<Value> = row.expressions.iter().map(|x| to_json(&x.value)).collect::<Result<_, _>>()?;
+        rows.push(json!({ "values": exprs, "bindings": bindings }));
+    }
+    let prints = e.take_prints().unwrap_or_default();
+    Ok(json!({ "results": rows, "prints": prints }))
+}
+
+/// One rule's value: `rego_eval(policy, data, input, "data.shop.allow")` gives `{ defined, value, prints }`, `defined` being false for a rule whose bodies all failed, as Rego has no false by default. `prints` is what `print()` wrote. A rule that does not exist is an error, and so is a policy that does not compile, with its line.
+pub fn rego_eval(policies: serde_json::Value, data: serde_json::Value, input: serde_json::Value, rule: &str) -> Result<Value, String> {
+    let mut e = engine(&policies, &data)?;
+    run_rule(&mut e, &input, rule)
+}
+
+/// Any Rego query: `{ results: [{ values, bindings }], prints }`, one result per way of satisfying it: `rego_query(p, d, i, "x := data.shop.reasons[_]")`.
+pub fn rego_query(policies: serde_json::Value, data: serde_json::Value, input: serde_json::Value, query: &str) -> Result<Value, String> {
+    let mut e = engine(&policies, &data)?;
+    run_query(&mut e, &input, query)
+}
+
+/// Whether a boolean rule holds: true only if the rule is defined and true. Undefined is false, so a deny-by-default rule stays that way.
+pub fn rego_allowed(policies: serde_json::Value, data: serde_json::Value, input: serde_json::Value, rule: &str) -> Result<bool, String> {
+    Ok(rego_eval(policies, data, input, rule)?["value"] == json!(true))
+}
+
+/// Compiles policies once and keeps them under a name, with their data, for many decisions. Gives the packages.
+pub fn rego_load(name: &str, policies: serde_json::Value, data: serde_json::Value) -> Result<Vec<String>, String> {
+    let e = engine(&policies, &data)?;
+    let packages = e.get_packages().map_err(|x| x.to_string())?;
+    NAMED.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_string(), e);
+    Ok(packages)
+}
+
+/// `rego_eval` on policies kept by `rego_load`; each call works on its own copy, so requests do not wait for each other.
+pub fn rego_decide(name: &str, input: serde_json::Value, rule: &str) -> Result<Value, String> {
+    let mut e = NAMED.lock().unwrap().as_ref().and_then(|m| m.get(name).cloned()).ok_or(format!("no policies are loaded as `{}`", name))?;
+    run_rule(&mut e, &input, rule)
+}
+
+fn ref_text(head: &Value) -> Option<String> {
+    let span = head["refr"]["span"].clone();
+    span.get("text").and_then(Value::as_str).map(str::to_string)
+}
+
+/// The rules of each package: `[{ package, file, name, kind, line, default }]`, `kind` being rule, set, object or function. Several bodies of one rule are listed once, with `bodies` counted.
+pub fn rego_rules(policies: serde_json::Value) -> Result<Vec<Value>, String> {
+    let e = engine(&policies, &Value::Null)?;
+    let text = e.get_ast_as_json().map_err(|x| x.to_string())?;
+    let ast: Value = serde_json::from_str(&text).map_err(|x| x.to_string())?;
+    let packages = e.get_packages().map_err(|x| x.to_string())?;
+    let mut out: Vec<Value> = vec![];
+    for (i, m) in ast.as_array().into_iter().flatten().enumerate() {
+        let package = packages.get(i).cloned().unwrap_or_default();
+        let file = m["source"]["path"].as_str().or(m["source"]["file"].as_str()).unwrap_or("").to_string();
+        for rule in m["ast"]["rules"].as_array().into_iter().flatten() {
+            let (name, kind, line, default) = if let Some(s) = rule.get("Spec") {
+                let head = &s["head"];
+                let (h, kind) = if let Some(c) = head.get("Compr") {
+                    (c, if c["refr"].get("RefBrack").is_some() { "object" } else { "rule" })
+                } else if let Some(c) = head.get("Set") {
+                    (c, "set")
+                } else {
+                    (&head["Func"], "function")
+                };
+                (rule_name(h), kind, s["span"]["line"].clone(), false)
+            } else if let Some(d) = rule.get("Default") {
+                (rule_name(d), "rule", d["span"]["line"].clone(), true)
+            } else {
+                continue;
+            };
+            if let Some(x) = out.iter_mut().find(|x| x["package"] == json!(package) && x["name"] == json!(name)) {
+                if default {
+                    x["default"] = json!(true);
+                } else {
+                    x["bodies"] = json!(x["bodies"].as_i64().unwrap_or(0) + 1);
+                }
+                continue;
+            }
+            out.push(json!({ "package": package, "file": file, "name": name, "kind": kind, "line": line, "default": default, "bodies": if default { 0 } else { 1 } }));
+        }
+    }
+    Ok(out)
+}
+
+fn rule_name(h: &Value) -> String {
+    ref_text(h).unwrap_or_else(|| {
+        // A Var in the AST is [span, name].
+        let r = &h["refr"];
+        r["Var"][1].as_str().map(str::to_string).unwrap_or_else(|| first_string(r))
+    })
+}
+
+fn first_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().map(first_string).find(|s| !s.is_empty()).unwrap_or_default(),
+        Value::Object(m) => m.iter().filter(|(k, _)| *k != "span").map(|(_, x)| first_string(x)).find(|s| !s.is_empty()).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Compiles without running: `{ ok, errors }`, each error with `file`, `line`, `column` and `message`.
+pub fn rego_check(policies: serde_json::Value) -> Value {
+    let mut problems = vec![];
+    let list: Vec<(String, String)> = match &policies {
+        Value::String(t) => vec![("policy.rego".to_string(), t.clone())],
+        Value::Object(m) => m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+        _ => vec![],
+    };
+    for (name, text) in list {
+        let mut e = Engine::new();
+        if let Err(x) = e.add_policy(name.clone(), text) {
+            problems.push(placed(&x.to_string()));
+            continue;
+        }
+        // Names are resolved when a query first prepares the engine.
+        if let Err(x) = e.eval_query("1 == 1".to_string(), false) {
+            problems.push(placed(&x.to_string()));
+        }
+    }
+    json!({ "ok": problems.is_empty(), "errors": problems })
+}

@@ -1,0 +1,1517 @@
+//! Amazon Ion 1.0 text and binary read and written: symbols and symbol tables, annotations, timestamps, decimals, big integers, blobs and clobs, and values turned to and from plain JSON.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+
+// A value here is a map that keeps Ion's types:
+//   { type: "int", value: 5 }                         past 64 bits, `value` is decimal text
+//   { type: "null", of: "int" }                       a typed null; `of` is absent for plain null
+//   { type: "decimal", value: "1.50" }                 the text form, with its exact digits
+//   { type: "float", value: 1.5 }                      or "nan", "+inf", "-inf"
+//   { type: "timestamp", value: "2026-11-01T09:30:00.25+01:00", precision: "fraction" }
+//   { type: "string", value: "x" }, { type: "symbol", value: "x" }     unknown text has `sid`
+//   { type: "blob", value: base64 }, { type: "clob", value: base64 }
+//   { type: "list", value: [...] }, { type: "sexp", value: [...] }
+//   { type: "struct", value: [{ name: "a", value: {...} }] }           names may repeat
+//   and on any of them, annotations: ["a", "b"].
+
+const MAX_DEPTH: usize = 128;
+const BVM: [u8; 4] = [0xE0, 0x01, 0x00, 0xEA];
+const SYSTEM: [&str; 10] = ["", "$ion", "$ion_1_0", "$ion_symbol_table", "name", "version", "imports", "symbols", "max_id", "$ion_shared_symbol_table"];
+const TYPES: [&str; 12] = ["null", "bool", "int", "float", "decimal", "timestamp", "symbol", "string", "clob", "blob", "list", "sexp"];
+
+fn tagged(t: &str, v: Value) -> Value {
+    json!({ "type": t, "value": v })
+}
+
+fn to_decimal(b: &[u8]) -> String {
+    let mut digits: Vec<u8> = vec![0];
+    for x in b {
+        let mut carry = *x as u32;
+        for d in digits.iter_mut() {
+            let v = *d as u32 * 256 + carry;
+            *d = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
+}
+
+fn from_decimal(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = vec![];
+    for c in s.bytes() {
+        let mut carry = (c - b'0') as u32;
+        for b in out.iter_mut().rev() {
+            let v = *b as u32 * 10 + carry;
+            *b = v as u8;
+            carry = v >> 8;
+        }
+        if carry > 0 {
+            out.insert(0, carry as u8);
+        }
+    }
+    out
+}
+
+fn big_value(neg: bool, digits: &str) -> Value {
+    let d = digits.trim_start_matches('0');
+    let d = if d.is_empty() { "0" } else { d };
+    let t = if neg && d != "0" { format!("-{}", d) } else { d.to_string() };
+    t.parse::<i64>().map(|i| json!(i)).unwrap_or(json!(t))
+}
+
+// Time, as the binary form keeps UTC and the offset apart.
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// Adds minutes to a date and time: `(y, m, d, h, mi)`.
+fn shift(t: (i64, i64, i64, i64, i64), minutes: i64) -> (i64, i64, i64, i64, i64) {
+    let total = days_from_civil(t.0, t.1, t.2) * 1440 + t.3 * 60 + t.4 + minutes;
+    let (y, m, d) = civil_from_days(total.div_euclid(1440));
+    let r = total.rem_euclid(1440);
+    (y, m, d, r / 60, r % 60)
+}
+
+fn month_days(y: i64, m: i64) -> i64 {
+    match m {
+        2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+struct Ts {
+    y: i64,
+    mo: Option<i64>,
+    d: Option<i64>,
+    h: Option<i64>,
+    mi: Option<i64>,
+    s: Option<i64>,
+    frac: Option<String>,
+    offset: Option<i64>,
+}
+
+impl Ts {
+    fn precision(&self) -> &'static str {
+        if self.frac.is_some() { "fraction" } else if self.s.is_some() { "second" } else if self.mi.is_some() { "minute" } else if self.d.is_some() { "day" } else if self.mo.is_some() { "month" } else { "year" }
+    }
+    fn text(&self) -> String {
+        let mut o = format!("{:04}", self.y);
+        match (self.mo, self.d) {
+            (None, _) => return o + "T",
+            (Some(m), None) => return format!("{}-{:02}T", o, m),
+            (Some(m), Some(d)) => o.push_str(&format!("-{:02}-{:02}", m, d)),
+        }
+        let (Some(h), Some(mi)) = (self.h, self.mi) else { return o };
+        o.push_str(&format!("T{:02}:{:02}", h, mi));
+        if let Some(s) = self.s {
+            o.push_str(&format!(":{:02}", s));
+            if let Some(f) = &self.frac {
+                o.push('.');
+                o.push_str(f);
+            }
+        }
+        o.push_str(&match self.offset {
+            None => "-00:00".to_string(),
+            Some(0) => "Z".to_string(),
+            Some(x) => format!("{}{:02}:{:02}", if x < 0 { '-' } else { '+' }, x.abs() / 60, x.abs() % 60),
+        });
+        o
+    }
+    fn value(&self) -> Value {
+        json!({ "type": "timestamp", "value": self.text(), "precision": self.precision() })
+    }
+}
+
+fn parse_ts(t: &str) -> Result<Ts, String> {
+    let bad = || format!("`{}` is not a timestamp", t);
+    let num = |s: Option<&str>, n: usize| -> Result<i64, String> {
+        let s = s.ok_or_else(bad)?;
+        if s.len() != n || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        s.parse().map_err(|_| bad())
+    };
+    let mut ts = Ts { y: num(t.get(..4), 4)?, ..Ts::default() };
+    let rest = &t[4..];
+    if ts.y == 0 {
+        return Err(bad());
+    }
+    if rest == "T" {
+        return Ok(ts);
+    }
+    if !rest.starts_with('-') {
+        return Err(bad());
+    }
+    ts.mo = Some(num(rest.get(1..3), 2)?);
+    if !(1..=12).contains(&ts.mo.unwrap()) {
+        return Err(bad());
+    }
+    let rest = &rest[3..];
+    if rest == "T" {
+        return Ok(ts);
+    }
+    if !rest.starts_with('-') {
+        return Err(bad());
+    }
+    let d = num(rest.get(1..3), 2)?;
+    if d < 1 || d > month_days(ts.y, ts.mo.unwrap()) {
+        return Err(bad());
+    }
+    ts.d = Some(d);
+    let rest = &rest[3..];
+    if rest.is_empty() || rest == "T" {
+        return Ok(ts);
+    }
+    if !rest.starts_with('T') {
+        return Err(bad());
+    }
+    let h = num(rest.get(1..3), 2)?;
+    if rest.get(3..4) != Some(":") {
+        return Err(bad());
+    }
+    let mi = num(rest.get(4..6), 2)?;
+    if h > 23 || mi > 59 {
+        return Err(bad());
+    }
+    ts.h = Some(h);
+    ts.mi = Some(mi);
+    let mut rest = &rest[6..];
+    if rest.starts_with(':') {
+        let s = num(rest.get(1..3), 2)?;
+        if s > 59 {
+            return Err(bad());
+        }
+        ts.s = Some(s);
+        rest = &rest[3..];
+        if let Some(r) = rest.strip_prefix('.') {
+            let n = r.bytes().take_while(u8::is_ascii_digit).count();
+            if n == 0 {
+                return Err(bad());
+            }
+            ts.frac = Some(r[..n].to_string());
+            rest = &r[n..];
+        }
+    }
+    if rest == "Z" {
+        ts.offset = Some(0);
+        return Ok(ts);
+    }
+    let sign = match rest.get(..1) {
+        Some("+") => 1,
+        Some("-") => -1,
+        _ => return Err(bad()),
+    };
+    let (oh, om) = (num(rest.get(1..3), 2)?, num(rest.get(4..6), 2)?);
+    if rest.get(3..4) != Some(":") || rest.len() != 6 || oh > 23 || om > 59 {
+        return Err(bad());
+    }
+    ts.offset = if sign < 0 && oh == 0 && om == 0 { None } else { Some(sign * (oh * 60 + om)) };
+    Ok(ts)
+}
+
+// Text.
+
+struct T {
+    c: Vec<char>,
+    i: usize,
+    line: usize,
+}
+
+const OPERATOR: &str = "!#%&*+-./;<=>?@^`|~";
+
+impl T {
+    fn err<X>(&self, m: &str) -> Result<X, String> {
+        Err(format!("line {}: {}", self.line, m))
+    }
+    fn peek(&self) -> Option<char> {
+        self.c.get(self.i).copied()
+    }
+    fn at(&self, k: usize) -> Option<char> {
+        self.c.get(self.i + k).copied()
+    }
+    fn starts(&self, s: &str) -> bool {
+        s.chars().enumerate().all(|(k, x)| self.at(k) == Some(x))
+    }
+    fn skip(&mut self) -> Result<(), String> {
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                self.line += 1;
+                self.i += 1;
+            } else if c.is_whitespace() {
+                self.i += 1;
+            } else if self.starts("//") {
+                while self.peek().map_or(false, |x| x != '\n') {
+                    self.i += 1;
+                }
+            } else if self.starts("/*") {
+                self.i += 2;
+                while !self.starts("*/") {
+                    match self.peek() {
+                        None => return self.err("a comment is never closed"),
+                        Some('\n') => self.line += 1,
+                        _ => {}
+                    }
+                    self.i += 1;
+                }
+                self.i += 2;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn word_end(c: Option<char>) -> bool {
+        c.map_or(true, |x| x.is_whitespace() || "{}[](),\"'".contains(x) || x == '/')
+    }
+    fn hex(&mut self, n: usize, s: &mut String) -> Result<(), String> {
+        let h: String = (0..n).filter_map(|k| self.at(k)).collect();
+        self.i += n;
+        match (h.len() == n).then(|| u32::from_str_radix(&h, 16).ok()).flatten() {
+            // A surrogate pair by 😀.
+            Some(x) if (0xD800..0xDC00).contains(&x) && n == 4 && self.starts("\\u") => {
+                self.i += 2;
+                let l: String = (0..4).filter_map(|k| self.at(k)).collect();
+                self.i += 4;
+                let low = u32::from_str_radix(&l, 16).map_err(|_| "a bad surrogate".to_string())?;
+                match char::from_u32(0x10000 + ((x - 0xD800) << 10) + low.wrapping_sub(0xDC00)) {
+                    Some(c) => s.push(c),
+                    None => return self.err("a bad surrogate pair"),
+                }
+                Ok(())
+            }
+            Some(x) => match char::from_u32(x) {
+                Some(c) => {
+                    s.push(c);
+                    Ok(())
+                }
+                None => self.err("a bad character code"),
+            },
+            None => self.err("a bad escape"),
+        }
+    }
+    fn escape(&mut self, s: &mut String) -> Result<(), String> {
+        let e = self.peek();
+        self.i += 1;
+        match e {
+            Some('0') => s.push('\0'),
+            Some('a') => s.push('\u{7}'),
+            Some('b') => s.push('\u{8}'),
+            Some('t') => s.push('\t'),
+            Some('n') => s.push('\n'),
+            Some('f') => s.push('\u{c}'),
+            Some('r') => s.push('\r'),
+            Some('v') => s.push('\u{b}'),
+            Some('"') => s.push('"'),
+            Some('\'') => s.push('\''),
+            Some('?') => s.push('?'),
+            Some('\\') => s.push('\\'),
+            Some('/') => s.push('/'),
+            Some('\n') => self.line += 1,
+            Some('x') => self.hex(2, s)?,
+            Some('u') => self.hex(4, s)?,
+            Some('U') => self.hex(8, s)?,
+            _ => return self.err("a bad escape"),
+        }
+        Ok(())
+    }
+    fn short(&mut self, q: char) -> Result<String, String> {
+        self.i += 1;
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') => return self.err("a string is never closed"),
+                Some(c) if c == q => {
+                    self.i += 1;
+                    return Ok(s);
+                }
+                Some('\\') => {
+                    self.i += 1;
+                    self.escape(&mut s)?;
+                }
+                Some(c) => {
+                    s.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+    }
+    /// `'''a''' '''b'''`: long strings next to each other are one.
+    fn long(&mut self) -> Result<String, String> {
+        let mut s = String::new();
+        loop {
+            self.i += 3;
+            loop {
+                if self.starts("'''") {
+                    self.i += 3;
+                    break;
+                }
+                match self.peek() {
+                    None => return self.err("a long string is never closed"),
+                    Some('\\') => {
+                        self.i += 1;
+                        self.escape(&mut s)?;
+                    }
+                    Some('\r') => {
+                        self.i += 1;
+                        if self.peek() != Some('\n') {
+                            s.push('\n');
+                        }
+                    }
+                    Some(c) => {
+                        if c == '\n' {
+                            self.line += 1;
+                        }
+                        s.push(c);
+                        self.i += 1;
+                    }
+                }
+            }
+            let (save_i, save_l) = (self.i, self.line);
+            self.skip()?;
+            if !self.starts("'''") {
+                self.i = save_i;
+                self.line = save_l;
+                return Ok(s);
+            }
+        }
+    }
+    fn identifier(&mut self) -> String {
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                s.push(c);
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        s
+    }
+    fn lob(&mut self) -> Result<Value, String> {
+        self.i += 2;
+        self.skip()?;
+        let v = if self.peek() == Some('"') {
+            let s = self.short('"')?;
+            tagged("clob", json!(STANDARD.encode(clob_bytes(&s)?)))
+        } else if self.starts("'''") {
+            let s = self.long()?;
+            tagged("clob", json!(STANDARD.encode(clob_bytes(&s)?)))
+        } else {
+            let mut b = String::new();
+            while let Some(c) = self.peek() {
+                if c == '}' {
+                    break;
+                }
+                if c == '\n' {
+                    self.line += 1;
+                }
+                if !c.is_whitespace() {
+                    b.push(c);
+                }
+                self.i += 1;
+            }
+            if STANDARD.decode(&b).is_err() {
+                return self.err("a blob is not base64");
+            }
+            tagged("blob", json!(b))
+        };
+        self.skip()?;
+        if !self.starts("}}") {
+            return self.err("a lob must end in }}");
+        }
+        self.i += 2;
+        Ok(v)
+    }
+    fn number_or_time(&mut self) -> Result<Value, String> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || "+-._:".contains(c) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        let w: String = self.c[start..self.i].iter().collect();
+        let bare = w.strip_prefix('-').unwrap_or(&w);
+        let looks_time = w.len() >= 5 && w.as_bytes()[..4].iter().all(u8::is_ascii_digit) && (w.as_bytes()[4] == b'-' || w.as_bytes()[4] == b'T');
+        if looks_time {
+            return parse_ts(&w).map(|t| t.value()).map_err(|e| format!("line {}: {}", self.line, e));
+        }
+        let neg = w.starts_with('-');
+        if bare.starts_with("0x") || bare.starts_with("0X") || bare.starts_with("0b") || bare.starts_with("0B") {
+            let radix = if bare.as_bytes()[1].to_ascii_lowercase() == b'x' { 16u32 } else { 2 };
+            let d = &bare[2..];
+            if d.is_empty() || d.starts_with('_') || d.ends_with('_') || d.contains("__") {
+                return self.err(&format!("`{}` is not a number", w));
+            }
+            let mut bytes: Vec<u8> = vec![];
+            for c in d.chars().filter(|c| *c != '_') {
+                let mut carry = c.to_digit(radix).ok_or(format!("line {}: `{}` is not a number", self.line, w))?;
+                for b in bytes.iter_mut().rev() {
+                    let v = *b as u32 * radix + carry;
+                    *b = v as u8;
+                    carry = v >> 8;
+                }
+                if carry > 0 {
+                    bytes.insert(0, carry as u8);
+                }
+            }
+            return Ok(tagged("int", big_value(neg, &to_decimal(&bytes))));
+        }
+        let shape_ok = |s: &str| !s.starts_with('_') && !s.ends_with('_') && !s.contains("__") && s.bytes().all(|b| b.is_ascii_digit() || b == b'_');
+        let (mant, exp, kind) = match bare.find(['e', 'E', 'd', 'D']) {
+            Some(i) => (&bare[..i], Some(&bare[i + 1..]), bare.as_bytes()[i].to_ascii_lowercase()),
+            None => (bare, None, b'i'),
+        };
+        let (whole, frac) = mant.split_once('.').map_or((mant, None), |(a, b)| (a, Some(b)));
+        let bad = whole.is_empty() || !shape_ok(whole) || (whole.len() > 1 && whole.starts_with('0') && whole.as_bytes()[1] != b'_' ) || (whole.starts_with("0_")) || frac.map_or(false, |f| !f.is_empty() && !shape_ok(f));
+        if bad {
+            return self.err(&format!("`{}` is not a number", w));
+        }
+        let clean = |s: &str| s.replace('_', "");
+        match kind {
+            b'e' => {
+                let ex = exp.unwrap_or("");
+                if ex.trim_start_matches(['+', '-']).is_empty() {
+                    return self.err(&format!("`{}` is not a number", w));
+                }
+                let text = format!("{}{}.{}e{}", if neg { "-" } else { "" }, clean(whole), clean(frac.unwrap_or("0")), ex);
+                let f: f64 = text.parse().map_err(|_| format!("line {}: `{}` is not a number", self.line, w))?;
+                Ok(tagged("float", json!(f)))
+            }
+            b'd' | b'i' if kind == b'd' || frac.is_some() => {
+                let e: i64 = match exp {
+                    Some(x) => x.parse().map_err(|_| format!("line {}: `{}` is not a number", self.line, w))?,
+                    None => 0,
+                };
+                let f = frac.map(clean).unwrap_or_default();
+                let digits = format!("{}{}", clean(whole), f);
+                Ok(decimal_value(neg, &digits, e - f.len() as i64))
+            }
+            _ => Ok(tagged("int", big_value(neg, &clean(whole)))),
+        }
+    }
+    fn value(&mut self, depth: usize, in_sexp: bool) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return self.err("nested too deep");
+        }
+        self.skip()?;
+        let mut notes: Vec<Value> = vec![];
+        loop {
+            let Some(c) = self.peek() else { return self.err("expected a value, found the end") };
+            // Annotation: a symbol followed by ::
+            let (save_i, save_l) = (self.i, self.line);
+            let sym = if c == '\'' && !self.starts("'''") {
+                Some(self.short('\'')?)
+            } else if c.is_ascii_alphabetic() || c == '_' || c == '$' {
+                Some(self.identifier())
+            } else {
+                None
+            };
+            if let Some(s) = sym {
+                self.skip()?;
+                if self.starts("::") {
+                    self.i += 2;
+                    self.skip()?;
+                    notes.push(json!(s));
+                    continue;
+                }
+                self.i = save_i;
+                self.line = save_l;
+            }
+            break;
+        }
+        let mut v = self.bare(depth, in_sexp)?;
+        if !notes.is_empty() {
+            v["annotations"] = Value::Array(notes);
+        }
+        Ok(v)
+    }
+    fn bare(&mut self, depth: usize, in_sexp: bool) -> Result<Value, String> {
+        let c = self.peek().unwrap_or(' ');
+        match c {
+            '"' => Ok(tagged("string", json!(self.short('"')?))),
+            '\'' if self.starts("'''") => Ok(tagged("string", json!(self.long()?))),
+            '\'' => Ok(tagged("symbol", json!(self.short('\'')?))),
+            '[' => {
+                self.i += 1;
+                let mut out = vec![];
+                loop {
+                    self.skip()?;
+                    if self.peek() == Some(']') {
+                        self.i += 1;
+                        break;
+                    }
+                    out.push(self.value(depth + 1, false)?);
+                    self.skip()?;
+                    match self.peek() {
+                        Some(',') => self.i += 1,
+                        Some(']') => {}
+                        _ => return self.err("expected , or ] in a list"),
+                    }
+                }
+                Ok(tagged("list", Value::Array(out)))
+            }
+            '(' => {
+                self.i += 1;
+                let mut out = vec![];
+                loop {
+                    self.skip()?;
+                    if self.peek() == Some(')') {
+                        self.i += 1;
+                        break;
+                    }
+                    if self.peek().is_none() {
+                        return self.err("a sexp is never closed");
+                    }
+                    out.push(self.value(depth + 1, true)?);
+                }
+                Ok(tagged("sexp", Value::Array(out)))
+            }
+            '{' if self.at(1) == Some('{') => self.lob(),
+            '{' => {
+                self.i += 1;
+                let mut out = vec![];
+                loop {
+                    self.skip()?;
+                    if self.peek() == Some('}') {
+                        self.i += 1;
+                        break;
+                    }
+                    let name = match self.peek() {
+                        Some('"') => self.short('"')?,
+                        Some('\'') if self.starts("'''") => self.long()?,
+                        Some('\'') => self.short('\'')?,
+                        Some(x) if x.is_ascii_alphabetic() || x == '_' || x == '$' => self.identifier(),
+                        _ => return self.err("expected a field name"),
+                    };
+                    self.skip()?;
+                    if self.peek() != Some(':') {
+                        return self.err("expected : after a field name");
+                    }
+                    self.i += 1;
+                    let v = self.value(depth + 1, false)?;
+                    out.push(json!({ "name": name, "value": v }));
+                    self.skip()?;
+                    match self.peek() {
+                        Some(',') => self.i += 1,
+                        Some('}') => {}
+                        _ => return self.err("expected , or } in a struct"),
+                    }
+                }
+                Ok(tagged("struct", Value::Array(out)))
+            }
+            c if c.is_ascii_digit() => self.number_or_time(),
+            '-' if self.at(1).map_or(false, |x| x.is_ascii_digit()) => self.number_or_time(),
+            '+' if self.starts("+inf") && T::word_end(self.at(4)) => {
+                self.i += 4;
+                Ok(tagged("float", json!("+inf")))
+            }
+            '-' if self.starts("-inf") && T::word_end(self.at(4)) => {
+                self.i += 4;
+                Ok(tagged("float", json!("-inf")))
+            }
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let w = self.identifier();
+                match w.as_str() {
+                    "true" => Ok(tagged("bool", json!(true))),
+                    "false" => Ok(tagged("bool", json!(false))),
+                    "nan" => Ok(tagged("float", json!("nan"))),
+                    "null" => {
+                        if self.peek() == Some('.') {
+                            self.i += 1;
+                            let t = self.identifier();
+                            if t == "null" {
+                                return Ok(json!({ "type": "null" }));
+                            }
+                            if !TYPES.contains(&t.as_str()) && t != "struct" {
+                                return self.err(&format!("null.{} is not a type", t));
+                            }
+                            return Ok(json!({ "type": "null", "of": t }));
+                        }
+                        Ok(json!({ "type": "null" }))
+                    }
+                    _ => {
+                        if let Some(n) = w.strip_prefix('$').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+                            let sid: usize = n.parse().map_err(|_| format!("line {}: ${} is too large", self.line, n))?;
+                            return Ok(json!({ "type": "symbol", "value": SYSTEM.get(sid).filter(|_| sid > 0), "sid": sid }));
+                        }
+                        Ok(tagged("symbol", json!(w)))
+                    }
+                }
+            }
+            c if in_sexp && OPERATOR.contains(c) => {
+                let mut s = String::new();
+                while let Some(x) = self.peek().filter(|x| OPERATOR.contains(*x)) {
+                    s.push(x);
+                    self.i += 1;
+                }
+                Ok(tagged("symbol", json!(s)))
+            }
+            c => self.err(&format!("expected a value, found `{}`", c)),
+        }
+    }
+}
+
+fn clob_bytes(s: &str) -> Result<Vec<u8>, String> {
+    s.chars().map(|c| if (c as u32) < 256 { Ok(c as u32 as u8) } else { Err(format!("`{}` cannot be in a clob: bytes only", c)) }).collect()
+}
+
+/// `digits` and `exponent` as text the reader gives back the same.
+fn decimal_text(neg: bool, digits: &str, exp: i64) -> String {
+    let d = digits.trim_start_matches('0');
+    let d = if d.is_empty() { "0" } else { d };
+    let sign = if neg { "-" } else { "" };
+    if exp == 0 {
+        return format!("{}{}.", sign, d);
+    }
+    if exp < 0 && -exp < d.len() as i64 {
+        let at = d.len() - (-exp) as usize;
+        return format!("{}{}.{}", sign, &d[..at], &d[at..]);
+    }
+    if exp < 0 && -exp <= 20 {
+        return format!("{}0.{}{}", sign, "0".repeat((-exp) as usize - d.len()), d);
+    }
+    format!("{}{}d{}", sign, d, exp)
+}
+
+fn decimal_value(neg: bool, digits: &str, exp: i64) -> Value {
+    json!({ "type": "decimal", "value": decimal_text(neg, digits, exp) })
+}
+
+/// Back from the text form: `(negative, digits, exponent)`.
+fn decimal_parts(t: &str) -> Result<(bool, String, i64), String> {
+    let (neg, b) = t.strip_prefix('-').map_or((false, t), |x| (true, x));
+    let (m, e) = b.split_once(['d', 'D']).map_or((b, "0"), |x| x);
+    let e: i64 = e.parse().map_err(|_| format!("`{}` is not a decimal", t))?;
+    let (w, f) = m.split_once('.').unwrap_or((m, ""));
+    let digits = format!("{}{}", w, f);
+    if digits.is_empty() || !digits.bytes().all(|x| x.is_ascii_digit()) {
+        return Err(format!("`{}` is not a decimal", t));
+    }
+    Ok((neg, digits, e - f.len() as i64))
+}
+
+fn parse_text(text: &str) -> Result<Vec<Value>, String> {
+    let mut t = T { c: text.trim_start_matches('\u{feff}').chars().collect(), i: 0, line: 1 };
+    let mut out = vec![];
+    let mut table: Vec<Option<String>> = vec![];
+    loop {
+        t.skip()?;
+        if t.peek().is_none() {
+            break;
+        }
+        let v = t.value(0, false)?;
+        if v["type"] == "symbol" && v["value"] == "$ion_1_0" && v.get("annotations").is_none() {
+            table.clear();
+            continue;
+        }
+        if v["type"] == "struct" && v["annotations"][0] == "$ion_symbol_table" {
+            table = local_table(&v, &table)?;
+            continue;
+        }
+        let mut v = v;
+        if !table.is_empty() {
+            fill_sids(&mut v, &table, 0);
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// `$10` in text is a local symbol, once a table has been given.
+fn fill_sids(v: &mut Value, table: &[Option<String>], depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if v["type"] == "symbol" {
+        if let Some(s) = v.get("sid").and_then(Value::as_u64) {
+            if let Some(Some(t)) = (s as usize).checked_sub(10).and_then(|i| table.get(i)) {
+                v["value"] = json!(t);
+                v.as_object_mut().unwrap().remove("sid");
+            }
+        }
+    }
+    if let Some(a) = v.get_mut("value").and_then(Value::as_array_mut) {
+        for x in a {
+            if x.get("name").is_some() {
+                fill_sids(&mut x["value"], table, depth + 1);
+            } else {
+                fill_sids(x, table, depth + 1);
+            }
+        }
+    }
+}
+
+fn local_table(v: &Value, old: &[Option<String>]) -> Result<Vec<Option<String>>, String> {
+    let fields = v["value"].as_array().ok_or("a bad symbol table")?;
+    let mut out: Vec<Option<String>> = vec![];
+    for f in fields {
+        match f["name"].as_str() {
+            Some("imports") => {
+                if f["value"]["type"] == "symbol" && f["value"]["value"] == "$ion_symbol_table" {
+                    out.splice(0..0, old.iter().cloned());
+                } else if f["value"]["type"] == "list" && !f["value"]["value"].as_array().map_or(true, Vec::is_empty) {
+                    let name = f["value"]["value"][0]["value"].as_array().and_then(|x| x.iter().find(|y| y["name"] == "name")).and_then(|y| y["value"]["value"].as_str()).unwrap_or("?").to_string();
+                    return Err(format!("the shared symbol table {} is not available here", name));
+                }
+            }
+            Some("symbols") => {
+                if f["value"]["type"] == "list" {
+                    for s in f["value"]["value"].as_array().into_iter().flatten() {
+                        out.push(if s["type"] == "string" { s["value"].as_str().map(str::to_string) } else { None });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+// Binary reading.
+
+struct D<'a> {
+    b: &'a [u8],
+    syms: Vec<Option<String>>,
+}
+
+fn var_uint(b: &[u8], i: &mut usize) -> Result<u64, String> {
+    let mut v: u64 = 0;
+    for n in 0.. {
+        let x = *b.get(*i).ok_or(format!("offset {}: the data ends inside a number", *i))?;
+        *i += 1;
+        if n >= 9 {
+            return Err(format!("offset {}: a VarUInt too long", *i));
+        }
+        v = (v << 7) | (x & 0x7f) as u64;
+        if x & 0x80 != 0 {
+            return Ok(v);
+        }
+    }
+    Ok(v)
+}
+
+/// A VarInt: `(negative, magnitude)`; -0 means something in a timestamp's offset.
+fn var_int(b: &[u8], i: &mut usize) -> Result<(bool, i64), String> {
+    let x = *b.get(*i).ok_or(format!("offset {}: the data ends inside a number", *i))?;
+    *i += 1;
+    let neg = x & 0x40 != 0;
+    let mut v = (x & 0x3f) as i64;
+    if x & 0x80 != 0 {
+        return Ok((neg, v));
+    }
+    for _ in 0..9 {
+        let y = *b.get(*i).ok_or(format!("offset {}: the data ends inside a number", *i))?;
+        *i += 1;
+        v = (v << 7) | (y & 0x7f) as i64;
+        if y & 0x80 != 0 {
+            return Ok((neg, v));
+        }
+    }
+    Err(format!("offset {}: a VarInt too long", *i))
+}
+
+impl D<'_> {
+    fn symbol(&self, sid: u64, at: usize) -> Result<Option<String>, String> {
+        let s = sid as usize;
+        if s == 0 {
+            return Ok(None);
+        }
+        if s < 10 {
+            return Ok(Some(SYSTEM[s].to_string()));
+        }
+        match self.syms.get(s - 10) {
+            Some(x) => Ok(x.clone()),
+            None => Err(format!("offset {}: symbol {} is not in the table", at, s)),
+        }
+    }
+    fn sym_value(&self, sid: u64, at: usize) -> Result<Value, String> {
+        Ok(match self.symbol(sid, at)? {
+            Some(t) => tagged("symbol", json!(t)),
+            None => json!({ "type": "symbol", "value": null, "sid": sid }),
+        })
+    }
+    fn timestamp(&self, b: &[u8], at: usize) -> Result<Value, String> {
+        let mut i = 0;
+        let (neg, off) = var_int(b, &mut i)?;
+        let offset = if neg && off == 0 { None } else { Some(if neg { -off } else { off }) };
+        let y = var_uint(b, &mut i)? as i64;
+        let mut ts = Ts { y, offset, ..Ts::default() };
+        let more = |i: &usize| *i < b.len();
+        if more(&i) { ts.mo = Some(var_uint(b, &mut i)? as i64); }
+        if more(&i) { ts.d = Some(var_uint(b, &mut i)? as i64); }
+        if more(&i) {
+            ts.h = Some(var_uint(b, &mut i)? as i64);
+            if !more(&i) {
+                return Err(format!("offset {}: a timestamp has an hour and no minute", at));
+            }
+            ts.mi = Some(var_uint(b, &mut i)? as i64);
+        }
+        if more(&i) { ts.s = Some(var_uint(b, &mut i)? as i64); }
+        if more(&i) {
+            let (eneg, e) = var_int(b, &mut i)?;
+            let (cneg, digits) = int_magnitude(&b[i..]);
+            if cneg {
+                return Err(format!("offset {}: a negative fraction", at));
+            }
+            let places = if eneg { e } else { -e };
+            if places > 0 {
+                let d = digits.trim_start_matches('0');
+                let t = format!("{}{}", "0".repeat((places as usize).saturating_sub(d.len())), d);
+                if t.len() > places as usize {
+                    return Err(format!("offset {}: a fraction of 1 or more", at));
+                }
+                ts.frac = Some(t);
+            }
+        }
+        let bad = ts.y < 1 || ts.y > 9999 || ts.mo.map_or(false, |m| !(1..=12).contains(&m)) || ts.d.map_or(false, |d| d < 1 || d > month_days(ts.y, ts.mo.unwrap_or(1))) || ts.h.map_or(false, |h| h > 23) || ts.mi.map_or(false, |m| m > 59) || ts.s.map_or(false, |s| s > 59) || ts.offset.map_or(false, |o| o.abs() >= 1440);
+        if bad {
+            return Err(format!("offset {}: a timestamp out of range", at));
+        }
+        // The fields are UTC; the text is local.
+        if let (Some(mo), Some(d), Some(h), Some(mi)) = (ts.mo, ts.d, ts.h, ts.mi) {
+            let l = shift((ts.y, mo, d, h, mi), ts.offset.unwrap_or(0));
+            ts.y = l.0;
+            ts.mo = Some(l.1);
+            ts.d = Some(l.2);
+            ts.h = Some(l.3);
+            ts.mi = Some(l.4);
+        }
+        Ok(ts.value())
+    }
+    fn value(&mut self, i: &mut usize, end: usize, depth: usize) -> Result<Option<Value>, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!("offset {}: nested too deep", *i));
+        }
+        let at = *i;
+        let td = self.b[at];
+        *i += 1;
+        let (t, l) = (td >> 4, td & 0x0f);
+        if t == 0xF {
+            return Err(format!("offset {}: type F is reserved", at));
+        }
+        if l == 15 {
+            if t == 0xE {
+                return Err(format!("offset {}: a bad annotation wrapper", at));
+            }
+            return Ok(Some(if t == 0 { json!({ "type": "null" }) } else { json!({ "type": "null", "of": name_of(t) }) }));
+        }
+        let mut len = l as u64;
+        if t == 0xD && l == 1 {
+            // A struct with sorted fields: the length follows.
+            len = var_uint(&self.b[..end], i)?;
+        } else if l == 14 {
+            len = var_uint(&self.b[..end], i)?;
+        }
+        if t == 1 {
+            if l > 1 {
+                return Err(format!("offset {}: a bad bool", at));
+            }
+            return Ok(Some(tagged("bool", json!(l == 1))));
+        }
+        let stop = usize::try_from(len).ok().and_then(|n| i.checked_add(n)).filter(|e| *e <= end).ok_or(format!("offset {}: the length {} runs past the end", at, len))?;
+        let body = &self.b[*i..stop];
+        let start = *i;
+        *i = stop;
+        Ok(Some(match t {
+            0 => return Ok(None), // Padding.
+            2 | 3 => {
+                let d = to_decimal(body);
+                if t == 3 && d.trim_start_matches('0').is_empty() {
+                    return Err(format!("offset {}: negative zero is not an int", at));
+                }
+                tagged("int", big_value(t == 3, &d))
+            }
+            4 => match body.len() {
+                0 => tagged("float", json!(0.0)),
+                4 => float_value(f32::from_be_bytes(body.try_into().unwrap()) as f64),
+                8 => float_value(f64::from_be_bytes(body.try_into().unwrap())),
+                n => return Err(format!("offset {}: a float of {} bytes", at, n)),
+            },
+            5 => {
+                if body.is_empty() {
+                    return Ok(Some(decimal_value(false, "0", 0)));
+                }
+                let mut k = 0;
+                let (eneg, e) = var_int(body, &mut k)?;
+                let (cneg, digits) = int_magnitude(&body[k..]);
+                decimal_value(cneg, &digits, if eneg { -e } else { e })
+            }
+            6 => self.timestamp(body, at)?,
+            7 => {
+                if body.len() > 8 {
+                    return Err(format!("offset {}: a symbol id too large", at));
+                }
+                let sid = body.iter().fold(0u64, |a, x| (a << 8) | *x as u64);
+                self.sym_value(sid, at)?
+            }
+            8 => tagged("string", json!(std::str::from_utf8(body).map_err(|_| format!("offset {}: a string is not UTF-8", at))?)),
+            9 => tagged("clob", json!(STANDARD.encode(body))),
+            0xA => tagged("blob", json!(STANDARD.encode(body))),
+            0xB | 0xC => {
+                let mut k = start;
+                let mut out = vec![];
+                while k < stop {
+                    if let Some(v) = self.value(&mut k, stop, depth + 1)? {
+                        out.push(v);
+                    }
+                }
+                tagged(if t == 0xB { "list" } else { "sexp" }, Value::Array(out))
+            }
+            0xD => {
+                let mut k = start;
+                let mut out = vec![];
+                while k < stop {
+                    let sid = var_uint(&self.b[..stop], &mut k)?;
+                    if k >= stop {
+                        return Err(format!("offset {}: a struct field has no value", k));
+                    }
+                    let name = self.symbol(sid, k)?;
+                    if let Some(v) = self.value(&mut k, stop, depth + 1)? {
+                        out.push(json!({ "name": name, "value": v }));
+                    } else if sid != 0 {
+                        return Err(format!("offset {}: padding with a field name", k));
+                    }
+                }
+                tagged("struct", Value::Array(out))
+            }
+            0xE => {
+                let mut k = start;
+                let n = var_uint(&self.b[..stop], &mut k)? as usize;
+                let notes_end = k.checked_add(n).filter(|e| *e < stop && n > 0).ok_or(format!("offset {}: a bad annotation length", at))?;
+                let mut notes = vec![];
+                while k < notes_end {
+                    let sid = var_uint(&self.b[..notes_end], &mut k)?;
+                    notes.push(json!(self.symbol(sid, at)?));
+                }
+                k = notes_end;
+                let mut v = self.value(&mut k, stop, depth + 1)?.ok_or(format!("offset {}: padding under an annotation", at))?;
+                if k != stop {
+                    return Err(format!("offset {}: an annotation holds more than one value", at));
+                }
+                v["annotations"] = Value::Array(notes);
+                v
+            }
+            o => return Err(format!("offset {}: type {} is not known", at, o)),
+        }))
+    }
+}
+
+fn name_of(t: u8) -> &'static str {
+    match t {
+        1 => "bool", 2 | 3 => "int", 4 => "float", 5 => "decimal", 6 => "timestamp", 7 => "symbol", 8 => "string", 9 => "clob", 0xA => "blob", 0xB => "list", 0xC => "sexp", _ => "struct",
+    }
+}
+
+fn float_value(f: f64) -> Value {
+    if f.is_nan() {
+        tagged("float", json!("nan"))
+    } else if f.is_infinite() {
+        tagged("float", json!(if f > 0.0 { "+inf" } else { "-inf" }))
+    } else {
+        tagged("float", json!(f))
+    }
+}
+
+/// Int: a sign bit, then the magnitude.
+fn int_magnitude(b: &[u8]) -> (bool, String) {
+    if b.is_empty() {
+        return (false, "0".to_string());
+    }
+    let neg = b[0] & 0x80 != 0;
+    let mut m = b.to_vec();
+    m[0] &= 0x7f;
+    (neg, to_decimal(&m))
+}
+
+fn read_binary(b: &[u8]) -> Result<Vec<Value>, String> {
+    if !b.starts_with(&BVM) {
+        return Err(if b.len() >= 4 && b[0] == 0xE0 { format!("Ion {}.{} is not read here: 1.0 only", b[1], b[2]) } else { "no Ion version marker: not binary Ion".to_string() });
+    }
+    let mut d = D { b, syms: vec![] };
+    let mut i = 4;
+    let mut out = vec![];
+    while i < b.len() {
+        if b[i..].starts_with(&BVM) {
+            d.syms.clear();
+            i += 4;
+            continue;
+        }
+        let at = i;
+        let Some(v) = d.value(&mut i, b.len(), 0)? else { continue };
+        if v["type"] == "struct" && v["annotations"][0] == "$ion_symbol_table" {
+            d.syms = local_table(&v, &d.syms).map_err(|e| format!("offset {}: {}", at, e))?;
+            continue;
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+fn unhex(t: &str) -> Result<Vec<u8>, String> {
+    let c: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if c.len() % 2 != 0 || !c.is_ascii() {
+        return Err("hex must have two digits to a byte".to_string());
+    }
+    (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).map_err(|_| format!("`{}` is not hex", &c[i..i + 2]))).collect()
+}
+
+// Binary writing.
+
+fn put_var_uint(mut v: u64, out: &mut Vec<u8>) {
+    let mut g = vec![(v & 0x7f) as u8 | 0x80];
+    v >>= 7;
+    while v > 0 {
+        g.push((v & 0x7f) as u8);
+        v >>= 7;
+    }
+    g.reverse();
+    out.extend(g);
+}
+
+fn put_var_int(neg: bool, mag: u64, out: &mut Vec<u8>) {
+    let mut g: Vec<u8> = vec![];
+    let mut v = mag;
+    // The last byte has seven bits, the first six and the sign.
+    g.push((v & 0x7f) as u8 | 0x80);
+    v >>= 7;
+    while v > 0 {
+        g.push((v & 0x7f) as u8);
+        v >>= 7;
+    }
+    if g.len() == 1 && g[0] & 0x40 != 0 || g.last().map_or(false, |l| l & 0x40 != 0) {
+        g.push(0);
+    }
+    g.reverse();
+    if neg {
+        g[0] |= 0x40;
+    }
+    out.extend(g);
+}
+
+fn header(t: u8, len: usize, out: &mut Vec<u8>) {
+    if len < 14 {
+        out.push((t << 4) | len as u8);
+    } else {
+        out.push((t << 4) | 14);
+        put_var_uint(len as u64, out);
+    }
+}
+
+fn sign_bytes(neg: bool, digits: &str) -> Vec<u8> {
+    let mut m = from_decimal(digits.trim_start_matches('0'));
+    if m.is_empty() {
+        return if neg { vec![0x80] } else { vec![] };
+    }
+    if m[0] & 0x80 != 0 {
+        m.insert(0, 0);
+    }
+    if neg {
+        m[0] |= 0x80;
+    }
+    m
+}
+
+struct W {
+    syms: Vec<String>,
+}
+
+impl W {
+    fn sid(&mut self, s: &str) -> u64 {
+        if let Some(i) = SYSTEM.iter().position(|x| *x == s).filter(|i| *i > 0) {
+            return i as u64;
+        }
+        if let Some(i) = self.syms.iter().position(|x| x == s) {
+            return i as u64 + 10;
+        }
+        self.syms.push(s.to_string());
+        self.syms.len() as u64 + 9
+    }
+    fn encode(&mut self, v: &Value, depth: usize) -> Result<Vec<u8>, String> {
+        if depth > MAX_DEPTH {
+            return Err("nested too deep".to_string());
+        }
+        let mut body = self.bare(v, depth)?;
+        if let Some(notes) = v.get("annotations").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+            let mut sids = vec![];
+            for n in notes {
+                put_var_uint(self.sid(n.as_str().ok_or("an annotation must be text")?), &mut sids);
+            }
+            let mut inner = vec![];
+            put_var_uint(sids.len() as u64, &mut inner);
+            inner.extend(sids);
+            inner.append(&mut body);
+            let mut out = vec![];
+            header(0xE, inner.len(), &mut out);
+            out.extend(inner);
+            return Ok(out);
+        }
+        Ok(body)
+    }
+    fn bare(&mut self, v: &Value, depth: usize) -> Result<Vec<u8>, String> {
+        let ty = v.get("type").and_then(Value::as_str).ok_or(format!("{} has no `type`", v))?;
+        let val = v.get("value").cloned().unwrap_or(Value::Null);
+        let mut out = vec![];
+        match ty {
+            "null" => out.push(match v.get("of").and_then(Value::as_str) {
+                None | Some("null") => 0x0F,
+                Some(t) => {
+                    let code = match t { "bool" => 1, "int" => 2, "float" => 4, "decimal" => 5, "timestamp" => 6, "symbol" => 7, "string" => 8, "clob" => 9, "blob" => 0xA, "list" => 0xB, "sexp" => 0xC, "struct" => 0xD, o => return Err(format!("null.{} is not a type", o)) };
+                    (code << 4) | 0x0F
+                }
+            }),
+            "bool" => out.push(if val == json!(true) { 0x11 } else { 0x10 }),
+            "int" => {
+                let t = match &val { Value::Number(n) => n.to_string(), Value::String(s) => s.clone(), o => return Err(format!("{} is not an int", o)) };
+                let (neg, d) = t.strip_prefix('-').map_or((false, t.as_str()), |x| (true, x));
+                if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("`{}` is not an int", t));
+                }
+                let m = from_decimal(d.trim_start_matches('0'));
+                header(if neg && !m.is_empty() { 3 } else { 2 }, m.len(), &mut out);
+                out.extend(m);
+            }
+            "float" => {
+                let f = match &val {
+                    Value::String(s) if s == "nan" => f64::NAN,
+                    Value::String(s) if s == "+inf" => f64::INFINITY,
+                    Value::String(s) if s == "-inf" => f64::NEG_INFINITY,
+                    Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                    o => return Err(format!("{} is not a float", o)),
+                };
+                if f == 0.0 && f.is_sign_positive() {
+                    out.push(0x40);
+                } else {
+                    out.push(0x48);
+                    out.extend(f.to_be_bytes());
+                }
+            }
+            "decimal" => {
+                let t = match &val { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), o => return Err(format!("{} is not a decimal", o)) };
+                let (neg, digits, e) = decimal_parts(&t)?;
+                if !neg && e == 0 && digits.trim_start_matches('0').is_empty() {
+                    out.push(0x50);
+                } else {
+                    let mut b = vec![];
+                    put_var_int(e < 0, e.unsigned_abs(), &mut b);
+                    b.extend(sign_bytes(neg, &digits));
+                    header(5, b.len(), &mut out);
+                    out.extend(b);
+                }
+            }
+            "timestamp" => {
+                let ts = parse_ts(val.as_str().ok_or("a timestamp's value must be text")?)?;
+                let mut b = vec![];
+                // Fields go out in UTC.
+                let (mut y, mut mo, mut d, mut h, mut mi) = (ts.y, ts.mo, ts.d, ts.h, ts.mi);
+                if let (Some(a), Some(c), Some(e), Some(f)) = (mo, d, h, mi) {
+                    let u = shift((y, a, c, e, f), -ts.offset.unwrap_or(0));
+                    y = u.0;
+                    mo = Some(u.1);
+                    d = Some(u.2);
+                    h = Some(u.3);
+                    mi = Some(u.4);
+                }
+                match ts.offset {
+                    None => b.push(0xC0),
+                    Some(o) => put_var_int(o < 0, o.unsigned_abs(), &mut b),
+                }
+                put_var_uint(y as u64, &mut b);
+                for x in [mo, d, h, mi, ts.s].into_iter().flatten() {
+                    put_var_uint(x as u64, &mut b);
+                }
+                if let Some(f) = &ts.frac {
+                    put_var_int(true, f.len() as u64, &mut b);
+                    b.extend(sign_bytes(false, f));
+                }
+                header(6, b.len(), &mut out);
+                out.extend(b);
+            }
+            "symbol" => {
+                let sid = match (val.as_str(), v.get("sid").and_then(Value::as_u64)) {
+                    (Some(s), _) => self.sid(s),
+                    (None, Some(s)) => s,
+                    _ => return Err("a symbol needs a `value`".to_string()),
+                };
+                let be = sid.to_be_bytes();
+                let skip = be.iter().position(|x| *x != 0).unwrap_or(8);
+                header(7, 8 - skip, &mut out);
+                out.extend(&be[skip..]);
+            }
+            "string" => {
+                let s = val.as_str().ok_or("a string's value must be text")?;
+                header(8, s.len(), &mut out);
+                out.extend(s.as_bytes());
+            }
+            "blob" | "clob" => {
+                let b = STANDARD.decode(val.as_str().ok_or("a lob's value must be base64 text")?).map_err(|e| format!("bad base64: {}", e))?;
+                header(if ty == "blob" { 0xA } else { 9 }, b.len(), &mut out);
+                out.extend(b);
+            }
+            "list" | "sexp" => {
+                let mut b = vec![];
+                for x in val.as_array().ok_or("a list's value must be a list")? {
+                    b.extend(self.encode(x, depth + 1)?);
+                }
+                header(if ty == "list" { 0xB } else { 0xC }, b.len(), &mut out);
+                out.extend(b);
+            }
+            "struct" => {
+                let mut b = vec![];
+                for f in val.as_array().ok_or("a struct's value must be a list of fields")? {
+                    let n = f.get("name").and_then(Value::as_str).ok_or("a struct field needs a `name`")?;
+                    put_var_uint(self.sid(n), &mut b);
+                    b.extend(self.encode(f.get("value").ok_or("a struct field needs a `value`")?, depth + 1)?);
+                }
+                header(0xD, b.len(), &mut out);
+                out.extend(b);
+            }
+            o => return Err(format!("`{}` is not an Ion type", o)),
+        }
+        Ok(out)
+    }
+}
+
+fn write_binary(values: &[Value]) -> Result<Vec<u8>, String> {
+    let mut w = W { syms: vec![] };
+    let mut body = vec![];
+    for v in values {
+        body.extend(w.encode(v, 0)?);
+    }
+    let mut out = BVM.to_vec();
+    if !w.syms.is_empty() {
+        // $ion_symbol_table::{ symbols: [...] }
+        let mut list = vec![];
+        for s in &w.syms {
+            header(8, s.len(), &mut list);
+            list.extend(s.as_bytes());
+        }
+        let mut field = vec![0x87];
+        header(0xB, list.len(), &mut field);
+        field.extend(list);
+        let mut st = vec![];
+        header(0xD, field.len(), &mut st);
+        st.extend(field);
+        let mut inner = vec![0x81, 0x83];
+        inner.extend(st);
+        header(0xE, inner.len(), &mut out);
+        out.extend(inner);
+    }
+    out.extend(body);
+    Ok(out)
+}
+
+// Text writing.
+
+fn sym_text(s: &str) -> String {
+    let plain = !s.is_empty() && s.as_bytes()[0] != b'$' && !s.as_bytes()[0].is_ascii_digit() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !["null", "true", "false", "nan"].contains(&s);
+    if plain { s.to_string() } else { format!("'{}'", esc(s, '\'')) }
+}
+
+fn esc(s: &str, q: char) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            c if c == q => { o.push('\\'); o.push(c); }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => o.push_str(&format!("\\x{:02x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn text_of(v: &Value, depth: usize, out: &mut String) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err("nested too deep".to_string());
+    }
+    for n in v.get("annotations").and_then(Value::as_array).into_iter().flatten() {
+        match n.as_str() {
+            Some(a) => out.push_str(&format!("{}::", sym_text(a))),
+            None => out.push_str("$0::"),
+        }
+    }
+    let ty = v.get("type").and_then(Value::as_str).ok_or(format!("{} has no `type`", v))?;
+    let val = v.get("value").cloned().unwrap_or(Value::Null);
+    match ty {
+        "null" => match v.get("of").and_then(Value::as_str) {
+            Some(t) => out.push_str(&format!("null.{}", t)),
+            None => out.push_str("null"),
+        },
+        "bool" => out.push_str(if val == json!(true) { "true" } else { "false" }),
+        "int" => out.push_str(&match &val { Value::String(s) => s.clone(), x => x.to_string() }),
+        "float" => match &val {
+            Value::String(s) => out.push_str(s),
+            Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                out.push_str(&format!("{:e}", f));
+                if !format!("{:e}", f).contains('e') {
+                    out.push_str("e0");
+                }
+            }
+            o => return Err(format!("{} is not a float", o)),
+        },
+        "decimal" | "timestamp" => out.push_str(val.as_str().ok_or(format!("a {} must be text", ty))?),
+        "symbol" => match val.as_str() {
+            Some(s) => out.push_str(&sym_text(s)),
+            None => out.push_str(&format!("${}", v.get("sid").and_then(Value::as_u64).unwrap_or(0))),
+        },
+        "string" => out.push_str(&format!("\"{}\"", esc(val.as_str().ok_or("a string must be text")?, '"'))),
+        "blob" => out.push_str(&format!("{{{{{}}}}}", val.as_str().ok_or("a blob must be base64")?)),
+        "clob" => {
+            let b = STANDARD.decode(val.as_str().ok_or("a clob must be base64")?).map_err(|e| format!("bad base64: {}", e))?;
+            let mut s = String::new();
+            for x in b {
+                match x {
+                    b'"' => s.push_str("\\\""),
+                    b'\\' => s.push_str("\\\\"),
+                    0x20..=0x7e => s.push(x as char),
+                    o => s.push_str(&format!("\\x{:02x}", o)),
+                }
+            }
+            out.push_str(&format!("{{{{\"{}\"}}}}", s));
+        }
+        "list" | "sexp" => {
+            let (open, close, sep) = if ty == "list" { ('[', ']', ", ") } else { ('(', ')', " ") };
+            out.push(open);
+            for (i, x) in val.as_array().ok_or("a list must be a list")?.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(sep);
+                }
+                text_of(x, depth + 1, out)?;
+            }
+            out.push(close);
+        }
+        "struct" => {
+            out.push('{');
+            for (i, f) in val.as_array().ok_or("a struct must hold fields")?.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                match f.get("name").and_then(Value::as_str) {
+                    Some(n) => out.push_str(&sym_text(n)),
+                    None => out.push_str("$0"),
+                }
+                out.push_str(": ");
+                text_of(f.get("value").ok_or("a struct field needs a `value`")?, depth + 1, out)?;
+            }
+            out.push('}');
+        }
+        o => return Err(format!("`{}` is not an Ion type", o)),
+    }
+    Ok(())
+}
+
+fn plain(v: &Value, depth: usize) -> Value {
+    if depth > MAX_DEPTH {
+        return Value::Null;
+    }
+    let val = v.get("value").cloned().unwrap_or(Value::Null);
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "list" | "sexp" => Value::Array(val.as_array().into_iter().flatten().map(|x| plain(x, depth + 1)).collect()),
+        "struct" => {
+            let mut m = Map::new();
+            for f in val.as_array().into_iter().flatten() {
+                m.insert(f["name"].as_str().unwrap_or("").to_string(), plain(&f["value"], depth + 1));
+            }
+            Value::Object(m)
+        }
+        "null" => Value::Null,
+        "decimal" => val.as_str().map(|s| s.trim_end_matches('.').to_string()).map(|s| s.parse::<f64>().ok().filter(|f| f.to_string() == s).map_or(json!(s), |f| json!(f))).unwrap_or(Value::Null),
+        _ => val,
+    }
+}
+
+fn from_plain(v: &Value, depth: usize) -> Result<Value, String> {
+    if depth > MAX_DEPTH {
+        return Err("nested too deep".to_string());
+    }
+    Ok(match v {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(b) => tagged("bool", json!(b)),
+        Value::Number(n) if n.is_f64() => tagged("float", json!(n)),
+        Value::Number(n) => tagged("int", json!(n)),
+        Value::String(s) => tagged("string", json!(s)),
+        Value::Array(a) => tagged("list", Value::Array(a.iter().map(|x| from_plain(x, depth + 1)).collect::<Result<_, _>>()?)),
+        Value::Object(m) => tagged("struct", Value::Array(m.iter().map(|(k, x)| Ok(json!({ "name": k, "value": from_plain(x, depth + 1)? }))).collect::<Result<Vec<_>, String>>()?)),
+    })
+}
+
+/// Reads Ion text: every top-level value, keeping Ion's types (see the file's head). A local symbol table is taken in; a version marker is passed over.
+pub fn amazon_ion_parse(text: &str) -> Result<Vec<Value>, String> {
+    parse_text(text)
+}
+
+/// Reads binary Ion given as hex: the same values, and its local symbol tables applied. Refuses what would run past the end.
+pub fn amazon_ion_decode(hex: &str) -> Result<Vec<Value>, String> {
+    read_binary(&unhex(hex)?)
+}
+
+/// Reads an Ion file, text or binary, told apart by the version marker.
+pub fn amazon_ion_read_file(path: &str) -> Result<Vec<Value>, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    if b.starts_with(&[0xE0]) {
+        read_binary(&b)
+    } else {
+        parse_text(&String::from_utf8(b).map_err(|_| format!("{} is neither Ion text nor binary", path))?)
+    }
+}
+
+/// Writes values as Ion text, one a line.
+pub fn amazon_ion_write_text(values: Vec<serde_json::Value>) -> Result<String, String> {
+    let mut out = String::new();
+    for v in &values {
+        text_of(v, 0, &mut out)?;
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Writes values as binary Ion in hex: the version marker, a local symbol table for what they use, then the values.
+pub fn amazon_ion_encode(values: Vec<serde_json::Value>) -> Result<String, String> {
+    Ok(write_binary(&values)?.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Values as plain JSON: types and annotations go, structs become maps, decimals stay exact as text unless a float says the same.
+pub fn amazon_ion_plain(values: Vec<serde_json::Value>) -> Vec<Value> {
+    values.iter().map(|v| plain(v, 0)).collect()
+}
+
+/// A plain value as an Ion value, ready to write.
+pub fn amazon_ion_from_plain(value: serde_json::Value) -> Result<Value, String> {
+    from_plain(&value, 0)
+}

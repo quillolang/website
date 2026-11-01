@@ -1,0 +1,309 @@
+//! OSRM routing: routes with their polylines decoded and steps read as directions, distance tables, nearest roads, trips and map matching, from any OSRM server, and the polyline format both ways.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+const DEMO: &str = "https://router.project-osrm.org";
+
+fn base() -> String {
+    std::env::var("OSRM_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or(DEMO.to_string()).trim_end_matches('/').to_string()
+}
+
+fn encode_value(v: i64, out: &mut String) {
+    let mut x = if v < 0 { !(v << 1) } else { v << 1 } as u64;
+    while x >= 32 {
+        out.push(char::from_u32((32 | (x & 31)) as u32 + 63).unwrap_or('?'));
+        x >>= 5;
+    }
+    out.push(char::from_u32(x as u32 + 63).unwrap_or('?'));
+}
+
+fn decode_poly(text: &str, precision: u32) -> Result<Vec<(f64, f64)>, String> {
+    let f = 10f64.powi(precision as i32);
+    let b = text.as_bytes();
+    let (mut i, mut lat, mut lon) = (0, 0i64, 0i64);
+    let mut out = vec![];
+    while i < b.len() {
+        let mut d = [0i64; 2];
+        for slot in d.iter_mut() {
+            let (mut r, mut shift) = (0i64, 0);
+            loop {
+                let c = *b.get(i).ok_or("a polyline ends in the middle of a number")? as i64 - 63;
+                if !(0..64).contains(&c) {
+                    return Err(format!("`{}` cannot be in a polyline", b[i] as char));
+                }
+                i += 1;
+                if shift > 58 {
+                    return Err("a polyline holds a number too long".into());
+                }
+                r |= (c & 31) << shift;
+                shift += 5;
+                if c < 32 {
+                    break;
+                }
+            }
+            *slot = if r & 1 == 1 { !(r >> 1) } else { r >> 1 };
+        }
+        lat += d[0];
+        lon += d[1];
+        out.push((lat as f64 / f, lon as f64 / f));
+    }
+    Ok(out)
+}
+
+/// A Google-style encoded polyline as [[lat, lon]]. `precision` is 5 for OSRM's default and Google's, 6 for polyline6.
+pub fn osrm_decode_polyline(text: &str, precision: i64) -> Result<Value, String> {
+    if !(1..=8).contains(&precision) {
+        return Err(format!("precision is 1 to 8, not {}", precision));
+    }
+    Ok(json!(decode_poly(text, precision as u32)?.iter().map(|p| [p.0, p.1]).collect::<Vec<_>>()))
+}
+
+/// [[lat, lon]] as an encoded polyline.
+pub fn osrm_encode_polyline(points: serde_json::Value, precision: i64) -> Result<String, String> {
+    if !(1..=8).contains(&precision) {
+        return Err(format!("precision is 1 to 8, not {}", precision));
+    }
+    let f = 10f64.powi(precision as i32);
+    let (mut last_a, mut last_b, mut out) = (0i64, 0i64, String::new());
+    for p in points.as_array().ok_or("give a list of [lat, lon]")? {
+        let (lat, lon) = (p.get(0).and_then(|v| v.as_f64()).ok_or("a point is [lat, lon]")?, p.get(1).and_then(|v| v.as_f64()).ok_or("a point is [lat, lon]")?);
+        let (a, b) = ((lat * f).round() as i64, (lon * f).round() as i64);
+        encode_value(a - last_a, &mut out);
+        encode_value(b - last_b, &mut out);
+        last_a = a;
+        last_b = b;
+    }
+    Ok(out)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~,;:".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// Points are [lat, lon] here, as everywhere in these plugins; OSRM's URLs want lon,lat.
+fn coords_text(points: &Value) -> Result<(String, usize), String> {
+    let list = points.as_array().ok_or("give the points as a list of [lat, lon]")?;
+    if list.is_empty() {
+        return Err("no points given".into());
+    }
+    let mut parts = vec![];
+    for (i, p) in list.iter().enumerate() {
+        let (lat, lon) = (p.get(0).and_then(|v| v.as_f64()), p.get(1).and_then(|v| v.as_f64()));
+        let (Some(lat), Some(lon)) = (lat, lon) else { return Err(format!("point {} is not [lat, lon]", i + 1)) };
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return Err(format!("point {} ({}, {}) is not a position: points are [lat, lon], OSRM's lon,lat is written for you", i + 1, lat, lon));
+        }
+        parts.push(format!("{},{}", lon, lat));
+    }
+    Ok((parts.join(";"), list.len()))
+}
+
+fn query(options: &Value, known: &[&str]) -> Result<(String, Vec<String>), String> {
+    let mut profile = "driving".to_string();
+    let mut q = vec![];
+    let o = options.as_object().ok_or("options must be a map")?;
+    for (k, v) in o {
+        if k == "profile" {
+            profile = v.as_str().ok_or("profile is text")?.to_string();
+            continue;
+        }
+        if !known.contains(&k.as_str()) {
+            return Err(format!("no option `{}`; there are profile, {}", k, known.join(", ")));
+        }
+        let t = match v {
+            Value::Array(a) => a.iter().map(|x| x.as_str().map(String::from).unwrap_or(x.to_string())).collect::<Vec<_>>().join(";"),
+            Value::String(s) => s.clone(),
+            x => x.to_string(),
+        };
+        q.push(format!("{}={}", k, enc(&t)));
+    }
+    Ok((profile, q))
+}
+
+fn call(service: &str, profile: &str, coords: &str, q: &[String]) -> Result<Value, String> {
+    let url = format!("{}/{}/v1/{}/{}{}{}", base(), service, enc(profile), coords, if q.is_empty() { "" } else { "?" }, q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).user_agent("quillo-osrm-plugin").build();
+    let r = agent.get(&url).call();
+    let text = match r {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(429, _)) => return Err("OSRM answered 429: the demo server is rate limited, and meant for testing only".into()),
+        Err(ureq::Error::Status(code, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            return Err(match serde_json::from_str::<Value>(&t) {
+                Ok(v) if v.get("code").is_some() => {
+                    let c = v["code"].as_str().unwrap_or("");
+                    let hint = match c {
+                        "NoRoute" => " (no road connects those points)",
+                        "NoSegment" => " (a point is too far from any road)",
+                        "TooBig" => " (too many points for this server's limits)",
+                        "NoTrips" => " (no trip visits every point)",
+                        _ => "",
+                    };
+                    format!("OSRM says {}: {}{}", c, v["message"].as_str().unwrap_or(""), hint)
+                }
+                _ => format!("OSRM answered {}: {}", code, t.chars().take(200).collect::<String>()),
+            });
+        }
+        Err(e) => return Err(format!("cannot reach OSRM at {}: {}", base(), e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|_| format!("OSRM's answer is not JSON: {:?}", text.chars().take(200).collect::<String>()))?;
+    if v.get("code").and_then(|c| c.as_str()) != Some("Ok") {
+        return Err(format!("OSRM says {}: {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or("")));
+    }
+    Ok(v)
+}
+
+fn line_of(g: Option<&Value>, precision: u32) -> Result<Value, String> {
+    Ok(match g {
+        Some(Value::String(s)) => json!(decode_poly(s, precision)?.iter().map(|p| [p.0, p.1]).collect::<Vec<_>>()),
+        Some(Value::Object(o)) => json!(o.get("coordinates").and_then(|c| c.as_array()).into_iter().flatten().map(|p| [p[1].clone(), p[0].clone()]).collect::<Vec<_>>()),
+        _ => Value::Null,
+    })
+}
+
+fn ordinal(n: i64) -> String {
+    match n {
+        1 => "first".into(),
+        2 => "second".into(),
+        3 => "third".into(),
+        4 => "fourth".into(),
+        5 => "fifth".into(),
+        o => format!("number {}", o),
+    }
+}
+
+// In the manner of osrm-text-instructions: plain English from a maneuver.
+fn say(step: &Value) -> String {
+    let m = &step["maneuver"];
+    let kind = m["type"].as_str().unwrap_or("");
+    let modifier = m["modifier"].as_str().unwrap_or("");
+    let name = step["name"].as_str().filter(|s| !s.is_empty());
+    let road = name.or(step["ref"].as_str()).map(|n| format!(" onto {}", n)).unwrap_or_default();
+    match kind {
+        "depart" => format!("Head {}{}", ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"][((m["bearing_after"].as_f64().unwrap_or(0.0) + 22.5) / 45.0) as usize % 8], name.map(|n| format!(" on {}", n)).unwrap_or_default()),
+        "arrive" => match modifier {
+            "left" => "You have arrived, on the left".into(),
+            "right" => "You have arrived, on the right".into(),
+            _ => "You have arrived".into(),
+        },
+        "roundabout" | "rotary" => match m["exit"].as_i64() {
+            Some(e) => format!("At the roundabout take the {} exit{}", ordinal(e), road),
+            None => format!("Enter the roundabout{}", road),
+        },
+        "turn" | "end of road" | "fork" | "merge" | "on ramp" | "off ramp" | "new name" | "continue" | "notification" => {
+            let way = match modifier {
+                "uturn" => "Make a U-turn".to_string(),
+                "straight" => "Go straight".to_string(),
+                "" => "Continue".to_string(),
+                o => format!("Turn {}", o),
+            };
+            format!("{}{}", if kind == "merge" { way.replace("Turn", "Merge") } else if kind == "fork" { way.replace("Turn", "Keep") } else { way }, road)
+        }
+        o => format!("{}{}", o, road),
+    }
+}
+
+fn tidy_route(r: &Value, precision: u32) -> Result<Value, String> {
+    let mut legs = vec![];
+    for l in r["legs"].as_array().into_iter().flatten() {
+        let mut steps = vec![];
+        for s in l["steps"].as_array().into_iter().flatten() {
+            steps.push(json!({
+                "instruction": say(s), "type": s["maneuver"]["type"], "modifier": s["maneuver"].get("modifier"), "exit": s["maneuver"].get("exit"), "name": s["name"], "ref": s.get("ref"),
+                "distance_m": s["distance"], "duration_s": s["duration"], "location": [s["maneuver"]["location"][1], s["maneuver"]["location"][0]], "geometry": line_of(s.get("geometry"), precision)?,
+            }));
+        }
+        legs.push(json!({ "distance_m": l["distance"], "duration_s": l["duration"], "summary": l["summary"], "steps": steps, "annotation": l.get("annotation") }));
+    }
+    Ok(json!({ "distance_m": r["distance"], "duration_s": r["duration"], "geometry": line_of(r.get("geometry"), precision)?, "legs": legs }))
+}
+
+fn waypoint(w: &Value) -> Value {
+    json!({ "name": w["name"], "location": [w["location"][1], w["location"][0]], "snapped_m": w["distance"] })
+}
+
+fn precision_of(o: &Value) -> u32 {
+    if o.get("geometries").and_then(|g| g.as_str()) == Some("polyline6") { 6 } else { 5 }
+}
+
+/// A route through points given as [lat, lon]: { routes: [{ distance_m, duration_s, geometry, legs: [{ steps: [{ instruction, type, modifier, name, distance_m, duration_s, location, geometry }] }] }], waypoints }. `geometry` is decoded to [lat, lon]. `options`: { profile, steps, alternatives, overview, geometries, annotations, continue_straight, exclude, radiuses, bearings, approaches }. `instruction` is plain English, in the spirit of osrm-text-instructions.
+pub fn osrm_route(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (c, n) = coords_text(&points)?;
+    if n < 2 {
+        return Err("a route needs at least two points".into());
+    }
+    let (profile, mut q) = query(&options, &["steps", "alternatives", "overview", "geometries", "annotations", "continue_straight", "exclude", "radiuses", "bearings", "approaches", "hints", "generate_hints"])?;
+    if options.get("overview").is_none() {
+        q.push("overview=full".into());
+    }
+    let v = call("route", &profile, &c, &q)?;
+    let p = precision_of(&options);
+    let routes = v["routes"].as_array().into_iter().flatten().map(|r| tidy_route(r, p)).collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({ "routes": routes, "waypoints": v["waypoints"].as_array().into_iter().flatten().map(waypoint).collect::<Vec<_>>() }))
+}
+
+/// Distances between many points: { durations, distances, sources, destinations }. Each is a matrix by source and destination, durations in seconds and distances in metres, with null for a pair no road joins. `options`: { profile, sources: [..], destinations: [..], annotations: "duration,distance", fallback_speed, scale_factor }.
+pub fn osrm_table(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (c, _) = coords_text(&points)?;
+    let (profile, mut q) = query(&options, &["sources", "destinations", "annotations", "fallback_speed", "fallback_coordinate", "scale_factor", "radiuses", "bearings", "exclude"])?;
+    if options.get("annotations").is_none() {
+        q.push("annotations=duration,distance".into());
+    }
+    let v = call("table", &profile, &c, &q)?;
+    Ok(json!({
+        "durations": v.get("durations"), "distances": v.get("distances"),
+        "sources": v["sources"].as_array().into_iter().flatten().map(waypoint).collect::<Vec<_>>(),
+        "destinations": v["destinations"].as_array().into_iter().flatten().map(waypoint).collect::<Vec<_>>(),
+    }))
+}
+
+/// The roads nearest a point, nearest first: [{ name, location, snapped_m, nodes }]. `options`: { profile, number }.
+pub fn osrm_nearest(point: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (c, _) = coords_text(&json!([point]))?;
+    let (profile, q) = query(&options, &["number", "bearings", "radiuses", "exclude"])?;
+    let v = call("nearest", &profile, &c, &q)?;
+    Ok(json!(v["waypoints"].as_array().into_iter().flatten().map(|w| {
+        let mut o = waypoint(w);
+        o["nodes"] = w["nodes"].clone();
+        o
+    }).collect::<Vec<_>>()))
+}
+
+/// The shortest round trip through points, solved by OSRM: { trips, order }, `order` giving each input point's place in the trip. `options` as osrm_route, with source, destination and roundtrip.
+pub fn osrm_trip(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (c, _) = coords_text(&points)?;
+    let (profile, mut q) = query(&options, &["steps", "overview", "geometries", "annotations", "roundtrip", "source", "destination"])?;
+    if options.get("overview").is_none() {
+        q.push("overview=full".into());
+    }
+    let v = call("trip", &profile, &c, &q)?;
+    let p = precision_of(&options);
+    Ok(json!({
+        "trips": v["trips"].as_array().into_iter().flatten().map(|r| tidy_route(r, p)).collect::<Result<Vec<_>, _>>()?,
+        "order": v["waypoints"].as_array().into_iter().flatten().map(|w| w["waypoint_index"].clone()).collect::<Vec<_>>(),
+    }))
+}
+
+/// A noisy GPS trace snapped to roads: { matchings, tracepoints }, a matching with its `confidence`, a tracepoint null where the point could not be used. `options`: { profile, timestamps, radiuses, gaps, tidy, steps, overview, geometries }.
+pub fn osrm_match(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (c, _) = coords_text(&points)?;
+    let (profile, mut q) = query(&options, &["timestamps", "radiuses", "gaps", "tidy", "steps", "overview", "geometries", "annotations"])?;
+    if options.get("overview").is_none() {
+        q.push("overview=full".into());
+    }
+    let v = call("match", &profile, &c, &q)?;
+    let p = precision_of(&options);
+    let mut matchings = vec![];
+    for m in v["matchings"].as_array().into_iter().flatten() {
+        let mut r: Map<String, Value> = tidy_route(m, p)?.as_object().cloned().unwrap_or_default();
+        r.insert("confidence".into(), m["confidence"].clone());
+        matchings.push(Value::Object(r));
+    }
+    Ok(json!({ "matchings": matchings, "tracepoints": v["tracepoints"].as_array().into_iter().flatten().map(|t| if t.is_null() { Value::Null } else { waypoint(t) }).collect::<Vec<_>>() }))
+}

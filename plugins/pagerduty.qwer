@@ -1,0 +1,231 @@
+//! PagerDuty: Events API v2 alerts triggered, acknowledged and resolved with dedup keys, change events, retries as the API asks, and the REST API's incidents listed, updated and noted.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+const SEVERITIES: &[&str] = &["critical", "error", "warning", "info"];
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build()
+}
+
+fn enqueue(path: &str, body: &Value, o: &Value) -> Result<Value, String> {
+    let base = opt(o, "events_url", "PAGERDUTY_EVENTS_URL").unwrap_or_else(|| "https://events.pagerduty.com".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let mut tries = 0;
+    loop {
+        let res = agent().post(&url).set("Content-Type", "application/json").set("User-Agent", "quillo-pagerduty/1.0").send_string(&body.to_string());
+        let backoff = 500u64 * 2u64.pow(tries);
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("PagerDuty's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                // A 429 or a 5xx: the event was not taken, so sending it again is right.
+                if (code == 429 || code >= 500) && tries < 3 {
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    tries += 1;
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let list: Vec<String> = v["errors"].as_array().map(|l| l.iter().filter_map(|e| e.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let hint = if list.iter().any(|e| e.contains("routing_key")) || code == 401 { " (check PAGERDUTY_ROUTING_KEY: an Events API v2 integration's key)" } else { "" };
+                return Err(format!("PagerDuty {}: {}{}{}", code, v["message"].as_str().unwrap_or(t.trim()), if list.is_empty() { String::new() } else { format!(": {}", list.join("; ")) }, hint));
+            }
+            Err(e) => {
+                if tries >= 3 {
+                    return Err(format!("cannot reach PagerDuty at {}: {}", base, e));
+                }
+                std::thread::sleep(Duration::from_millis(backoff));
+                tries += 1;
+            }
+        }
+    }
+}
+
+fn routing(o: &Value) -> Result<String, String> {
+    let k = opt(o, "routing_key", "PAGERDUTY_ROUTING_KEY").ok_or("no routing key: set PAGERDUTY_ROUTING_KEY, or give the option routing_key")?;
+    if k.len() != 32 {
+        return Err(format!("a routing key has 32 characters; this one has {}", k.len()));
+    }
+    Ok(k)
+}
+
+fn event(action: &str, dedup: Option<&str>, payload: Option<Value>, o: &Value) -> Result<Value, String> {
+    let mut b = json!({ "routing_key": routing(o)?, "event_action": action });
+    if let Some(d) = dedup {
+        if d.is_empty() || d.len() > 255 {
+            return Err(format!("a dedup key is 1 to 255 characters; this one has {}", d.len()));
+        }
+        b["dedup_key"] = json!(d);
+    }
+    if let Some(p) = payload {
+        b["payload"] = p;
+    }
+    for k in ["client", "client_url", "links", "images"] {
+        if let Some(v) = o.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    let r = enqueue("/v2/enqueue", &b, o)?;
+    Ok(json!({ "status": r["status"], "message": r["message"], "dedup_key": r["dedup_key"] }))
+}
+
+/// A stable dedup key from the parts that say what is wrong: the same parts give the same key, so a repeat of an alert joins its incident. At most 255 characters, as PagerDuty wants, whatever the parts.
+pub fn pagerduty_dedup_key(parts: Vec<String>) -> String {
+    let joined = parts.join("/");
+    if !joined.is_empty() && joined.len() <= 255 && joined.chars().all(|c| c.is_ascii_graphic()) {
+        return joined;
+    }
+    hex::encode(Sha256::digest(joined.as_bytes()))
+}
+
+/// Raises an alert: a `summary` (cut at 1024 characters), its `source` (a host or service) and `severity` (critical, error, warning, info). Options: dedup_key (leave out and PagerDuty makes one; keep it to resolve), component, group, class, timestamp (ISO 8601), custom_details, client, client_url, links ([{ href, text }]), images ([{ src, href, alt }]), routing_key (else PAGERDUTY_ROUTING_KEY), events_url (else PAGERDUTY_EVENTS_URL). Gives { status, message, dedup_key }.
+pub fn pagerduty_trigger(summary: &str, source: &str, severity: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if summary.trim().is_empty() || source.trim().is_empty() {
+        return Err("an alert needs a summary and a source".into());
+    }
+    if !SEVERITIES.contains(&severity) {
+        return Err(format!("{:?} is not a severity: critical, error, warning or info", severity));
+    }
+    let short: String = summary.chars().take(1024).collect();
+    let mut p = json!({ "summary": short, "source": source, "severity": severity });
+    for k in ["component", "group", "class", "timestamp", "custom_details"] {
+        if let Some(v) = options.get(k) {
+            p[k] = v.clone();
+        }
+    }
+    event("trigger", options.get("dedup_key").and_then(|d| d.as_str()), Some(p), &options)
+}
+
+/// Says someone is on an incident, by its dedup key: its escalation stops for now.
+pub fn pagerduty_acknowledge(dedup_key: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    event("acknowledge", Some(dedup_key), None, &options)
+}
+
+/// Closes an incident by its dedup key. Further triggers with that key open a new one.
+pub fn pagerduty_resolve(dedup_key: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    event("resolve", Some(dedup_key), None, &options)
+}
+
+/// Records a change, such as a deploy, for the people on call to see beside incidents. Options: timestamp, custom_details, links, routing_key.
+pub fn pagerduty_change(summary: &str, source: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut p = json!({ "summary": summary, "source": source });
+    for k in ["timestamp", "custom_details"] {
+        if let Some(v) = options.get(k) {
+            p[k] = v.clone();
+        }
+    }
+    let mut b = json!({ "routing_key": routing(&options)?, "payload": p });
+    if let Some(l) = options.get("links") {
+        b["links"] = l.clone();
+    }
+    enqueue("/v2/change/enqueue", &b, &options)
+}
+
+fn rest(method: &str, path: &str, body: Option<&Value>, o: &Value, from: Option<&str>) -> Result<Value, String> {
+    let token = opt(o, "token", "PAGERDUTY_API_TOKEN").ok_or("no token: set PAGERDUTY_API_TOKEN, or give the option token")?;
+    let base = opt(o, "api_url", "PAGERDUTY_API_URL").unwrap_or_else(|| "https://api.pagerduty.com".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let text = body.map(|b| b.to_string());
+    let mut tries = 0;
+    loop {
+        let mut r = agent().request(method, &url).set("Authorization", &format!("Token token={}", token)).set("Accept", "application/vnd.pagerduty+json;version=2").set("User-Agent", "quillo-pagerduty/1.0");
+        if let Some(f) = from {
+            r = r.set("From", f);
+        }
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("PagerDuty's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("ratelimit-reset").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                if code == 429 && tries < 2 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let more: Vec<String> = v.pointer("/error/errors").and_then(|e| e.as_array()).map(|l| l.iter().filter_map(|e| e.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let hint = if code == 401 { " (check PAGERDUTY_API_TOKEN)" } else { "" };
+                return Err(format!("PagerDuty {}: {}{}{}", code, v.pointer("/error/message").and_then(|m| m.as_str()).unwrap_or(t.trim()), if more.is_empty() { String::new() } else { format!(" ({})", more.join("; ")) }, hint));
+            }
+            Err(e) => return Err(format!("cannot reach PagerDuty at {}: {}", base, e)),
+        }
+    }
+}
+
+/// Incidents through the REST API, following its offset pages. Options: statuses (["triggered", "acknowledged", "resolved"]), since, until, urgencies, service_ids, team_ids, sort_by, max_items, token (else PAGERDUTY_API_TOKEN), api_url (else PAGERDUTY_API_URL). With no dates PagerDuty looks back 30 days.
+pub fn pagerduty_incidents(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut q = vec![];
+    for k in ["statuses", "urgencies", "service_ids", "team_ids"] {
+        for v in options.get(k).and_then(|v| v.as_array()).into_iter().flatten() {
+            if let Some(s) = v.as_str() {
+                q.push(format!("{}%5B%5D={}", k, enc(s)));
+            }
+        }
+    }
+    for k in ["since", "until", "sort_by"] {
+        if let Some(v) = options.get(k).and_then(|v| v.as_str()) {
+            q.push(format!("{}={}", k, enc(v)));
+        }
+    }
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut out = vec![];
+    let mut offset = 0;
+    loop {
+        let path = format!("/incidents?limit=100&offset={}&{}", offset, q.join("&"));
+        let r = rest("GET", path.trim_end_matches('&'), None, &options, None)?;
+        let page = r["incidents"].as_array().cloned().unwrap_or_default();
+        offset += page.len();
+        out.extend(page);
+        if r["more"] != true || out.len() >= max {
+            break;
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// One incident by id or number.
+pub fn pagerduty_incident(id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(rest("GET", &format!("/incidents/{}", enc(id)), None, &options, None)?["incident"].clone())
+}
+
+/// Changes an incident's status to "acknowledged" or "resolved", as the user `from` (a PagerDuty login email: the API wants one on every change).
+pub fn pagerduty_incident_update(id: &str, status: &str, from: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !["acknowledged", "resolved"].contains(&status) {
+        return Err(format!("an incident can be set to acknowledged or resolved, not {:?}", status));
+    }
+    let b = json!({ "incident": { "type": "incident_reference", "status": status } });
+    Ok(rest("PUT", &format!("/incidents/{}", enc(id)), Some(&b), &options, Some(from))?["incident"].clone())
+}
+
+/// Adds a note to an incident, as the user `from`.
+pub fn pagerduty_note(id: &str, content: &str, from: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(rest("POST", &format!("/incidents/{}/notes", enc(id)), Some(&json!({ "note": { "content": content } })), &options, Some(from))?["note"].clone())
+}

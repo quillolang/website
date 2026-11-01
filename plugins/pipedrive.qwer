@@ -1,0 +1,267 @@
+//! Pipedrive's API without an SDK: deals, persons and activities on the v2 endpoints with their cursors, v1's start and limit where it still rules, custom fields written and read by their names instead of 40-character keys, option labels turned into ids, rate limits waited out, and Pipedrive's error answers read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+// PIPEDRIVE_API_TOKEN is the token; PIPEDRIVE_API_URL your company's address
+// (https://yourcompany.pipedrive.com), or https://api.pipedrive.com when not set.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("PIPEDRIVE_API_URL").unwrap_or_else(|| "https://api.pipedrive.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    match v["error"].as_str() {
+        Some(e) => {
+            let info = v["error_info"].as_str().filter(|i| !i.is_empty() && *i != e).map_or(String::new(), |i| format!(" ({})", i));
+            format!("Pipedrive {}: {}{}", status, e, info)
+        }
+        None => format!("Pipedrive {}: {}", status, text.trim().chars().take(300).collect::<String>()),
+    }
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("PIPEDRIVE_API_TOKEN").ok_or("PIPEDRIVE_API_TOKEN is not set")?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..5u32 {
+        let req = agent.request(method, &url).set("x-api-token", &token).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                let v: Value = serde_json::from_str(&t).map_err(|_| format!("Pipedrive's answer is not JSON: {}", t.chars().take(200).collect::<String>()))?;
+                if v["success"] == json!(false) {
+                    return Err(error_text(200, &t));
+                }
+                return Ok(v);
+            }
+            // The token budget: x-ratelimit-reset says how many seconds until it fills.
+            Err(ureq::Error::Status(429, r)) => {
+                if r.header("x-daily-requests-left").map_or(false, |d| d == "0") {
+                    return Err("Pipedrive's daily budget is spent: it comes back at midnight, the company's time".into());
+                }
+                if attempt == 4 {
+                    return Err(error_text(429, &r.into_string().unwrap_or_default()));
+                }
+                let wait = r.header("x-ratelimit-reset").or(r.header("Retry-After")).and_then(|s| s.parse::<u64>().ok()).map_or(1000u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Pipedrive at {}: {}", api(), e)),
+        }
+    }
+    Err("Pipedrive stayed over its limit through five tries".into())
+}
+
+fn q(filter: &Value) -> Vec<String> {
+    filter.as_object().map_or(vec![], |m| m.iter().map(|(k, v)| format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect())
+}
+
+// v2: limit and cursor, the next one in additional_data.next_cursor.
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut parts = q(filter);
+        parts.push("limit=100".into());
+        if let Some(c) = &cursor {
+            parts.push(format!("cursor={}", enc(c)));
+        }
+        let v = call("GET", &format!("{}?{}", path, parts.join("&")), None)?;
+        out.extend(v["data"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["additional_data"]["next_cursor"].as_str() {
+            Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
+            _ => return Ok(out),
+        }
+    }
+}
+
+// v1: start and limit, more_items_in_collection saying when to stop.
+fn walk_v1(path: &str) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut start = 0;
+    loop {
+        let v = call("GET", &format!("{}?start={}&limit=500", path, start), None)?;
+        out.extend(v["data"].as_array().cloned().unwrap_or_default());
+        let p = &v["additional_data"]["pagination"];
+        if p["more_items_in_collection"] != json!(true) {
+            return Ok(out);
+        }
+        start = p["next_start"].as_i64().unwrap_or(out.len() as i64);
+    }
+}
+
+// Field definitions are kept a while: custom fields rarely change, and every record needs them.
+static FIELDS: Mutex<Option<HashMap<String, Vec<Value>>>> = Mutex::new(None);
+
+fn fields_path(entity: &str) -> Result<&'static str, String> {
+    match entity {
+        "deal" => Ok("/v1/dealFields"),
+        "person" => Ok("/v1/personFields"),
+        "organization" => Ok("/v1/organizationFields"),
+        "product" => Ok("/v1/productFields"),
+        o => Err(format!("`{}` has no custom fields here: deal, person, organization or product", o)),
+    }
+}
+
+/// The field definitions of "deal", "person", "organization" or "product": each with its `key`, `name`, `field_type`, `options`. Read once and kept: pass `refresh` true after adding a field.
+pub fn pipedrive_fields(entity: &str, refresh: bool) -> Result<Vec<serde_json::Value>, String> {
+    let path = fields_path(entity)?;
+    if !refresh {
+        if let Some(l) = FIELDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(entity)) {
+            return Ok(l.clone());
+        }
+    }
+    let list = walk_v1(path)?;
+    FIELDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(entity.to_string(), list.clone());
+    Ok(list)
+}
+
+/// A custom field's name turned into its 40-character key: `custom` is { "Region": "EU" }, and enum options given by label become ids. Gives the map for a record's `custom_fields`. An unknown name or option is an error naming what there is.
+pub fn pipedrive_custom(entity: &str, custom: serde_json::Value) -> Result<serde_json::Value, String> {
+    let defs = pipedrive_fields(entity, false)?;
+    let mut out = Map::new();
+    for (name, value) in custom.as_object().ok_or("custom fields must be a map of names to values")? {
+        let def = defs.iter().find(|d| d["name"].as_str() == Some(name)).ok_or(format!("{} has no field named `{}`", entity, name))?;
+        let key = def["key"].as_str().ok_or("the field has no key")?;
+        let id_of = |label: &str| -> Result<Value, String> {
+            let opts = def["options"].as_array().cloned().unwrap_or_default();
+            opts.iter().find(|o| o["label"].as_str() == Some(label)).map(|o| o["id"].clone()).ok_or(format!("field `{}` has no option `{}`; it has {}", name, label, opts.iter().filter_map(|o| o["label"].as_str()).collect::<Vec<_>>().join(", ")))
+        };
+        let v = match (def["field_type"].as_str(), value) {
+            (Some("enum"), Value::String(s)) => id_of(s)?,
+            (Some("set"), Value::Array(a)) => Value::Array(a.iter().map(|x| x.as_str().map_or(Ok(x.clone()), |s| id_of(s))).collect::<Result<_, _>>()?),
+            (_, v) => v.clone(),
+        };
+        out.insert(key.to_string(), v);
+    }
+    Ok(Value::Object(out))
+}
+
+/// A record with its custom fields under their names: gives the record, with `custom` as { "Region": "EU" }, option ids turned back into labels.
+pub fn pipedrive_named(entity: &str, record: serde_json::Value) -> Result<serde_json::Value, String> {
+    let defs = pipedrive_fields(entity, false)?;
+    let mut out = record;
+    let mut named = Map::new();
+    if let Some(custom) = out["custom_fields"].as_object().cloned() {
+        for (k, v) in &custom {
+            let Some(def) = defs.iter().find(|d| d["key"].as_str() == Some(k)) else { continue };
+            let label = |id: &Value| def["options"].as_array().and_then(|l| l.iter().find(|o| o["id"] == *id)).map_or(id.clone(), |o| o["label"].clone());
+            let shown = match (def["field_type"].as_str(), v) {
+                (Some("enum"), x) if !x.is_null() => label(x),
+                (Some("set"), Value::Array(a)) => Value::Array(a.iter().map(label).collect()),
+                (_, x) => x.clone(),
+            };
+            named.insert(def["name"].as_str().unwrap_or(k).to_string(), shown);
+        }
+    }
+    out["custom"] = Value::Object(named);
+    Ok(out)
+}
+
+fn with_custom(entity: &str, mut fields: Value) -> Result<Value, String> {
+    let custom = fields.as_object_mut().and_then(|m| m.remove("custom"));
+    if let Some(c) = custom {
+        fields["custom_fields"] = pipedrive_custom(entity, c)?;
+    }
+    Ok(fields)
+}
+
+/// Makes a deal: Pipedrive's fields (`title`, `value`, `currency`, `person_id`, `org_id`, `stage_id`...), and `custom` for custom fields by name.
+pub fn pipedrive_deal_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !fields["title"].is_string() {
+        return Err("a deal needs a title".into());
+    }
+    Ok(call("POST", "/api/v2/deals", Some(&with_custom("deal", fields)?))?["data"].clone())
+}
+
+/// One deal by id.
+pub fn pipedrive_deal(id: i64) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/api/v2/deals/{}", id), None)?["data"].clone())
+}
+
+/// Changes a deal, with `custom` as for pipedrive_deal_create.
+pub fn pipedrive_deal_update(id: i64, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("PATCH", &format!("/api/v2/deals/{}", id), Some(&with_custom("deal", fields)?))?["data"].clone())
+}
+
+/// Deals through every cursor: `filter` is Pipedrive's (`status`, `stage_id`, `owner_id`, `person_id`, `sort_by`...), `max_items` caps them (0: all).
+pub fn pipedrive_deals(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/api/v2/deals", &filter, max_items)
+}
+
+/// Makes a person: `name`, `emails` (texts become Pipedrive's list, the first primary), `phones` likewise, and `custom`.
+pub fn pipedrive_person_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !fields["name"].is_string() {
+        return Err("a person needs a name".into());
+    }
+    let mut b = with_custom("person", fields)?;
+    for k in ["emails", "phones"] {
+        if let Some(list) = b[k].as_array() {
+            let made: Vec<Value> = list.iter().enumerate().map(|(i, x)| if x.is_string() { json!({ "value": x, "primary": i == 0, "label": "work" }) } else { x.clone() }).collect();
+            b[k] = Value::Array(made);
+        }
+    }
+    Ok(call("POST", "/api/v2/persons", Some(&b))?["data"].clone())
+}
+
+/// One person by id.
+pub fn pipedrive_person(id: i64) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/api/v2/persons/{}", id), None)?["data"].clone())
+}
+
+/// Persons through every cursor: `filter` is Pipedrive's, `max_items` caps them (0: all).
+pub fn pipedrive_persons(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/api/v2/persons", &filter, max_items)
+}
+
+/// Finds persons by name, email or phone: a search of at least 2 characters. Gives the matching items.
+pub fn pipedrive_person_search(term: &str) -> Result<Vec<serde_json::Value>, String> {
+    if term.chars().count() < 2 {
+        return Err("a search needs at least 2 characters".into());
+    }
+    let v = call("GET", &format!("/api/v2/persons/search?term={}", enc(term)), None)?;
+    Ok(v["data"]["items"].as_array().map(|l| l.iter().map(|i| i["item"].clone()).collect()).unwrap_or_default())
+}
+
+/// Makes an activity: `subject`, `type` ("call", "meeting"...), `due_date` as YYYY-MM-DD, `deal_id`, `person_id`...
+pub fn pipedrive_activity_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !fields["subject"].is_string() || !fields["type"].is_string() {
+        return Err("an activity needs a subject and a type".into());
+    }
+    Ok(call("POST", "/api/v2/activities", Some(&fields))?["data"].clone())
+}
+
+/// Marks an activity done.
+pub fn pipedrive_activity_done(id: i64) -> Result<serde_json::Value, String> {
+    Ok(call("PATCH", &format!("/api/v2/activities/{}", id), Some(&json!({ "done": true })))?["data"].clone())
+}
+
+/// Activities through every cursor: `filter` is Pipedrive's (`deal_id`, `done`, `owner_id`...), `max_items` caps them (0: all).
+pub fn pipedrive_activities(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/api/v2/activities", &filter, max_items)
+}

@@ -1,0 +1,262 @@
+//! Adyen's Checkout API without an SDK: sessions and payments with their result codes read, 3-D Secure details sent on, captures, refunds, cancels and reversals, amounts in the minor units Adyen counts for each currency, idempotency keys, Adyen's error codes, and the HMAC signature of each webhook notification checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// ADYEN_API_KEY is the key, ADYEN_MERCHANT_ACCOUNT the account, ADYEN_API_URL the Checkout API with
+// its version (https://checkout-test.adyen.com/v71 when not set; a live account's URL has its own
+// prefix: https://<prefix>-checkout-live.adyenpayments.com/checkout/v71).
+
+// Adyen's own table: not Stripe's. CLP has two decimals here, and IDR none.
+const ZERO: &[&str] = &["CVE", "DJF", "GNF", "IDR", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"];
+const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("ADYEN_API_URL").unwrap_or_else(|| "https://checkout-test.adyen.com/v71".into()).trim_end_matches('/').to_string()
+}
+
+fn merchant() -> Result<String, String> {
+    setting("ADYEN_MERCHANT_ACCOUNT").ok_or("ADYEN_MERCHANT_ACCOUNT is not set".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, idempotency: &str) -> Result<Value, String> {
+    let token = setting("ADYEN_API_KEY").ok_or("ADYEN_API_KEY is not set")?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    // Without a key a retry could pay twice, so only a call that has one is retried.
+    let tries = if method == "GET" || !idempotency.is_empty() { 4u32 } else { 1 };
+    for attempt in 0..tries {
+        let mut req = agent.request(method, &url).set("X-API-Key", &token).set("Accept", "application/json");
+        if !idempotency.is_empty() {
+            req = req.set("Idempotency-Key", idempotency);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Adyen's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(429 | 500 | 502 | 503, r)) if attempt + 1 < tries => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(300u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let what = match (v["errorCode"].as_str(), v["message"].as_str()) {
+                    (Some(code), Some(m)) => format!("{} {}", code, m),
+                    (_, Some(m)) => m.to_string(),
+                    _ => t.trim().chars().take(300).collect(),
+                };
+                let hint = match c {
+                    401 => " (check ADYEN_API_KEY)",
+                    403 => " (the key's role does not allow this, or the merchant account is not its own)",
+                    _ => "",
+                };
+                let psp = v["pspReference"].as_str().map_or(String::new(), |p| format!(" [{}]", p));
+                return Err(format!("Adyen {}: {}{}{}", c, what, hint, psp));
+            }
+            Err(e) => return Err(format!("cannot reach Adyen at {}: {}", api(), e)),
+        }
+    }
+    Err("Adyen stayed busy through four tries".into())
+}
+
+fn places(currency: &str) -> usize {
+    if ZERO.contains(&currency) { 0 } else if THREE.contains(&currency) { 3 } else { 2 }
+}
+
+/// An amount as Adyen wants it: `adyen_amount("11.30", "EUR")` is `{ currency: "EUR", value: 1130 }`, by Adyen's own table of minor units (IDR has none, CLP two, KWD three). Takes text so no float rounding creeps in.
+pub fn adyen_amount(amount: &str, currency: &str) -> Result<serde_json::Value, String> {
+    let c = currency.to_uppercase();
+    if c.len() != 3 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("`{}` is not a three-letter currency code", currency));
+    }
+    let p = places(&c);
+    let a = amount.trim();
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > p {
+        return Err(format!("{} has {} decimals; {} has {} at Adyen", amount, frac.len(), c, p));
+    }
+    let n: i64 = format!("{}{}{}", whole, frac, "0".repeat(p - frac.len())).parse().map_err(|_| format!("`{}` is too large", amount))?;
+    Ok(json!({ "currency": c, "value": n }))
+}
+
+/// An amount from Adyen back to text: `adyen_amount_text({ currency: "KWD", value: 1250 })` is "1.250".
+pub fn adyen_amount_text(amount: serde_json::Value) -> Result<String, String> {
+    let c = amount["currency"].as_str().ok_or("the amount has no currency")?.to_uppercase();
+    let v = amount["value"].as_i64().ok_or("the amount has no whole `value`")?;
+    let p = places(&c);
+    let (sign, abs) = if v < 0 { ("-", -v) } else { ("", v) };
+    if p == 0 {
+        return Ok(format!("{}{}", sign, abs));
+    }
+    let scale = 10i64.pow(p as u32);
+    Ok(format!("{}{}.{:0w$}", sign, abs / scale, abs % scale, w = p))
+}
+
+fn outcome(code: &str) -> &'static str {
+    match code {
+        "Authorised" => "paid",
+        "Refused" | "Cancelled" | "Error" => "failed",
+        "Pending" | "Received" => "pending",
+        "RedirectShopper" | "IdentifyShopper" | "ChallengeShopper" | "PresentToShopper" => "shopper",
+        _ => "unknown",
+    }
+}
+
+fn check_amount(a: &Value) -> Result<(), String> {
+    if a["value"].is_i64() && a["currency"].is_string() { Ok(()) } else { Err("the amount must be { currency, value }: see adyen_amount".into()) }
+}
+
+fn with_outcome(mut v: Value) -> Value {
+    let o = outcome(v["resultCode"].as_str().unwrap_or(""));
+    v["outcome"] = json!(o);
+    v
+}
+
+/// Starts a Drop-in or Components session: `amount` from adyen_amount, `reference` your order's, `return_url` where the shopper comes back; `params` adds `countryCode`, `shopperReference`, `lineItems`, `idempotency_key`... Gives { id, sessionData, expiresAt, ... } for the page.
+pub fn adyen_session(amount: serde_json::Value, reference: &str, return_url: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_amount(&amount)?;
+    if reference.is_empty() || return_url.is_empty() {
+        return Err("a session needs a reference and a return_url".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    let idem = b.as_object_mut().and_then(|m| m.remove("idempotency_key")).and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    b["merchantAccount"] = json!(merchant()?);
+    b["amount"] = amount;
+    b["reference"] = json!(reference);
+    b["returnUrl"] = json!(return_url);
+    call("POST", "/sessions", Some(&b), &idem)
+}
+
+/// What became of a session: `session_result` is what the page's Drop-in gave. Gives { id, status } (completed, paymentPending, refused, canceled, expired).
+pub fn adyen_session_result(id: &str, session_result: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/sessions/{}?sessionResult={}", enc(id), enc(session_result)), None, "")
+}
+
+/// A payment (POST /payments) with the `payment_method` map the page encrypted. `params` adds `returnUrl`, `browserInfo`, `shopperReference`, `idempotency_key`... Gives Adyen's answer with `outcome`: "paid", "failed" (see `refusalReason`), "pending" or "shopper" (send `action` to the page). A refusal is an answer, not an error.
+pub fn adyen_payment(amount: serde_json::Value, reference: &str, payment_method: serde_json::Value, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_amount(&amount)?;
+    if !payment_method["type"].is_string() {
+        return Err("the payment method needs a `type`".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    let idem = b.as_object_mut().and_then(|m| m.remove("idempotency_key")).and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    b["merchantAccount"] = json!(merchant()?);
+    b["amount"] = amount;
+    b["reference"] = json!(reference);
+    b["paymentMethod"] = payment_method;
+    Ok(with_outcome(call("POST", "/payments", Some(&b), &idem)?))
+}
+
+/// Sends on what came back from a redirect or a 3-D Secure challenge: `details` is { redirectResult } or { threeDSResult }. Gives the answer with `outcome`.
+pub fn adyen_payment_details(details: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(with_outcome(call("POST", "/payments/details", Some(&json!({ "details": details })), "")?))
+}
+
+// A modification is only received here; its result comes later, by webhook.
+fn modify(psp: &str, what: &str, mut b: Value, idempotency_key: &str) -> Result<Value, String> {
+    if psp.is_empty() {
+        return Err("a pspReference is needed".into());
+    }
+    b["merchantAccount"] = json!(merchant()?);
+    call("POST", &format!("/payments/{}/{}", enc(psp), what), Some(&b), idempotency_key)
+}
+
+/// Captures `amount` of an authorised payment. Gives { pspReference, status: "received" }: the result comes by a CAPTURE webhook. `idempotency_key` may be "".
+pub fn adyen_capture(psp_reference: &str, amount: serde_json::Value, reference: &str, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    check_amount(&amount)?;
+    modify(psp_reference, "captures", json!({ "amount": amount, "reference": reference }), idempotency_key)
+}
+
+/// Refunds `amount` of a captured payment. Gives { pspReference, status: "received" }: the result comes by a REFUND webhook. `idempotency_key` may be "".
+pub fn adyen_refund(psp_reference: &str, amount: serde_json::Value, reference: &str, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    check_amount(&amount)?;
+    modify(psp_reference, "refunds", json!({ "amount": amount, "reference": reference }), idempotency_key)
+}
+
+/// Cancels an authorised payment not yet captured.
+pub fn adyen_cancel(psp_reference: &str, reference: &str, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    modify(psp_reference, "cancels", json!({ "reference": reference }), idempotency_key)
+}
+
+/// Cancels or refunds, whichever the payment's state calls for, when you do not know if it was captured.
+pub fn adyen_reverse(psp_reference: &str, reference: &str, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    modify(psp_reference, "reversals", json!({ "reference": reference }), idempotency_key)
+}
+
+fn field(item: &Value, k: &str) -> String {
+    match &item[k] {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// The text signed for a notification item: pspReference, originalReference, merchantAccountCode, merchantReference, value, currency, eventCode and success joined by colons, an empty field staying empty. Nothing is escaped here, as Adyen's libraries do it.
+pub fn adyen_signing_text(item: serde_json::Value) -> String {
+    [field(&item, "pspReference"), field(&item, "originalReference"), field(&item, "merchantAccountCode"), field(&item, "merchantReference"), field(&item["amount"], "value"), field(&item["amount"], "currency"), field(&item, "eventCode"), field(&item, "success")].join(":")
+}
+
+fn hmac_of(item: &Value, hmac_key: &str) -> Result<Hmac<sha2::Sha256>, String> {
+    let raw = hex::decode(hmac_key.trim()).map_err(|_| "the HMAC key is hex, as the Customer Area gives it".to_string())?;
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(&raw).expect("HMAC takes any key");
+    m.update(adyen_signing_text(item.clone()).as_bytes());
+    Ok(m)
+}
+
+/// The base64 HMAC of one notification item, with the hex key from the Customer Area, for tests.
+pub fn adyen_hmac(item: serde_json::Value, hmac_key: &str) -> Result<String, String> {
+    Ok(STANDARD.encode(hmac_of(&item, hmac_key)?.finalize().into_bytes()))
+}
+
+/// Reads a webhook's raw `body` and checks each item's `additionalData.hmacSignature`, with the hex key from the Customer Area. Gives { live, items: [{ eventCode, success, pspReference, originalReference, merchantReference, amount, reason, paymentMethod }] }, or an error when any item is not signed by that key. Answer Adyen with `[accepted]`.
+pub fn adyen_webhook(body: &str, hmac_key: &str) -> Result<serde_json::Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the notification is not JSON: {}", e))?;
+    let list = v["notificationItems"].as_array().ok_or("the notification has no notificationItems")?;
+    let mut items = vec![];
+    for (i, wrapped) in list.iter().enumerate() {
+        let item = &wrapped["NotificationRequestItem"];
+        if !item.is_object() {
+            return Err(format!("notification item {} has no NotificationRequestItem", i));
+        }
+        let sig = item["additionalData"]["hmacSignature"].as_str().ok_or(format!("notification item {} has no hmacSignature: turn on HMAC signing for this webhook", i))?;
+        let raw = STANDARD.decode(sig).map_err(|_| format!("notification item {}'s signature is not base64", i))?;
+        if hmac_of(item, hmac_key)?.verify_slice(&raw).is_err() {
+            return Err(format!("notification item {}'s signature does not match: a wrong HMAC key, or the item was changed", i));
+        }
+        items.push(json!({
+            "eventCode": item["eventCode"], "success": field(item, "success") == "true", "pspReference": item["pspReference"],
+            "originalReference": item["originalReference"], "merchantReference": item["merchantReference"], "amount": item["amount"],
+            "reason": item["reason"], "paymentMethod": item["paymentMethod"],
+        }));
+    }
+    Ok(json!({ "live": field(&v, "live") == "true", "items": items }))
+}

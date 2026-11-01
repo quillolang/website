@@ -1,0 +1,386 @@
+//! BigQuery's REST API: jobs.query with named or positional parameters, polling until a job finishes and following every page, rows typed by their schema (integers, numerics kept exact, timestamps as text, nested records and repeated fields), streaming inserts with each row's errors read, dry runs for a cost estimate, and sign-in by a service account's RS256 JWT, kept until it expires.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+// BIGQUERY_API_URL is the API (https://bigquery.googleapis.com when not set). BIGQUERY_PROJECT
+// names the project, else the service account's own; BIGQUERY_LOCATION the location.
+// GOOGLE_SERVICE_ACCOUNT_JSON holds the service account's JSON, or GOOGLE_APPLICATION_CREDENTIALS
+// its file.
+
+const SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn credentials() -> Result<Value, String> {
+    let text = match (env("GOOGLE_SERVICE_ACCOUNT_JSON"), env("GOOGLE_APPLICATION_CREDENTIALS")) {
+        (Some(t), _) => t,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS".into()),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn token() -> Result<String, String> {
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    let sa = credentials()?;
+    let uri = sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let jwt = jsonwebtoken::encode(&head, &json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": uri, "iat": t, "exp": t + 3600 }), &key).map_err(|e| e.to_string())?;
+    let res = ureq::post(&uri).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("the token server answered {}: {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach the token server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), t + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(tok)
+}
+
+fn base() -> String {
+    env("BIGQUERY_API_URL").unwrap_or_else(|| "https://bigquery.googleapis.com".into()).trim_end_matches('/').to_string()
+}
+
+fn project() -> Result<String, String> {
+    if let Some(p) = env("BIGQUERY_PROJECT") {
+        return Ok(p);
+    }
+    credentials()?["project_id"].as_str().map(str::to_string).ok_or("set BIGQUERY_PROJECT".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, v: &Value) -> String {
+    let e = &v["error"];
+    let first = &e["errors"][0];
+    let reason = first["reason"].as_str().unwrap_or("");
+    let at = first["location"].as_str().filter(|l| !l.is_empty()).map_or(String::new(), |l| format!(" (at {})", l));
+    format!("BigQuery answered {} {}: {}{}", status, reason, e["message"].as_str().unwrap_or(""), at)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let tok = token()?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let url = format!("{}/bigquery/v2{}", base(), path);
+    for attempt in 0..5 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", tok));
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        let (status, text) = match res {
+            Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+            Err(e) => return Err(format!("cannot reach BigQuery at {}: {}", base(), e)),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap_or(json!({ "error": { "message": text } }));
+        if status < 300 {
+            return Ok(v);
+        }
+        // Rate limits come as 403 with this reason, as well as 429, and backend errors as 5xx.
+        let reason = v["error"]["errors"][0]["reason"].as_str().unwrap_or("");
+        if attempt < 4 && (status == 429 || status == 502 || status == 503 || reason == "rateLimitExceeded" || reason == "backendError") {
+            std::thread::sleep(Duration::from_millis(250 << attempt));
+            continue;
+        }
+        return Err(error_text(status, &v));
+    }
+    Err("BigQuery stayed busy through five tries".into())
+}
+
+/// Days since 1970 to a civil date (Howard Hinnant's algorithm).
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// A TIMESTAMP as text: asked for in whole microseconds, so that none is lost to a float.
+fn timestamp(micros: &str) -> Value {
+    let Ok(us) = micros.parse::<i64>() else { return json!(micros) };
+    let (secs, frac) = (us.div_euclid(1_000_000), us.rem_euclid(1_000_000));
+    let (y, m, d) = civil(secs.div_euclid(86_400));
+    let s = secs.rem_euclid(86_400);
+    let f = if frac == 0 { String::new() } else { format!(".{:06}", frac).trim_end_matches('0').to_string() };
+    json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}Z", y, m, d, s / 3600, s / 60 % 60, s % 60, f))
+}
+
+fn cell(field: &Value, v: &Value) -> Value {
+    if field["mode"] == "REPEATED" {
+        let mut single = field.clone();
+        single["mode"] = json!("NULLABLE");
+        return Value::Array(v.as_array().into_iter().flatten().map(|x| cell(&single, &x["v"])).collect());
+    }
+    if v.is_null() {
+        return Value::Null;
+    }
+    let text = v.as_str().unwrap_or("");
+    match field["type"].as_str().unwrap_or("") {
+        "INTEGER" | "INT64" => text.parse::<i64>().map_or(v.clone(), |n| json!(n)),
+        "FLOAT" | "FLOAT64" => match text.parse::<f64>() {
+            Ok(f) if f.is_finite() => json!(f),
+            _ => v.clone(),
+        },
+        "BOOLEAN" | "BOOL" => json!(text == "true"),
+        "TIMESTAMP" => timestamp(text),
+        "RECORD" | "STRUCT" => record(field["fields"].as_array().map(Vec::as_slice).unwrap_or(&[]), v),
+        // NUMERIC and BIGNUMERIC stay text, being exact; DATE, TIME, DATETIME, BYTES, GEOGRAPHY are text.
+        _ => v.clone(),
+    }
+}
+
+fn record(fields: &[Value], row: &Value) -> Value {
+    let mut o = Map::new();
+    for (f, c) in fields.iter().zip(row["f"].as_array().into_iter().flatten()) {
+        o.insert(f["name"].as_str().unwrap_or("").to_string(), cell(f, &c["v"]));
+    }
+    Value::Object(o)
+}
+
+fn param_type(v: &Value) -> Result<(Value, Value), String> {
+    Ok(match v {
+        Value::Bool(b) => (json!({ "type": "BOOL" }), json!({ "value": b.to_string() })),
+        Value::String(s) => (json!({ "type": "STRING" }), json!({ "value": s })),
+        Value::Number(n) if n.is_i64() || n.is_u64() => (json!({ "type": "INT64" }), json!({ "value": n.to_string() })),
+        Value::Number(n) => (json!({ "type": "FLOAT64" }), json!({ "value": n.to_string() })),
+        Value::Null => return Err("a null parameter needs its type: { type: \"STRING\", value: null }".into()),
+        Value::Array(a) => {
+            let first = a.first().ok_or("an empty list parameter needs its type: { type: \"ARRAY<STRING>\", value: [] }")?;
+            let (t, _) = param_type(first)?;
+            let mut vals = vec![];
+            for x in a {
+                let (xt, xv) = param_type(x)?;
+                if xt != t {
+                    return Err("the values of a list parameter are of one type".into());
+                }
+                vals.push(xv);
+            }
+            (json!({ "type": "ARRAY", "arrayType": t }), json!({ "arrayValues": vals }))
+        }
+        Value::Object(m) if m.contains_key("type") && m.contains_key("value") => {
+            let t = m["type"].as_str().ok_or("a parameter's type is a text")?.to_uppercase();
+            if let Some(inner) = t.strip_prefix("ARRAY<").and_then(|r| r.strip_suffix('>')) {
+                let vals: Vec<Value> = m["value"].as_array().into_iter().flatten().map(|x| json!({ "value": x.as_str().map_or(x.to_string(), str::to_string) })).collect();
+                (json!({ "type": "ARRAY", "arrayType": { "type": inner } }), json!({ "arrayValues": vals }))
+            } else {
+                let value = match &m["value"] {
+                    Value::Null => Value::Null,
+                    Value::String(s) => json!(s),
+                    o => json!(o.to_string()),
+                };
+                (json!({ "type": t }), json!({ "value": value }))
+            }
+        }
+        Value::Object(m) => {
+            let (mut types, mut vals) = (vec![], Map::new());
+            for (k, x) in m {
+                let (xt, xv) = param_type(x)?;
+                types.push(json!({ "name": k, "type": xt }));
+                vals.insert(k.clone(), xv);
+            }
+            (json!({ "type": "STRUCT", "structTypes": types }), json!({ "structValues": vals }))
+        }
+    })
+}
+
+fn set_params(b: &mut Value, params: &Value) -> Result<(), String> {
+    match params {
+        Value::Null => {}
+        Value::Object(m) => {
+            b["parameterMode"] = json!("NAMED");
+            let mut list = vec![];
+            for (k, v) in m {
+                let (t, x) = param_type(v)?;
+                list.push(json!({ "name": k, "parameterType": t, "parameterValue": x }));
+            }
+            b["queryParameters"] = Value::Array(list);
+        }
+        Value::Array(a) => {
+            b["parameterMode"] = json!("POSITIONAL");
+            let mut list = vec![];
+            for v in a {
+                let (t, x) = param_type(v)?;
+                list.push(json!({ "parameterType": t, "parameterValue": x }));
+            }
+            b["queryParameters"] = Value::Array(list);
+        }
+        _ => return Err("parameters are a map for @name, a list for ?, or null".into()),
+    }
+    Ok(())
+}
+
+/// Runs GoogleSQL: `params` a map for `@name`, a list for `?`, or null; a value's type is taken from it, or say it with `{ type: "DATE", value: "2026-11-01" }`. `options`: `timeout_ms` (how long to wait for the job, 120000), `max_rows` (all when not set), `location`, `max_bytes` (refuse a query over this size), `labels`. It polls until the job is done and reads every page. Gives `{ rows, total_rows, schema, job_id, bytes, cache_hit }`, each row a map with values by their column types: INT64 a number, NUMERIC exact text, TIMESTAMP text, records as maps, repeated fields as lists.
+pub fn bigquery_query(sql: &str, params: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let project = project()?;
+    let wait = options["timeout_ms"].as_i64().unwrap_or(120_000).max(1000);
+    let max_rows = options["max_rows"].as_i64().unwrap_or(i64::MAX);
+    let location = options["location"].as_str().map(str::to_string).or(env("BIGQUERY_LOCATION"));
+    let mut b = json!({ "query": sql, "useLegacySql": false, "timeoutMs": wait.min(10_000), "formatOptions": { "useInt64Timestamp": true } });
+    if max_rows < 100_000 {
+        b["maxResults"] = json!(max_rows);
+    }
+    set_params(&mut b, &params)?;
+    if let Some(l) = &location {
+        b["location"] = json!(l);
+    }
+    if let Some(m) = options["max_bytes"].as_i64() {
+        b["maximumBytesBilled"] = json!(m.to_string());
+    }
+    if let Some(l) = options.get("labels") {
+        b["labels"] = l.clone();
+    }
+    let start = Instant::now();
+    let mut r = call("POST", &format!("/projects/{}/queries", enc(&project)), Some(&b))?;
+    let job = r["jobReference"]["jobId"].as_str().unwrap_or("").to_string();
+    let job_location = r["jobReference"]["location"].as_str().map(str::to_string).or(location);
+    let results = |token: Option<&str>, hold: i64| -> Result<Value, String> {
+        let mut p = format!("/projects/{}/queries/{}?timeoutMs={}&formatOptions.useInt64Timestamp=true", enc(&project), enc(&job), hold);
+        if let Some(l) = &job_location {
+            p.push_str(&format!("&location={}", enc(l)));
+        }
+        if let Some(t) = token {
+            p.push_str(&format!("&pageToken={}", enc(t)));
+        }
+        call("GET", &p, None)
+    };
+    while r["jobComplete"] != true {
+        if job.is_empty() {
+            return Err("BigQuery gave no job to wait for".into());
+        }
+        if start.elapsed().as_millis() as i64 > wait {
+            return Err(format!("job {} is still running after {} ms: read it later with bigquery_job", job, wait));
+        }
+        r = results(None, 2000)?;
+    }
+    if let Some(e) = r["errors"].as_array().and_then(|a| a.first()) {
+        return Err(format!("the job failed, {}: {}", e["reason"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or("")));
+    }
+    let fields = r["schema"]["fields"].as_array().cloned().unwrap_or_default();
+    let mut rows: Vec<Value> = vec![];
+    let total = r["totalRows"].as_str().and_then(|s| s.parse::<i64>().ok());
+    let (bytes, cache) = (r["totalBytesProcessed"].clone(), r["cacheHit"].clone());
+    loop {
+        rows.extend(r["rows"].as_array().into_iter().flatten().map(|x| record(&fields, x)));
+        let next = r["pageToken"].as_str().map(str::to_string);
+        if (rows.len() as i64) >= max_rows {
+            rows.truncate(max_rows.max(0) as usize);
+            break;
+        }
+        match next {
+            Some(t) => r = results(Some(&t), 10_000)?,
+            None => break,
+        }
+    }
+    let schema: Vec<Value> = fields.iter().map(|f| json!({ "name": f["name"], "type": f["type"], "mode": f["mode"] })).collect();
+    Ok(json!({ "rows": rows, "total_rows": total, "schema": schema, "job_id": job, "bytes": bytes.as_str().and_then(|s| s.parse::<i64>().ok()), "cache_hit": cache }))
+}
+
+/// What a query would read, without running or paying for it: `{ bytes, schema }`. A query that does not parse is an error.
+pub fn bigquery_dry_run(sql: &str, params: serde_json::Value) -> Result<Value, String> {
+    let mut b = json!({ "query": sql, "useLegacySql": false, "dryRun": true });
+    set_params(&mut b, &params)?;
+    let r = call("POST", &format!("/projects/{}/queries", enc(&project()?)), Some(&b))?;
+    Ok(json!({ "bytes": r["totalBytesProcessed"].as_str().and_then(|s| s.parse::<i64>().ok()), "schema": r["schema"]["fields"] }))
+}
+
+/// A job's state: `{ state, error, bytes }`, `state` being PENDING, RUNNING or DONE.
+pub fn bigquery_job(job_id: &str) -> Result<Value, String> {
+    let mut p = format!("/projects/{}/jobs/{}", enc(&project()?), enc(job_id));
+    if let Some(l) = env("BIGQUERY_LOCATION") {
+        p.push_str(&format!("?location={}", enc(&l)));
+    }
+    let r = call("GET", &p, None)?;
+    Ok(json!({ "state": r["status"]["state"], "error": r["status"]["errorResult"], "bytes": r["statistics"]["totalBytesProcessed"] }))
+}
+
+/// Streams rows into a table, 500 to a request. A row's `_insert_id` field, taken off it, lets BigQuery drop a repeat of it. By default one bad row stops the rest of its request, as BigQuery does; `options`: `skip_invalid` to keep the good ones, `ignore_unknown` to ignore fields the table lacks, `suffix` for a template table. Gives `{ inserted, failed: [{ position, reason, field, message }] }`, `reason` "stopped" for a row refused only because of another.
+pub fn bigquery_insert(dataset: &str, table: &str, rows: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    let path = format!("/projects/{}/datasets/{}/tables/{}/insertAll", enc(&project()?), enc(dataset), enc(table));
+    let (mut inserted, mut failed) = (0i64, vec![]);
+    for (n, chunk) in rows.chunks(500).enumerate() {
+        let mut list = vec![];
+        for r in chunk {
+            let mut row = r.as_object().ok_or("each row is a map")?.clone();
+            let mut entry = json!({});
+            if let Some(id) = row.remove("_insert_id") {
+                entry["insertId"] = id;
+            }
+            entry["json"] = Value::Object(row);
+            list.push(entry);
+        }
+        let mut b = json!({ "kind": "bigquery#tableDataInsertAllRequest", "rows": list });
+        for (o, k) in [("skip_invalid", "skipInvalidRows"), ("ignore_unknown", "ignoreUnknownValues")] {
+            if options[o] == true {
+                b[k] = json!(true);
+            }
+        }
+        if let Some(s) = options["suffix"].as_str() {
+            b["templateSuffix"] = json!(s);
+        }
+        let r = call("POST", &path, Some(&b))?;
+        let errs = r["insertErrors"].as_array().cloned().unwrap_or_default();
+        inserted += chunk.len() as i64 - errs.len() as i64;
+        for e in errs {
+            let first = &e["errors"][0];
+            failed.push(json!({ "position": e["index"].as_i64().unwrap_or(0) + (n as i64) * 500, "reason": first["reason"], "field": first["location"], "message": first["message"] }));
+        }
+    }
+    Ok(json!({ "inserted": inserted, "failed": failed }))
+}
+
+/// The tables of a dataset, every page: each `{ id, type }`.
+pub fn bigquery_tables(dataset: &str) -> Result<Vec<Value>, String> {
+    let (mut out, mut page): (Vec<Value>, Option<String>) = (vec![], None);
+    let project = project()?;
+    loop {
+        let q = page.as_ref().map_or(String::new(), |t| format!("?pageToken={}", enc(t)));
+        let r = call("GET", &format!("/projects/{}/datasets/{}/tables{}", enc(&project), enc(dataset), q), None)?;
+        out.extend(r["tables"].as_array().into_iter().flatten().map(|t| json!({ "id": t["tableReference"]["tableId"], "type": t["type"] })));
+        match r["nextPageToken"].as_str() {
+            Some(t) => page = Some(t.to_string()),
+            None => return Ok(out),
+        }
+    }
+}

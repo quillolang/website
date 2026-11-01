@@ -1,0 +1,348 @@
+//! WHOIS for domains, IP addresses and AS numbers over TCP port 43: IANA asked first and the registry's and registrar's referrals followed, each server's query quirks handled, text in Latin-1 read, and the common fields pulled out of every format: registrar, dates, name servers, status, network, organisation, abuse contact.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{Read, Write};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+
+const IANA: &str = "whois.iana.org";
+const MAX_REPLY: usize = 1 << 20;
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
+}
+
+fn start_server(o: &Value) -> String {
+    o.get("server").and_then(|v| v.as_str()).map(String::from).or(std::env::var("WHOIS_HOST").ok()).filter(|s| !s.is_empty()).unwrap_or(IANA.to_string())
+}
+
+fn split_host(server: &str) -> (String, u16) {
+    let s = server.trim().trim_start_matches("whois://").trim_start_matches("rwhois://").trim_end_matches('/');
+    match s.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().unwrap_or(43)),
+        _ => (s.to_string(), 43),
+    }
+}
+
+// A bad name in a referral must not become another protocol's request.
+fn host_ok(h: &str) -> bool {
+    !h.is_empty() && h.len() < 254 && h.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b':')
+}
+
+// WHOIS_ROUTES says where a server really is: "whois.arin.net=proxy:4301,whois.ripe.net=proxy:4302",
+// for a network that blocks port 43. The name still decides the query's form.
+fn routed(host: &str, port: u16) -> (String, u16) {
+    for pair in std::env::var("WHOIS_ROUTES").unwrap_or_default().split(',') {
+        if let Some((name, to)) = pair.trim().split_once('=') {
+            if name.eq_ignore_ascii_case(host) {
+                return split_host(to);
+            }
+        }
+    }
+    (host.to_string(), port)
+}
+
+fn ask(server: &str, line: &str, timeout: Duration) -> Result<String, String> {
+    let (host, port) = split_host(server);
+    if !host_ok(&host) {
+        return Err(format!("`{}` is not a WHOIS server", server));
+    }
+    let (host, port) = routed(&host, port);
+    let addrs: Vec<_> = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.collect();
+    let mut last = format!("{}: no address", host);
+    let mut stream = None;
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last = format!("cannot reach {}:{}: {}", host, port, e),
+        }
+    }
+    let mut s = stream.ok_or(last)?;
+    s.set_write_timeout(Some(timeout)).ok();
+    s.write_all(format!("{}\r\n", line).as_bytes()).map_err(|e| format!("{}: {}", host, e))?;
+    let end = Instant::now() + timeout;
+    let mut out = vec![];
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            if out.is_empty() {
+                return Err(format!("{} sent nothing in {} ms", host, timeout.as_millis()));
+            }
+            break;
+        }
+        s.set_read_timeout(Some(left)).ok();
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend(&buf[..n]);
+                if out.len() > MAX_REPLY {
+                    break;
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if out.is_empty() {
+                    return Err(format!("{} sent nothing in {} ms", host, timeout.as_millis()));
+                }
+                break;
+            }
+            Err(e) => return Err(format!("{}: {}", host, e)),
+        }
+    }
+    Ok(match String::from_utf8(out) {
+        Ok(t) => t,
+        Err(e) => e.into_bytes().iter().map(|b| *b as char).collect(), // Latin-1, as older registries send
+    })
+}
+
+fn kind_of(q: &str) -> &'static str {
+    let t = q.trim();
+    if t.parse::<IpAddr>().is_ok() || t.contains('/') && t.split('/').next().map_or(false, |x| x.parse::<IpAddr>().is_ok()) {
+        "ip"
+    } else if t.len() > 2 && t.get(..2).map_or(false, |a| a.eq_ignore_ascii_case("as")) && t[2..].bytes().all(|c| c.is_ascii_digit()) {
+        "asn"
+    } else {
+        "domain"
+    }
+}
+
+// What each server wants on the line, beyond the name itself.
+fn line_for(server: &str, q: &str, kind: &str) -> String {
+    let (host, _) = split_host(server);
+    let host = host.to_lowercase();
+    match (host.as_str(), kind) {
+        ("whois.verisign-grs.com", "domain") | ("whois.crsnic.net", "domain") => format!("domain {}", q),
+        ("whois.arin.net", "ip") => format!("n + {}", q),
+        ("whois.arin.net", "asn") => format!("a + {}", &q[2..]),
+        ("whois.denic.de", "domain") => format!("-T dn {}", q),
+        ("whois.jprs.jp", "domain") => format!("{}/e", q),
+        _ => q.to_string(),
+    }
+}
+
+fn referral_of(text: &str, current: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim().to_lowercase(), v.trim());
+        if v.is_empty() {
+            continue;
+        }
+        if matches!(k.as_str(), "refer" | "whois" | "registrar whois server" | "whois server" | "referralserver") {
+            let v = if k == "referralserver" && !v.starts_with("whois://") {
+                continue; // rwhois:// and http:// referrals are other protocols
+            } else {
+                v
+            };
+            let h = v.split_whitespace().next().unwrap_or("").to_string();
+            if split_host(&h).0.eq_ignore_ascii_case(&split_host(current).0) && split_host(&h).1 == split_host(current).1 {
+                continue;
+            }
+            best = Some(h);
+        }
+    }
+    best.filter(|h| host_ok(&split_host(h).0))
+}
+
+/// One question to one server, as it is: the raw text. Options: `timeout_ms`.
+pub fn whois_query(server: &str, query: &str, options: serde_json::Value) -> Result<String, String> {
+    ask(server, &clean(query)?, Duration::from_millis(opt_u64(&options, "timeout_ms", 8000)))
+}
+
+fn clean(q: &str) -> Result<String, String> {
+    let t = q.trim();
+    if t.is_empty() {
+        return Err("nothing to look up".into());
+    }
+    // A query is one line: a newline here would be a second question to the server.
+    if t.chars().any(|c| c.is_control()) {
+        return Err("a query cannot hold control characters".into());
+    }
+    Ok(t.to_string())
+}
+
+fn norm_date(v: &str) -> String {
+    let t = v.trim();
+    let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    // 31-Dec-2025, and 2025.12.31 or 2025/12/31.
+    let p: Vec<&str> = t.split(|c: char| c == '-' || c == '.' || c == '/').collect();
+    if p.len() == 3 {
+        if let Some(m) = months.iter().position(|x| p[1].len() >= 3 && p[1][..3].eq_ignore_ascii_case(x)) {
+            return format!("{}-{:02}-{:02}", p[2].split_whitespace().next().unwrap_or(""), m + 1, p[0].parse::<u32>().unwrap_or(0));
+        }
+        if p[0].len() == 4 && p[0].bytes().all(|c| c.is_ascii_digit()) && p[1].len() == 2 && p[2].len() == 2 {
+            return p.join("-");
+        }
+    }
+    t.to_string()
+}
+
+/// Pulls the common fields out of WHOIS text: `registrar`, `created`, `updated`, `expires` (dates as `YYYY-MM-DD...` where they can be), `name_servers`, `status`, `dnssec`, `abuse_email`, `registrant_org`, `country`; for an address `range`, `cidr`, `net_name`, `organisation`, `origin_as`. A field a format does not have is left out.
+pub fn whois_parse(text: &str) -> Value {
+    let mut m = Map::new();
+    let mut ns: Vec<String> = vec![];
+    let mut status: Vec<String> = vec![];
+    let mut set = |m: &mut Map<String, Value>, k: &str, v: String| {
+        if !m.contains_key(k) && !v.is_empty() {
+            m.insert(k.to_string(), json!(v));
+        }
+    };
+    let mut in_comment_free = true;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('%') || l.starts_with('#') || l.starts_with(">>>") {
+            if l.starts_with(">>>") {
+                in_comment_free = false; // what follows is the registry's terms
+            }
+            continue;
+        }
+        if !in_comment_free {
+            continue;
+        }
+        let Some((k, v)) = l.split_once(':') else { continue };
+        let key = k.trim().to_lowercase();
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "registrar" | "sponsoring registrar" | "registrar name" => set(&mut m, "registrar", v.to_string()),
+            "registrar iana id" => set(&mut m, "registrar_iana_id", v.to_string()),
+            "registrar url" => set(&mut m, "registrar_url", v.to_string()),
+            "creation date" | "created" | "created on" | "registered on" | "registration time" | "registered" | "domain registration date" => set(&mut m, "created", norm_date(v)),
+            "updated date" | "changed" | "last-update" | "last modified" | "last updated" | "updated" | "modified" => set(&mut m, "updated", norm_date(v)),
+            "registry expiry date" | "registrar registration expiration date" | "expiry date" | "expires" | "expires on" | "expiration date" | "paid-till" | "expire" => set(&mut m, "expires", norm_date(v)),
+            "name server" | "nserver" | "nameserver" | "nameservers" | "name servers" => {
+                let n = v.split_whitespace().next().unwrap_or("").trim_end_matches('.').to_lowercase();
+                if !n.is_empty() && !ns.contains(&n) {
+                    ns.push(n);
+                }
+            }
+            "domain status" | "status" | "state" => {
+                let s = v.split_whitespace().next().unwrap_or("").to_string();
+                if !s.is_empty() && !status.contains(&s) {
+                    status.push(s);
+                }
+            }
+            "dnssec" => set(&mut m, "dnssec", v.to_lowercase()),
+            "registrar abuse contact email" | "abuse-mailbox" | "orgabuseemail" => set(&mut m, "abuse_email", v.to_lowercase()),
+            "registrant organization" | "registrant organisation" | "registrant" | "org-name" | "registrant name" => set(&mut m, "registrant_org", v.to_string()),
+            "registrant country" | "country" => set(&mut m, "country", v.to_uppercase()),
+            "netrange" | "inetnum" | "inet6num" | "inetrev" => set(&mut m, "range", v.to_string()),
+            "cidr" | "route" | "route6" => set(&mut m, "cidr", v.to_string()),
+            "netname" | "aut-num" | "asname" | "as-name" => set(&mut m, if key == "aut-num" { "as_number" } else { "net_name" }, v.to_string()),
+            "organization" | "orgname" | "organisation" | "descr" | "owner" => set(&mut m, "organisation", v.to_string()),
+            "originas" | "origin" => set(&mut m, "origin_as", v.to_string()),
+            _ => {}
+        }
+    }
+    if !ns.is_empty() {
+        m.insert("name_servers".into(), json!(ns));
+    }
+    if !status.is_empty() {
+        m.insert("status".into(), json!(status));
+    }
+    Value::Object(m)
+}
+
+fn missing(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["no match for", "not found", "no data found", "no entries found", "no object found", "domain not found", "status: free", "status: available", "is available for", "no matching record", "does not exist", "returned 0 objects"]
+        .iter()
+        .any(|m| t.contains(m))
+}
+
+fn limited(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["limit exceeded", "exceeded the", "rate limit", "too many requests", "query rate", "try again later", "quota exceeded", "excessive querying"].iter().any(|m| t.contains(m))
+}
+
+/// Looks up a domain, IP address or AS number ("AS15169"): starts at IANA, or `options.server` or `WHOIS_HOST`, and follows referrals up to `max_referrals` (3). Answers `{ query, kind, found, limited, servers, fields, text }`, with `text` from the last server. Set `follow: false` to stay on the first.
+pub fn whois_lookup(query: &str, options: serde_json::Value) -> Result<Value, String> {
+    let q = clean(query)?;
+    let kind = kind_of(&q);
+    let q = if kind == "domain" { q.to_lowercase() } else { q };
+    let timeout = Duration::from_millis(opt_u64(&options, "timeout_ms", 8000));
+    let follow = options.get("follow").and_then(|v| v.as_bool()).unwrap_or(true);
+    let hops = opt_u64(&options, "max_referrals", 3);
+    let mut server = start_server(&options);
+    let mut servers: Vec<String> = vec![];
+    let mut texts: Vec<String> = vec![];
+    let mut fields = Map::new();
+    let mut note = Value::Null;
+    loop {
+        let text = match ask(&server, &line_for(&server, &q, kind), timeout) {
+            Ok(t) => t,
+            // A registrar's server is often the one that is down: the registry's answer stands.
+            Err(e) if !texts.is_empty() => {
+                note = json!(e);
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        servers.push(server.clone());
+        let next = referral_of(&text, &server);
+        // Later servers know more; what only an earlier one had stays. IANA's own answer is
+        // about the TLD or the address block, not the name asked for.
+        let about_the_parent = servers.len() == 1 && next.is_some() && text.lines().any(|l| l.to_lowercase().starts_with("refer:"));
+        if !about_the_parent {
+            if let Value::Object(f) = whois_parse(&text) {
+                for (k, v) in f {
+                    fields.insert(k, v);
+                }
+            }
+        }
+        texts.push(text);
+        match next {
+            Some(n) if follow && (servers.len() as u64) <= hops && !servers.contains(&n) => server = n,
+            _ => break,
+        }
+    }
+    let text = texts.last().cloned().unwrap_or_default();
+    let is_limited = limited(&text);
+    let has = !fields.is_empty();
+    let mut out = json!({
+        "query": q, "kind": kind,
+        "found": !is_limited && !missing(&text) && has,
+        "limited": is_limited,
+        "servers": servers,
+        "fields": fields,
+        "text": text,
+    });
+    if !note.is_null() {
+        out["referral_failed"] = note;
+    }
+    Ok(out)
+}
+
+/// True when WHOIS says a domain is registered, false when the registry has no such name. Errors when the server rate-limits, as that says nothing either way.
+pub fn whois_registered(domain: &str, options: serde_json::Value) -> Result<bool, String> {
+    let r = whois_lookup(domain, options)?;
+    if r["limited"] == true {
+        return Err(format!("{} is rate-limiting this address", r["servers"].as_array().and_then(|a| a.last()).and_then(|v| v.as_str()).unwrap_or("the server")));
+    }
+    Ok(r["found"] == true)
+}
+
+/// The days until a domain expires, null when WHOIS shows no date, negative once past. `now` is seconds since 1970, from `now()`.
+pub fn whois_days_left(expires: &str, now_seconds: i64) -> Option<i64> {
+    let d = expires.get(..10)?;
+    let p: Vec<i64> = d.split('-').filter_map(|x| x.parse().ok()).collect();
+    if p.len() != 3 {
+        return None;
+    }
+    // Days from civil, Howard Hinnant's.
+    let (y, m, day) = (if p[1] <= 2 { p[0] - 1 } else { p[0] }, p[1], p[2]);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468 - now_seconds.div_euclid(86400))
+}

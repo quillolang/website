@@ -1,0 +1,532 @@
+//! Art-Net and sACN (E1.31) DMX lighting from a program: ArtDMX frames sent with their sequence numbers, a fade run on a thread at a steady frame rate, ArtPoll and ArtPollReply to find nodes, E1.31 packets framed for unicast or multicast, and all of them parsed for a console of your own on `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const ID: &[u8; 8] = b"Art-Net\0";
+const OP_POLL: u16 = 0x2000;
+const OP_POLL_REPLY: u16 = 0x2100;
+const OP_DMX: u16 = 0x5000;
+const OP_SYNC: u16 = 0x5200;
+const PROT: u16 = 14;
+const ARTNET_PORT: u16 = 6454;
+const SACN_PORT: u16 = 5568;
+const ACN_ID: &[u8; 12] = b"ASC-E1.17\0\0\0";
+
+// A universe is a number from 0 to 32767 (Art-Net's 15-bit Port-Address), or "net:subnet:universe"
+// as a console shows it ("0:1:3"). Channels are a list of 0..255 levels from channel 1, or a map of
+// channel number to level, the others staying at 0.
+
+fn universe_of(u: &Value) -> Result<u16, String> {
+    match u {
+        Value::Number(n) => n.as_u64().filter(|x| *x <= 32767).map(|x| x as u16).ok_or(format!("{} is not an Art-Net universe: 0 to 32767", n)),
+        Value::String(s) => {
+            let p: Vec<&str> = s.split(':').collect();
+            let num = |x: &str, max: u16| x.parse::<u16>().ok().filter(|v| *v <= max).ok_or(format!("`{}` is not net:subnet:universe (net to 127, the others to 15)", s));
+            match p.as_slice() {
+                [n, sub, u] => Ok(num(n, 127)? << 8 | num(sub, 15)? << 4 | num(u, 15)?),
+                _ => Err(format!("`{}` is not net:subnet:universe", s)),
+            }
+        }
+        _ => Err("give a universe as a number or \"net:subnet:universe\"".into()),
+    }
+}
+
+fn channels_of(c: &Value) -> Result<Vec<u8>, String> {
+    let level = |v: &Value| v.as_u64().filter(|x| *x < 256).map(|x| x as u8).ok_or(format!("a DMX level is 0 to 255, not {}", v));
+    match c {
+        Value::Array(a) => {
+            if a.is_empty() || a.len() > 512 {
+                return Err(format!("a universe holds 1 to 512 channels, not {}", a.len()));
+            }
+            a.iter().map(level).collect()
+        }
+        Value::Object(m) => {
+            let mut out = vec![];
+            for (k, v) in m {
+                let ch: usize = k.parse().ok().filter(|x| (1..=512).contains(x)).ok_or(format!("`{}` is not a DMX channel: 1 to 512", k))?;
+                if out.len() < ch {
+                    out.resize(ch, 0);
+                }
+                out[ch - 1] = level(v)?;
+            }
+            if out.is_empty() {
+                return Err("no channels given".into());
+            }
+            Ok(out)
+        }
+        _ => Err("give channels as a list of levels or a map of channel to level".into()),
+    }
+}
+
+fn opts<'a>(o: &'a Value, k: &str) -> Option<&'a Value> {
+    o.get(k).filter(|v| !v.is_null())
+}
+
+fn dmx_packet(universe: u16, levels: &[u8], sequence: u8, physical: u8) -> Vec<u8> {
+    let mut d = levels.to_vec();
+    if d.len() % 2 == 1 {
+        d.push(0); // the length must be even
+    }
+    if d.len() < 2 {
+        d.resize(2, 0);
+    }
+    let mut p = ID.to_vec();
+    p.extend(OP_DMX.to_le_bytes());
+    p.extend(PROT.to_be_bytes());
+    p.push(sequence);
+    p.push(physical);
+    p.push((universe & 0xff) as u8); // SubUni, the low byte
+    p.push((universe >> 8) as u8); // Net
+    p.extend((d.len() as u16).to_be_bytes());
+    p.extend(d);
+    p
+}
+
+fn target(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let t = if host.contains(':') { host.to_string() } else { format!("{}:{}", host, port) };
+    t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.find(|a| a.is_ipv4()).ok_or(format!("{}: no IPv4 address", t))
+}
+
+fn socket() -> Result<UdpSocket, String> {
+    let s = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    s.set_broadcast(true).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+// One socket for a program's sends, and the next sequence number per destination and universe.
+struct Out {
+    sock: UdpSocket,
+    seq: HashMap<(SocketAddr, u16, u8), u8>,
+}
+
+fn out() -> &'static Mutex<Option<Out>> {
+    static O: OnceLock<Mutex<Option<Out>>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(None))
+}
+
+fn send_seq(to: SocketAddr, universe: u16, kind: u8, make: impl Fn(u8) -> Vec<u8>) -> Result<u8, String> {
+    let mut g = out().lock().map_err(|_| "lock")?;
+    if g.is_none() {
+        *g = Some(Out { sock: socket()?, seq: HashMap::new() });
+    }
+    let o = g.as_mut().expect("just made");
+    // Art-Net's sequence runs 1..255 (0 turns the check off); sACN's runs through 0..255.
+    let e = o.seq.entry((to, universe, kind)).or_insert(if kind == 0 { 0 } else { 255 });
+    *e = if kind == 0 {
+        if *e >= 255 { 1 } else { *e + 1 }
+    } else {
+        e.wrapping_add(1)
+    };
+    let n = *e;
+    o.sock.send_to(&make(n), to).map_err(|e| format!("cannot send to {}: {}", to, e))?;
+    Ok(n)
+}
+
+/// One ArtDMX packet as bytes, for `udp.send`: `sequence` and `physical` in `options`, padded to an even length as the protocol asks.
+pub fn artnet_dmx_packet(universe: serde_json::Value, channels: serde_json::Value, options: serde_json::Value) -> Result<Vec<u8>, String> {
+    let n = |k: &str, d: u64| opts(&options, k).and_then(|v| v.as_u64()).unwrap_or(d) as u8;
+    Ok(dmx_packet(universe_of(&universe)?, &channels_of(&channels)?, n("sequence", 0), n("physical", 0)))
+}
+
+/// Sends a universe's levels to a node (`host` or "host:port"; 6454 by default), numbering its frames 1 to 255 per destination and universe so a node can drop late ones. Answers `{ sequence, bytes }`.
+pub fn artnet_send(host: &str, universe: serde_json::Value, channels: serde_json::Value) -> Result<Value, String> {
+    let u = universe_of(&universe)?;
+    let levels = channels_of(&channels)?;
+    let to = target(host, ARTNET_PORT)?;
+    let size = 18 + levels.len() + levels.len() % 2;
+    let n = send_seq(to, u, 0, |s| dmx_packet(u, &levels, s, 0))?;
+    Ok(json!({ "sequence": n, "bytes": size, "universe": u }))
+}
+
+/// Sends ArtSync, for nodes to show frames already sent all at once.
+pub fn artnet_sync(host: &str) -> Result<i64, String> {
+    let mut p = ID.to_vec();
+    p.extend(OP_SYNC.to_le_bytes());
+    p.extend(PROT.to_be_bytes());
+    p.extend([0, 0]);
+    socket()?.send_to(&p, target(host, ARTNET_PORT)?).map_err(|e| e.to_string())?;
+    Ok(p.len() as i64)
+}
+
+/// Fades a universe's levels from `from` to `to` over `duration_ms` at `fps` (30 unless given, at most 44, DMX's limit). It blocks while it runs; answers the frames sent.
+pub fn artnet_fade(host: &str, universe: serde_json::Value, from: serde_json::Value, to: serde_json::Value, duration_ms: i64, fps: i64) -> Result<Value, String> {
+    let u = universe_of(&universe)?;
+    let (mut a, mut b) = (channels_of(&from)?, channels_of(&to)?);
+    let n = a.len().max(b.len());
+    a.resize(n, 0);
+    b.resize(n, 0);
+    let fps = if fps <= 0 { 30 } else { fps.min(44) };
+    if !(0..=600_000).contains(&duration_ms) {
+        return Err("duration_ms must be from 0 to 600000".into());
+    }
+    let dest = target(host, ARTNET_PORT)?;
+    let frames = (duration_ms * fps / 1000).max(1) as usize;
+    let start = Instant::now();
+    let tick = Duration::from_micros(1_000_000 / fps as u64);
+    let mut last = 0;
+    for f in 1..=frames {
+        let t = f as f64 / frames as f64;
+        let now: Vec<u8> = a.iter().zip(&b).map(|(x, y)| (*x as f64 + (*y as f64 - *x as f64) * t).round() as u8).collect();
+        last = send_seq(dest, u, 0, |s| dmx_packet(u, &now, s, 0))?;
+        let due = tick * f as u32;
+        if let Some(w) = due.checked_sub(start.elapsed()) {
+            std::thread::sleep(w);
+        }
+    }
+    Ok(json!({ "frames": frames, "last_sequence": last, "ms": start.elapsed().as_millis() as u64 }))
+}
+
+fn cstr(b: &[u8]) -> String {
+    let n = b.iter().position(|x| *x == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..n]).to_string()
+}
+
+fn parse_reply(p: &[u8]) -> Result<Value, String> {
+    if p.len() < 207 {
+        return Err(format!("an ArtPollReply is at least 207 bytes; this is {}", p.len()));
+    }
+    let n = (p[172] as usize) << 8 | p[173] as usize;
+    let ports = n.min(4);
+    let sw = |at: usize| -> Vec<u16> { (0..ports).map(|i| (p[18] as u16) << 8 | (p[19] as u16 & 15) << 4 | (p[at + i] as u16 & 15)).collect() };
+    let mut m = json!({
+        "op": "poll_reply",
+        "ip": Ipv4Addr::new(p[10], p[11], p[12], p[13]).to_string(),
+        "port": u16::from_le_bytes([p[14], p[15]]),
+        "firmware": (p[16] as u16) << 8 | p[17] as u16,
+        "oem": (p[20] as u16) << 8 | p[21] as u16,
+        "esta": cstr(&[p[25], p[24]]),
+        "short_name": cstr(&p[26..44]),
+        "long_name": cstr(&p[44..108]),
+        "report": cstr(&p[108..172]),
+        "ports": n,
+        "port_types": p[174..174 + ports].iter().map(|t| {
+            let dir = match (t & 0x80 != 0, t & 0x40 != 0) { (true, true) => "both", (true, false) => "output", (false, true) => "input", _ => "none" };
+            let proto = match t & 63 { 0 => "DMX512", 1 => "MIDI", 2 => "Avab", 3 => "CMX", 4 => "ADB62.5", 5 => "Art-Net", _ => "other" };
+            json!({ "direction": dir, "protocol": proto })
+        }).collect::<Vec<_>>(),
+        "inputs": sw(186),
+        "outputs": sw(190),
+    });
+    if p.len() >= 207 {
+        m["style"] = json!(match p[200] { 0 => "node", 1 => "controller", 2 => "media", 3 => "route", 4 => "backup", 5 => "config", 6 => "visual", _ => "other" });
+        m["mac"] = json!(p[201..207].iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":"));
+    }
+    Ok(m)
+}
+
+/// Asks who is on the network with ArtPoll (to `host`: the broadcast address, 2.255.255.255 unless given) and gathers each ArtPollReply for `wait_ms` (3000 is what the protocol allows a node). Options: `port`, `reply_on_change`.
+pub fn artnet_poll(host: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let h = if host.is_empty() { "2.255.255.255" } else { host };
+    let wait = opts(&options, "wait_ms").and_then(|v| v.as_u64()).unwrap_or(1000);
+    let to = target(h, opts(&options, "port").and_then(|v| v.as_u64()).unwrap_or(ARTNET_PORT as u64) as u16)?;
+    let sock = socket()?;
+    let mut p = ID.to_vec();
+    p.extend(OP_POLL.to_le_bytes());
+    p.extend(PROT.to_be_bytes());
+    p.push(if opts(&options, "reply_on_change").and_then(|v| v.as_bool()).unwrap_or(false) { 2 } else { 0 });
+    p.push(0x10); // diagnostics priority: DpLow
+    sock.send_to(&p, to).map_err(|e| format!("cannot send to {}: {}", to, e))?;
+    let end = Instant::now() + Duration::from_millis(wait);
+    let mut found = vec![];
+    let mut buf = [0u8; 1500];
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                let b = &buf[..n];
+                if n >= 10 && &b[..8] == ID && u16::from_le_bytes([b[8], b[9]]) == OP_POLL_REPLY {
+                    let mut m = parse_reply(b)?;
+                    m["from"] = json!(from.to_string());
+                    found.push(m);
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(found)
+}
+
+/// Builds an ArtPollReply as bytes for a node of your own: `node` has `ip`, `short_name`, `long_name`, `report`, `mac`, `universe` and `port`. Answer an ArtPoll with it from `udp.listen`.
+pub fn artnet_poll_reply(node: serde_json::Value) -> Result<Vec<u8>, String> {
+    let s = |k: &str| node.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ip: Ipv4Addr = s("ip").parse().map_err(|_| "the node needs `ip`, an IPv4 address")?;
+    let mut p = vec![0u8; 239];
+    p[..8].copy_from_slice(ID);
+    p[8..10].copy_from_slice(&OP_POLL_REPLY.to_le_bytes());
+    p[10..14].copy_from_slice(&ip.octets());
+    p[14..16].copy_from_slice(&(node.get("port").and_then(|v| v.as_u64()).unwrap_or(ARTNET_PORT as u64) as u16).to_le_bytes());
+    let u = universe_of(node.get("universe").unwrap_or(&json!(0)))?;
+    p[18] = (u >> 8) as u8;
+    p[19] = ((u >> 4) & 15) as u8;
+    p[23] = 0xd0; // Status1: indicators normal, set by network
+    let mut text = |at: usize, len: usize, v: String| {
+        let b = v.as_bytes();
+        let n = b.len().min(len - 1);
+        p[at..at + n].copy_from_slice(&b[..n]);
+    };
+    text(26, 18, s("short_name"));
+    text(44, 64, s("long_name"));
+    text(108, 64, s("report"));
+    p[173] = 1; // one port
+    p[174] = 0x80; // DMX512, can output
+    p[182] = 0x80; // data is being sent
+    p[190] = (u & 15) as u8;
+    if !s("mac").is_empty() {
+        let m: Vec<u8> = s("mac").split(':').map(|x| u8::from_str_radix(x, 16)).collect::<Result<_, _>>().map_err(|_| "`mac` is six hex bytes with colons")?;
+        if m.len() != 6 {
+            return Err("`mac` is six bytes".into());
+        }
+        p[201..207].copy_from_slice(&m);
+    }
+    Ok(p)
+}
+
+fn flags_len(n: usize) -> [u8; 2] {
+    (0x7000u16 | (n as u16 & 0x0fff)).to_be_bytes()
+}
+
+fn sacn_packet(universe: u16, levels: &[u8], o: &Value, seq: u8, cid: &[u8; 16]) -> Vec<u8> {
+    let name = o.get("source").and_then(|v| v.as_str()).unwrap_or("Quillo");
+    let priority = o.get("priority").and_then(|v| v.as_u64()).unwrap_or(100).min(200) as u8;
+    let n = levels.len();
+    let mut p = Vec::with_capacity(126 + n);
+    p.extend(0x0010u16.to_be_bytes()); // preamble size
+    p.extend(0u16.to_be_bytes()); // postamble size
+    p.extend(ACN_ID);
+    p.extend(flags_len(110 + n));
+    p.extend(4u32.to_be_bytes()); // VECTOR_ROOT_E131_DATA
+    p.extend(cid);
+    // Framing layer.
+    p.extend(flags_len(88 + n));
+    p.extend(2u32.to_be_bytes()); // VECTOR_E131_DATA_PACKET
+    let mut src = [0u8; 64];
+    let b = name.as_bytes();
+    src[..b.len().min(63)].copy_from_slice(&b[..b.len().min(63)]);
+    p.extend(src);
+    p.push(priority);
+    p.extend(0u16.to_be_bytes()); // synchronization address
+    p.push(seq);
+    let mut flags = 0u8;
+    if o.get("preview").and_then(|v| v.as_bool()).unwrap_or(false) {
+        flags |= 0x80;
+    }
+    if o.get("terminate").and_then(|v| v.as_bool()).unwrap_or(false) {
+        flags |= 0x40;
+    }
+    p.push(flags);
+    p.extend(universe.to_be_bytes());
+    // DMP layer.
+    p.extend(flags_len(11 + n));
+    p.push(2); // VECTOR_DMP_SET_PROPERTY
+    p.push(0xa1); // address and data type
+    p.extend(0u16.to_be_bytes()); // first property address
+    p.extend(1u16.to_be_bytes()); // address increment
+    p.extend(((n + 1) as u16).to_be_bytes());
+    p.push(0); // start code
+    p.extend(levels);
+    p
+}
+
+fn sacn_universe(u: &Value) -> Result<u16, String> {
+    u.as_u64().filter(|x| (1..=63999).contains(x)).map(|x| x as u16).ok_or(format!("{} is not an sACN universe: 1 to 63999", u))
+}
+
+fn cid_of(o: &Value) -> Result<[u8; 16], String> {
+    static CID: OnceLock<[u8; 16]> = OnceLock::new();
+    if let Some(h) = o.get("cid").and_then(|v| v.as_str()) {
+        let b = hex::decode(h.replace('-', "")).map_err(|_| "`cid` is a UUID")?;
+        return <[u8; 16]>::try_from(b.as_slice()).map_err(|_| "`cid` is 16 bytes".to_string());
+    }
+    Ok(*CID.get_or_init(|| {
+        let mut c = [0u8; 16];
+        let _ = getrandom::getrandom(&mut c);
+        c[6] = (c[6] & 0x0f) | 0x40;
+        c[8] = (c[8] & 0x3f) | 0x80;
+        c
+    }))
+}
+
+/// One E1.31 data packet as bytes: `sequence`, `source`, `priority`, `cid`, `preview`, `terminate` in `options`.
+pub fn artnet_sacn_packet(universe: serde_json::Value, channels: serde_json::Value, options: serde_json::Value) -> Result<Vec<u8>, String> {
+    let u = sacn_universe(&universe)?;
+    Ok(sacn_packet(u, &channels_of(&channels)?, &options, options.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0) as u8, &cid_of(&options)?))
+}
+
+/// The multicast address a universe is sent to: `artnet_sacn_multicast(1)` is "239.255.0.1".
+pub fn artnet_sacn_multicast(universe: serde_json::Value) -> Result<String, String> {
+    let u = sacn_universe(&universe)?;
+    Ok(format!("239.255.{}.{}", u >> 8, u & 255))
+}
+
+/// Sends a universe over sACN, numbered per destination: to `options.host`, or to the universe's multicast address. Set `terminate: true` on the last packet to let a receiver go at once. Answers `{ sequence, bytes, to }`.
+pub fn artnet_sacn_send(universe: serde_json::Value, channels: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let u = sacn_universe(&universe)?;
+    let levels = channels_of(&channels)?;
+    let host = match options.get("host").and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => artnet_sacn_multicast(universe.clone())?,
+    };
+    let to = target(&host, SACN_PORT)?;
+    let cid = cid_of(&options)?;
+    let n = send_seq(to, u, 1, |s| sacn_packet(u, &levels, &options, s, &cid))?;
+    Ok(json!({ "sequence": n, "bytes": 126 + levels.len(), "to": to.to_string() }))
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.replace(' ', "")).map_err(|_| "not hex".to_string()),
+        _ => Err("give a packet as a list of bytes or hex".into()),
+    }
+}
+
+/// Reads a packet (`p.bytes` from `udp.listen`, or hex): Art-Net's ArtDMX, ArtPoll, ArtPollReply and ArtSync, or an E1.31 data packet. Anything else is an error saying what it found.
+pub fn artnet_parse(packet: serde_json::Value) -> Result<Value, String> {
+    let p = bytes_of(&packet)?;
+    if p.len() >= 12 && p[..8] == ID[..] {
+        let op = u16::from_le_bytes([p[8], p[9]]);
+        return match op {
+            OP_DMX => {
+                if p.len() < 18 {
+                    return Err("an ArtDMX packet is cut off".into());
+                }
+                let n = (p[16] as usize) << 8 | p[17] as usize;
+                if n % 2 != 0 || n < 2 || n > 512 {
+                    return Err(format!("ArtDMX length {} must be even, from 2 to 512", n));
+                }
+                if p.len() < 18 + n {
+                    return Err(format!("ArtDMX says {} channels and carries {}", n, p.len() - 18));
+                }
+                Ok(json!({
+                    "op": "dmx", "protocol": (p[10] as u16) << 8 | p[11] as u16, "sequence": p[12], "physical": p[13],
+                    "universe": (p[15] as u16) << 8 | p[14] as u16,
+                    "name": format!("{}:{}:{}", p[15], p[14] >> 4, p[14] & 15),
+                    "length": n, "channels": &p[18..18 + n],
+                }))
+            }
+            OP_POLL => Ok(json!({ "op": "poll", "protocol": (p[10] as u16) << 8 | p[11] as u16, "reply_on_change": p.get(12).map_or(false, |f| f & 2 != 0) })),
+            OP_POLL_REPLY => parse_reply(&p),
+            OP_SYNC => Ok(json!({ "op": "sync" })),
+            x => Ok(json!({ "op": format!("0x{:04x}", x) })),
+        };
+    }
+    if p.len() >= 126 && p[4..16] == ACN_ID[..] {
+        let be32 = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+        if be32(18) != 4 {
+            return Err(format!("root vector {} is not E1.31 data", be32(18)));
+        }
+        let root_len = (((p[16] as usize) << 8) | p[17] as usize) & 0x0fff;
+        if root_len + 16 != p.len() {
+            return Err(format!("the root layer says {} bytes, the packet has {}", root_len + 16, p.len()));
+        }
+        if be32(40) != 2 {
+            return Err(format!("framing vector {} is not a data packet", be32(40)));
+        }
+        if p[117] != 2 || p[118] != 0xa1 {
+            return Err("the DMP layer is not a set-property message".into());
+        }
+        let count = (p[123] as usize) << 8 | p[124] as usize;
+        if count < 1 || count > 513 || p.len() < 125 + count {
+            return Err(format!("the DMP layer says {} properties", count));
+        }
+        return Ok(json!({
+            "op": "sacn",
+            "cid": hex::encode(&p[22..38]),
+            "source": cstr(&p[44..108]),
+            "priority": p[108],
+            "sequence": p[111],
+            "preview": p[112] & 0x80 != 0,
+            "terminated": p[112] & 0x40 != 0,
+            "universe": (p[113] as u16) << 8 | p[114] as u16,
+            "start_code": p[125],
+            "channels": &p[126..125 + count],
+        }));
+    }
+    Err(format!("{} bytes that are neither Art-Net nor E1.31", p.len()))
+}
+
+// A receiver of frames on a thread, drained by `artnet_receive`.
+
+struct Rx {
+    stop: Arc<AtomicBool>,
+    queue: Arc<(Mutex<Vec<Value>>, std::sync::Condvar)>,
+}
+
+fn rx() -> &'static Mutex<HashMap<String, Rx>> {
+    static R: OnceLock<Mutex<HashMap<String, Rx>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Listens on a UDP port for Art-Net or sACN on a thread of its own, keeping the newest 1000 frames; answers the port. Drain with `artnet_receive`.
+pub fn artnet_listen(name: &str, port: i64) -> Result<i64, String> {
+    let sock = UdpSocket::bind(("0.0.0.0", port as u16)).map_err(|e| format!("cannot listen on port {}: {}", port, e))?;
+    sock.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let bound = sock.local_addr().map_err(|e| e.to_string())?.port() as i64;
+    let stop = Arc::new(AtomicBool::new(false));
+    let queue = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+    let (s2, q2) = (stop.clone(), queue.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while !s2.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let list: Vec<Value> = buf[..n].iter().map(|x| json!(x)).collect();
+                if let Ok(mut m) = artnet_parse(Value::Array(list)) {
+                    m["from"] = json!(from.to_string());
+                    let mut g = q2.0.lock().unwrap();
+                    if g.len() >= 1000 {
+                        g.remove(0);
+                    }
+                    g.push(m);
+                    q2.1.notify_all();
+                }
+            }
+        }
+    });
+    if let Some(old) = rx().lock().map_err(|_| "lock")?.insert(name.to_string(), Rx { stop, queue }) {
+        old.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(bound)
+}
+
+/// Up to `max` frames a listener has taken, waiting up to `wait_ms` for the first.
+pub fn artnet_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let q = rx().lock().map_err(|_| "lock")?.get(name).map(|r| r.queue.clone()).ok_or(format!("no listener `{}`: call artnet_listen first", name))?;
+    let end = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    let mut g = q.0.lock().map_err(|_| "lock")?;
+    while g.is_empty() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(vec![]);
+        }
+        g = q.1.wait_timeout(g, left).map_err(|_| "lock")?.0;
+    }
+    let n = (max.max(0) as usize).min(g.len());
+    Ok(g.drain(..n).collect())
+}
+
+/// Stops a listener.
+pub fn artnet_stop(name: &str) -> Result<bool, String> {
+    Ok(match rx().lock().map_err(|_| "lock")?.remove(name) {
+        Some(r) => {
+            r.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    })
+}

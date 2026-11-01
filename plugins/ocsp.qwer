@@ -1,0 +1,561 @@
+//! OCSP, whether a certificate is still good: requests built with their nonce, the responder's and issuer's URLs read from the certificate, responses read with status, reason and times, and the signature checked against the issuer or a delegated responder it authorized.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha1 = { version = "0.10", features = ["oid"] }
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! rsa = "0.9"
+//! p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! hex = "0.4"
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use rsa::pkcs8::DecodePublicKey;
+use serde_json::{json, Value};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::time::Duration;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const NONCE: &str = "1.3.6.1.5.5.7.48.1.2";
+const BASIC: &str = "1.3.6.1.5.5.7.48.1.1";
+const OCSP_SIGNING: &str = "1.3.6.1.5.5.7.3.9";
+
+// ---- DER, read and written by hand ----
+
+#[derive(Clone, Copy)]
+struct Tlv<'a> {
+    tag: u8,
+    body: &'a [u8],
+    raw: &'a [u8],
+}
+
+fn tlv_at(b: &[u8]) -> Result<(Tlv<'_>, &[u8]), String> {
+    if b.len() < 2 {
+        return Err("cut-off DER".into());
+    }
+    let (len, head) = if b[1] < 0x80 {
+        (b[1] as usize, 2)
+    } else {
+        let n = (b[1] & 0x7f) as usize;
+        if n == 0 || n > 4 || b.len() < 2 + n {
+            return Err("DER with a bad length".into());
+        }
+        (b[2..2 + n].iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
+    };
+    if b.len() < head + len {
+        return Err("cut-off DER".into());
+    }
+    Ok((Tlv { tag: b[0], body: &b[head..head + len], raw: &b[..head + len] }, &b[head + len..]))
+}
+
+fn items(b: &[u8]) -> Result<Vec<Tlv<'_>>, String> {
+    let mut out = vec![];
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (t, r) = tlv_at(rest)?;
+        out.push(t);
+        rest = r;
+    }
+    Ok(out)
+}
+
+impl<'a> Tlv<'a> {
+    fn kids(&self) -> Result<Vec<Tlv<'a>>, String> {
+        items(self.body)
+    }
+    fn oid(&self) -> String {
+        oid_text(self.body)
+    }
+}
+
+fn oid_text(b: &[u8]) -> String {
+    let mut out = vec![];
+    let mut n = 0u64;
+    for (i, x) in b.iter().enumerate() {
+        n = n << 7 | (*x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            if out.is_empty() {
+                let first = (n / 40).min(2);
+                out.push(first);
+                out.push(n - first * 40);
+            } else {
+                out.push(n);
+            }
+            n = 0;
+        }
+        let _ = i;
+    }
+    out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".")
+}
+
+fn mk(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u32).to_be_bytes();
+        let skip = b.iter().position(|x| *x != 0).unwrap_or(3);
+        out.push(0x80 | (4 - skip) as u8);
+        out.extend(&b[skip..]);
+    }
+    out.extend(body);
+    out
+}
+
+fn seq(parts: &[&[u8]]) -> Vec<u8> {
+    mk(0x30, &parts.concat())
+}
+
+fn mk_oid(s: &str) -> Vec<u8> {
+    let p: Vec<u64> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    let mut out = vec![(p[0] * 40 + p[1]) as u8];
+    for x in &p[2..] {
+        let mut b = vec![(*x & 0x7f) as u8];
+        let mut v = *x >> 7;
+        while v > 0 {
+            b.insert(0, (v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.extend(b);
+    }
+    mk(6, &out)
+}
+
+fn mk_int(n: u64) -> Vec<u8> {
+    let b = n.to_be_bytes();
+    let skip = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let mut v = b[skip..].to_vec();
+    if v[0] & 0x80 != 0 {
+        v.insert(0, 0);
+    }
+    mk(2, &v)
+}
+
+fn int_of(t: &Tlv) -> u64 {
+    t.body.iter().fold(0u64, |a, x| a << 8 | *x as u64)
+}
+
+fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
+    let (open, close) = (format!("-----BEGIN {}-----", label), format!("-----END {}-----", label));
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find(&open) {
+        let body = &rest[a + open.len()..];
+        let Some(b) = body.find(&close) else { break };
+        let clean: String = body[..b].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(d) = B64.decode(clean) {
+            out.push(d);
+        }
+        rest = &body[b + close.len()..];
+    }
+    out
+}
+
+fn pem_of(label: &str, der: &[u8]) -> String {
+    let b = B64.encode(der);
+    let lines: Vec<&str> = b.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN {}-----\n{}\n-----END {}-----\n", label, lines.join("\n"), label)
+}
+
+fn iso(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// UTCTime or GeneralizedTime as Unix seconds.
+fn time_of(t: &Tlv) -> Result<i64, String> {
+    let s = std::str::from_utf8(t.body).map_err(|_| "a time that is not text".to_string())?;
+    let s = s.trim_end_matches('Z');
+    let s = s.split('.').next().unwrap_or(s);
+    let full = if t.tag == 0x17 {
+        let yy: i64 = s.get(..2).and_then(|x| x.parse().ok()).ok_or("a bad time")?;
+        format!("{}{}", if yy >= 50 { 19 } else { 20 }, s)
+    } else {
+        s.to_string()
+    };
+    let n = |a: usize, b: usize| -> Result<i64, String> { full.get(a..b).and_then(|x| x.parse().ok()).ok_or(format!("the time `{}` cannot be read", s)) };
+    let (y, mo, d, h, mi, sec) = (n(0, 4)?, n(4, 6)?, n(6, 8)?, n(8, 10)?, n(10, 12)?, full.get(12..14).and_then(|x| x.parse().ok()).unwrap_or(0));
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    Ok((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+// ---- Certificates and signatures ----
+
+struct Cert {
+    der: Vec<u8>,
+    tbs: Vec<u8>,
+    issuer: Vec<u8>,
+    subject: Vec<u8>,
+    serial: Vec<u8>,
+    spki: Vec<u8>,
+    key_bits: Vec<u8>,
+    not_before: i64,
+    not_after: i64,
+    exts: Vec<(String, Vec<u8>)>,
+    sig_alg: String,
+    signature: Vec<u8>,
+}
+
+fn cert_of(der: &[u8]) -> Result<Cert, String> {
+    let (c, _) = tlv_at(der).map_err(|_| "that is not a certificate".to_string())?;
+    let top = c.kids().map_err(|_| "that is not a certificate".to_string())?;
+    if top.len() != 3 {
+        return Err("that is not a certificate".into());
+    }
+    let t = top[0].kids()?;
+    let s = usize::from(t.first().is_some_and(|x| x.tag == 0xa0));
+    let get = |i: usize| t.get(s + i).ok_or("a certificate cut short".to_string());
+    let validity = get(3)?.kids()?;
+    let spki = get(5)?;
+    let mut exts = vec![];
+    if let Some(e) = t.iter().find(|x| x.tag == 0xa3) {
+        for x in e.kids()?.first().ok_or("empty extensions")?.kids()? {
+            let k = x.kids()?;
+            exts.push((k[0].oid(), k.last().ok_or("an empty extension")?.body.to_vec()));
+        }
+    }
+    Ok(Cert {
+        der: c.raw.to_vec(), tbs: top[0].raw.to_vec(), issuer: get(2)?.raw.to_vec(), subject: get(4)?.raw.to_vec(), serial: get(0)?.body.to_vec(), spki: spki.raw.to_vec(),
+        key_bits: spki.kids()?.get(1).ok_or("no public key")?.body.get(1..).unwrap_or(&[]).to_vec(),
+        not_before: time_of(&validity[0])?, not_after: time_of(&validity[1])?, exts,
+        sig_alg: top[1].kids()?.first().ok_or("no signature algorithm")?.oid(), signature: top[2].body.get(1..).unwrap_or(&[]).to_vec(),
+    })
+}
+
+fn pem_cert(text: &str, what: &str) -> Result<Cert, String> {
+    let der = pem_blocks(text, "CERTIFICATE").into_iter().next().ok_or(format!("{} is not a PEM certificate", what))?;
+    cert_of(&der)
+}
+
+/// Whether `sig` is a good signature over `msg`. `alg` is an X.509 signature algorithm's OID.
+fn verify_sig(spki: &[u8], alg: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    use rsa::signature::Verifier;
+    macro_rules! with_rsa {
+        ($h:ty) => {{
+            let key = rsa::RsaPublicKey::from_public_key_der(spki).map_err(|_| "the key is not RSA".to_string())?;
+            let s = rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(rsa::pkcs1v15::VerifyingKey::<$h>::new(key).verify(msg, &s).is_ok())
+        }};
+    }
+    match alg {
+        "1.2.840.113549.1.1.5" => with_rsa!(sha1::Sha1),
+        "1.2.840.113549.1.1.11" => with_rsa!(Sha256),
+        "1.2.840.113549.1.1.12" => with_rsa!(sha2::Sha384),
+        "1.2.840.113549.1.1.13" => with_rsa!(sha2::Sha512),
+        "1.2.840.10045.4.3.2" => {
+            let key = p256::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-256".to_string())?;
+            let s = p256::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        "1.2.840.10045.4.3.3" => {
+            let key = p384::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-384".to_string())?;
+            let s = p384::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        other => Err(format!("the signature algorithm {} is not one this checks", other)),
+    }
+}
+
+fn uris(body: &[u8], out: &mut Vec<String>) {
+    for t in items(body).unwrap_or_default() {
+        if t.tag == 0x86 {
+            out.push(String::from_utf8_lossy(t.body).into_owned());
+        } else if t.tag & 0x20 != 0 {
+            uris(t.body, out);
+        }
+    }
+}
+
+fn access(c: &Cert, method: &str) -> Vec<String> {
+    let mut out = vec![];
+    if let Some((_, v)) = c.exts.iter().find(|(o, _)| o == "1.3.6.1.5.5.7.1.1") {
+        if let Ok((list, _)) = tlv_at(v) {
+            for d in list.kids().unwrap_or_default() {
+                let k = d.kids().unwrap_or_default();
+                if k.first().map(|o| o.oid()).as_deref() == Some(method) {
+                    if let Some(l) = k.get(1).filter(|l| l.tag == 0x86) {
+                        out.push(String::from_utf8_lossy(l.body).into_owned());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The URLs a certificate carries: { ocsp, ca_issuers, crl }.
+pub fn ocsp_urls(cert: &str) -> Result<serde_json::Value, String> {
+    let c = pem_cert(cert, "the certificate")?;
+    let mut crl = vec![];
+    if let Some((_, v)) = c.exts.iter().find(|(o, _)| o == "2.5.29.31") {
+        uris(v, &mut crl);
+    }
+    Ok(json!({ "ocsp": access(&c, "1.3.6.1.5.5.7.48.1"), "ca_issuers": access(&c, "1.3.6.1.5.5.7.48.2"), "crl": crl }))
+}
+
+fn cert_id(c: &Cert, issuer: &Cert, hash: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let (alg, name, key) = match hash {
+        "sha1" => ("1.3.14.3.2.26", Sha1::digest(&c.issuer).to_vec(), Sha1::digest(&issuer.key_bits).to_vec()),
+        "sha256" => ("2.16.840.1.101.3.4.2.1", Sha256::digest(&c.issuer).to_vec(), Sha256::digest(&issuer.key_bits).to_vec()),
+        other => return Err(format!("`{}` is not a hash: sha1 or sha256", other)),
+    };
+    Ok((seq(&[&seq(&[&mk_oid(alg), &[5, 0]]), &mk(4, &name), &mk(4, &key), &mk(2, &c.serial)]), name, key))
+}
+
+fn build(c: &Cert, issuer: &Cert, o: &Value) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    if c.issuer != issuer.subject {
+        return Err("the issuer given is not the one that signed this certificate".into());
+    }
+    let hash = o.get("hash").and_then(|h| h.as_str()).unwrap_or("sha1");
+    let id = cert_id(c, issuer, hash)?.0;
+    let list = seq(&[&seq(&[&id])]);
+    let nonce = if o.get("nonce") == Some(&Value::Bool(false)) {
+        None
+    } else {
+        let mut n = vec![0; 16];
+        getrandom::getrandom(&mut n).map_err(|e| e.to_string())?;
+        Some(n)
+    };
+    let tbs = match &nonce {
+        Some(n) => {
+            let ext = seq(&[&mk_oid(NONCE), &mk(4, &mk(4, n))]);
+            seq(&[&list, &mk(0xa2, &seq(&[&ext]))])
+        }
+        None => seq(&[&list]),
+    };
+    Ok((seq(&[&tbs]), nonce))
+}
+
+/// Builds a request: `cert` and `issuer` PEM. Options: hash (sha1, which most responders expect, or sha256), nonce (false to leave it out). Gives { der (base64), nonce (hex), url, get_url }; `get_url` is the small-request GET form, which a CDN can cache.
+pub fn ocsp_request(cert: &str, issuer: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (c, i) = (pem_cert(cert, "the certificate")?, pem_cert(issuer, "the issuer")?);
+    let (der, nonce) = build(&c, &i, &options)?;
+    let url = access(&c, "1.3.6.1.5.5.7.48.1").first().cloned();
+    let text = B64.encode(&der);
+    let get = url.as_ref().map(|u| format!("{}/{}", u.trim_end_matches('/'), text.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")));
+    Ok(json!({ "der": text, "nonce": nonce.map(hex::encode), "url": url, "get_url": get }))
+}
+
+const REASONS: &[&str] = &["unspecified", "keyCompromise", "cACompromise", "affiliationChanged", "superseded", "cessationOfOperation", "certificateHold", "(unused)", "removeFromCRL", "privilegeWithdrawn", "aACompromise"];
+
+struct Single {
+    hash_oid: String,
+    name_hash: Vec<u8>,
+    key_hash: Vec<u8>,
+    serial: Vec<u8>,
+    status: &'static str,
+    revoked_at: Option<i64>,
+    reason: Option<String>,
+    this_update: i64,
+    next_update: Option<i64>,
+}
+
+struct Basic {
+    tbs: Vec<u8>,
+    sig_alg: String,
+    signature: Vec<u8>,
+    certs: Vec<Vec<u8>>,
+    by_name: Option<Vec<u8>>,
+    by_key: Option<Vec<u8>>,
+    produced_at: i64,
+    nonce: Option<Vec<u8>>,
+    singles: Vec<Single>,
+}
+
+fn parse_basic(der: &[u8]) -> Result<Basic, String> {
+    let (top, _) = tlv_at(der).map_err(|_| "that is not an OCSP response".to_string())?;
+    let k = top.kids().map_err(|_| "that is not an OCSP response".to_string())?;
+    if top.tag != 0x30 || k.first().map(|x| x.tag) != Some(0x0a) {
+        return Err("that is not an OCSP response".into());
+    }
+    let code = k[0].body.first().copied().unwrap_or(255);
+    if code != 0 {
+        let text = match code {
+            1 => "malformedRequest: the responder could not read the request",
+            2 => "internalError: the responder is in trouble",
+            3 => "tryLater: the responder is busy",
+            5 => "sigRequired: the responder wants a signed request",
+            6 => "unauthorized: the responder does not answer for this issuer",
+            _ => "an unknown failure",
+        };
+        return Err(format!("OCSP: {}", text));
+    }
+    let bytes = k.get(1).filter(|x| x.tag == 0xa0).ok_or("no response bytes")?.kids()?;
+    let b = bytes.first().ok_or("no response bytes")?.kids()?;
+    if b.first().map(|o| o.oid()).as_deref() != Some(BASIC) {
+        return Err("a response type other than basic".into());
+    }
+    let (basic, _) = tlv_at(b.get(1).ok_or("no response")?.body)?;
+    let parts = basic.kids()?;
+    let (tbs, alg, sig) = (parts.first().ok_or("no response data")?, parts.get(1).ok_or("no signature algorithm")?, parts.get(2).ok_or("no signature")?);
+    let certs = match parts.get(3).filter(|c| c.tag == 0xa0) {
+        Some(c) => c.kids()?.first().ok_or("an empty certs field")?.kids()?.iter().map(|x| x.raw.to_vec()).collect(),
+        None => vec![],
+    };
+    let r = tbs.kids()?;
+    let s = usize::from(r.first().is_some_and(|x| x.tag == 0xa0));
+    let id = r.get(s).ok_or("no responder id")?;
+    let (mut by_name, mut by_key) = (None, None);
+    match id.tag {
+        0xa1 => by_name = id.kids()?.first().map(|n| n.raw.to_vec()),
+        0xa2 => by_key = id.kids()?.first().map(|n| n.body.to_vec()),
+        _ => return Err("a bad responder id".into()),
+    }
+    let produced_at = time_of(r.get(s + 1).ok_or("no producedAt")?)?;
+    let mut singles = vec![];
+    for x in r.get(s + 2).ok_or("no responses")?.kids()? {
+        let f = x.kids()?;
+        let cid = f.first().ok_or("no CertID")?.kids()?;
+        let st = f.get(1).ok_or("no status")?;
+        let (status, mut revoked_at, mut reason) = match st.tag & 0x1f {
+            0 => ("good", None, None),
+            1 => ("revoked", None, None),
+            2 => ("unknown", None, None),
+            _ => return Err("a bad certificate status".into()),
+        };
+        if status == "revoked" {
+            let rv = st.kids()?;
+            revoked_at = Some(time_of(rv.first().ok_or("no revocation time")?)?);
+            reason = rv.get(1).and_then(|c| c.kids().ok()).and_then(|c| c.first().map(|e| e.body.first().copied().unwrap_or(0))).map(|n| REASONS.get(n as usize).unwrap_or(&"unknown").to_string());
+        }
+        let next = f.iter().find(|y| y.tag == 0xa0).and_then(|y| y.kids().ok()).and_then(|y| y.first().map(|t| time_of(t))).transpose()?;
+        singles.push(Single {
+            hash_oid: cid.first().ok_or("no hash")?.kids()?.first().ok_or("no hash")?.oid(),
+            name_hash: cid.get(1).ok_or("no name hash")?.body.to_vec(), key_hash: cid.get(2).ok_or("no key hash")?.body.to_vec(), serial: cid.get(3).ok_or("no serial")?.body.to_vec(),
+            status, revoked_at, reason, this_update: time_of(f.get(2).ok_or("no thisUpdate")?)?, next_update: next,
+        });
+    }
+    let mut nonce = None;
+    if let Some(e) = r.iter().find(|x| x.tag == 0xa1 && r.iter().position(|y| y.raw.as_ptr() == x.raw.as_ptr()).unwrap_or(0) > s) {
+        for ext in e.kids()?.first().ok_or("empty extensions")?.kids()? {
+            let f = ext.kids()?;
+            if f.first().map(|o| o.oid()).as_deref() == Some(NONCE) {
+                let v = f.last().ok_or("an empty nonce")?.body;
+                nonce = Some(tlv_at(v).ok().filter(|(t, _)| t.tag == 4).map_or(v.to_vec(), |(t, _)| t.body.to_vec()));
+            }
+        }
+    }
+    Ok(Basic { tbs: tbs.raw.to_vec(), sig_alg: alg.kids()?.first().ok_or("no signature algorithm")?.oid(), signature: sig.body.get(1..).unwrap_or(&[]).to_vec(), certs, by_name, by_key, produced_at, nonce, singles })
+}
+
+/// The key that must have signed: the issuer's, or a delegated responder's in `certs`, itself signed by the issuer, marked for OCSP signing and in date.
+fn signer(b: &Basic, issuer: &Cert, t: i64) -> Result<(Vec<u8>, &'static str), String> {
+    let is_issuer = b.by_name.as_ref().is_some_and(|n| *n == issuer.subject) || b.by_key.as_ref().is_some_and(|k| *k == Sha1::digest(&issuer.key_bits).to_vec());
+    if is_issuer {
+        return Ok((issuer.spki.clone(), "issuer"));
+    }
+    for der in &b.certs {
+        let c = cert_of(der)?;
+        let named = b.by_name.as_ref().is_some_and(|n| *n == c.subject) || b.by_key.as_ref().is_some_and(|k| *k == Sha1::digest(&c.key_bits).to_vec());
+        if !named {
+            continue;
+        }
+        if c.issuer != issuer.subject || !verify_sig(&issuer.spki, &c.sig_alg, &c.tbs, &c.signature)? {
+            return Err("the responder's certificate was not issued by the certificate's issuer".into());
+        }
+        let mut purposes = vec![];
+        if let Some((_, v)) = c.exts.iter().find(|(o, _)| o == "2.5.29.37") {
+            purposes = tlv_at(v)?.0.kids()?.iter().map(|o| o.oid()).collect();
+        }
+        if !purposes.iter().any(|p| p == OCSP_SIGNING) {
+            return Err("the responder's certificate is not authorized for OCSP signing".into());
+        }
+        if t < c.not_before || t > c.not_after {
+            return Err("the responder's certificate is out of date".into());
+        }
+        return Ok((c.spki.clone(), "delegated"));
+    }
+    Err("the response was signed by neither the issuer nor a responder it names".into())
+}
+
+fn judge(der: &[u8], c: &Cert, issuer: &Cert, want_nonce: Option<&[u8]>, o: &Value) -> Result<Value, String> {
+    let b = parse_basic(der)?;
+    let t = o.get("now").and_then(|n| n.as_i64()).unwrap_or_else(now);
+    let skew = o.get("max_skew_s").and_then(|n| n.as_i64()).unwrap_or(300);
+    let (key, by) = signer(&b, issuer, t)?;
+    if !verify_sig(&key, &b.sig_alg, &b.tbs, &b.signature)? {
+        return Err("the response's signature does not match: it was changed or forged".into());
+    }
+    let hit = b.singles.iter().find(|s| {
+        s.serial == c.serial && match s.hash_oid.as_str() {
+            "1.3.14.3.2.26" => s.name_hash == Sha1::digest(&c.issuer).to_vec() && s.key_hash == Sha1::digest(&issuer.key_bits).to_vec(),
+            "2.16.840.1.101.3.4.2.1" => s.name_hash == Sha256::digest(&c.issuer).to_vec() && s.key_hash == Sha256::digest(&issuer.key_bits).to_vec(),
+            _ => false,
+        }
+    }).ok_or("the response does not speak of this certificate")?;
+    if let Some(n) = want_nonce {
+        match &b.nonce {
+            Some(g) if g != n => return Err("the response's nonce is not the one sent: a replay".into()),
+            None if o.get("require_nonce") == Some(&Value::Bool(true)) => return Err("the response has no nonce".into()),
+            _ => {}
+        }
+    }
+    if hit.this_update > t + skew {
+        return Err(format!("the response is from the future: thisUpdate {}", iso(hit.this_update)));
+    }
+    if let Some(n) = hit.next_update {
+        if n + skew < t {
+            return Err(format!("the response is stale: nextUpdate was {}", iso(n)));
+        }
+    }
+    Ok(json!({
+        "status": hit.status, "good": hit.status == "good", "this_update": iso(hit.this_update), "next_update": hit.next_update.map(iso), "produced_at": iso(b.produced_at),
+        "revoked_at": hit.revoked_at.map(iso), "reason": hit.reason, "signed_by": by, "nonce_checked": want_nonce.is_some() && b.nonce.is_some(), "serial": hex::encode(&c.serial),
+    }))
+}
+
+/// Reads a response (base64 DER) and checks it all: the signer, its signature, that it speaks of this certificate, the time window (`max_skew_s`, 300), and the nonce if the option nonce holds what was sent (hex). Gives { status (good, revoked or unknown), good, this_update, next_update, produced_at, revoked_at, reason, signed_by, nonce_checked, serial }. `good` is true only for a checked good.
+pub fn ocsp_read(response: &str, cert: &str, issuer: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let der = B64.decode(response.trim()).map_err(|_| "the response is not base64".to_string())?;
+    let (c, i) = (pem_cert(cert, "the certificate")?, pem_cert(issuer, "the issuer")?);
+    let nonce = options.get("nonce").and_then(|n| n.as_str()).map(|n| hex::decode(n).map_err(|_| "the nonce is not hex".to_string())).transpose()?;
+    judge(&der, &c, &i, nonce.as_deref(), &options)
+}
+
+/// What a response says, taken at its word: nothing is checked. For looking at one, never for deciding.
+pub fn ocsp_dump(response: &str) -> Result<serde_json::Value, String> {
+    let der = B64.decode(response.trim()).map_err(|_| "the response is not base64".to_string())?;
+    let b = parse_basic(&der)?;
+    let list: Vec<Value> = b.singles.iter().map(|s| json!({ "serial": hex::encode(&s.serial), "status": s.status, "this_update": iso(s.this_update), "next_update": s.next_update.map(iso), "reason": s.reason })).collect();
+    Ok(json!({ "produced_at": iso(b.produced_at), "responses": list, "certs": b.certs.len(), "signature_algorithm": b.sig_alg }))
+}
+
+/// The whole check: asks the responder named in the certificate (or the option url), by POST, and does as `ocsp_read`. Options as for `ocsp_request` and `ocsp_read`, with timeout_ms (10 s). A certificate with no OCSP URL is an error value saying so.
+pub fn ocsp_check(cert: &str, issuer: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (c, i) = (pem_cert(cert, "the certificate")?, pem_cert(issuer, "the issuer")?);
+    let url = options.get("url").and_then(|u| u.as_str()).map(str::to_string).or_else(|| access(&c, "1.3.6.1.5.5.7.48.1").first().cloned()).ok_or("the certificate names no OCSP responder")?;
+    let (der, nonce) = build(&c, &i, &options)?;
+    let t = Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000));
+    let agent = ureq::AgentBuilder::new().timeout(t).build();
+    let r = match agent.post(&url).set("Content-Type", "application/ocsp-request").set("Accept", "application/ocsp-response").send_bytes(&der) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(s, _)) => return Err(format!("the responder answered {}", s)),
+        Err(e) => return Err(format!("cannot reach the responder {}: {}", url, e)),
+    };
+    let mut body = vec![];
+    r.into_reader().take(4 << 20).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    let mut v = judge(&body, &c, &i, nonce.as_deref(), &options)?;
+    v["responder"] = json!(url);
+    Ok(v)
+}

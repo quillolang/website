@@ -1,0 +1,353 @@
+//! Jira Cloud's REST API v3: issues made and changed, JQL searches walked through their page tokens, comments, transitions by name, and plain text turned into the Atlassian Document Format that descriptions and comments must be.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(code: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let mut parts: Vec<String> = v["errorMessages"].as_array().map(|l| l.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    if let Some(m) = v["errors"].as_object() {
+        for (k, e) in m {
+            parts.push(format!("{}: {}", k, e.as_str().unwrap_or("invalid")));
+        }
+    }
+    if let Some(m) = v["message"].as_str() {
+        parts.push(m.to_string());
+    }
+    if parts.is_empty() {
+        parts.push(body.trim().chars().take(300).collect());
+    }
+    let hint = match code {
+        401 => " (check JIRA_EMAIL and JIRA_API_TOKEN)",
+        403 => " (this user may not do that)",
+        _ => "",
+    };
+    format!("Jira {}: {}{}", code, parts.join("; "), hint)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let base = opt(o, "base_url", "JIRA_API_URL").ok_or("no site: set JIRA_API_URL (like https://your-team.atlassian.net), or give the option base_url")?;
+    let email = opt(o, "email", "JIRA_EMAIL").ok_or("no user: set JIRA_EMAIL, or give the option email")?;
+    let token = opt(o, "token", "JIRA_API_TOKEN").ok_or("no token: set JIRA_API_TOKEN, or give the option token")?;
+    let header = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", email, token)));
+    let url = format!("{}/rest/api/3{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let text = body.map(|b| b.to_string());
+    let mut tries = 0;
+    loop {
+        let r = agent.request(method, &url).set("Authorization", &header).set("Accept", "application/json").set("User-Agent", "quillo-jira/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Jira's answer is not JSON: {:?}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                if (code == 429 || code == 503) && tries < 3 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                return Err(error_text(code, &t));
+            }
+            Err(e) => return Err(format!("cannot reach Jira at {}: {}", base, e)),
+        }
+    }
+}
+
+/// Calls any endpoint under /rest/api/3: `method`, `path`, `body` or null. Options: base_url (else JIRA_API_URL), email (else JIRA_EMAIL), token (else JIRA_API_TOKEN).
+pub fn jira_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+// Text with links marked, and never an empty text node, which Jira refuses.
+fn inline(line: &str) -> Vec<Value> {
+    let mut out = vec![];
+    let mut plain = String::new();
+    for word in line.split_inclusive(' ') {
+        let w = word.trim_end();
+        let href = w.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
+        if href.starts_with("https://") || href.starts_with("http://") {
+            if !plain.is_empty() {
+                out.push(json!({ "type": "text", "text": std::mem::take(&mut plain) }));
+            }
+            out.push(json!({ "type": "text", "text": href, "marks": [{ "type": "link", "attrs": { "href": href } }] }));
+            plain.push_str(&word[href.len()..]);
+        } else {
+            plain.push_str(word);
+        }
+    }
+    if !plain.is_empty() {
+        out.push(json!({ "type": "text", "text": plain }));
+    }
+    out
+}
+
+fn paragraph(lines: &[&str]) -> Value {
+    let mut content = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            content.push(json!({ "type": "hardBreak" }));
+        }
+        content.extend(inline(l));
+    }
+    json!({ "type": "paragraph", "content": content })
+}
+
+/// Plain text as an Atlassian Document Format document: a blank line starts a paragraph, a line break stays one, lines starting "- " make a bullet list, "1. " a numbered one, a ``` fence a code block, and links are made links.
+pub fn jira_adf(text: &str) -> serde_json::Value {
+    let mut content = vec![];
+    let mut para: Vec<&str> = vec![];
+    let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    let mut i = 0;
+    let flush = |para: &mut Vec<&str>, content: &mut Vec<Value>| {
+        if !para.is_empty() {
+            content.push(paragraph(para));
+            para.clear();
+        }
+    };
+    let number = |l: &str| l.split_once(". ").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).map(|(_, t)| t.to_string());
+    while i < lines.len() {
+        let l = lines[i];
+        if l.trim().is_empty() {
+            flush(&mut para, &mut content);
+            i += 1;
+        } else if l.trim_start().starts_with("```") {
+            flush(&mut para, &mut content);
+            let lang = l.trim_start().trim_start_matches('`').trim().to_string();
+            let mut code = vec![];
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+                code.push(lines[i]);
+                i += 1;
+            }
+            i += 1;
+            let mut b = json!({ "type": "codeBlock" });
+            if !lang.is_empty() {
+                b["attrs"] = json!({ "language": lang });
+            }
+            let joined = code.join("\n");
+            b["content"] = if joined.is_empty() { json!([]) } else { json!([{ "type": "text", "text": joined }]) };
+            content.push(b);
+        } else if l.starts_with("- ") || number(l).is_some() {
+            flush(&mut para, &mut content);
+            let ordered = !l.starts_with("- ");
+            let mut items = vec![];
+            while i < lines.len() {
+                let t = if ordered { number(lines[i]) } else { lines[i].strip_prefix("- ").map(str::to_string) };
+                let Some(t) = t else { break };
+                items.push(json!({ "type": "listItem", "content": [{ "type": "paragraph", "content": inline(&t) }] }));
+                i += 1;
+            }
+            content.push(json!({ "type": if ordered { "orderedList" } else { "bulletList" }, "content": items }));
+        } else {
+            para.push(l);
+            i += 1;
+        }
+    }
+    flush(&mut para, &mut content);
+    json!({ "version": 1, "type": "doc", "content": content })
+}
+
+/// An Atlassian Document Format document as plain text, for reading descriptions and comments.
+pub fn jira_text(adf: serde_json::Value) -> String {
+    fn walk(n: &Value, out: &mut String) {
+        match n["type"].as_str().unwrap_or("") {
+            "text" => out.push_str(n["text"].as_str().unwrap_or("")),
+            "hardBreak" => out.push('\n'),
+            "mention" => out.push_str(n.pointer("/attrs/text").and_then(|t| t.as_str()).unwrap_or("")),
+            "emoji" => out.push_str(n.pointer("/attrs/text").and_then(|t| t.as_str()).unwrap_or("")),
+            "inlineCard" => out.push_str(n.pointer("/attrs/url").and_then(|t| t.as_str()).unwrap_or("")),
+            t => {
+                for c in n["content"].as_array().into_iter().flatten() {
+                    walk(c, out);
+                }
+                if matches!(t, "paragraph" | "heading" | "codeBlock") {
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&adf, &mut out);
+    out.trim_end().to_string()
+}
+
+fn doc(v: &Value) -> Value {
+    match v {
+        Value::String(s) => jira_adf(s),
+        o => o.clone(),
+    }
+}
+
+/// Opens an issue: `fields` holds project (a key), issuetype (a name), summary, description (plain text or ADF), and any others as the API takes them: labels, priority: { name }, assignee: { accountId }, parent: { key }, customfield_10010... Gives { id, key, self }.
+pub fn jira_issue_create(fields: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut f = fields;
+    if f.get("summary").and_then(|s| s.as_str()).map(|s| s.is_empty() || s.contains('\n')).unwrap_or(true) {
+        return Err("an issue needs a `summary` of one line".into());
+    }
+    if let Some(Value::String(p)) = f.get("project") {
+        let v = json!({ "key": p });
+        f["project"] = v;
+    }
+    if let Some(Value::String(t)) = f.get("issuetype") {
+        let v = json!({ "name": t });
+        f["issuetype"] = v;
+    }
+    if let Some(d) = f.get("description") {
+        let v = doc(d);
+        f["description"] = v;
+    }
+    call("POST", "/issue", Some(&json!({ "fields": f })), &options)
+}
+
+/// One issue by key. Options: fields (a list), expand.
+pub fn jira_issue(key: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q = vec![];
+    if let Some(l) = options.get("fields").and_then(|f| f.as_array()) {
+        q.push(format!("fields={}", enc(&l.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","))));
+    }
+    if let Some(e) = options.get("expand").and_then(|e| e.as_str()) {
+        q.push(format!("expand={}", enc(e)));
+    }
+    call("GET", &format!("/issue/{}{}{}", enc(key), if q.is_empty() { "" } else { "?" }, q.join("&")), None, &options)
+}
+
+/// An issue as plain values: { key, summary, status, category, type, priority, assignee, reporter, labels, created, updated, description }.
+pub fn jira_row(issue: serde_json::Value) -> serde_json::Value {
+    let f = &issue["fields"];
+    json!({
+        "key": issue["key"], "summary": f["summary"], "status": f.pointer("/status/name"), "category": f.pointer("/status/statusCategory/key"),
+        "type": f.pointer("/issuetype/name"), "priority": f.pointer("/priority/name"), "assignee": f.pointer("/assignee/displayName"), "reporter": f.pointer("/reporter/displayName"),
+        "labels": f["labels"], "created": f["created"], "updated": f["updated"], "description": jira_text(f["description"].clone()),
+    })
+}
+
+/// Changes an issue's fields; a description may be plain text.
+pub fn jira_issue_update(key: &str, fields: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    let mut f = fields;
+    if let Some(d) = f.get("description") {
+        let v = doc(d);
+        f["description"] = v;
+    }
+    call("PUT", &format!("/issue/{}", enc(key)), Some(&json!({ "fields": f })), &options)?;
+    Ok(true)
+}
+
+/// Gives an issue to a user by account id, or nobody with "".
+pub fn jira_assign(key: &str, account_id: &str, options: serde_json::Value) -> Result<bool, String> {
+    let body = if account_id.is_empty() { json!({ "accountId": null }) } else { json!({ "accountId": account_id }) };
+    call("PUT", &format!("/issue/{}/assignee", enc(key)), Some(&body), &options)?;
+    Ok(true)
+}
+
+/// A text as a string in JQL, quoted so that a visitor's input cannot change the query.
+pub fn jira_quote(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Every issue a JQL search finds, through /search/jql and its nextPageToken. Options: fields (a list; `*navigable` by default), expand, max_items. Page sizes are Jira's to choose, so ask for few fields.
+pub fn jira_search(jql: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut b = json!({ "jql": jql, "maxResults": 100, "fields": options.get("fields").cloned().unwrap_or(json!(["*navigable"])) });
+    if let Some(e) = options.get("expand") {
+        b["expand"] = e.clone();
+    }
+    let mut out = vec![];
+    loop {
+        let r = call("POST", "/search/jql", Some(&b), &options)?;
+        out.extend(r["issues"].as_array().cloned().unwrap_or_default());
+        match r["nextPageToken"].as_str() {
+            Some(t) if !t.is_empty() && out.len() < max => b["nextPageToken"] = json!(t),
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// About how many issues a JQL search would find: the page endpoint no longer gives a total.
+pub fn jira_count(jql: &str, options: serde_json::Value) -> Result<i64, String> {
+    call("POST", "/search/approximate-count", Some(&json!({ "jql": jql })), &options)?["count"].as_i64().ok_or("the answer has no count".to_string())
+}
+
+/// Comments on an issue: `body` is plain text or ADF. Options add visibility ({ type: "role", value: "Developers" }). Gives the comment.
+pub fn jira_comment(key: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if body.as_str().map(|s| s.trim().is_empty()).unwrap_or(false) {
+        return Err("a comment needs a body".into());
+    }
+    let mut b = json!({ "body": doc(&body) });
+    if let Some(v) = options.get("visibility") {
+        b["visibility"] = v.clone();
+    }
+    call("POST", &format!("/issue/{}/comment", enc(key)), Some(&b), &options)
+}
+
+/// An issue's comments, oldest first, all pages, each as { id, author, created, text, body }.
+pub fn jira_comments(key: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut start = 0;
+    loop {
+        let r = call("GET", &format!("/issue/{}/comment?startAt={}&maxResults=100", enc(key), start), None, &options)?;
+        let page = r["comments"].as_array().cloned().unwrap_or_default();
+        let n = page.len() as i64;
+        for c in page {
+            out.push(json!({ "id": c["id"], "author": c.pointer("/author/displayName"), "created": c["created"], "text": jira_text(c["body"].clone()), "body": c["body"] }));
+        }
+        start += n;
+        if n == 0 || start >= r["total"].as_i64().unwrap_or(0) {
+            return Ok(out);
+        }
+    }
+}
+
+/// The moves an issue can make now: { id, name, to, category }. They depend on its workflow and status, so they are asked for, not assumed.
+pub fn jira_transitions(key: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let r = call("GET", &format!("/issue/{}/transitions", enc(key)), None, &options)?;
+    Ok(r["transitions"].as_array().map(|l| l.iter().map(|t| json!({ "id": t["id"], "name": t["name"], "to": t.pointer("/to/name"), "category": t.pointer("/to/statusCategory/key") })).collect()).unwrap_or_default())
+}
+
+/// Moves an issue: `to` is a transition's name or id, or the status it leads to, in any case. An error lists the moves it could make. Options add fields (a screen's required fields) and comment (text).
+pub fn jira_transition(key: &str, to: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let moves = jira_transitions(key, options.clone())?;
+    let hit = moves.iter().find(|m| m["id"] == to || m["name"].as_str().map(|n| n.eq_ignore_ascii_case(to)).unwrap_or(false) || m["to"].as_str().map(|n| n.eq_ignore_ascii_case(to)).unwrap_or(false));
+    let Some(hit) = hit else {
+        let names: Vec<&str> = moves.iter().filter_map(|m| m["name"].as_str()).collect();
+        return Err(format!("{} cannot move to {:?} now; it can: {}", key, to, names.join(", ")));
+    };
+    let mut b = json!({ "transition": { "id": hit["id"] } });
+    if let Some(f) = options.get("fields") {
+        b["fields"] = f.clone();
+    }
+    if let Some(c) = options.get("comment").and_then(|c| c.as_str()) {
+        b["update"] = json!({ "comment": [{ "add": { "body": jira_adf(c) } }] });
+    }
+    call("POST", &format!("/issue/{}/transitions", enc(key)), Some(&b), &options)?;
+    Ok(hit.clone())
+}
+
+/// Finds users by name or email: { accountId, displayName, active }. Jira has no usernames now: an assignee is an account id.
+pub fn jira_find_user(query: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let r = call("GET", &format!("/user/search?query={}", enc(query)), None, &options)?;
+    Ok(r.as_array().map(|l| l.iter().map(|u| json!({ "accountId": u["accountId"], "displayName": u["displayName"], "active": u["active"] })).collect()).unwrap_or_default())
+}

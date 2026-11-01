@@ -1,0 +1,194 @@
+//! Neo4j's HTTP transaction API: Cypher with parameters, rows read into maps with nodes marked by their ids, update counts, several statements in one transaction, transactions held open over several calls, the errors that arrive inside a 200 turned into errors, and deadlocks and other transient failures retried.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// NEO4J_API_URL is the server's HTTP address (http://localhost:7474 when not set), NEO4J_USER and
+// NEO4J_PASSWORD sign in, NEO4J_DATABASE picks the database (neo4j when not set).
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("NEO4J_API_URL").unwrap_or_else(|| "http://localhost:7474".into()).trim_end_matches('/').to_string()
+}
+
+fn database() -> String {
+    env("NEO4J_DATABASE").unwrap_or_else(|| "neo4j".into())
+}
+
+/// One request; gives the status, the Location header and the JSON.
+fn send(method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Option<String>, Value), String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let mut req = agent.request(method, url).set("Accept", "application/json;charset=UTF-8");
+    if let (Some(u), Some(p)) = (env("NEO4J_USER"), env("NEO4J_PASSWORD")) {
+        req = req.set("Authorization", &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p))));
+    }
+    let res = match body {
+        Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+        None => req.call(),
+    };
+    let (status, location, text) = match res {
+        Ok(r) => (r.status(), r.header("Location").map(str::to_string), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, None, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach Neo4j at {}: {}", base(), e)),
+    };
+    let v = serde_json::from_str(&text).unwrap_or(json!({ "errors": [{ "code": format!("HTTP {}", status), "message": text.chars().take(200).collect::<String>() }] }));
+    Ok((status, location, v))
+}
+
+fn first_error(v: &Value) -> Option<(String, String)> {
+    v["errors"].as_array().and_then(|e| e.first()).map(|e| (e["code"].as_str().unwrap_or("Neo.Unknown").to_string(), e["message"].as_str().unwrap_or("").to_string()))
+}
+
+fn error_text(code: &str, message: &str) -> String {
+    if code == "Neo.ClientError.Security.Unauthorized" {
+        return format!("{}: {} (check NEO4J_USER and NEO4J_PASSWORD)", code, message);
+    }
+    format!("{}: {}", code, message)
+}
+
+/// `meta` lies beside `row`: a node or relationship in `row` is only its properties, and this
+/// says which it was. Elements get `_id` and `_kind`, lists are walked.
+fn with_meta(cell: &Value, meta: &Value) -> Value {
+    match (cell, meta) {
+        (Value::Object(m), Value::Object(info)) if info.contains_key("type") => {
+            let mut o = Map::new();
+            o.insert("_id".into(), info.get("elementId").cloned().unwrap_or(info.get("id").cloned().unwrap_or(Value::Null)));
+            o.insert("_kind".into(), info["type"].clone());
+            for (k, v) in m {
+                o.insert(k.clone(), v.clone());
+            }
+            Value::Object(o)
+        }
+        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => Value::Array(a.iter().zip(b).map(|(x, y)| with_meta(x, y)).collect()),
+        _ => cell.clone(),
+    }
+}
+
+fn table(r: &Value) -> Value {
+    let columns: Vec<String> = r["columns"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+    let rows: Vec<Value> = r["data"].as_array().into_iter().flatten().map(|d| {
+        let mut o = Map::new();
+        let metas = d["meta"].as_array();
+        for (i, (cell, name)) in d["row"].as_array().into_iter().flatten().zip(&columns).enumerate() {
+            o.insert(name.clone(), with_meta(cell, metas.and_then(|m| m.get(i)).unwrap_or(&Value::Null)));
+        }
+        Value::Object(o)
+    }).collect();
+    let mut out = json!({ "columns": columns, "rows": rows });
+    if let Some(s) = r.get("stats") {
+        out["stats"] = s.clone();
+    }
+    out
+}
+
+fn statement(cypher: &str, params: &Value) -> Result<Value, String> {
+    if !(params.is_null() || params.is_object()) {
+        return Err("parameters are a map, or null: { name: \"Ada\" } for $name in the Cypher".into());
+    }
+    Ok(json!({ "statement": cypher, "parameters": if params.is_null() { json!({}) } else { params.clone() }, "includeStats": true }))
+}
+
+/// Runs statements on /tx/commit; everything rolls back on an error. Transient errors, like a
+/// deadlock, roll back on the server and are safe to try again.
+fn commit(statements: Vec<Value>) -> Result<Vec<Value>, String> {
+    let url = format!("{}/db/{}/tx/commit", base(), database());
+    let body = json!({ "statements": statements });
+    for attempt in 0..4 {
+        let (status, _, v) = send("POST", &url, Some(&body))?;
+        match first_error(&v) {
+            Some((code, _)) if code.starts_with("Neo.TransientError.") && attempt < 3 => {
+                std::thread::sleep(Duration::from_millis(100 << attempt));
+                continue;
+            }
+            Some((code, m)) => return Err(error_text(&code, &m)),
+            None => {}
+        }
+        if status >= 300 {
+            return Err(format!("Neo4j answered {}", status));
+        }
+        return Ok(v["results"].as_array().into_iter().flatten().map(table).collect());
+    }
+    Err("Neo4j stayed in a transient failure through four tries".into())
+}
+
+/// Runs one Cypher statement in its own transaction, values given as `$name` in `params` (a map, or null). Gives `{ columns, rows, stats }`, each row a map by column; a node or relationship returned whole has `_id` and `_kind` beside its properties.
+pub fn neo4j_query(cypher: &str, params: serde_json::Value) -> Result<Value, String> {
+    let mut r = commit(vec![statement(cypher, &params)?])?;
+    r.pop().ok_or("Neo4j gave no result".to_string())
+}
+
+/// The first row of a query, or null.
+pub fn neo4j_one(cypher: &str, params: serde_json::Value) -> Result<Value, String> {
+    let r = neo4j_query(cypher, params)?;
+    Ok(r["rows"].get(0).cloned().unwrap_or(Value::Null))
+}
+
+/// Several statements, `[{ cypher, params }]`, in one transaction: they all happen or none does. Gives a result for each.
+pub fn neo4j_transaction(statements: Vec<serde_json::Value>) -> Result<Vec<Value>, String> {
+    let mut list = vec![];
+    for s in &statements {
+        list.push(statement(s["cypher"].as_str().ok_or("each statement needs `cypher`")?, s.get("params").unwrap_or(&Value::Null))?);
+    }
+    commit(list)
+}
+
+fn tx_url(tx: &Value) -> Result<String, String> {
+    tx["url"].as_str().map(str::to_string).ok_or("that is not a transaction from neo4j_begin".to_string())
+}
+
+/// Opens a transaction to hold across several calls: `{ url, commit, expires }`. It expires after a minute without a statement, so end it with `neo4j_commit` or `neo4j_rollback`.
+pub fn neo4j_begin() -> Result<Value, String> {
+    let (status, location, v) = send("POST", &format!("{}/db/{}/tx", base(), database()), Some(&json!({ "statements": [] })))?;
+    if let Some((c, m)) = first_error(&v) {
+        return Err(error_text(&c, &m));
+    }
+    let url = location.ok_or(format!("Neo4j answered {} with no Location for the transaction", status))?;
+    Ok(json!({ "url": url, "commit": v["commit"], "expires": v["transaction"]["expires"] }))
+}
+
+/// Runs a statement inside a transaction from `neo4j_begin`. On an error the server has rolled the transaction back, and this says so.
+pub fn neo4j_run(tx: serde_json::Value, cypher: &str, params: serde_json::Value) -> Result<Value, String> {
+    let url = tx_url(&tx)?;
+    let (_, _, v) = send("POST", &url, Some(&json!({ "statements": [statement(cypher, &params)?] })))?;
+    if let Some((c, m)) = first_error(&v) {
+        return Err(format!("{} (the transaction is rolled back)", error_text(&c, &m)));
+    }
+    v["results"].get(0).map(table).ok_or("Neo4j gave no result".to_string())
+}
+
+/// Commits a transaction from `neo4j_begin`.
+pub fn neo4j_commit(tx: serde_json::Value) -> Result<bool, String> {
+    let url = tx["commit"].as_str().map(str::to_string).unwrap_or(format!("{}/commit", tx_url(&tx)?));
+    let (_, _, v) = send("POST", &url, Some(&json!({ "statements": [] })))?;
+    if let Some((c, m)) = first_error(&v) {
+        return Err(error_text(&c, &m));
+    }
+    Ok(true)
+}
+
+/// Rolls back a transaction from `neo4j_begin`.
+pub fn neo4j_rollback(tx: serde_json::Value) -> Result<bool, String> {
+    let (_, _, v) = send("DELETE", &tx_url(&tx)?, None)?;
+    if let Some((c, m)) = first_error(&v) {
+        return Err(error_text(&c, &m));
+    }
+    Ok(true)
+}
+
+/// A label, relationship type or property name quoted for Cypher, as parameters cannot stand in for those: backticks around it, its own backticks doubled.
+pub fn neo4j_quote_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("a name cannot be empty".into());
+    }
+    Ok(format!("`{}`", name.replace('`', "``")))
+}

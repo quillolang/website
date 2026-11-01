@@ -180,6 +180,114 @@ Crate traps met in these:
 - **Node stand-ins:** close a dgram socket a moment after its last send; end a TLS socket a moment
   after its handshake; retry a bind on EADDRINUSE.
 
+## The 100 after those
+
+Written on 2026-11-01, in four batches of 25 (`catalog-pw.json` … `catalog-pz.json`), 527 in all,
+with three new groups. **AI**: anthropic, openai, gemini, ollama, mcp. **Infrastructure**: docker,
+kubernetes, etcd, consul, vault, prometheus_query, sftp, ssh_exec. **Payments**: nacha, bai2,
+epc_qr, swiss_qr, pix, emv_qr, upi_qr, paypal. The rest went into Services (telegram, whatsapp,
+teams, matrix_chat, mastodon, bluesky, github_api, gitlab_api, notion, airtable, hubspot, shopify,
+zendesk, jira, linear, cloudflare, pagerduty, datadog, mailchimp, apns, cloudinary, dropbox,
+google_drive, google_sheets, microsoft_graph), Stores (mongodb, elasticsearch, clickhouse,
+meilisearch, typesense, qdrant, memcached, neo4j, couchdb, firestore, supabase, bigquery), Devices
+(serial, bacnet, lorawan, mbus, knx, usb, nfc_ndef, artnet, ethernet_ip), Protocols (whois, rdap,
+stun, ssdp, sip, netflow, pcap, dhcp, ping), Security (passkeys, oidc, acme, openpgp, cedar, rego),
+Developer tools (cli_args, cli_run, ffmpeg_cli, git_cli, system_info, spdx), Data formats (thrift,
+capnp, fhir, dicom, gedcom, gettext_po), Places (ip_location, metar, satellites, gtfs), Text
+(latex_math) and Numbers (chess).
+
+What they were tried on: `sftp` and `ssh_exec` on real OpenSSH (not password login, which a
+non-root sshd cannot check), `ping` on real ICMP on loopback (macOS only), `usb`'s listing on real
+devices (no transfers), `stun` on RFC 5769's vectors, `lorawan` on lora-packet's published frame,
+`openpgp` on RFC 9580's sample signature, `acme`'s CSR by `openssl req -verify`, `gettext_po`'s
+`.mo` by Python's gettext. Everything else ran on stand-ins, written from the specifications: no
+web service, device or server has seen these plugins. `serial` ran on a pseudo-terminal, where
+macOS sets no line speed, so baud rates are unproven. `passkeys` has not met a real browser, and
+reads `none` and `packed` attestation only. `cedar` needs a C compiler at build time (see below).
+Quillo issues found are in `feedback/reports/FEEDBACK26.md` in the quillo repository, Q-197 on.
+
+Crate traps met in these:
+
+- **ureq 2:** `into_json` needs feature `json`; `into_string` stops at 10 MB (`into_reader`); a 308
+  from a resumable upload needs `.redirects(0)`; client certificates:
+  `ClientConfig::builder_with_provider(ring)`, passed to `tls_config`.
+- **p256 0.13:** `Signature::to_bytes()` is already JOSE's r||s, so no DER step for ES256.
+- **russh 0.65:** default is aws-lc-rs (C): `default-features = false, features = ["ring", "rsa"]`.
+  **russh-sftp 3.0:** `write()` opens with WRITE only (use `open_with_flags`); rename onto an
+  existing file fails on OpenSSH, as it has no posix-rename.
+- **mongodb 3.9:** `coll.find()` borrows the collection, so bind it first.
+- **pulldown-latex 0.8:** operators and `\operatorname{}` are written unescaped (`a<b` gives
+  `<mo><</mo>`); errors have no offset. **sgp4 2.4:** `Constants::from_elements` is 15 m off the
+  verification tables: use `_afspc_compatibility_mode`. **maxminddb 0.32:** `build_epoch` is
+  uint64 and `node_count` uint32, strictly.
+- **cedar-policy 4.14:** `stacker`→`psm` runs a C compiler at build, with no way to turn it off;
+  permissive validation needs `experimental`. **regorus 0.14:** `ast` is private: feature `ast`
+  and `get_ast_as_json`. **pgp 0.21:** turn off default `bzip2`; `verify` takes `&impl`, so no
+  `dyn` across primary and subkeys.
+- **serialport 4:** `default-features = false` avoids libudev; a macOS pty refuses the speed ioctl
+  ("Not a typewriter"): open again with baud 0. **nusb 0.2:** `MaybeFuture` in scope for `.wait()`;
+  a bulk read's length must be a multiple of the max packet size.
+- **clap 4:** feature `string` for owned names, `env` for fallbacks. **sysinfo 0.37:** CPU use needs
+  two reads 200 ms apart; Linux threads appear as processes (`thread_kind()`). **socket2 0.5:**
+  macOS leaves the IP header on ICMP datagrams; Linux strips it and rewrites the id.
+- **ffmpeg 9:** one image needs `-update 1`; `out_time_ms` is really microseconds.
+- **Node stand-ins:** `http` refuses method LIST with a bare 400: Vault's `?list=true` is the same
+  call.
+
+## The second 100 of 2026-11-01
+
+Written the same day, in four batches (`catalog-pk.json` … `catalog-pn.json`), 627 in all, with one
+new group, **Games**: sudoku, poker, dice, go_sgf, maze, and chess moved there from Numbers. The
+rest: Developer tools (sarif, junit_xml, har, ipynb, sbom, nginx_conf, dockerfile, gitignore,
+editorconfig, lockfiles, tap_results), Data formats (warc, rdf_turtle, ldif, flatbuffers, arrow_ipc,
+asn1_der, amazon_ion, xliff), Text (asciidoc, rst, org_mode, morse, braille), Media (m3u,
+cue_sheet), Payments (qif, square, adyen, mollie, razorpay, paddle, wise), Services (xero,
+quickbooks, woocommerce, bigcommerce, salesforce, pipedrive, trello, asana, zoom, google_calendar,
+calendly, youtube_data, spotify, reddit, posthog, mixpanel, segment, ga4, algolia), Places
+(open_meteo, nominatim, osrm, mapbox, topojson, mbtiles, pmtiles, mgrs, geotiff, osm_pbf), Numbers
+(chemistry, fasta, music_theory, astronomy, sat_solver), Validation (bitcoin_address, eth_address,
+lightning_invoice), Security (saml, dnsbl, hpke, pkcs12, ocsp, ct_logs, ssh_certs, yubico_otp,
+dmarc_report, osv), Infrastructure (aws_dynamodb, aws_lambda, aws_ses, aws_sns, aws_secrets,
+digitalocean, hetzner, grafana, loki), Stores (cassandra, mssql, rqlite, backblaze_b2) and Devices
+(iec104, dnp3).
+
+What they were tried on: `gitignore` against `git check-ignore` on 17,103 random paths, `flatbuffers`
+both ways with the official runtime, `nginx_conf`'s output by real `nginx -t`, `asn1_der` by
+`openssl asn1parse`, `hpke` on all 28 RFC 9180 setups, `ssh_certs` both ways with `ssh-keygen`,
+`pkcs12` by OpenSSL and Node, `saml`'s canonical XML by `xmllint`, `m3u` by ffprobe, `geotiff` on
+files from macOS `sips`, `lightning_invoice` on BOLT-11's vectors, `astronomy` on Meeus's examples
+(moon distance about 20 km off), `sat_solver` against brute force, `adyen` on its published HMAC
+sample. Everything else ran on stand-ins or made-up samples. No web service has seen the service
+plugins, and `open_meteo`, `nominatim`, `osrm` and `mapbox` were written from memory of their docs.
+`iec104` and `dnp3` come from public guides, not the paid standards, and want real devices. `saml`
+has met no real identity provider, and refuses EncryptedAssertion. `mssql`'s TLS path never ran.
+`amazon_ion` has only hand-worked bytes behind it. Quillo issues found are in
+`feedback/reports/FEEDBACK27.md` in the quillo repository, Q-326 on.
+
+Crate traps met in these:
+
+- **serde_json `preserve_order`:** `Map::remove` is a swap-remove and reorders fields: use
+  `shift_remove`. `Serializer` with `PrettyFormatter` needs `serde = "1"` in the plugin's own
+  dependencies.
+- **ssh-key 0.6.7:** `Certificate` cannot read a `forever` validity (`valid_before` u64::MAX), so
+  parse by hand; RSA signing fails, as it builds the key with `p` twice.
+- **tiberius 0.12.3:** `Numeric`'s Display writes -123.45 as `-123.-45`: use `value()` and `scale()`.
+- **hpke =0.13.0:** rand_core 0.9, so write your own RNG. **aes with hmac 0.12:**
+  `Hmac::new_from_slice` is ambiguous with `KeyInit`: write `<Hmac<Sha1> as Mac>::new_from_slice`.
+- **arrow 60:** `Field::metadata()` is `Metadata`, not serde (`.iter()`); a file allows one
+  dictionary per field; the `lz4` feature is pure Rust, `zstd` is C.
+- **jsonwebtoken 9:** `crypto::sign` signs any text with RS256, but gives base64url.
+- **osmpbf 0.3:** default `rust-zlib` is pure Rust. **TIFF LZW:** libtiff's encoder widens at 512,
+  its decoder after entry 510.
+- **Rust:** an empty `f64` `.sum()` is `-0.0` and prints so; `trim()` eats NBSP, so never slice by
+  `len() - trim_start().len()`.
+- **Payments:** Adyen's webhook HMAC text is not escaped (only the old HPP signing is), and CLP has
+  2 decimals and IDR 0 there. For Mollie HUF has 2 decimals, ISK and JPY 0.
+- **Node stand-ins:** `node:sqlite`, `zlib.zstdCompressSync` and `brotliCompressSync` make samples
+  without tools. astropy's `constellation_names.dat` misspells Ophiuchus.
+- **`*.gz` is git-ignored here.** A sample that ends in `.gz` needs a `!` line in `.gitignore`, or
+  its plugin passes here and fails on a fresh checkout.
+
 ## Ideas, to write later
 
 Each idea has the crate to start from. A star (★) marks those that fill a gap in the
@@ -187,8 +295,6 @@ standard library people meet early.
 
 ### Security and sign-in
 
-- ★ **passkeys**: WebAuthn registration and sign-in (`webauthn-rs`).
-- **saml**: SAML 2.0 sign-in for enterprises (`samael`; needs libxml2, so harder).
 
 ### Data formats
 
@@ -211,27 +317,19 @@ standard library people meet early.
 
 ### Stores and services
 
-- **mongodb**: MongoDB's find, insert, update and aggregate (`mongodb` with its sync API).
-- **apns**: push notifications to iPhones (`a2`).
-- **sftp**: files to and from SFTP servers, for partners who still use them (`russh-sftp`).
 - **gcs** and **azure_blob**: signed links for Google Cloud Storage and Azure (by hand, or their crates).
 
 ### Places
 
-- **ip_location**: an IP address's country and city, from a GeoLite2 file (`maxminddb`).
 
 ### Numbers
 
 
 ### CLI and RPC (next, after the 200)
 
-- **cli**: plugins that wrap command-line tools and parse their output: `git`, `ffmpeg`,
-  `pandoc`, `imagemagick`, `pg_dump`, run with arguments as a list (never a shell
-  string), a timeout and an output limit.
-- **cli_args**: argument parsing for Quillo scripts run from the command line (`clap`).
-- **thrift** and **capnp**: Apache Thrift and Cap'n Proto messages and clients.
+- **cli**: more plugins wrapping command-line tools as `ffmpeg_cli` and `git_cli` do: `pandoc`,
+  `imagemagick`, `pg_dump`.
 
 ### Hardware
 
-- **serial**: read and write serial ports, for scales, sensors and printers (`serialport`).
 - **receipts**: ESC/POS receipt printers (`escpos`).

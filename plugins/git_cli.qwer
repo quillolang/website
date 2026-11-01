@@ -1,0 +1,479 @@
+//! The `git` command driven through argument lists, its output parsed to maps: status --porcelain=v2, branches with their upstreams, tags, diff --numstat, blame --porcelain, show, and a file as it was, with a repository's hooks and pagers kept out of it. For working trees, which `git_log` (history only, no git needed) does not read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const MAX_OUTPUT: usize = 64 << 20;
+const DEFAULT_TIMEOUT: u64 = 30_000;
+
+fn program() -> String {
+    std::env::var("GIT_BIN").ok().filter(|s| !s.is_empty()).unwrap_or("git".to_string())
+}
+
+fn run(repo: &str, args: &[String], timeout_ms: u64) -> Result<(Option<i32>, Vec<u8>, String), String> {
+    let mut c = Command::new(program());
+    // Settings a cloned repository's own config could turn into commands, and output that changes
+    // with the machine, are fixed here.
+    c.args(["--no-pager", "-c", "core.quotepath=off", "-c", "color.ui=false", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-c", "diff.external=", "-C", repo]);
+    c.args(args);
+    c.env("GIT_TERMINAL_PROMPT", "0").env("GIT_PAGER", "cat").env("GIT_OPTIONAL_LOCKS", "0").env("LC_ALL", "C");
+    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "git is not installed, or not on PATH".to_string(),
+        _ => format!("cannot run git: {}", e),
+    })?;
+    let mut o = child.stdout.take().ok_or("no stdout")?;
+    let mut e = child.stderr.take().ok_or("no stderr")?;
+    let a = std::thread::spawn(move || {
+        let mut b = vec![];
+        let mut t = [0u8; 65536];
+        while let Ok(n) = o.read(&mut t) {
+            if n == 0 || b.len() > MAX_OUTPUT {
+                break;
+            }
+            b.extend(&t[..n]);
+        }
+        b
+    });
+    let b = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = e.read_to_string(&mut s);
+        s
+    });
+    let end = Instant::now() + Duration::from_millis(timeout_ms);
+    let code = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st.code();
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("git {} took longer than {} ms", args.first().map(|s| s.as_str()).unwrap_or(""), timeout_ms));
+        }
+        std::thread::sleep(Duration::from_millis(3));
+    };
+    Ok((code, a.join().unwrap_or_default(), b.join().unwrap_or_default()))
+}
+
+fn git(repo: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (code, out, err) = run(repo, &v, DEFAULT_TIMEOUT)?;
+    if code == Some(0) {
+        return Ok(out);
+    }
+    let msg = err.trim();
+    if msg.contains("not a git repository") {
+        return Err(format!("{} is not inside a git repository", repo));
+    }
+    if msg.contains("cannot change to") {
+        return Err(format!("{}: no such folder", repo));
+    }
+    if msg.contains("detected dubious ownership") {
+        return Err(format!("{} is owned by someone else: git refuses it until `safe.directory` allows it", repo));
+    }
+    Err(format!("git {}: {}", args.first().unwrap_or(&""), msg.lines().next().unwrap_or("failed")))
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).to_string()
+}
+
+// A revision or ref from a caller must not be taken for an option.
+fn rev_ok(r: &str) -> Result<(), String> {
+    if r.starts_with('-') || r.is_empty() || r.contains(['\0', '\n']) {
+        return Err(format!("`{}` is not a revision", r));
+    }
+    Ok(())
+}
+
+fn file_ok(f: &str) -> Result<(), String> {
+    if f.is_empty() || f.contains('\0') {
+        return Err("no file named".into());
+    }
+    Ok(())
+}
+
+fn state_name(c: char) -> &'static str {
+    match c {
+        'M' => "modified",
+        'T' => "type changed",
+        'A' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        'C' => "copied",
+        'U' => "unmerged",
+        _ => "",
+    }
+}
+
+/// The working tree, from `status --porcelain=v2`: `{ branch, commit, upstream, ahead, behind, clean, staged, unstaged, untracked, conflicts }`, the changed lists holding `{ path, state, from }`. `options.ignored` adds `ignored`. A repository with no commits yet has `commit: null`.
+pub fn git_cli_status(repo: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut args = vec!["status", "--porcelain=v2", "--branch", "-z"];
+    if options.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+        args.push("--ignored");
+    }
+    let out = text(&git(repo, &args)?);
+    let mut m = json!({ "branch": Value::Null, "commit": Value::Null, "upstream": Value::Null, "ahead": 0, "behind": 0 });
+    let (mut staged, mut unstaged, mut untracked, mut ignored, mut conflicts) = (vec![], vec![], vec![], vec![], vec![]);
+    let mut items = out.split('\0');
+    while let Some(line) = items.next() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut change = |xy: &str, path: &str, from: Option<&str>| {
+            let c: Vec<char> = xy.chars().collect();
+            let mut one = |ch: char, list: &mut Vec<Value>| {
+                if ch != '.' {
+                    let mut e = json!({ "path": path, "state": state_name(ch) });
+                    if let Some(f) = from {
+                        e["from"] = json!(f);
+                    }
+                    list.push(e);
+                }
+            };
+            one(c[0], &mut staged);
+            one(c[1], &mut unstaged);
+        };
+        match line.as_bytes()[0] {
+            b'#' => {
+                let p: Vec<&str> = line.splitn(3, ' ').collect();
+                match (p.get(1).copied(), p.get(2).copied()) {
+                    (Some("branch.oid"), Some(v)) if v != "(initial)" => m["commit"] = json!(v),
+                    (Some("branch.head"), Some(v)) if v != "(detached)" => m["branch"] = json!(v),
+                    (Some("branch.upstream"), Some(v)) => m["upstream"] = json!(v),
+                    (Some("branch.ab"), Some(v)) => {
+                        let n: Vec<i64> = v.split(' ').filter_map(|x| x.parse().ok()).collect();
+                        m["ahead"] = json!(n.first().map(|x| x.abs()));
+                        m["behind"] = json!(n.get(1).map(|x| x.abs()));
+                    }
+                    _ => {}
+                }
+            }
+            b'1' => {
+                let p: Vec<&str> = line.splitn(9, ' ').collect();
+                if p.len() == 9 {
+                    change(p[1], p[8], None);
+                }
+            }
+            b'2' => {
+                let p: Vec<&str> = line.splitn(10, ' ').collect();
+                let from = items.next();
+                if p.len() == 10 {
+                    change(p[1], p[9], from);
+                }
+            }
+            b'u' => {
+                let p: Vec<&str> = line.splitn(11, ' ').collect();
+                if p.len() == 11 {
+                    conflicts.push(json!({ "path": p[10], "kind": p[1] }));
+                }
+            }
+            b'?' => untracked.push(json!(line[2..].to_string())),
+            b'!' => ignored.push(json!(line[2..].to_string())),
+            _ => {}
+        }
+    }
+    m["detached"] = json!(m["branch"].is_null() && !m["commit"].is_null());
+    m["clean"] = json!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty() && conflicts.is_empty());
+    m["staged"] = json!(staged);
+    m["unstaged"] = json!(unstaged);
+    m["untracked"] = json!(untracked);
+    m["conflicts"] = json!(conflicts);
+    if options.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+        m["ignored"] = json!(ignored);
+    }
+    Ok(m)
+}
+
+/// Local and remote branches: `{ name, commit, upstream, ahead, behind, gone, current, remote, date, subject }`, newest first.
+pub fn git_cli_branches(repo: &str) -> Result<Vec<Value>, String> {
+    let f = "%(refname)%00%(objectname)%00%(upstream:short)%00%(upstream:track)%00%(HEAD)%00%(committerdate:iso-strict)%00%(contents:subject)";
+    let out = text(&git(repo, &["for-each-ref", "--sort=-committerdate", &format!("--format={}", f), "refs/heads", "refs/remotes"])?);
+    let mut list = vec![];
+    for l in out.lines() {
+        let p: Vec<&str> = l.split('\0').collect();
+        if p.len() < 7 || p[0].ends_with("/HEAD") {
+            continue;
+        }
+        let remote = p[0].starts_with("refs/remotes/");
+        let name = p[0].trim_start_matches("refs/heads/").trim_start_matches("refs/remotes/");
+        let num = |w: &str| p[3].split(w).nth(1).and_then(|x| x.trim_start().split(|c: char| !c.is_ascii_digit()).next()).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+        list.push(json!({
+            "name": name, "commit": p[1], "upstream": if p[2].is_empty() { Value::Null } else { json!(p[2]) },
+            "ahead": num("ahead"), "behind": num("behind"), "gone": p[3].contains("gone"),
+            "current": p[4] == "*", "remote": remote, "date": p[5], "subject": p[6],
+        }));
+    }
+    Ok(list)
+}
+
+/// Tags: `{ name, commit, annotated, tagger, date, subject }`, newest first; `commit` is what a tag points at, for an annotated one too.
+pub fn git_cli_tags(repo: &str) -> Result<Vec<Value>, String> {
+    let f = "%(refname:short)%00%(objecttype)%00%(objectname)%00%(*objectname)%00%(taggername)%00%(creatordate:iso-strict)%00%(contents:subject)";
+    let out = text(&git(repo, &["for-each-ref", "--sort=-creatordate", &format!("--format={}", f), "refs/tags"])?);
+    Ok(out.lines().filter_map(|l| {
+        let p: Vec<&str> = l.split('\0').collect();
+        if p.len() < 7 {
+            return None;
+        }
+        let annotated = p[1] == "tag";
+        Some(json!({ "name": p[0], "commit": if annotated { p[3] } else { p[2] }, "annotated": annotated, "tagger": if p[4].is_empty() { Value::Null } else { json!(p[4]) }, "date": p[5], "subject": p[6] }))
+    }).collect())
+}
+
+/// `diff --numstat` read: `{ files: [{ path, from, added, deleted, binary }], added, deleted, changed }`. `options`: `from` and `to` (revisions; the working tree against the index unless given), `staged`, `path`.
+pub fn git_cli_diff_stat(repo: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut a = vec!["diff".to_string(), "--numstat".to_string(), "-z".to_string(), "-M".to_string()];
+    if options.get("staged").and_then(|v| v.as_bool()).unwrap_or(false) {
+        a.push("--cached".into());
+    }
+    for k in ["from", "to"] {
+        if let Some(r) = options.get(k).and_then(|v| v.as_str()) {
+            rev_ok(r)?;
+            a.push(r.to_string());
+        }
+    }
+    a.push("--".into());
+    if let Some(p) = options.get("path").and_then(|v| v.as_str()) {
+        a.push(p.to_string());
+    }
+    let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    let out = text(&git(repo, &refs)?);
+    let mut items = out.split('\0');
+    let mut files = vec![];
+    let (mut added, mut deleted) = (0u64, 0u64);
+    while let Some(head) = items.next() {
+        if head.is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = head.splitn(3, '\t').collect();
+        if p.len() < 3 {
+            continue;
+        }
+        // A rename has an empty path here, and the two paths after it.
+        let (path, from) = if p[2].is_empty() {
+            let f = items.next().unwrap_or("");
+            let t = items.next().unwrap_or("");
+            (t.to_string(), Some(f.to_string()))
+        } else {
+            (p[2].to_string(), None)
+        };
+        let binary = p[0] == "-";
+        let (x, y) = (p[0].parse::<u64>().unwrap_or(0), p[1].parse::<u64>().unwrap_or(0));
+        added += x;
+        deleted += y;
+        let mut f = json!({ "path": path, "added": x, "deleted": y, "binary": binary });
+        if let Some(o) = from {
+            f["from"] = json!(o);
+        }
+        files.push(f);
+    }
+    let changed = files.len();
+    Ok(json!({ "files": files, "added": added, "deleted": deleted, "changed": changed }))
+}
+
+/// `blame --porcelain` read: `{ lines: [{ line, commit, author, email, date, summary, text }], authors: [{ author, lines }] }`. `options`: `rev`, `from` and `to` line numbers.
+pub fn git_cli_blame(repo: &str, file: &str, options: serde_json::Value) -> Result<Value, String> {
+    file_ok(file)?;
+    let mut a = vec!["blame".to_string(), "--porcelain".to_string()];
+    if let (Some(x), Some(y)) = (options.get("from").and_then(|v| v.as_u64()), options.get("to").and_then(|v| v.as_u64())) {
+        a.push(format!("-L{},{}", x, y));
+    }
+    if let Some(r) = options.get("rev").and_then(|v| v.as_str()) {
+        rev_ok(r)?;
+        a.push(r.to_string());
+    }
+    a.push("--".into());
+    a.push(file.to_string());
+    let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    let out = text(&git(repo, &refs)?);
+    let mut commits: std::collections::HashMap<String, Map<String, Value>> = std::collections::HashMap::new();
+    let mut lines = vec![];
+    let mut sha = String::new();
+    let mut number = 0u64;
+    for l in out.split('\n') {
+        if let Some(t) = l.strip_prefix('\t') {
+            let c = commits.get(&sha).cloned().unwrap_or_default();
+            let mut e = json!({ "line": number, "commit": sha, "text": t });
+            for k in ["author", "email", "date", "summary"] {
+                e[k] = c.get(k).cloned().unwrap_or(Value::Null);
+            }
+            lines.push(e);
+            continue;
+        }
+        let mut w = l.split(' ');
+        let first = w.next().unwrap_or("");
+        if first.len() >= 40 && first.bytes().all(|c| c.is_ascii_hexdigit()) {
+            sha = first.to_string();
+            let _orig = w.next();
+            number = w.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            commits.entry(sha.clone()).or_default();
+            continue;
+        }
+        let e = commits.entry(sha.clone()).or_default();
+        let rest = l.get(first.len() + 1..).unwrap_or("");
+        match first {
+            "author" => {
+                e.insert("author".into(), json!(rest));
+            }
+            "author-mail" => {
+                e.insert("email".into(), json!(rest.trim_matches(['<', '>'])));
+            }
+            "author-time" => {
+                e.insert("date".into(), json!(rest.parse::<u64>().unwrap_or(0)));
+            }
+            "summary" => {
+                e.insert("summary".into(), json!(rest));
+            }
+            _ => {}
+        }
+    }
+    let mut by: Vec<(String, u64)> = vec![];
+    for l in &lines {
+        let n = l["author"].as_str().unwrap_or("").to_string();
+        match by.iter_mut().find(|x| x.0 == n) {
+            Some(x) => x.1 += 1,
+            None => by.push((n, 1)),
+        }
+    }
+    by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(json!({ "lines": lines, "authors": by.iter().map(|x| json!({ "author": x.0, "lines": x.1 })).collect::<Vec<_>>() }))
+}
+
+/// One commit: `{ commit, short, parents, author, email, date, committer, subject, body, files, added, deleted }`.
+pub fn git_cli_show(repo: &str, rev: &str) -> Result<Value, String> {
+    rev_ok(rev)?;
+    let f = "--format=%H%x00%h%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%s%x00%b%x00";
+    let out = text(&git(repo, &["show", "-s", f, "--end-of-options", rev])?);
+    let p: Vec<&str> = out.splitn(10, '\0').collect();
+    if p.len() < 9 {
+        return Err(format!("`{}` is not a commit", rev));
+    }
+    let parents: Vec<&str> = p[2].split_whitespace().collect();
+    let stat = if parents.len() <= 1 {
+        let base = if parents.is_empty() { "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string() } else { parents[0].to_string() };
+        git_cli_diff_stat(repo, json!({ "from": base, "to": p[0] }))?
+    } else {
+        json!({ "files": [], "added": 0, "deleted": 0 })
+    };
+    Ok(json!({
+        "commit": p[0], "short": p[1], "parents": parents, "author": p[3], "email": p[4], "date": p[5], "committer": p[6],
+        "subject": p[7], "body": p[8].trim(), "files": stat["files"], "added": stat["added"], "deleted": stat["deleted"],
+    }))
+}
+
+/// A file as it was at a revision, as text; null when it is not in that commit.
+pub fn git_cli_file(repo: &str, rev: &str, file: &str) -> Result<Option<String>, String> {
+    rev_ok(rev)?;
+    file_ok(file)?;
+    match git(repo, &["show", &format!("{}:{}", rev, file)]) {
+        Ok(b) => Ok(Some(text(&b))),
+        Err(e) if e.contains("does not exist") || e.contains("exists on disk, but not in") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Any git command, for what has no function here: `git_cli_run(repo, ["log", "-1", "--format=%s"], {})`. Answers `{ ok, status, stdout, stderr }`. `options.timeout_ms`. Nothing goes through a shell.
+pub fn git_cli_run(repo: &str, args: Vec<String>, options: serde_json::Value) -> Result<Value, String> {
+    let (code, out, err) = run(repo, &args, options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT))?;
+    Ok(json!({ "ok": code == Some(0), "status": code, "stdout": text(&out), "stderr": err }))
+}
+
+/// Makes a new repository in a folder (made if needed), on `branch`, "main" unless given. Answers the folder.
+pub fn git_cli_init(path: &str, branch: &str) -> Result<String, String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("{}: {}", path, e))?;
+    rev_ok(if branch.is_empty() { "main" } else { branch })?;
+    git(path, &["init", "-q", "-b", if branch.is_empty() { "main" } else { branch }])?;
+    Ok(path.to_string())
+}
+
+/// Stages files (a list of paths; everything when it is empty) and commits them: `options.author` is "Name <email>"; the committer is that too unless the machine's git has its own. Answers the new commit's id. Hooks in the repository do not run.
+pub fn git_cli_commit(repo: &str, message: &str, files: Vec<String>, options: serde_json::Value) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("a commit needs a message".into());
+    }
+    let mut add = vec!["add".to_string()];
+    if files.is_empty() {
+        add.push("-A".into());
+    } else {
+        add.push("--".into());
+        add.extend(files);
+    }
+    let refs: Vec<&str> = add.iter().map(|s| s.as_str()).collect();
+    git(repo, &refs)?;
+    let mut a = vec!["-c".to_string(), "core.hooksPath=/dev/null".to_string()];
+    let who = options.get("author").and_then(|v| v.as_str());
+    if let Some(w) = who {
+        let (n, e) = w.split_once('<').ok_or(format!("`{}` is not \"Name <email>\"", w))?;
+        a.extend(["-c".to_string(), format!("user.name={}", n.trim()), "-c".to_string(), format!("user.email={}", e.trim_end_matches('>'))]);
+    }
+    a.extend(["commit".to_string(), "-q".to_string(), "--no-gpg-sign".to_string(), "-m".to_string(), message.to_string()]);
+    let mut c = vec![];
+    for x in &a {
+        c.push(x.as_str());
+    }
+    if let Some(d) = options.get("date").and_then(|v| v.as_str()) {
+        c.push("--date");
+        c.push(d);
+    }
+    git(repo, &c)?;
+    Ok(text(&git(repo, &["rev-parse", "HEAD"])?).trim().to_string())
+}
+
+/// Adds a tag at HEAD: annotated when `message` is not empty. Answers the tag's name.
+pub fn git_cli_tag(repo: &str, name: &str, message: &str, options: serde_json::Value) -> Result<String, String> {
+    rev_ok(name)?;
+    let mut a = vec![];
+    if let Some(w) = options.get("author").and_then(|v| v.as_str()) {
+        let (n, e) = w.split_once('<').ok_or(format!("`{}` is not \"Name <email>\"", w))?;
+        a.extend(["-c".to_string(), format!("user.name={}", n.trim()), "-c".to_string(), format!("user.email={}", e.trim_end_matches('>'))]);
+    }
+    a.extend(["tag".to_string(), "--no-sign".to_string()]);
+    if !message.is_empty() {
+        a.extend(["-a".to_string(), "-m".to_string(), message.to_string()]);
+    }
+    a.push(name.to_string());
+    let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    git(repo, &refs)?;
+    Ok(name.to_string())
+}
+
+/// Writes a file inside a repository's folder, for scripts and tests that make their own: a path leaving the folder is refused.
+pub fn git_cli_write(repo: &str, file: &str, content: &str) -> Result<i64, String> {
+    file_ok(file)?;
+    let p = std::path::Path::new(file);
+    if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("`{}` leaves the repository", file));
+    }
+    let full = std::path::Path::new(repo).join(p);
+    if let Some(d) = full.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", repo, e))?;
+    }
+    std::fs::write(&full, content).map_err(|e| format!("{}: {}", file, e))?;
+    Ok(content.len() as i64)
+}
+
+/// Deletes a throwaway repository: only a folder holding `.git` directly, inside the system's temporary folder. Answers true when one went.
+pub fn git_cli_discard(path: &str) -> Result<bool, String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Ok(false);
+    }
+    let real = p.canonicalize().map_err(|e| format!("{}: {}", path, e))?;
+    let temps = [std::env::temp_dir(), std::path::PathBuf::from("/tmp")];
+    let inside = temps.iter().filter_map(|t| t.canonicalize().ok()).any(|t| real.starts_with(&t) && real != t);
+    if !inside {
+        return Err(format!("{} is outside the temporary folder: it stays", path));
+    }
+    if !real.join(".git").exists() {
+        return Err(format!("{} is not a repository: it stays", path));
+    }
+    std::fs::remove_dir_all(&real).map_err(|e| format!("{}: {}", path, e))?;
+    Ok(true)
+}

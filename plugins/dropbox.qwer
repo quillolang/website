@@ -1,0 +1,390 @@
+//! Dropbox's HTTP API: files uploaded in one request or by upload sessions for big ones, downloads, folders listed with cursors, shared links made or found again, metadata, moves and deletes, a refresh token traded for short-lived access tokens, and 429s waited out as Retry-After says.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// DROPBOX_API_URL and DROPBOX_CONTENT_URL are the two hosts (https://api.dropboxapi.com and
+// https://content.dropboxapi.com when not set). DROPBOX_ACCESS_TOKEN is a token; or give
+// DROPBOX_REFRESH_TOKEN with DROPBOX_APP_KEY and DROPBOX_APP_SECRET, and short-lived tokens are
+// fetched as they are needed.
+
+const SINGLE_LIMIT: usize = 150 * 1024 * 1024;
+const CHUNK: usize = 4 * 1024 * 1024;
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    env("DROPBOX_API_URL").unwrap_or_else(|| "https://api.dropboxapi.com".into()).trim_end_matches('/').to_string()
+}
+
+fn content() -> String {
+    env("DROPBOX_CONTENT_URL").unwrap_or_else(|| "https://content.dropboxapi.com".into()).trim_end_matches('/').to_string()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn fresh_token() -> Result<String, String> {
+    let (r, k, s) = (env("DROPBOX_REFRESH_TOKEN"), env("DROPBOX_APP_KEY"), env("DROPBOX_APP_SECRET"));
+    let (Some(refresh), Some(key), Some(secret)) = (r, k, s) else {
+        return Err("set DROPBOX_ACCESS_TOKEN, or DROPBOX_REFRESH_TOKEN with DROPBOX_APP_KEY and DROPBOX_APP_SECRET".into());
+    };
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", key, secret));
+    let res = ureq::post(&format!("{}/oauth2/token", api())).timeout(Duration::from_secs(20)).set("Authorization", &format!("Basic {}", auth)).send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("Dropbox refused the refresh token ({}): {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach Dropbox at {}: {}", api(), e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("Dropbox gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), now() + v["expires_in"].as_i64().unwrap_or(14400)));
+    Ok(tok)
+}
+
+fn token() -> Result<String, String> {
+    if env("DROPBOX_REFRESH_TOKEN").is_none() {
+        if let Some(t) = env("DROPBOX_ACCESS_TOKEN") {
+            return Ok(t);
+        }
+    }
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 60 {
+            return Ok(t.clone());
+        }
+    }
+    fresh_token()
+}
+
+/// JSON for the Dropbox-API-Arg header: everything past ASCII as \uXXXX, as a header carries only ASCII.
+fn header_json(v: &Value) -> String {
+    let mut o = String::new();
+    for c in v.to_string().chars() {
+        if (c as u32) < 0x7f {
+            o.push(c);
+        } else {
+            let mut b = [0u16; 2];
+            for u in c.encode_utf16(&mut b) {
+                o.push_str(&format!("\\u{:04x}", u));
+            }
+        }
+    }
+    o
+}
+
+enum Body<'a> {
+    None,
+    Json(&'a Value),
+    Bytes(&'a [u8]),
+}
+
+struct Reply {
+    result: Option<String>,
+    bytes: Vec<u8>,
+}
+
+/// One call: waits out 429 and 503, and when an access token has expired fetches a new one and repeats.
+fn call(url: &str, arg: Option<&Value>, body: Body) -> Result<Result<Reply, (u16, Value)>, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
+    let mut refreshed = false;
+    for attempt in 0..6 {
+        let mut req = agent.post(url).set("Authorization", &format!("Bearer {}", token()?));
+        if let Some(a) = arg {
+            req = req.set("Dropbox-API-Arg", &header_json(a));
+        }
+        let res = match &body {
+            Body::None if arg.is_some() => req.set("Content-Type", "application/octet-stream").send_bytes(b""),
+            Body::None => req.call(),
+            Body::Json(v) => req.set("Content-Type", "application/json").send_string(&v.to_string()),
+            Body::Bytes(b) => req.set("Content-Type", "application/octet-stream").send_bytes(b),
+        };
+        match res {
+            Ok(r) => {
+                let result = r.header("Dropbox-API-Result").map(str::to_string);
+                let mut bytes = Vec::new();
+                r.into_reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                return Ok(Ok(Reply { result, bytes }));
+            }
+            Err(ureq::Error::Status(c, r)) if (c == 429 || c == 503) && attempt < 5 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1 << attempt);
+                std::thread::sleep(Duration::from_secs(wait.min(60)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&text).unwrap_or(json!({ "error_summary": text }));
+                let expired = c == 401 && v["error_summary"].as_str().map_or(false, |s| s.starts_with("expired_access_token"));
+                if expired && !refreshed && env("DROPBOX_REFRESH_TOKEN").is_some() {
+                    refreshed = true;
+                    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    continue;
+                }
+                return Ok(Err((c, v)));
+            }
+            Err(e) => return Err(format!("cannot reach Dropbox: {}", e)),
+        }
+    }
+    Err("Dropbox stayed busy through six tries".into())
+}
+
+fn summary(c: u16, v: &Value) -> String {
+    format!("Dropbox answered {}: {}", c, v["error_summary"].as_str().unwrap_or(&v.to_string()).trim_end_matches('/').trim_end_matches(|x: char| x == '.' || x.is_ascii_digit()).trim_end_matches('/'))
+}
+
+fn rpc_raw(route: &str, body: &Value) -> Result<Result<Value, (u16, Value)>, String> {
+    Ok(match call(&format!("{}/2/{}", api(), route), None, Body::Json(body))? {
+        Ok(r) => Ok(serde_json::from_slice(&r.bytes).unwrap_or(Value::Null)),
+        Err(e) => Err(e),
+    })
+}
+
+fn rpc(route: &str, body: &Value) -> Result<Value, String> {
+    rpc_raw(route, body)?.map_err(|(c, v)| summary(c, &v))
+}
+
+fn check_path(p: &str) -> Result<(), String> {
+    if !(p.is_empty() || p.starts_with('/') || p.starts_with("id:") || p.starts_with("rev:") || p.starts_with("ns:")) {
+        return Err(format!("{:?} is not a Dropbox path: it starts with a /, or is an id:", p));
+    }
+    if p.len() > 1 && p.ends_with('/') {
+        return Err(format!("{:?}: a Dropbox path does not end in /", p));
+    }
+    Ok(())
+}
+
+fn mode_of(mode: &str) -> Result<Value, String> {
+    Ok(match mode {
+        "" | "add" => json!("add"),
+        "overwrite" => json!("overwrite"),
+        m if m.starts_with("update:") => json!({ ".tag": "update", "update": &m[7..] }),
+        m => return Err(format!("{:?} is not a write mode: add, overwrite, or update:<rev>", m)),
+    })
+}
+
+fn result_of(r: Reply) -> Value {
+    if !r.bytes.is_empty() {
+        if let Ok(v) = serde_json::from_slice(&r.bytes) {
+            return v;
+        }
+    }
+    r.result.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+}
+
+/// Uploads text to `path` in one request (at most 150 MB). `mode` is "add" (the default; a name in use is an error), "overwrite", or "update:<rev>", which fails if the file has changed. Gives its metadata: `name`, `path_display`, `rev`, `size`, `content_hash`.
+pub fn dropbox_upload(path: &str, text: &str, mode: &str) -> Result<Value, String> {
+    check_path(path)?;
+    if text.len() > SINGLE_LIMIT {
+        return Err("over 150 MB: use dropbox_upload_file, which uses an upload session".into());
+    }
+    let arg = json!({ "path": path, "mode": mode_of(mode)?, "autorename": false, "mute": true });
+    match call(&format!("{}/2/files/upload", content()), Some(&arg), Body::Bytes(text.as_bytes()))? {
+        Ok(r) => Ok(result_of(r)),
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+/// Uploads a local file: in one request when it is small, by an upload session in pieces of `chunk_kb` (0 for 4 MiB; Dropbox wants multiples of 4 MiB, save the last) when it is not. If Dropbox reports a different offset after a lost answer, it carries on from there. Gives its metadata, with `pieces`.
+pub fn dropbox_upload_file(local: &str, path: &str, mode: &str, chunk_kb: i64) -> Result<Value, String> {
+    check_path(path)?;
+    let mut f = std::fs::File::open(local).map_err(|e| format!("{}: {}", local, e))?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    let chunk = if chunk_kb > 0 { chunk_kb as usize * 1024 } else { CHUNK };
+    let commit = json!({ "path": path, "mode": mode_of(mode)?, "autorename": false, "mute": true });
+    let mut buf = vec![0u8; chunk];
+    if size as usize <= chunk {
+        let mut all = Vec::with_capacity(size as usize);
+        f.read_to_end(&mut all).map_err(|e| e.to_string())?;
+        return match call(&format!("{}/2/files/upload", content()), Some(&commit), Body::Bytes(&all))? {
+            Ok(r) => {
+                let mut v = result_of(r);
+                v["pieces"] = json!(1);
+                Ok(v)
+            }
+            Err((c, v)) => Err(summary(c, &v)),
+        };
+    }
+    let read = |f: &mut std::fs::File, buf: &mut Vec<u8>| -> Result<usize, String> {
+        let mut got = 0;
+        while got < buf.len() {
+            let n = f.read(&mut buf[got..]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        Ok(got)
+    };
+    let n = read(&mut f, &mut buf)?;
+    let start = call(&format!("{}/2/files/upload_session/start", content()), Some(&json!({ "close": false })), Body::Bytes(&buf[..n]))?.map_err(|(c, v)| summary(c, &v))?;
+    let id = result_of(start)["session_id"].as_str().ok_or("Dropbox gave no session_id")?.to_string();
+    let mut offset = n as u64;
+    let mut pieces = 1;
+    let mut retries = 0;
+    while offset < size {
+        f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        let n = read(&mut f, &mut buf)?;
+        let last = offset + n as u64 >= size;
+        let cursor = json!({ "session_id": id, "offset": offset });
+        let (url, arg) = if last {
+            (format!("{}/2/files/upload_session/finish", content()), json!({ "cursor": cursor, "commit": commit }))
+        } else {
+            (format!("{}/2/files/upload_session/append_v2", content()), json!({ "cursor": cursor, "close": false }))
+        };
+        match call(&url, Some(&arg), Body::Bytes(&buf[..n]))? {
+            Ok(r) => {
+                pieces += 1;
+                if last {
+                    let mut v = result_of(r);
+                    v["pieces"] = json!(pieces);
+                    return Ok(v);
+                }
+                offset += n as u64;
+            }
+            // The last append arrived though its answer was lost, or the reverse: Dropbox says where it is.
+            Err((409, v)) if v["error"]["correct_offset"].is_u64() || v["error"]["lookup_failed"]["correct_offset"].is_u64() => {
+                retries += 1;
+                if retries > 3 {
+                    return Err(summary(409, &v));
+                }
+                offset = v["error"]["correct_offset"].as_u64().or(v["error"]["lookup_failed"]["correct_offset"].as_u64()).unwrap_or(offset);
+            }
+            Err((c, v)) => return Err(summary(c, &v)),
+        }
+    }
+    Err("the file ended before the session finished".into())
+}
+
+/// A file's content as text, with the metadata Dropbox sends in a header: `{ text, metadata }`.
+pub fn dropbox_download(path: &str) -> Result<Value, String> {
+    check_path(path)?;
+    match call(&format!("{}/2/files/download", content()), Some(&json!({ "path": path })), Body::None)? {
+        Ok(r) => {
+            let meta: Value = r.result.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null);
+            Ok(json!({ "text": String::from_utf8_lossy(&r.bytes), "metadata": meta }))
+        }
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+/// Saves a file to a local path, and gives its metadata.
+pub fn dropbox_download_file(path: &str, local: &str) -> Result<Value, String> {
+    check_path(path)?;
+    match call(&format!("{}/2/files/download", content()), Some(&json!({ "path": path })), Body::None)? {
+        Ok(r) => {
+            std::fs::write(local, &r.bytes).map_err(|e| format!("{}: {}", local, e))?;
+            Ok(r.result.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null))
+        }
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+fn entries(r: &Value) -> Value {
+    json!({ "entries": r["entries"], "cursor": r["cursor"], "more": r["has_more"] })
+}
+
+/// One page of a folder, "" being the root. `options`: `recursive`, `limit`, `include_deleted`. Gives `{ entries, cursor, more }`, each entry with `.tag` file, folder or deleted. Keep `cursor` to ask later what has changed.
+pub fn dropbox_list(path: &str, options: serde_json::Value) -> Result<Value, String> {
+    check_path(path)?;
+    let mut b = json!({ "path": path, "recursive": options["recursive"] == true, "include_deleted": options["include_deleted"] == true });
+    if let Some(l) = options["limit"].as_i64() {
+        b["limit"] = json!(l);
+    }
+    Ok(entries(&rpc("files/list_folder", &b)?))
+}
+
+/// The next page after a `cursor`, or what has changed since it.
+pub fn dropbox_list_continue(cursor: &str) -> Result<Value, String> {
+    Ok(entries(&rpc("files/list_folder/continue", &json!({ "cursor": cursor }))?))
+}
+
+/// Every entry of a folder, page after page, up to `max`: `{ entries, cursor, complete }`.
+pub fn dropbox_list_all(path: &str, recursive: bool, max: i64) -> Result<Value, String> {
+    let mut p = dropbox_list(path, json!({ "recursive": recursive }))?;
+    let mut out: Vec<Value> = vec![];
+    loop {
+        out.extend(p["entries"].as_array().cloned().unwrap_or_default());
+        if out.len() as i64 >= max {
+            out.truncate(max.max(0) as usize);
+            return Ok(json!({ "entries": out, "cursor": p["cursor"], "complete": p["more"] != true }));
+        }
+        if p["more"] != true {
+            return Ok(json!({ "entries": out, "cursor": p["cursor"], "complete": true }));
+        }
+        p = dropbox_list_continue(p["cursor"].as_str().ok_or("no cursor")?)?;
+    }
+}
+
+/// A file or folder's metadata, or null when there is none at that path.
+pub fn dropbox_metadata(path: &str) -> Result<Value, String> {
+    check_path(path)?;
+    match rpc_raw("files/get_metadata", &json!({ "path": path }))? {
+        Ok(v) => Ok(v),
+        Err((409, v)) if v["error_summary"].as_str().map_or(false, |s| s.starts_with("path/not_found")) => Ok(Value::Null),
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+/// Makes a folder; false when it was there.
+pub fn dropbox_create_folder(path: &str) -> Result<bool, String> {
+    check_path(path)?;
+    match rpc_raw("files/create_folder_v2", &json!({ "path": path, "autorename": false }))? {
+        Ok(_) => Ok(true),
+        Err((409, v)) if v["error_summary"].as_str().map_or(false, |s| s.starts_with("path/conflict")) => Ok(false),
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+/// Moves or renames; gives the new metadata.
+pub fn dropbox_move(from: &str, to: &str) -> Result<Value, String> {
+    check_path(from)?;
+    check_path(to)?;
+    Ok(rpc("files/move_v2", &json!({ "from_path": from, "to_path": to }))?["metadata"].clone())
+}
+
+/// Deletes a file or folder; false when there was none.
+pub fn dropbox_delete(path: &str) -> Result<bool, String> {
+    check_path(path)?;
+    match rpc_raw("files/delete_v2", &json!({ "path": path }))? {
+        Ok(_) => Ok(true),
+        Err((409, v)) if v["error_summary"].as_str().map_or(false, |s| s.starts_with("path_lookup/not_found")) => Ok(false),
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}
+
+/// A shared link for a path. Dropbox refuses to make a second one, so when one exists that one is given. `options` are its settings, like `{ requested_visibility: "public", expires: "2027-01-01T00:00:00Z" }`, for a new link. Gives `{ url, name, path, new, expires }`.
+pub fn dropbox_shared_link(path: &str, options: serde_json::Value) -> Result<Value, String> {
+    check_path(path)?;
+    let mut b = json!({ "path": path });
+    if options.is_object() {
+        b["settings"] = options;
+    }
+    let shape = |m: &Value, new: bool| json!({ "url": m["url"], "name": m["name"], "path": m["path_lower"], "new": new, "expires": m["expires"] });
+    match rpc_raw("sharing/create_shared_link_with_settings", &b)? {
+        Ok(m) => Ok(shape(&m, true)),
+        Err((409, v)) if v["error_summary"].as_str().map_or(false, |s| s.starts_with("shared_link_already_exists")) => {
+            if let Some(m) = v["error"]["shared_link_already_exists"]["metadata"].as_object() {
+                return Ok(shape(&Value::Object(m.clone()), false));
+            }
+            let l = rpc("sharing/list_shared_links", &json!({ "path": path, "direct_only": true }))?;
+            l["links"].get(0).map(|m| shape(m, false)).ok_or("Dropbox says a link exists but lists none".to_string())
+        }
+        Err((c, v)) => Err(summary(c, &v)),
+    }
+}

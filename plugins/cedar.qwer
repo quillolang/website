@@ -1,0 +1,150 @@
+//! Amazon's Cedar policies: requests authorized against policies and entities from JSON, policies validated against a schema, and why a decision was reached, each problem placed by line.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! cedar-policy = "=4.14.0"
+//! miette = "7"
+
+use cedar_policy::{Authorizer, Context, Decision, Entities, EntityUid, PolicyId, PolicySet, Request, Schema, ValidationMode, Validator};
+use miette::Diagnostic;
+use serde_json::{json, Value};
+use std::str::FromStr;
+
+/// Line and column, from 1, of a byte in a text.
+fn place(text: &str, at: usize) -> (usize, usize) {
+    let before = &text[..text.floor_char_boundary(at.min(text.len()))];
+    (before.matches('\n').count() + 1, before.rsplit('\n').next().unwrap_or("").chars().count() + 1)
+}
+
+/// A problem with where it is: `{ message, line, column, help }`.
+fn described(d: &dyn Diagnostic, text: &str) -> Value {
+    let mut message = d.to_string();
+    let mut src = std::error::Error::source(d);
+    while let Some(e) = src {
+        let s = e.to_string();
+        if !message.contains(&s) {
+            message = format!("{}: {}", message, s);
+        }
+        src = e.source();
+    }
+    // Only a label in a text we hold says anything.
+    let at = if text.is_empty() { None } else { d.labels().and_then(|mut l| l.next()).map(|l| l.offset()) };
+    let (line, column) = match at {
+        Some(a) => { let (l, c) = place(text, a); (json!(l), json!(c)) }
+        None => (Value::Null, Value::Null),
+    };
+    json!({ "message": message, "line": line, "column": column, "help": d.help().map(|h| h.to_string()) })
+}
+
+fn first_line(v: &Value) -> String {
+    match v["line"].as_u64() {
+        Some(l) => format!("line {}, column {}: {}", l, v["column"], v["message"].as_str().unwrap_or("")),
+        None => v["message"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+fn parse(policies: &str) -> Result<PolicySet, String> {
+    PolicySet::from_str(policies).map_err(|e| first_line(&described(&e, policies)))
+}
+
+fn schema(s: &Value) -> Result<Option<Schema>, String> {
+    match s {
+        Value::Null => Ok(None),
+        Value::String(t) => Schema::from_cedarschema_str(t).map(|x| Some(x.0)).map_err(|e| format!("schema: {}", first_line(&described(&e, t)))),
+        o => Schema::from_json_value(o.clone()).map(Some).map_err(|e| format!("schema: {}", first_line(&described(&e, "")))),
+    }
+}
+
+fn uid(v: &Value, what: &str) -> Result<EntityUid, String> {
+    match v {
+        Value::String(s) => EntityUid::from_str(s).map_err(|e| format!("{} `{}` is not an entity like User::\"alice\": {}", what, s, e)),
+        Value::Object(_) => {
+            let t = v["type"].as_str().ok_or(format!("{}: no type", what))?;
+            let id = v["id"].as_str().ok_or(format!("{}: no id", what))?;
+            Ok(EntityUid::from_type_name_and_id(t.parse().map_err(|e: cedar_policy::ParseErrors| format!("{}: {}", what, e))?, id.parse().map_err(|e| format!("{}: {:?}", what, e))?))
+        }
+        _ => Err(format!("{} is needed", what)),
+    }
+}
+
+fn label(set: &PolicySet, id: &PolicyId) -> Value {
+    let Some(p) = set.policy(id) else { return json!({ "id": id.to_string() }) };
+    let notes: serde_json::Map<String, Value> = p.annotations().map(|(k, v)| (k.to_string(), json!(v))).collect();
+    let name = notes.get("id").cloned().unwrap_or_else(|| json!(id.to_string()));
+    let effect = format!("{:?}", p.effect()).to_lowercase();
+    json!({ "id": name, "effect": effect, "annotations": notes, "text": p.to_string().trim() })
+}
+
+/// Decides a request. `request` is `{ principal, action, resource, context }`, entities written `User::"alice"` or `{ type, id }`. `entities` is Cedar's JSON, `[{ uid, attrs, parents }]`, or text. `schema` is null, Cedar schema text or schema JSON: given, the request, the context and the entities are checked against it. Gives `{ allowed, decision, reasons, errors, why }`: `reasons` are the policies that decided, by their `@id` annotation if they have one, `errors` the policies that failed to evaluate and so were skipped, `why` a sentence. A policy that fails to parse is an error with its line.
+pub fn cedar_authorize(policies: &str, entities: serde_json::Value, request: serde_json::Value, schema_value: serde_json::Value) -> Result<Value, String> {
+    let set = parse(policies)?;
+    let sch = schema(&schema_value)?;
+    let principal = uid(&request["principal"], "principal")?;
+    let action = uid(&request["action"], "action")?;
+    let resource = uid(&request["resource"], "resource")?;
+    let context = match &request["context"] {
+        Value::Null => Context::empty(),
+        c => Context::from_json_value(c.clone(), sch.as_ref().map(|s| (s, &action))).map_err(|e| format!("context: {}", first_line(&described(&e, ""))))?,
+    };
+    let list = match entities {
+        Value::String(t) => serde_json::from_str(&t).map_err(|e| format!("entities: not JSON: {}", e))?,
+        Value::Null => json!([]),
+        o => o,
+    };
+    let ents = Entities::from_json_value(list, sch.as_ref()).map_err(|e| format!("entities: {}", first_line(&described(&e, ""))))?;
+    let q = Request::new(principal.clone(), action.clone(), resource.clone(), context, sch.as_ref()).map_err(|e| format!("the request: {}", first_line(&described(&e, ""))))?;
+    let r = Authorizer::new().is_authorized(&q, &set, &ents);
+    let allowed = r.decision() == Decision::Allow;
+    let reasons: Vec<Value> = r.diagnostics().reason().map(|id| label(&set, id)).collect();
+    let errors: Vec<String> = r.diagnostics().errors().map(|e| { let v = described(e, ""); v["message"].as_str().unwrap_or("").to_string() }).collect();
+    let names: Vec<String> = reasons.iter().map(|x| x["id"].as_str().unwrap_or("").to_string()).collect();
+    let why = if allowed {
+        format!("allowed by {}", names.join(", "))
+    } else if !names.is_empty() {
+        format!("denied: forbidden by {}", names.join(", "))
+    } else if !errors.is_empty() {
+        format!("denied: no policy permits it, and {} failed to evaluate", errors.len())
+    } else {
+        "denied: no policy permits it".to_string()
+    };
+    Ok(json!({ "allowed": allowed, "decision": if allowed { "Allow" } else { "Deny" }, "reasons": reasons, "errors": errors, "why": why }))
+}
+
+/// Parses policies without deciding anything: `{ ok, errors, policies }`, each error with `line` and `column`, each policy with its `id`, `effect` and annotations.
+pub fn cedar_check(policies: &str) -> Value {
+    match PolicySet::from_str(policies) {
+        Err(e) => {
+            let errors: Vec<Value> = e.iter().map(|d| described(d, policies)).collect();
+            json!({ "ok": false, "errors": if errors.is_empty() { vec![described(&e, policies)] } else { errors }, "policies": [] })
+        }
+        Ok(set) => {
+            let list: Vec<Value> = set.policies().map(|p| { let mut v = label(&set, p.id()); v.as_object_mut().unwrap().remove("text"); v }).collect();
+            json!({ "ok": true, "errors": [], "policies": list })
+        }
+    }
+}
+
+/// Checks policies against a schema, Cedar schema text or JSON: a misspelled attribute, a type that cannot fit, an action applied to what it does not take. `{ ok, errors, warnings }`, each with `message` and `line`, in strict mode.
+pub fn cedar_validate(policies: &str, schema_value: serde_json::Value) -> Result<Value, String> {
+    let set = parse(policies)?;
+    let sch = schema(&schema_value)?.ok_or("no schema given")?;
+    let r = Validator::new(sch).validate(&set, ValidationMode::Strict);
+    let errors: Vec<Value> = r.validation_errors().map(|e| described(e, policies)).collect();
+    let warnings: Vec<Value> = r.validation_warnings().map(|e| described(e, policies)).collect();
+    Ok(json!({ "ok": errors.is_empty(), "errors": errors, "warnings": warnings }))
+}
+
+/// Who may do what, one line per pair of `principals`, `actions` and `resources`: a small access matrix for an admin page. Each cell is `{ principal, action, resource, allowed, why }`.
+pub fn cedar_matrix(policies: &str, entities: serde_json::Value, principals: Vec<String>, actions: Vec<String>, resources: Vec<String>) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    for p in &principals {
+        for a in &actions {
+            for r in &resources {
+                let d = cedar_authorize(policies, entities.clone(), json!({ "principal": p, "action": a, "resource": r }), Value::Null)?;
+                out.push(json!({ "principal": p, "action": a, "resource": r, "allowed": d["allowed"], "why": d["why"] }));
+            }
+        }
+    }
+    Ok(out)
+}

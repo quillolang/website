@@ -1,0 +1,345 @@
+//! Google Sheets' v4 API: ranges read and written, rows appended, several ranges at once, rows read as maps by their headers, structural batch updates, tabs added, A1 notation worked out both ways with sheet names quoted, retries on quota errors, and sign-in by a service account's RS256 JWT, kept until it expires.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// GOOGLE_SHEETS_API_URL is the API (https://sheets.googleapis.com when not set).
+// GOOGLE_SERVICE_ACCOUNT_JSON holds the service account's JSON, or GOOGLE_APPLICATION_CREDENTIALS
+// its file. Share the spreadsheet with the service account's address.
+
+const SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets";
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn credentials() -> Result<Value, String> {
+    let text = match (env("GOOGLE_SERVICE_ACCOUNT_JSON"), env("GOOGLE_APPLICATION_CREDENTIALS")) {
+        (Some(t), _) => t,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS".into()),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn token() -> Result<String, String> {
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    let sa = credentials()?;
+    let uri = sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let jwt = jsonwebtoken::encode(&head, &json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": uri, "iat": t, "exp": t + 3600 }), &key).map_err(|e| e.to_string())?;
+    let res = ureq::post(&uri).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("the token server answered {}: {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b)));
+        }
+        Err(e) => return Err(format!("cannot reach the token server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), t + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(tok)
+}
+
+fn base() -> String {
+    env("GOOGLE_SHEETS_API_URL").unwrap_or_else(|| "https://sheets.googleapis.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let tok = token()?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let url = format!("{}/v4/spreadsheets/{}", base(), path);
+    for attempt in 0..5 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", tok));
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|e| e.to_string());
+            }
+            // The per-minute quota: Google's advice is to back off and try again.
+            Err(ureq::Error::Status(429 | 503, r)) if attempt < 4 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(400u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let hint = if c == 403 { " (share the spreadsheet with the service account)" } else { "" };
+                return Err(format!("Sheets answered {} {}: {}{}", c, v["error"]["status"].as_str().unwrap_or(""), v["error"]["message"].as_str().unwrap_or(&t), hint));
+            }
+            Err(e) => return Err(format!("cannot reach Sheets at {}: {}", base(), e)),
+        }
+    }
+    Err("Sheets stayed busy through five tries".into())
+}
+
+fn input_mode(i: &str) -> Result<&'static str, String> {
+    match i {
+        "" | "user" | "USER_ENTERED" => Ok("USER_ENTERED"),
+        "raw" | "RAW" => Ok("RAW"),
+        o => Err(format!("{:?} is not an input mode: \"user\" reads values as if typed, formulas and dates too; \"raw\" keeps them as given", o)),
+    }
+}
+
+fn check_rows(values: &Value) -> Result<(), String> {
+    if !values.as_array().map_or(false, |a| a.iter().all(|r| r.is_array())) {
+        return Err("values are a list of rows, each a list of cells: [[1, 2], [3, 4]]".into());
+    }
+    Ok(())
+}
+
+// ---- A1 notation ----
+
+/// A column's letters from its number, from 1: 1 gives A, 27 AA, 703 AAA.
+pub fn gsheets_column_letters(n: i64) -> Result<String, String> {
+    if n < 1 {
+        return Err(format!("columns count from 1, not {}", n));
+    }
+    let (mut n, mut s) = (n, String::new());
+    while n > 0 {
+        let r = ((n - 1) % 26) as u8;
+        s.insert(0, (b'A' + r) as char);
+        n = (n - 1) / 26;
+    }
+    Ok(s)
+}
+
+/// A column's number from its letters, from 1: "A" gives 1, "AA" 27.
+pub fn gsheets_column_number(letters: &str) -> Result<i64, String> {
+    if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(format!("{:?} is not a column: letters only", letters));
+    }
+    Ok(letters.to_ascii_uppercase().bytes().fold(0i64, |n, b| n * 26 + (b - b'A') as i64 + 1))
+}
+
+/// A sheet's name as a range wants it: in single quotes when it holds anything but letters, digits and _, with any quote in it doubled.
+pub fn gsheets_quote_sheet(name: &str) -> String {
+    let looks_like_cell = name.chars().next().map_or(false, |c| c.is_ascii_digit());
+    if !name.is_empty() && !looks_like_cell && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return name.to_string();
+    }
+    format!("'{}'", name.replace('\'', "''"))
+}
+
+/// A range in A1 notation from numbers counted from 1: `gsheets_range("Q1 sales", 2, 1, 5, 3)` gives `'Q1 sales'!A2:C5`. `sheet` may be "". An `end_row` of 0 means the whole of those columns (`A:C`), and `end_row` equal to `row` and `end_col` to `col` one cell.
+pub fn gsheets_range(sheet: &str, row: i64, col: i64, end_row: i64, end_col: i64) -> Result<String, String> {
+    let prefix = if sheet.is_empty() { String::new() } else { format!("{}!", gsheets_quote_sheet(sheet)) };
+    let (a, b) = (gsheets_column_letters(col)?, gsheets_column_letters(end_col)?);
+    if end_row == 0 {
+        return Ok(format!("{}{}:{}", prefix, a, b));
+    }
+    if row < 1 || end_row < row || end_col < col {
+        return Err(format!("the range from row {} column {} to row {} column {} runs backwards", row, col, end_row, end_col));
+    }
+    if row == end_row && col == end_col {
+        return Ok(format!("{}{}{}", prefix, a, row));
+    }
+    Ok(format!("{}{}{}:{}{}", prefix, a, row, b, end_row))
+}
+
+fn cell_part(t: &str) -> Result<(Option<i64>, Option<i64>), String> {
+    let t = t.replace('$', "");
+    let split = t.find(|c: char| c.is_ascii_digit()).unwrap_or(t.len());
+    let (letters, digits) = t.split_at(split);
+    if !digits.chars().all(|c| c.is_ascii_digit()) || (letters.is_empty() && digits.is_empty()) {
+        return Err(format!("{:?} is not a cell", t));
+    }
+    let col = if letters.is_empty() { None } else { Some(gsheets_column_number(letters)?) };
+    let row = if digits.is_empty() { None } else { Some(digits.parse::<i64>().map_err(|_| format!("{:?} is not a cell", t))?) };
+    Ok((col, row))
+}
+
+/// A range read: `'Q1 sales'!B2:D5` gives `{ sheet, col, row, end_col, end_row }`, counted from 1, null where the range leaves it open (`A:C` has no rows). `sheet` is unquoted.
+pub fn gsheets_parse_range(range: &str) -> Result<Value, String> {
+    let r = range.trim();
+    let (sheet, cells) = if let Some(rest) = r.strip_prefix('\'') {
+        let mut name = String::new();
+        let mut it = rest.char_indices().peekable();
+        let mut end = None;
+        while let Some((i, c)) = it.next() {
+            if c == '\'' {
+                if it.peek().map(|x| x.1) == Some('\'') {
+                    name.push('\'');
+                    it.next();
+                    continue;
+                }
+                end = Some(i);
+                break;
+            }
+            name.push(c);
+        }
+        let end = end.ok_or(format!("{:?}: a quote is not closed", range))?;
+        let after = rest[end + 1..].strip_prefix('!').unwrap_or("");
+        (Some(name), after.to_string())
+    } else if let Some((s, c)) = r.split_once('!') {
+        (Some(s.to_string()), c.to_string())
+    } else if r.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '$') && r.chars().any(|c| c.is_ascii_digit() || c == ':') {
+        (None, r.to_string())
+    } else {
+        (Some(r.to_string()), String::new())
+    };
+    if cells.is_empty() {
+        return Ok(json!({ "sheet": sheet, "col": null, "row": null, "end_col": null, "end_row": null }));
+    }
+    let (a, b) = cells.split_once(':').map_or((cells.as_str(), cells.as_str()), |x| x);
+    let (c1, r1) = cell_part(a)?;
+    let (c2, r2) = cell_part(b)?;
+    Ok(json!({ "sheet": sheet, "col": c1, "row": r1, "end_col": c2, "end_row": r2 }))
+}
+
+/// A range as a batch update's GridRange: `sheet_id` is the tab's number (see `gsheets_info`), and indexes count from 0, ends exclusive.
+pub fn gsheets_grid_range(sheet_id: i64, range: &str) -> Result<Value, String> {
+    let p = gsheets_parse_range(range)?;
+    let mut g = json!({ "sheetId": sheet_id });
+    if let Some(r) = p["row"].as_i64() {
+        g["startRowIndex"] = json!(r - 1);
+    }
+    if let Some(r) = p["end_row"].as_i64() {
+        g["endRowIndex"] = json!(r);
+    }
+    if let Some(c) = p["col"].as_i64() {
+        g["startColumnIndex"] = json!(c - 1);
+    }
+    if let Some(c) = p["end_col"].as_i64() {
+        g["endColumnIndex"] = json!(c);
+    }
+    Ok(g)
+}
+
+// ---- Values ----
+
+fn get_query(render: &str) -> Result<String, String> {
+    Ok(match render {
+        "" | "formatted" => String::new(),
+        "unformatted" => "?valueRenderOption=UNFORMATTED_VALUE".to_string(),
+        "formula" => "?valueRenderOption=FORMULA".to_string(),
+        o => return Err(format!("{:?} is not a render: formatted, unformatted or formula", o)),
+    })
+}
+
+/// The cells of a range as a list of rows. Rows and cells empty at the end are left out by Sheets, so rows differ in length. `render`: "formatted" as shown (text; the default), "unformatted" (numbers as numbers), "formula".
+pub fn gsheets_get(spreadsheet: &str, range: &str, render: &str) -> Result<Value, String> {
+    let r = call("GET", &format!("{}/values/{}{}", enc(spreadsheet), enc(range), get_query(render)?), None)?;
+    Ok(r.get("values").cloned().unwrap_or(json!([])))
+}
+
+/// A table read as maps: the first row of the range is the headers, each other row a map by them, short rows filled with null.
+pub fn gsheets_get_rows(spreadsheet: &str, range: &str, render: &str) -> Result<Vec<Value>, String> {
+    let v = gsheets_get(spreadsheet, range, render)?;
+    let rows = v.as_array().cloned().unwrap_or_default();
+    let Some((head, rest)) = rows.split_first() else { return Ok(vec![]) };
+    let names: Vec<String> = head.as_array().into_iter().flatten().map(|c| c.as_str().map_or(c.to_string(), str::to_string)).collect();
+    Ok(rest.iter().map(|r| {
+        let mut o = Map::new();
+        let cells = r.as_array().cloned().unwrap_or_default();
+        for (i, n) in names.iter().enumerate() {
+            o.insert(n.clone(), cells.get(i).cloned().unwrap_or(Value::Null));
+        }
+        Value::Object(o)
+    }).collect())
+}
+
+/// Several ranges in one call: a list of `{ range, values }`, in the same order.
+pub fn gsheets_get_many(spreadsheet: &str, ranges: Vec<String>, render: &str) -> Result<Vec<Value>, String> {
+    let q = get_query(render)?;
+    let mut parts: Vec<String> = ranges.iter().map(|r| format!("ranges={}", enc(r))).collect();
+    if !q.is_empty() {
+        parts.push(q[1..].to_string());
+    }
+    let r = call("GET", &format!("{}/values:batchGet?{}", enc(spreadsheet), parts.join("&")), None)?;
+    Ok(r["valueRanges"].as_array().into_iter().flatten().map(|x| json!({ "range": x["range"], "values": x.get("values").cloned().unwrap_or(json!([])) })).collect())
+}
+
+/// Writes rows over a range. `input` is "user" (as typed: formulas work, "5" is a number; the default) or "raw" (kept as they are). Gives `{ range, rows, columns, cells }`.
+pub fn gsheets_write(spreadsheet: &str, range: &str, values: serde_json::Value, input: &str) -> Result<Value, String> {
+    check_rows(&values)?;
+    let body = json!({ "range": range, "majorDimension": "ROWS", "values": values });
+    let r = call("PUT", &format!("{}/values/{}?valueInputOption={}", enc(spreadsheet), enc(range), input_mode(input)?), Some(&body))?;
+    Ok(json!({ "range": r["updatedRange"], "rows": r["updatedRows"], "columns": r["updatedColumns"], "cells": r["updatedCells"] }))
+}
+
+/// Writes several ranges in one call: `data` a list of `{ range, values }`. Gives `{ cells, ranges }`.
+pub fn gsheets_write_many(spreadsheet: &str, data: Vec<serde_json::Value>, input: &str) -> Result<Value, String> {
+    for d in &data {
+        check_rows(&d["values"])?;
+    }
+    let body = json!({ "valueInputOption": input_mode(input)?, "data": data });
+    let r = call("POST", &format!("{}/values:batchUpdate", enc(spreadsheet)), Some(&body))?;
+    Ok(json!({ "cells": r["totalUpdatedCells"], "ranges": r["totalUpdatedSheets"].as_i64().map(|_| r["responses"].as_array().map_or(0, |a| a.len())) }))
+}
+
+/// Adds rows after the table `range` finds, sliding nothing unless `insert` is true, which adds new rows for them. Gives `{ range, rows, table }`, `range` where they went, `table` the table found.
+pub fn gsheets_append(spreadsheet: &str, range: &str, rows: serde_json::Value, input: &str, insert: bool) -> Result<Value, String> {
+    check_rows(&rows)?;
+    let body = json!({ "majorDimension": "ROWS", "values": rows });
+    let q = format!("valueInputOption={}&insertDataOption={}", input_mode(input)?, if insert { "INSERT_ROWS" } else { "OVERWRITE" });
+    let r = call("POST", &format!("{}/values/{}:append?{}", enc(spreadsheet), enc(range), q), Some(&body))?;
+    Ok(json!({ "range": r["updates"]["updatedRange"], "rows": r["updates"]["updatedRows"], "table": r["tableRange"] }))
+}
+
+/// Empties a range, its formatting staying.
+pub fn gsheets_clear(spreadsheet: &str, range: &str) -> Result<String, String> {
+    let r = call("POST", &format!("{}/values/{}:clear", enc(spreadsheet), enc(range)), Some(&json!({})))?;
+    Ok(r["clearedRange"].as_str().unwrap_or("").to_string())
+}
+
+// ---- The spreadsheet ----
+
+/// A spreadsheet's title and tabs: `{ title, sheets: [{ id, title, rows, columns, index }] }`. A tab's `id` is what batch updates want.
+pub fn gsheets_info(spreadsheet: &str) -> Result<Value, String> {
+    let r = call("GET", &format!("{}?fields={}", enc(spreadsheet), enc("properties.title,sheets.properties")), None)?;
+    let tabs: Vec<Value> = r["sheets"].as_array().into_iter().flatten().map(|s| {
+        let p = &s["properties"];
+        json!({ "id": p["sheetId"], "title": p["title"], "rows": p["gridProperties"]["rowCount"], "columns": p["gridProperties"]["columnCount"], "index": p["index"] })
+    }).collect();
+    Ok(json!({ "title": r["properties"]["title"], "sheets": tabs }))
+}
+
+/// Changes to the spreadsheet itself, a list of Sheets' requests (`addSheet`, `repeatCell`, `deleteDimension`, `autoResizeDimensions`...), applied together or not at all. Gives the replies, one per request.
+pub fn gsheets_batch_update(spreadsheet: &str, requests: Vec<serde_json::Value>) -> Result<Value, String> {
+    let r = call("POST", &format!("{}:batchUpdate", enc(spreadsheet)), Some(&json!({ "requests": requests })))?;
+    Ok(r["replies"].clone())
+}
+
+/// Adds a tab and gives its id. An existing name is an error.
+pub fn gsheets_add_sheet(spreadsheet: &str, title: &str) -> Result<i64, String> {
+    let r = gsheets_batch_update(spreadsheet, vec![json!({ "addSheet": { "properties": { "title": title } } })])?;
+    r[0]["addSheet"]["properties"]["sheetId"].as_i64().ok_or("Sheets gave no sheet id".to_string())
+}

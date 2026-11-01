@@ -1,0 +1,396 @@
+//! Xero's Accounting API without an SDK: OAuth2 with refresh tokens that change on every use and are kept for you, the tenant header, invoices, contacts and payments, pages walked to the end, per-record validation errors, Xero's /Date()/ values read, rate limits waited out and reported, and webhook signatures with the intent-to-receive check.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// XERO_CLIENT_ID, XERO_CLIENT_SECRET and XERO_REFRESH_TOKEN sign in. A refresh token works once, so
+// set XERO_TOKEN_FILE to keep the newest across restarts; it is read before XERO_REFRESH_TOKEN.
+// XERO_TENANT_ID picks the organisation (else the only connection). XERO_API_URL is the API
+// (https://api.xero.com), XERO_TOKEN_URL the token endpoint (https://identity.xero.com/connect/token).
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("XERO_API_URL").unwrap_or_else(|| "https://api.xero.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+#[derive(Default)]
+struct Session {
+    access: String,
+    until: i64,
+    refresh: String,
+    rotations: i64,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+static LIMITS: Mutex<Option<Value>> = Mutex::new(None);
+
+fn stored_refresh() -> Result<String, String> {
+    if let Some(p) = setting("XERO_TOKEN_FILE") {
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            if !t.trim().is_empty() {
+                return Ok(t.trim().to_string());
+            }
+        }
+    }
+    setting("XERO_REFRESH_TOKEN").ok_or("XERO_REFRESH_TOKEN is not set (and XERO_TOKEN_FILE holds none)".to_string())
+}
+
+// The lock is held across the request: two requests refreshing at once would spend the same token.
+fn token(force: bool) -> Result<String, String> {
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let s = guard.get_or_insert_with(Session::default);
+    if !force && !s.access.is_empty() && s.until > now() + 60 {
+        return Ok(s.access.clone());
+    }
+    let refresh = if s.refresh.is_empty() { stored_refresh()? } else { s.refresh.clone() };
+    let id = setting("XERO_CLIENT_ID").ok_or("XERO_CLIENT_ID is not set")?;
+    let secret = setting("XERO_CLIENT_SECRET").ok_or("XERO_CLIENT_SECRET is not set")?;
+    let url = setting("XERO_TOKEN_URL").unwrap_or_else(|| "https://identity.xero.com/connect/token".into());
+    let res = ureq::post(&url).timeout(Duration::from_secs(20)).set("Authorization", &format!("Basic {}", STANDARD.encode(format!("{}:{}", id, secret)))).send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            let e = v["error"].as_str().unwrap_or(&b).to_string();
+            let hint = if e == "invalid_grant" { " (the refresh token was already used or is over 60 days old: sign in again, and set XERO_TOKEN_FILE)" } else { "" };
+            return Err(format!("Xero refused the token refresh, {}: {}{}", c, e, hint));
+        }
+        Err(e) => return Err(format!("cannot reach Xero's token endpoint: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    s.access = v["access_token"].as_str().ok_or("Xero gave no access_token")?.to_string();
+    s.until = now() + v["expires_in"].as_i64().unwrap_or(1800);
+    if let Some(n) = v["refresh_token"].as_str() {
+        s.refresh = n.to_string();
+        s.rotations += 1;
+        if let Some(p) = setting("XERO_TOKEN_FILE") {
+            let tmp = format!("{}.tmp", p);
+            std::fs::write(&tmp, n).and_then(|_| std::fs::rename(&tmp, &p)).map_err(|e| format!("cannot keep the new refresh token in {}: {}", p, e))?;
+        }
+    }
+    Ok(s.access.clone())
+}
+
+/// The newest refresh token, to store if you do not use XERO_TOKEN_FILE; "" before the first refresh. Gives { refresh_token, rotations }.
+pub fn xero_session() -> serde_json::Value {
+    let g = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_ref() {
+        Some(s) => json!({ "refresh_token": s.refresh, "rotations": s.rotations }),
+        None => json!({ "refresh_token": "", "rotations": 0 }),
+    }
+}
+
+fn note_limits(r: &ureq::Response) {
+    let g = |h: &str| r.header(h).and_then(|v| v.parse::<i64>().ok());
+    if g("X-MinLimit-Remaining").is_some() || g("X-DayLimit-Remaining").is_some() {
+        *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({ "minute": g("X-MinLimit-Remaining"), "day": g("X-DayLimit-Remaining"), "app_minute": g("X-AppMinLimit-Remaining") }));
+    }
+}
+
+/// What Xero said is left after the last call: { minute, day, app_minute }, or null before one.
+pub fn xero_rate_limits() -> serde_json::Value {
+    LIMITS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Value::Null)
+}
+
+fn validation(v: &Value) -> Vec<String> {
+    let mut out = vec![];
+    for e in v["Elements"].as_array().into_iter().flatten() {
+        for m in e["ValidationErrors"].as_array().into_iter().flatten() {
+            if let Some(t) = m["Message"].as_str() {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let list = validation(&v);
+    if !list.is_empty() {
+        return format!("Xero {}: {}", status, list.join("; "));
+    }
+    if let Some(m) = v["Message"].as_str() {
+        return format!("Xero {}: {}", status, m);
+    }
+    if let Some(m) = v["Detail"].as_str() {
+        return format!("Xero {}: {}{}", status, v["Title"].as_str().map_or(String::new(), |t| format!("{}: ", t)), m);
+    }
+    format!("Xero {}: {}", status, text.trim().chars().take(300).collect::<String>())
+}
+
+fn fetch(method: &str, path: &str, body: Option<&Value>, tenant: Option<&str>, headers: &[(&str, String)]) -> Result<Value, String> {
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let mut renewed = false;
+    let mut waited = 0;
+    loop {
+        let mut req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token(false)?)).set("Accept", "application/json");
+        if let Some(t) = tenant {
+            req = req.set("xero-tenant-id", t);
+        }
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                note_limits(&r);
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Xero's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                token(true)?;
+            }
+            Err(ureq::Error::Status(429, r)) => {
+                note_limits(&r);
+                let which = r.header("X-Rate-Limit-Problem").unwrap_or("minute").to_string();
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+                // A minute's limit is worth waiting for; the day's is not.
+                if which == "day" || wait > 60 || waited >= 3 {
+                    return Err(format!("Xero's {} limit is reached: try again in {} s", which, wait));
+                }
+                waited += 1;
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Xero at {}: {}", api(), e)),
+        }
+    }
+}
+
+/// The organisations this sign-in reaches: each with `tenantId`, `tenantName`, `tenantType`.
+pub fn xero_connections() -> Result<serde_json::Value, String> {
+    fetch("GET", "/connections", None, None, &[])
+}
+
+fn tenant() -> Result<String, String> {
+    if let Some(t) = setting("XERO_TENANT_ID") {
+        return Ok(t);
+    }
+    let c = xero_connections()?;
+    match c.as_array().map(|l| l.as_slice()) {
+        Some([one]) => one["tenantId"].as_str().map(str::to_string).ok_or("the connection has no tenantId".to_string()),
+        Some([]) | None => Err("this sign-in is connected to no organisation".into()),
+        Some(l) => Err(format!("this sign-in reaches {} organisations: set XERO_TENANT_ID", l.len())),
+    }
+}
+
+fn acc(method: &str, path: &str, body: Option<&Value>, headers: &[(&str, String)]) -> Result<Value, String> {
+    fetch(method, &format!("/api.xro/2.0{}", path), body, Some(&tenant()?), headers)
+}
+
+/// Any other accounting call: `method`, `path` under /api.xro/2.0 like "/Items", `body` or null.
+pub fn xero_call(method: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    acc(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &[])
+}
+
+// `filter` keys go in the query, but `modified_since` becomes the If-Modified-Since header.
+fn walk(path: &str, field: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut q = String::new();
+    let mut headers = vec![];
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            if k == "modified_since" {
+                headers.push(("If-Modified-Since", t));
+            } else {
+                q.push_str(&format!("&{}={}", enc(k), enc(&t)));
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let v = acc("GET", &format!("{}?page={}{}", path, page, q), None, &headers)?;
+        let items = v[field].as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        let pages = v["pagination"]["pageCount"].as_i64();
+        if n == 0 || pages.map_or(n < 100, |p| page >= p) {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+// Creates records one by one in Xero's eyes: with summarizeErrors=false, a 200 holds each result.
+fn put_many(path: &str, field: &str, records: Vec<Value>, idempotency_key: &str) -> Result<Value, String> {
+    let headers: Vec<(&str, String)> = if idempotency_key.is_empty() { vec![] } else { vec![("Idempotency-Key", idempotency_key.to_string())] };
+    let v = acc("PUT", &format!("{}?summarizeErrors=false", path), Some(&json!({ field: records })), &headers)?;
+    let mut made = vec![];
+    let mut failed = vec![];
+    for r in v[field].as_array().into_iter().flatten() {
+        let msgs: Vec<&str> = r["ValidationErrors"].as_array().into_iter().flatten().filter_map(|m| m["Message"].as_str()).collect();
+        if r["HasErrors"] == json!(true) || !msgs.is_empty() {
+            failed.push(json!({ "record": r, "errors": msgs }));
+        } else {
+            made.push(r.clone());
+        }
+    }
+    Ok(json!({ "created": made, "failed": failed }))
+}
+
+fn single(path: &str, field: &str, record: Value, idempotency_key: &str) -> Result<Value, String> {
+    let r = put_many(path, field, vec![record], idempotency_key)?;
+    if let Some(f) = r["failed"].get(0) {
+        let list: Vec<&str> = f["errors"].as_array().into_iter().flatten().filter_map(|m| m.as_str()).collect();
+        return Err(format!("Xero refused it: {}", list.join("; ")));
+    }
+    Ok(r["created"][0].clone())
+}
+
+/// Makes an invoice: Xero's fields (`Type`, `Contact`, `LineItems`, `Date`, `DueDate`, `Status`...). `idempotency_key` may be "". Gives it; a refusal names Xero's reasons.
+pub fn xero_invoice_create(fields: serde_json::Value, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    single("/Invoices", "Invoices", fields, idempotency_key)
+}
+
+/// Makes up to 50 invoices at a go, each standing or falling alone. Gives { created, failed: [{ record, errors }] }.
+pub fn xero_invoices_create(records: Vec<serde_json::Value>, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    if records.is_empty() || records.len() > 50 {
+        return Err(format!("this takes 1 to 50 invoices at a go, not {}", records.len()));
+    }
+    put_many("/Invoices", "Invoices", records, idempotency_key)
+}
+
+/// One invoice by id or number.
+pub fn xero_invoice(id: &str) -> Result<serde_json::Value, String> {
+    Ok(acc("GET", &format!("/Invoices/{}", enc(id)), None, &[])?["Invoices"][0].clone())
+}
+
+/// Changes an invoice, as `{ Status: "AUTHORISED" }`.
+pub fn xero_invoice_update(id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(acc("POST", &format!("/Invoices/{}", enc(id)), Some(&json!({ "Invoices": [fields] })), &[])?["Invoices"][0].clone())
+}
+
+/// Invoices through every page: `filter` takes `where` (see xero_where), `order`, `Statuses`, `ContactIDs`, and `modified_since` for the header; `max_items` caps them (0: all).
+pub fn xero_invoices(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/Invoices", "Invoices", &filter, max_items)
+}
+
+/// Makes a contact: Xero's fields (`Name` is required and must be unique).
+pub fn xero_contact_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    single("/Contacts", "Contacts", fields, "")
+}
+
+/// One contact by id.
+pub fn xero_contact(id: &str) -> Result<serde_json::Value, String> {
+    Ok(acc("GET", &format!("/Contacts/{}", enc(id)), None, &[])?["Contacts"][0].clone())
+}
+
+/// Contacts through every page; `filter` as for xero_invoices, `max_items` caps them (0: all).
+pub fn xero_contacts(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/Contacts", "Contacts", &filter, max_items)
+}
+
+/// Records a payment on an invoice: `account_code` of the bank account, `amount` a number, `date` as YYYY-MM-DD.
+pub fn xero_payment_create(invoice_id: &str, account_code: &str, amount: f64, date: &str) -> Result<serde_json::Value, String> {
+    if amount <= 0.0 {
+        return Err("a payment's amount must be more than 0".into());
+    }
+    single("/Payments", "Payments", json!({ "Invoice": { "InvoiceID": invoice_id }, "Account": { "Code": account_code }, "Amount": amount, "Date": date }), "")
+}
+
+/// Payments through every page; `filter` as for xero_invoices, `max_items` caps them (0: all).
+pub fn xero_payments(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/Payments", "Payments", &filter, max_items)
+}
+
+/// A clause for `where`: text is quoted, a YYYY-MM-DD is `DateTime(y, m, d)`, a UUID is `Guid("...")`, a number stays bare. `xero_where("Status", "==", "AUTHORISED")` is `Status=="AUTHORISED"`.
+pub fn xero_where(field: &str, op: &str, value: serde_json::Value) -> Result<String, String> {
+    if !["==", "!=", ">", ">=", "<", "<="].contains(&op) {
+        return Err(format!("`{}` is not an operator Xero's where has", op));
+    }
+    let text = match &value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => return Ok(format!("{}{}{}", field, op, n)),
+        Value::Bool(b) => return Ok(format!("{}{}{}", field, op, b)),
+        _ => return Err("the value must be text, a number or true or false".into()),
+    };
+    let b = text.as_bytes();
+    let is_date = text.len() == 10 && b[4] == b'-' && b[7] == b'-' && text.bytes().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if is_date {
+        return Ok(format!("{}{}DateTime({}, {}, {})", field, op, &text[..4], &text[5..7], &text[8..10]));
+    }
+    let is_guid = text.len() == 36 && [8, 13, 18, 23].iter().all(|i| b[*i] == b'-') && text.bytes().enumerate().all(|(i, c)| [8, 13, 18, 23].contains(&i) || c.is_ascii_hexdigit());
+    if is_guid {
+        return Ok(format!("{}{}Guid(\"{}\")", field, op, text));
+    }
+    Ok(format!("{}{}\"{}\"", field, op, text.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+fn civil(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// Xero's JSON dates in plain UTC: `xero_date("/Date(1518685950940+0000)/")` is "2018-02-15T09:12:30Z". Text that is already a date comes back as it is.
+pub fn xero_date(value: &str) -> Result<String, String> {
+    let Some(inner) = value.strip_prefix("/Date(").and_then(|r| r.strip_suffix(")/")) else {
+        return Ok(value.to_string());
+    };
+    let split = inner.char_indices().skip(1).find(|(_, c)| *c == '+' || *c == '-').map_or(inner.len(), |(i, _)| i);
+    let ms: i64 = inner[..split].parse().map_err(|_| format!("`{}` is not a Xero date", value))?;
+    let secs = ms.div_euclid(1000);
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let t = secs.rem_euclid(86400);
+    Ok(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, t / 3600, t / 60 % 60, t % 60))
+}
+
+fn sign(body: &str, webhook_key: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(webhook_key.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    m
+}
+
+/// True when `signature` (the x-xero-signature header) is the base64 HMAC-SHA256 of the raw `body` with the webhook's key. For Xero's intent-to-receive, and every delivery: answer 200 with an empty body when true, and 401 when false.
+pub fn xero_webhook_valid(body: &str, signature: &str, webhook_key: &str) -> bool {
+    STANDARD.decode(signature).map_or(false, |raw| sign(body, webhook_key).verify_slice(&raw).is_ok())
+}
+
+/// The events of a webhook, once checked: each with `resourceId`, `eventCategory`, `eventType`, `tenantId`, `eventDateUtc`. An intent-to-receive call gives an empty list.
+pub fn xero_webhook_events(body: &str, signature: &str, webhook_key: &str) -> Result<serde_json::Value, String> {
+    if !xero_webhook_valid(body, signature, webhook_key) {
+        return Err("the webhook's signature does not match: a wrong key, or the body was changed (use the raw body)".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(v["events"].clone())
+}

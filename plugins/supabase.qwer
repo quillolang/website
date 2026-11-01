@@ -1,0 +1,364 @@
+//! Supabase from a server: PostgREST's filters written as maps and quoted as it wants, rows read with exact counts and paged, inserts, upserts, updates, deletes and RPC calls, under the service key or a user's token, Auth sign-in, refresh and sign-out, its JWTs checked here, and Storage uploads and signed links.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// SUPABASE_API_URL is the project's address (https://xyz.supabase.co), SUPABASE_API_KEY its anon or
+// service-role key, SUPABASE_JWT_SECRET the secret its JWTs are signed with. Calls take `options`
+// with `token`, a signed-in user's access token, so that row level security applies to that user;
+// without it the key itself is the caller.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> Result<String, String> {
+    env("SUPABASE_API_URL").map(|u| u.trim_end_matches('/').to_string()).ok_or("SUPABASE_API_URL is not set".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn enc_path(s: &str) -> String {
+    s.split('/').map(enc).collect::<Vec<_>>().join("/")
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".into(),
+        o => o.to_string(),
+    }
+}
+
+/// A value in an `in.()` or `cs.{}` list: PostgREST reads , . : ( ) as its own unless the value is in double quotes.
+fn list_item(v: &Value) -> String {
+    let t = text_of(v);
+    if v.is_string() && (t.is_empty() || t.chars().any(|c| ",.:()\"\\{} ".contains(c)) || t == "null") {
+        return format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""));
+    }
+    t
+}
+
+const OPS: &[&str] = &["eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike", "match", "imatch", "is", "in", "cs", "cd", "ov", "fts", "plfts", "phfts", "wfts", "not"];
+
+fn one_filter(column: &str, v: &Value) -> Result<(String, String), String> {
+    let pair = match v {
+        Value::Object(m) if m.len() == 1 => {
+            let (op, x) = m.iter().next().unwrap();
+            if !OPS.contains(&op.as_str()) {
+                return Err(format!("{:?} is not a filter: {}", op, OPS.join(", ")));
+            }
+            if op == "not" {
+                let (_, inner) = one_filter(column, x)?;
+                (column.to_string(), format!("not.{}", inner))
+            } else {
+                let text = match (op.as_str(), x) {
+                    ("in", Value::Array(a)) => format!("({})", a.iter().map(list_item).collect::<Vec<_>>().join(",")),
+                    ("cs" | "cd" | "ov", Value::Array(a)) => format!("{{{}}}", a.iter().map(list_item).collect::<Vec<_>>().join(",")),
+                    ("in", _) => return Err(format!("in on {} takes a list", column)),
+                    _ => text_of(x),
+                };
+                (column.to_string(), format!("{}.{}", op, text))
+            }
+        }
+        Value::Object(_) => return Err(format!("the filter on {} is a map of one operator, like {{ gte: 18 }}", column)),
+        Value::Null => (column.to_string(), "is.null".to_string()),
+        Value::Array(a) => (column.to_string(), format!("in.({})", a.iter().map(list_item).collect::<Vec<_>>().join(","))),
+        Value::Bool(b) => (column.to_string(), format!("is.{}", b)),
+        o => (column.to_string(), format!("eq.{}", text_of(o))),
+    };
+    Ok(pair)
+}
+
+fn filters(f: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut out = vec![];
+    for (k, v) in f.as_object().ok_or("filters are a map of column to value")? {
+        if k == "or" || k == "and" {
+            out.push((k.clone(), v.as_str().ok_or("`or` is PostgREST's own text, like (age.lt.18,age.gt.65)")?.to_string()));
+        } else {
+            out.push(one_filter(k, v)?);
+        }
+    }
+    Ok(out)
+}
+
+/// A filter as PostgREST writes it: `supabase_filter("age", { gte: 18 })` gives `age=gte.18`, `("id", [1, 2])` gives `id=in.(1,2)`, percent-encoded as a query string needs. Text values holding commas or other marks are quoted.
+pub fn supabase_filter(column: &str, value: serde_json::Value) -> Result<String, String> {
+    let (k, v) = one_filter(column, &value)?;
+    Ok(format!("{}={}", enc(&k), enc(&v)))
+}
+
+struct Reply {
+    status: u16,
+    range: Option<String>,
+    body: Value,
+}
+
+fn send(method: &str, url: &str, bearer: Option<&str>, headers: &[(&str, String)], body: Option<(&str, Vec<u8>)>) -> Result<Reply, String> {
+    let key = env("SUPABASE_API_KEY").ok_or("SUPABASE_API_KEY is not set")?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let mut req = agent.request(method, url).set("apikey", &key).set("Authorization", &format!("Bearer {}", bearer.unwrap_or(&key)));
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let res = match &body {
+        Some((kind, b)) => req.set("Content-Type", kind).send_bytes(b),
+        None => req.call(),
+    };
+    let (status, range, text) = match res {
+        Ok(r) => (r.status(), r.header("Content-Range").map(str::to_string), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, None, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach Supabase: {}", e)),
+    };
+    let body = if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(json!({ "message": text })) };
+    Ok(Reply { status, range, body })
+}
+
+fn rest_error(r: &Reply) -> String {
+    let b = &r.body;
+    let mut m = format!("Supabase refused this ({}): {}", b["code"].as_str().map_or(r.status.to_string(), str::to_string), b["message"].as_str().unwrap_or(""));
+    if let Some(d) = b["details"].as_str() {
+        m.push_str(&format!(" ({})", d));
+    }
+    if let Some(h) = b["hint"].as_str() {
+        m.push_str(&format!(" Hint: {}", h));
+    }
+    m
+}
+
+fn auth_error(r: &Reply) -> String {
+    let b = &r.body;
+    let code = b["error_code"].as_str().or(b["error"].as_str()).map_or(r.status.to_string(), str::to_string);
+    let msg = b["msg"].as_str().or(b["error_description"].as_str()).or(b["message"].as_str()).unwrap_or("");
+    format!("Supabase Auth refused this ({}): {}", code, msg)
+}
+
+fn token_of(o: &Value) -> Option<String> {
+    o["token"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn rest_url(table: &str, pairs: &[(String, String)]) -> Result<String, String> {
+    if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        return Err(format!("{:?} is not a table name", table));
+    }
+    let q = pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&");
+    Ok(format!("{}/rest/v1/{}{}{}", base()?, table, if q.is_empty() { "" } else { "?" }, q))
+}
+
+/// Reads rows. `query`: `select` (columns, embedded tables too: "id,name,orders(total)"), `where` (a map of column to value or `{ op: value }`, see `supabase_filter`, and `or`), `order` ("created_at.desc"), `limit`, `offset`, `count` (true for an exact total). `options`: `token`. Gives `{ rows, total }`.
+pub fn supabase_select(table: &str, query: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let mut p = vec![("select".to_string(), query["select"].as_str().unwrap_or("*").to_string())];
+    if !query["where"].is_null() {
+        p.extend(filters(&query["where"])?);
+    }
+    for k in ["order", "limit", "offset"] {
+        if !query[k].is_null() {
+            p.push((k.to_string(), text_of(&query[k])));
+        }
+    }
+    let mut h = vec![];
+    if query["count"] == true {
+        h.push(("Prefer", "count=exact".to_string()));
+    }
+    let r = send("GET", &rest_url(table, &p)?, token_of(&options).as_deref(), &h, None)?;
+    if r.status >= 300 {
+        return Err(rest_error(&r));
+    }
+    // Content-Range is `0-24/3573`, the total after the slash, * when not counted.
+    let total = r.range.as_deref().and_then(|c| c.rsplit('/').next()).and_then(|t| t.parse::<i64>().ok());
+    Ok(json!({ "rows": r.body, "total": total }))
+}
+
+/// Inserts one row (a map) or many (a list), and gives them back as stored, with their ids. `options`: `upsert` (true), `on_conflict` (the unique columns to upsert on), `ignore_duplicates`, `token`.
+pub fn supabase_insert(table: &str, rows: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let mut prefer = vec!["return=representation".to_string()];
+    let mut p = vec![];
+    if options["upsert"] == true {
+        prefer.push("resolution=merge-duplicates".into());
+    } else if options["ignore_duplicates"] == true {
+        prefer.push("resolution=ignore-duplicates".into());
+    }
+    if let Some(c) = options["on_conflict"].as_str() {
+        p.push(("on_conflict".to_string(), c.to_string()));
+    }
+    let r = send("POST", &rest_url(table, &p)?, token_of(&options).as_deref(), &[("Prefer", prefer.join(","))], Some(("application/json", rows.to_string().into_bytes())))?;
+    if r.status >= 300 {
+        return Err(rest_error(&r));
+    }
+    Ok(r.body)
+}
+
+/// Changes the rows matching `where`, which must not be empty, for a bare PATCH changes the whole table. Gives the changed rows.
+pub fn supabase_update(table: &str, where_filter: serde_json::Value, changes: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let f = filters(&where_filter)?;
+    if f.is_empty() {
+        return Err("an update needs a filter: without one it would change every row".into());
+    }
+    let r = send("PATCH", &rest_url(table, &f)?, token_of(&options).as_deref(), &[("Prefer", "return=representation".to_string())], Some(("application/json", changes.to_string().into_bytes())))?;
+    if r.status >= 300 {
+        return Err(rest_error(&r));
+    }
+    Ok(r.body)
+}
+
+/// Deletes the rows matching `where`, which must not be empty. Gives the deleted rows.
+pub fn supabase_delete(table: &str, where_filter: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let f = filters(&where_filter)?;
+    if f.is_empty() {
+        return Err("a delete needs a filter: without one it would remove every row".into());
+    }
+    let r = send("DELETE", &rest_url(table, &f)?, token_of(&options).as_deref(), &[("Prefer", "return=representation".to_string())], None)?;
+    if r.status >= 300 {
+        return Err(rest_error(&r));
+    }
+    Ok(r.body)
+}
+
+/// Calls a Postgres function with named arguments (a map).
+pub fn supabase_rpc(function: &str, args: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let r = send("POST", &format!("{}/rest/v1/rpc/{}", base()?, enc(function)), token_of(&options).as_deref(), &[], Some(("application/json", if args.is_null() { "{}".to_string().into_bytes() } else { args.to_string().into_bytes() })))?;
+    if r.status >= 300 {
+        return Err(rest_error(&r));
+    }
+    Ok(r.body)
+}
+
+fn session(r: Reply) -> Result<Value, String> {
+    if r.status >= 300 {
+        return Err(auth_error(&r));
+    }
+    let b = r.body;
+    Ok(json!({ "access_token": b["access_token"], "refresh_token": b["refresh_token"], "expires_at": b["expires_at"], "user": b["user"] }))
+}
+
+/// Signs in with email and password. Gives `{ access_token, refresh_token, expires_at, user }`, or an error like `invalid_credentials`.
+pub fn supabase_sign_in(email: &str, password: &str) -> Result<Value, String> {
+    let b = json!({ "email": email, "password": password });
+    session(send("POST", &format!("{}/auth/v1/token?grant_type=password", base()?), None, &[], Some(("application/json", b.to_string().into_bytes())))?)
+}
+
+/// A new session from a refresh token. A refresh token works once: keep the new one.
+pub fn supabase_refresh(refresh_token: &str) -> Result<Value, String> {
+    let b = json!({ "refresh_token": refresh_token });
+    session(send("POST", &format!("{}/auth/v1/token?grant_type=refresh_token", base()?), None, &[], Some(("application/json", b.to_string().into_bytes())))?)
+}
+
+/// The user an access token belongs to, as Supabase sees them now.
+pub fn supabase_user(access_token: &str) -> Result<Value, String> {
+    let r = send("GET", &format!("{}/auth/v1/user", base()?), Some(access_token), &[], None)?;
+    if r.status >= 300 {
+        return Err(auth_error(&r));
+    }
+    Ok(r.body)
+}
+
+/// Ends a user's sessions, so that their refresh tokens stop working. An access token already given lives until it expires.
+pub fn supabase_sign_out(access_token: &str) -> Result<bool, String> {
+    let r = send("POST", &format!("{}/auth/v1/logout", base()?), Some(access_token), &[], None)?;
+    if r.status >= 300 {
+        return Err(auth_error(&r));
+    }
+    Ok(true)
+}
+
+/// Checks a Supabase access token here, with no request, by SUPABASE_JWT_SECRET: HS256 only, its signature, `exp`, `nbf` and an `aud` of "authenticated". Gives its claims (`sub`, `email`, `role`, ...), or an error saying what was wrong.
+pub fn supabase_verify_jwt(token: &str) -> Result<Value, String> {
+    let secret = env("SUPABASE_JWT_SECRET").ok_or("SUPABASE_JWT_SECRET is not set")?;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("that is not a JWT".into());
+    }
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let head: Value = b64.decode(parts[0]).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or("the JWT's header is not readable")?;
+    if head["alg"] != "HS256" {
+        return Err(format!("the JWT is signed with {}, not HS256: refused", head["alg"]));
+    }
+    let sig = b64.decode(parts[2]).map_err(|_| "the JWT's signature is not base64url".to_string())?;
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(format!("{}.{}", parts[0], parts[1]).as_bytes());
+    m.verify_slice(&sig).map_err(|_| "the JWT's signature does not match".to_string())?;
+    let claims: Value = b64.decode(parts[1]).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or("the JWT's claims are not readable")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    match claims["exp"].as_i64() {
+        Some(e) if e <= now => return Err(format!("the JWT expired {} s ago", now - e)),
+        None => return Err("the JWT has no exp".into()),
+        _ => {}
+    }
+    if claims["nbf"].as_i64().map_or(false, |n| n > now) {
+        return Err("the JWT is not valid yet".into());
+    }
+    if claims["aud"] != "authenticated" {
+        return Err(format!("the JWT is for {}, not an authenticated user", claims["aud"]));
+    }
+    Ok(claims)
+}
+
+fn storage_error(r: &Reply) -> String {
+    format!("Supabase Storage refused this ({}): {}", r.body["error"].as_str().unwrap_or(&r.status.to_string()), r.body["message"].as_str().unwrap_or(""))
+}
+
+fn absolute(path: &str) -> Result<String, String> {
+    Ok(if path.starts_with("http") { path.to_string() } else { format!("{}/storage/v1{}{}", base()?, if path.starts_with('/') { "" } else { "/" }, path) })
+}
+
+/// Uploads text to a bucket's `path`; `upsert` replaces a file that is there, otherwise that is an error. Gives `{ key }`.
+pub fn supabase_upload(bucket: &str, path: &str, content: &str, content_type: &str, upsert: bool) -> Result<Value, String> {
+    let url = format!("{}/storage/v1/object/{}/{}", base()?, enc(bucket), enc_path(path));
+    let kind = if content_type.is_empty() { "application/octet-stream" } else { content_type };
+    let r = send("POST", &url, None, &[("x-upsert", upsert.to_string())], Some((kind, content.as_bytes().to_vec())))?;
+    if r.status >= 300 {
+        return Err(storage_error(&r));
+    }
+    Ok(json!({ "key": r.body["Key"] }))
+}
+
+/// A link to a private file that works for `expires_in` seconds, for anyone who has it.
+pub fn supabase_signed_url(bucket: &str, path: &str, expires_in: i64) -> Result<String, String> {
+    if expires_in <= 0 {
+        return Err("a link needs a lifetime of at least a second".into());
+    }
+    let url = format!("{}/storage/v1/object/sign/{}/{}", base()?, enc(bucket), enc_path(path));
+    let b = json!({ "expiresIn": expires_in });
+    let r = send("POST", &url, None, &[], Some(("application/json", b.to_string().into_bytes())))?;
+    if r.status >= 300 {
+        return Err(storage_error(&r));
+    }
+    absolute(r.body["signedURL"].as_str().or(r.body["signedUrl"].as_str()).ok_or("Supabase gave no signedURL")?)
+}
+
+/// A link a browser can PUT a file to, without a key, once. Gives `{ url, token }`.
+pub fn supabase_signed_upload_url(bucket: &str, path: &str) -> Result<Value, String> {
+    let url = format!("{}/storage/v1/object/upload/sign/{}/{}", base()?, enc(bucket), enc_path(path));
+    let r = send("POST", &url, None, &[], Some(("application/json", b"{}".to_vec())))?;
+    if r.status >= 300 {
+        return Err(storage_error(&r));
+    }
+    Ok(json!({ "url": absolute(r.body["url"].as_str().ok_or("Supabase gave no url")?)?, "token": r.body["token"] }))
+}
+
+/// The address of a file in a public bucket. No request is made, and no check that it exists.
+pub fn supabase_public_url(bucket: &str, path: &str) -> Result<String, String> {
+    Ok(format!("{}/storage/v1/object/public/{}/{}", base()?, enc(bucket), enc_path(path)))
+}
+
+/// Removes files from a bucket; gives how many went.
+pub fn supabase_remove(bucket: &str, paths: Vec<String>) -> Result<i64, String> {
+    let b = json!({ "prefixes": paths });
+    let r = send("DELETE", &format!("{}/storage/v1/object/{}", base()?, enc(bucket)), None, &[], Some(("application/json", b.to_string().into_bytes())))?;
+    if r.status >= 300 {
+        return Err(storage_error(&r));
+    }
+    Ok(r.body.as_array().map_or(0, |a| a.len() as i64))
+}

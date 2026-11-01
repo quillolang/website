@@ -1,0 +1,275 @@
+//! Cloudinary without an SDK: signed uploads from a URL, data or a file, the signed parameters a browser needs to upload directly, delivery URLs with transformations and URL signatures, upload and webhook signatures checked, assets listed by cursor and destroyed.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! sha1 = "0.10"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Map, Value};
+use sha1::{Digest, Sha1};
+use std::time::Duration;
+
+// CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET come from the console.
+// CLOUDINARY_API_URL is the upload and admin API (https://api.cloudinary.com when not set),
+// CLOUDINARY_DELIVERY_URL where files are served from (https://res.cloudinary.com when not set).
+// CLOUDINARY_SIGNATURE_ALGORITHM is sha1 or sha256, as the product environment is set.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn need(k: &str) -> Result<String, String> {
+    env(k).ok_or(format!("{} is not set", k))
+}
+
+fn api() -> String {
+    env("CLOUDINARY_API_URL").unwrap_or_else(|| "https://api.cloudinary.com".into()).trim_end_matches('/').to_string()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn digest_hex(text: &str) -> String {
+    if env("CLOUDINARY_SIGNATURE_ALGORITHM").map_or(false, |a| a.eq_ignore_ascii_case("sha256")) {
+        hex::encode(sha2::Sha256::digest(text.as_bytes()))
+    } else {
+        hex::encode(Sha1::digest(text.as_bytes()))
+    }
+}
+
+fn param_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::String(s) if s.is_empty() => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => Some(a.iter().map(|x| x.as_str().map_or(x.to_string(), str::to_string)).collect::<Vec<_>>().join(",")),
+        o => Some(o.to_string()),
+    }
+}
+
+/// A signature over parameters as Cloudinary wants it: those it signs, sorted, joined as `a=1&b=2`, the secret added at the end, and hashed. `file`, `cloud_name`, `resource_type`, `api_key` and empty values are left out; lists are joined by commas.
+pub fn cloudinary_signature(params: serde_json::Value) -> Result<String, String> {
+    let secret = need("CLOUDINARY_API_SECRET")?;
+    let mut pairs: Vec<(String, String)> = vec![];
+    for (k, v) in params.as_object().ok_or("the parameters are a map")? {
+        if ["file", "cloud_name", "resource_type", "api_key", "signature"].contains(&k.as_str()) {
+            continue;
+        }
+        if let Some(t) = param_text(v) {
+            pairs.push((k.clone(), t));
+        }
+    }
+    pairs.sort();
+    let text = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    Ok(digest_hex(&format!("{}{}", text, secret)))
+}
+
+fn multipart(fields: &[(String, String)], file: Option<(&str, &[u8])>) -> (String, Vec<u8>) {
+    let boundary = format!("quillo{:x}{:x}", now(), std::process::id());
+    let mut b = Vec::new();
+    for (k, v) in fields {
+        b.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n", boundary, k, v).as_bytes());
+    }
+    if let Some((name, bytes)) = file {
+        let safe: String = name.chars().filter(|c| *c != '"' && *c != '\r' && *c != '\n').collect();
+        b.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, safe).as_bytes());
+        b.extend_from_slice(bytes);
+        b.extend_from_slice(b"\r\n");
+    }
+    b.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    (format!("multipart/form-data; boundary={}", boundary), b)
+}
+
+fn read_answer(res: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach Cloudinary at {}: {}", api(), e)),
+    };
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status >= 300 {
+        let m = v["error"]["message"].as_str().map(str::to_string).unwrap_or(text.chars().take(300).collect());
+        return Err(format!("Cloudinary answered {}: {}", status, m));
+    }
+    Ok(v)
+}
+
+fn resource_of(o: &Value) -> String {
+    o["resource_type"].as_str().unwrap_or("image").to_string()
+}
+
+/// The parameters of a signed call: what was given, with `timestamp`, `api_key` and `signature`.
+fn signed(params: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut m = params.as_object().cloned().unwrap_or_default();
+    m.remove("resource_type");
+    m.entry("timestamp".to_string()).or_insert(json!(now()));
+    let sig = cloudinary_signature(Value::Object(m.clone()))?;
+    let mut out: Vec<(String, String)> = m.iter().filter_map(|(k, v)| param_text(v).map(|t| (k.clone(), t))).collect();
+    out.push(("api_key".to_string(), need("CLOUDINARY_API_KEY")?));
+    out.push(("signature".to_string(), sig));
+    Ok(out)
+}
+
+/// Uploads `file`, which is an http(s) address, a `data:` URI or a path on this machine. `options` are Cloudinary's upload parameters: `public_id`, `folder`, `tags`, `overwrite`, `eager`, `resource_type` ("image", "video", "raw", "auto"). Gives Cloudinary's answer: `public_id`, `version`, `secure_url`, `width`, `height`, `format`, `bytes`, `signature`.
+pub fn cloudinary_upload(file: &str, options: serde_json::Value) -> Result<Value, String> {
+    let cloud = need("CLOUDINARY_CLOUD_NAME")?;
+    let url = format!("{}/v1_1/{}/{}/upload", api(), cloud, resource_of(&options));
+    let mut fields = signed(&if options.is_object() { options } else { json!({}) })?;
+    let is_remote = ["http://", "https://", "data:", "s3://", "gs://"].iter().any(|p| file.starts_with(p));
+    let bytes;
+    let part = if is_remote {
+        fields.push(("file".to_string(), file.to_string()));
+        None
+    } else {
+        bytes = std::fs::read(file).map_err(|e| format!("{}: {}", file, e))?;
+        Some((std::path::Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or("upload"), bytes.as_slice()))
+    };
+    let (kind, body) = multipart(&fields, part);
+    read_answer(ureq::post(&url).timeout(Duration::from_secs(300)).set("Content-Type", &kind).send_bytes(&body))
+}
+
+/// What a browser needs to upload straight to Cloudinary, after this server has decided it may: `{ url, api_key, timestamp, signature, fields }`, `fields` being `params` as signed. They must all be sent unchanged, with `file`.
+pub fn cloudinary_upload_params(params: serde_json::Value) -> Result<Value, String> {
+    let cloud = need("CLOUDINARY_CLOUD_NAME")?;
+    let url = format!("{}/v1_1/{}/{}/upload", api(), cloud, resource_of(&params));
+    let t = now();
+    let mut m = params.as_object().cloned().unwrap_or_default();
+    m.remove("resource_type");
+    m.insert("timestamp".into(), json!(t));
+    let sig = cloudinary_signature(Value::Object(m.clone()))?;
+    Ok(json!({ "url": url, "api_key": need("CLOUDINARY_API_KEY")?, "timestamp": t, "signature": sig, "fields": m }))
+}
+
+/// Deletes an asset. `options`: `resource_type`, `invalidate` (true also clears the CDN). True when it was deleted, false when there was no such asset.
+pub fn cloudinary_destroy(public_id: &str, options: serde_json::Value) -> Result<bool, String> {
+    let cloud = need("CLOUDINARY_CLOUD_NAME")?;
+    let mut p = json!({ "public_id": public_id });
+    if options["invalidate"] == true {
+        p["invalidate"] = json!(true);
+    }
+    let url = format!("{}/v1_1/{}/{}/destroy", api(), cloud, resource_of(&options));
+    let (kind, body) = multipart(&signed(&p)?, None);
+    let r = read_answer(ureq::post(&url).timeout(Duration::from_secs(60)).set("Content-Type", &kind).send_bytes(&body))?;
+    match r["result"].as_str() {
+        Some("ok") => Ok(true),
+        Some("not found") => Ok(false),
+        o => Err(format!("Cloudinary answered {:?}", o)),
+    }
+}
+
+/// One page of assets through the Admin API, in `folder` prefix ("" for all), up to `max` (500 at most), from `cursor` ("" at first). Gives `{ assets, next }`.
+pub fn cloudinary_assets(prefix: &str, max: i64, cursor: &str) -> Result<Value, String> {
+    let cloud = need("CLOUDINARY_CLOUD_NAME")?;
+    let (key, secret) = (need("CLOUDINARY_API_KEY")?, need("CLOUDINARY_API_SECRET")?);
+    let mut req = ureq::get(&format!("{}/v1_1/{}/resources/image/upload", api(), cloud)).timeout(Duration::from_secs(60)).query("max_results", &max.clamp(1, 500).to_string());
+    if !prefix.is_empty() {
+        req = req.query("prefix", prefix);
+    }
+    if !cursor.is_empty() {
+        req = req.query("next_cursor", cursor);
+    }
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", key, secret));
+    let r = read_answer(req.set("Authorization", &format!("Basic {}", auth)).call())?;
+    Ok(json!({ "assets": r["resources"], "next": r["next_cursor"] }))
+}
+
+const SHORT: &[(&str, &str)] = &[
+    ("angle", "a"), ("aspect_ratio", "ar"), ("background", "b"), ("border", "bo"), ("crop", "c"), ("color", "co"), ("dpr", "dpr"), ("duration", "du"),
+    ("effect", "e"), ("end_offset", "eo"), ("flags", "fl"), ("fetch_format", "f"), ("gravity", "g"), ("height", "h"), ("opacity", "o"), ("overlay", "l"),
+    ("page", "pg"), ("quality", "q"), ("radius", "r"), ("start_offset", "so"), ("underlay", "u"), ("video_codec", "vc"), ("width", "w"), ("x", "x"), ("y", "y"), ("zoom", "z"),
+];
+
+fn step(t: &Value) -> Result<String, String> {
+    let m: &Map<String, Value> = match t {
+        Value::String(s) => return Ok(s.clone()),
+        Value::Object(m) => m,
+        _ => return Err("a transformation is a map, like { width: 300, crop: \"fill\" }, or Cloudinary's text".into()),
+    };
+    let mut parts = vec![];
+    for (k, v) in m {
+        let code = SHORT.iter().find(|(long, short)| long == k || short == k).map(|x| x.1).ok_or(format!("{} is not a transformation parameter this plugin knows: write the transformation as text", k))?;
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().map(|x| x.as_str().map_or(x.to_string(), str::to_string)).collect::<Vec<_>>().join("."),
+            o => o.to_string(),
+        };
+        parts.push(format!("{}_{}", code, text));
+    }
+    // SDKs sort the parameters of a step, so that one transformation has one URL.
+    parts.sort();
+    Ok(parts.join(","))
+}
+
+/// A transformation as URL text: a map becomes `c_fill,h_200,w_300`, parameters sorted as the SDKs do, a list becomes steps joined by `/`, and a text is used as it is.
+pub fn cloudinary_transformation(transformation: serde_json::Value) -> Result<String, String> {
+    match &transformation {
+        Value::Null => Ok(String::new()),
+        Value::Array(a) => Ok(a.iter().map(step).collect::<Result<Vec<_>, _>>()?.join("/")),
+        t => step(t),
+    }
+}
+
+fn url_part(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/:,!@$*()'".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// The delivery URL of an asset. `options`: `transformation` (as for `cloudinary_transformation`), `format` ("webp"), `version`, `resource_type`, `type` ("upload", "private", "authenticated"), `sign` (true adds the `s--...--` signature, which an authenticated asset or a strict transformation needs). No request is made.
+pub fn cloudinary_url(public_id: &str, options: serde_json::Value) -> Result<String, String> {
+    let cloud = need("CLOUDINARY_CLOUD_NAME")?;
+    let host = env("CLOUDINARY_DELIVERY_URL").unwrap_or_else(|| "https://res.cloudinary.com".into());
+    let t = cloudinary_transformation(options.get("transformation").cloned().unwrap_or(Value::Null))?;
+    let file = match options["format"].as_str() {
+        Some(f) => format!("{}.{}", public_id, f),
+        None => public_id.to_string(),
+    };
+    let mut parts = vec![host.trim_end_matches('/').to_string(), cloud, resource_of(&options), options["type"].as_str().unwrap_or("upload").to_string()];
+    if options["sign"] == true {
+        // Signed: the transformation and the id, not the version.
+        let signed = if t.is_empty() { file.clone() } else { format!("{}/{}", t, file) };
+        let secret = need("CLOUDINARY_API_SECRET")?;
+        let d = Sha1::digest(format!("{}{}", signed, secret).as_bytes());
+        let b = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d);
+        parts.push(format!("s--{}--", &b[..8]));
+    }
+    if !t.is_empty() {
+        parts.push(t);
+    }
+    if let Some(v) = param_text(options.get("version").unwrap_or(&Value::Null)) {
+        parts.push(format!("v{}", v));
+    }
+    parts.push(url_part(&file));
+    Ok(parts.join("/"))
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Checks a webhook from Cloudinary: `body` the raw body, `timestamp` and `signature` the `X-Cld-Timestamp` and `X-Cld-Signature` headers. Refused when not signed with this secret, or signed more than `max_age` seconds ago (7200 is what Cloudinary suggests; 0 skips that). Gives the notification.
+pub fn cloudinary_webhook(body: &str, timestamp: &str, signature: &str, max_age: i64) -> Result<Value, String> {
+    let secret = need("CLOUDINARY_API_SECRET")?;
+    let t: i64 = timestamp.parse().map_err(|_| format!("{:?} is not a timestamp", timestamp))?;
+    if !same(&digest_hex(&format!("{}{}{}", body, timestamp, secret)), &signature.to_ascii_lowercase()) {
+        return Err("the webhook's signature does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    if max_age > 0 && (now() - t).abs() > max_age {
+        return Err(format!("the webhook was signed {} s ago, more than the {} s allowed", (now() - t).abs(), max_age));
+    }
+    serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))
+}
+
+/// Signs a webhook body as Cloudinary does, for tests: the `X-Cld-Signature` value.
+pub fn cloudinary_webhook_sign(body: &str, timestamp: &str) -> Result<String, String> {
+    Ok(digest_hex(&format!("{}{}{}", body, timestamp, need("CLOUDINARY_API_SECRET")?)))
+}
+
+/// Checks the `signature` of an upload's answer, for when a browser reports an upload it made itself: true when `public_id` and `version` are what Cloudinary signed.
+pub fn cloudinary_verify_upload(public_id: &str, version: &str, signature: &str) -> Result<bool, String> {
+    Ok(same(&digest_hex(&format!("public_id={}&version={}{}", public_id, version, need("CLOUDINARY_API_SECRET")?)), signature))
+}

@@ -1,0 +1,332 @@
+//! A Telegram bot through the Bot API: messages split at Telegram's limit, photos by URL or upload, inline keyboards, updates by webhook or polling read into one shape, the webhook's secret token checked, and the Login Widget's hash verified.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const LIMIT: usize = 4096;
+const CAPTION_LIMIT: usize = 1024;
+
+fn token_of(o: &Value) -> Result<String, String> {
+    o.get("token").and_then(|t| t.as_str()).map(str::to_string).or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok()).filter(|t| !t.is_empty()).ok_or("no bot token: set TELEGRAM_BOT_TOKEN (from @BotFather), or give the option token".to_string())
+}
+
+fn base() -> String {
+    std::env::var("TELEGRAM_API_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "https://api.telegram.org".into()).trim_end_matches('/').to_string()
+}
+
+fn agent(read_s: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(read_s)).build()
+}
+
+// A failed call answers { ok: false, error_code, description, parameters }. A 429 says how long to wait.
+fn finish(method: &str, text: &str) -> Result<Result<Value, (Option<u64>, String)>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|_| format!("Telegram's answer to {} is not JSON: {:?}", method, text.chars().take(200).collect::<String>()))?;
+    if v["ok"] == true {
+        return Ok(Ok(v["result"].clone()));
+    }
+    let code = v["error_code"].as_i64().unwrap_or(0);
+    let desc = v["description"].as_str().unwrap_or("no description");
+    let mut msg = format!("Telegram {}: {}", code, desc);
+    if let Some(to) = v.pointer("/parameters/migrate_to_chat_id") {
+        msg.push_str(&format!(" (the group is now the supergroup {})", to));
+    }
+    match code {
+        401 => msg.push_str(" (check TELEGRAM_BOT_TOKEN)"),
+        403 => msg.push_str(" (the user blocked the bot, or never started it)"),
+        _ => {}
+    }
+    let wait = if code == 429 { Some(v.pointer("/parameters/retry_after").and_then(|r| r.as_u64()).unwrap_or(1)) } else { None };
+    Ok(Err((wait, msg)))
+}
+
+fn post(token: &str, method: &str, params: &Value, read_s: u64) -> Result<Value, String> {
+    let url = format!("{}/bot{}/{}", base(), token, method);
+    let body = params.to_string();
+    let mut tries = 0;
+    loop {
+        let res = agent(read_s).post(&url).set("Content-Type", "application/json").send_string(&body);
+        let text = match res {
+            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+            Err(ureq::Error::Status(_, r)) => r.into_string().unwrap_or_default(),
+            // The token is in the URL, so ureq's own message must not be shown.
+            Err(ureq::Error::Transport(t)) => return Err(format!("cannot reach Telegram at {}: {}", base(), t.kind())),
+        };
+        match finish(method, &text)? {
+            Ok(v) => return Ok(v),
+            Err((Some(wait), _)) if tries < 2 && wait <= 30 => {
+                std::thread::sleep(Duration::from_secs(wait));
+                tries += 1;
+            }
+            Err((_, msg)) => return Err(msg),
+        }
+    }
+}
+
+/// Calls any Bot API method with its parameters (a map), giving its `result`. A 429 is waited out and tried again, twice at most. Options: token (else TELEGRAM_BOT_TOKEN).
+pub fn telegram_call(method: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = if params.is_null() { json!({}) } else { params };
+    post(&token_of(&options)?, method, &p, 30)
+}
+
+// Telegram counts UTF-16 code units; a long text breaks at a line, else a space, else anywhere.
+fn split(text: &str, limit: usize) -> Vec<String> {
+    let mut out = vec![];
+    let mut rest = text;
+    loop {
+        let mut units = 0;
+        let mut cut = rest.len();
+        for (i, c) in rest.char_indices() {
+            if units + c.len_utf16() > limit {
+                cut = i;
+                break;
+            }
+            units += c.len_utf16();
+        }
+        if cut == rest.len() {
+            out.push(rest.to_string());
+            return out;
+        }
+        let head = &rest[..cut];
+        let at = head.rfind('\n').or_else(|| head.rfind(' ')).filter(|i| *i > 0).unwrap_or(cut);
+        out.push(rest[..at].trim_end().to_string());
+        rest = rest[at..].trim_start_matches(['\n', ' ']);
+    }
+}
+
+fn with_options(mut p: Value, o: &Value) -> Value {
+    for k in ["parse_mode", "reply_markup", "disable_notification", "protect_content", "message_thread_id", "reply_parameters", "link_preview_options"] {
+        if let Some(v) = o.get(k) {
+            p[k] = v.clone();
+        }
+    }
+    p
+}
+
+/// Sends `text` to `chat_id` (a number or @channel), split into several messages over 4096 characters, a keyboard going on the last. Options: parse_mode ("HTML", "MarkdownV2"), reply_markup, disable_notification, protect_content, message_thread_id, reply_parameters, link_preview_options, token. Gives the messages sent.
+pub fn telegram_send(chat_id: serde_json::Value, text: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    if text.trim().is_empty() {
+        return Err("Telegram refuses an empty message".into());
+    }
+    let token = token_of(&options)?;
+    let parts = split(text, LIMIT);
+    let n = parts.len();
+    if n > 1 && options.get("parse_mode").is_some() {
+        return Err(format!("the text is over {} characters: a split could cut a tag in two, so send it in parts yourself or without parse_mode", LIMIT));
+    }
+    let mut out = vec![];
+    for (i, part) in parts.into_iter().enumerate() {
+        let mut p = with_options(json!({ "chat_id": chat_id, "text": part }), &options);
+        if i + 1 < n {
+            p.as_object_mut().map(|m| m.remove("reply_markup"));
+        }
+        out.push(post(&token, "sendMessage", &p, 30)?);
+    }
+    Ok(out)
+}
+
+fn caption_ok(caption: &str) -> Result<(), String> {
+    let n: usize = caption.chars().map(char::len_utf16).sum();
+    if n > CAPTION_LIMIT { Err(format!("a caption is at most {} characters; this one is {}", CAPTION_LIMIT, n)) } else { Ok(()) }
+}
+
+/// Sends a photo by URL or by a file_id Telegram already has, with a `caption` (or ""). Options as for telegram_send.
+pub fn telegram_photo(chat_id: serde_json::Value, photo: &str, caption: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    caption_ok(caption)?;
+    let mut p = with_options(json!({ "chat_id": chat_id, "photo": photo }), &options);
+    if !caption.is_empty() {
+        p["caption"] = json!(caption);
+    }
+    post(&token_of(&options)?, "sendPhoto", &p, 60)
+}
+
+/// Uploads a photo from a file on disk, as multipart/form-data (10 MB at most).
+pub fn telegram_photo_upload(chat_id: serde_json::Value, path: &str, caption: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    caption_ok(caption)?;
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    if bytes.len() > 10_000_000 {
+        return Err(format!("a photo is at most 10 MB; {} is {} bytes", path, bytes.len()));
+    }
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("photo.jpg").replace('"', "");
+    let boundary = format!("quillo{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1));
+    let mut body = Vec::with_capacity(bytes.len() + 1024);
+    let mut field = |k: &str, v: &str| body.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n", boundary, k, v).as_bytes());
+    field("chat_id", &chat_id.as_str().map(str::to_string).unwrap_or(chat_id.to_string()));
+    if !caption.is_empty() {
+        field("caption", caption);
+    }
+    for k in ["parse_mode", "reply_markup"] {
+        match options.get(k) {
+            Some(Value::String(s)) => field(k, s),
+            Some(v) => field(k, &v.to_string()),
+            None => {}
+        }
+    }
+    body.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, name).as_bytes());
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+    let token = token_of(&options)?;
+    let url = format!("{}/bot{}/sendPhoto", base(), token);
+    let res = agent(120).post(&url).set("Content-Type", &format!("multipart/form-data; boundary={}", boundary)).send_bytes(&body);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(_, r)) => r.into_string().unwrap_or_default(),
+        Err(ureq::Error::Transport(t)) => return Err(format!("cannot reach Telegram at {}: {}", base(), t.kind())),
+    };
+    finish("sendPhoto", &text)?.map_err(|(_, m)| m)
+}
+
+/// An inline keyboard for `reply_markup`: `rows` is a list of rows, each a list of { text, url } or { text, callback_data } (at most 64 bytes). Checked here, as Telegram's own error does not say which button is wrong.
+pub fn telegram_keyboard(rows: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = rows.as_array().ok_or("rows must be a list of rows of buttons")?;
+    if list.is_empty() {
+        return Err("the keyboard has no rows".into());
+    }
+    for row in list {
+        for b in row.as_array().ok_or("each row must be a list of buttons")? {
+            let t = b["text"].as_str().unwrap_or("");
+            if t.is_empty() {
+                return Err(format!("a button has no text: {}", b));
+            }
+            let kinds = ["url", "callback_data", "web_app", "login_url", "switch_inline_query", "switch_inline_query_current_chat", "copy_text", "pay"];
+            if !kinds.iter().any(|k| b.get(*k).is_some()) {
+                return Err(format!("the button {:?} needs a url or a callback_data", t));
+            }
+            if let Some(d) = b["callback_data"].as_str() {
+                if d.is_empty() || d.len() > 64 {
+                    return Err(format!("the button {:?} has {} bytes of callback_data; it takes 1 to 64", t, d.len()));
+                }
+            }
+        }
+    }
+    Ok(json!({ "inline_keyboard": rows }))
+}
+
+/// Answers a button press: without this the button keeps spinning. `text` ("" for none) shows as a note, or an alert with `show_alert`.
+pub fn telegram_answer_callback(callback_id: &str, text: &str, show_alert: bool, options: serde_json::Value) -> Result<bool, String> {
+    let mut p = json!({ "callback_query_id": callback_id, "show_alert": show_alert });
+    if !text.is_empty() {
+        p["text"] = json!(text);
+    }
+    post(&token_of(&options)?, "answerCallbackQuery", &p, 30).map(|r| r == true)
+}
+
+/// Changes a message the bot sent. Telegram's "message is not modified" is not an error here, as the message already says this.
+pub fn telegram_edit(chat_id: serde_json::Value, message_id: i64, text: &str, options: serde_json::Value) -> Result<bool, String> {
+    let p = with_options(json!({ "chat_id": chat_id, "message_id": message_id, "text": text }), &options);
+    match post(&token_of(&options)?, "editMessageText", &p, 30) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("message is not modified") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Tells Telegram where to post updates: an https `url`, and a `secret` of 1 to 256 of A-Z, a-z, 0-9, _ and - that comes back in a header. Options: allowed_updates, max_connections, drop_pending_updates.
+pub fn telegram_set_webhook(url: &str, secret: &str, options: serde_json::Value) -> Result<bool, String> {
+    if secret.is_empty() || secret.len() > 256 || !secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("the secret is 1 to 256 of A-Z, a-z, 0-9, _ and -".into());
+    }
+    let mut p = json!({ "url": url, "secret_token": secret });
+    for k in ["allowed_updates", "max_connections", "drop_pending_updates"] {
+        if let Some(v) = options.get(k) {
+            p[k] = v.clone();
+        }
+    }
+    post(&token_of(&options)?, "setWebhook", &p, 30).map(|r| r == true)
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether a webhook request is really from Telegram: its X-Telegram-Bot-Api-Secret-Token header (`headers` are the request's) against the `secret` given to setWebhook, compared in constant time.
+pub fn telegram_webhook_ok(headers: std::collections::HashMap<String, serde_json::Value>, secret: &str) -> bool {
+    let got = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-telegram-bot-api-secret-token")).and_then(|(_, v)| v.as_str());
+    !secret.is_empty() && got.map(|g| same(g, secret)).unwrap_or(false)
+}
+
+/// Long polls getUpdates from `offset` (the last update_id + 1, 0 at first) for up to `wait_s` seconds; each update read as telegram_read_update does. Fails with a 409 while a webhook is set.
+pub fn telegram_updates(offset: i64, wait_s: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let wait = wait_s.clamp(0, 50);
+    let r = post(&token_of(&options)?, "getUpdates", &json!({ "offset": offset, "timeout": wait }), wait as u64 + 10)?;
+    Ok(r.as_array().map(|l| l.iter().map(read).collect()).unwrap_or_default())
+}
+
+fn read(u: &Value) -> Value {
+    let id = u["update_id"].clone();
+    if let Some(q) = u.get("callback_query") {
+        return json!({ "update_id": id, "kind": "callback", "callback_id": q["id"], "data": q["data"], "user": q["from"], "chat_id": q.pointer("/message/chat/id"), "message_id": q.pointer("/message/message_id") });
+    }
+    for (key, kind) in [("message", "message"), ("edited_message", "edited"), ("channel_post", "channel_post")] {
+        if let Some(m) = u.get(key) {
+            let text = m.get("text").or(m.get("caption")).cloned().unwrap_or(Value::Null);
+            // The biggest size comes last.
+            let photo = m.get("photo").and_then(|p| p.as_array()).and_then(|l| l.last()).map(|p| p["file_id"].clone()).unwrap_or(Value::Null);
+            let command = text.as_str().filter(|t| t.starts_with('/')).and_then(|t| t.split_whitespace().next()).map(|c| c.split('@').next().unwrap_or(c).to_string());
+            return json!({ "update_id": id, "kind": kind, "chat_id": m.pointer("/chat/id"), "message_id": m["message_id"], "user": m.get("from").cloned().unwrap_or(Value::Null), "text": text, "photo": photo, "command": command });
+        }
+    }
+    let kind = u.as_object().and_then(|m| m.keys().find(|k| *k != "update_id").cloned()).unwrap_or_default();
+    json!({ "update_id": id, "kind": kind })
+}
+
+/// An update from a webhook's body read into { update_id, kind, chat_id, message_id, user, text, photo, command } for a message, or { kind: "callback", callback_id, data, user, chat_id, message_id } for a button.
+pub fn telegram_read_update(body: &str) -> Result<serde_json::Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the update is not JSON: {}", e))?;
+    Ok(read(&v))
+}
+
+/// MarkdownV2 text with every special character escaped, as the mode refuses them bare.
+pub fn telegram_escape(text: &str) -> String {
+    let mut o = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "_*[]()~`>#+-=|{}.!\\".contains(c) {
+            o.push('\\');
+        }
+        o.push(c);
+    }
+    o
+}
+
+fn data_check(fields: &std::collections::HashMap<String, serde_json::Value>) -> String {
+    let mut lines: Vec<String> = fields.iter().filter(|(k, _)| *k != "hash").map(|(k, v)| format!("{}={}", k, v.as_str().map(str::to_string).unwrap_or(v.to_string()))).collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn login_hash(token: &str, check: &str) -> String {
+    let secret = Sha256::digest(token.as_bytes());
+    let mut m = Hmac::<Sha256>::new_from_slice(&secret).expect("HMAC takes any key");
+    m.update(check.as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+/// Checks a Login Widget sign-in: `fields` are the query it sent (id, first_name, username, photo_url, auth_date, hash). The hash is an HMAC-SHA256 with the SHA-256 of the bot token as its key, and sign-ins older than `max_age_s` are refused (0: no limit). Gives the user's fields without the hash.
+pub fn telegram_login_check(fields: std::collections::HashMap<String, serde_json::Value>, max_age_s: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let got = fields.get("hash").and_then(|h| h.as_str()).ok_or("the sign-in has no hash")?.to_ascii_lowercase();
+    let want = login_hash(&token_of(&options)?, &data_check(&fields));
+    if !same(&got, &want) {
+        return Err("the sign-in's hash does not match: it did not come from Telegram for this bot".into());
+    }
+    let date = fields.get("auth_date").and_then(|d| d.as_str().map(str::to_string).or(d.as_i64().map(|n| n.to_string()))).and_then(|d| d.parse::<i64>().ok()).ok_or("the sign-in has no auth_date")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    if max_age_s > 0 && now - date > max_age_s {
+        return Err(format!("the sign-in is {} s old, over the {} s allowed", now - date, max_age_s));
+    }
+    let mut user = serde_json::Map::new();
+    let mut keys: Vec<&String> = fields.keys().filter(|k| *k != "hash").collect();
+    keys.sort();
+    for k in keys {
+        user.insert(k.clone(), fields[k].clone());
+    }
+    Ok(Value::Object(user))
+}

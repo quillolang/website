@@ -1,0 +1,294 @@
+//! PayPal's Orders API without an SDK: an OAuth token reused until it expires, orders created and captured, refunds, webhook signatures checked through PayPal's verify call, and retries made safe by PayPal-Request-Id.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Tokens by base URL and client id. A token counts as gone a minute before it expires.
+static TOKENS: Mutex<Option<HashMap<String, (String, Instant)>>> = Mutex::new(None);
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+const NO_DECIMALS: &[&str] = &["HUF", "JPY", "TWD"];
+const TRIES: u32 = 3;
+
+struct Conn {
+    base: String,
+    id: String,
+    secret: String,
+}
+
+fn opt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(Value::as_str).map(str::to_string).filter(|x| !x.is_empty())
+}
+
+fn conn(o: &Value) -> Result<Conn, String> {
+    let id = opt(o, "client_id").or_else(|| std::env::var("PAYPAL_CLIENT_ID").ok()).filter(|x| !x.is_empty()).ok_or("no client_id, and PAYPAL_CLIENT_ID is not set")?;
+    let secret = opt(o, "client_secret").or_else(|| std::env::var("PAYPAL_CLIENT_SECRET").ok()).filter(|x| !x.is_empty()).ok_or("no client_secret, and PAYPAL_CLIENT_SECRET is not set")?;
+    // The sandbox unless told otherwise: nobody takes real money by accident.
+    let base = opt(o, "base_url").or_else(|| std::env::var("PAYPAL_API_URL").ok().filter(|x| !x.is_empty())).unwrap_or_else(|| "https://api-m.sandbox.paypal.com".into());
+    Ok(Conn { base: base.trim_end_matches('/').to_string(), id, secret })
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
+}
+
+fn key(c: &Conn) -> String {
+    format!("{} {}", c.base, c.id)
+}
+
+fn forget(c: &Conn) {
+    if let Some(m) = TOKENS.lock().unwrap().as_mut() {
+        m.remove(&key(c));
+    }
+}
+
+fn token(c: &Conn) -> Result<String, String> {
+    if let Some((t, until)) = TOKENS.lock().unwrap().as_ref().and_then(|m| m.get(&key(c))) {
+        if Instant::now() < *until {
+            return Ok(t.clone());
+        }
+    }
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", c.id, c.secret));
+    let r = agent().post(&format!("{}/v1/oauth2/token", c.base)).set("Authorization", &format!("Basic {}", basic)).set("Accept", "application/json").send_form(&[("grant_type", "client_credentials")]);
+    let (status, text) = match r {
+        Ok(a) => (a.status(), a.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(s, a)) => (s, a.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("PayPal: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(format!("PayPal {} getting a token: {}: {}", status, v["error"].as_str().unwrap_or("error"), v["error_description"].as_str().unwrap_or(&text)));
+    }
+    let t = v["access_token"].as_str().ok_or("PayPal's token answer has no access_token")?.to_string();
+    let life = v["expires_in"].as_u64().unwrap_or(0).saturating_sub(60);
+    TOKENS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key(c), (t.clone(), Instant::now() + Duration::from_secs(life)));
+    Ok(t)
+}
+
+/// A token for the app, fetched once and reused until a minute before it expires. The other functions call this themselves.
+pub fn paypal_token(options: serde_json::Value) -> Result<String, String> {
+    token(&conn(&options)?)
+}
+
+fn request_id() -> String {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("quillo-{:x}-{:x}-{:x}", t, std::process::id(), n)
+}
+
+/// The reason in PayPal's error body, as one line: name, the first detail's issue, its description or the message, and the debug id support asks for.
+fn problem(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if v.get("name").is_none() {
+        if let Some(e) = v["error"].as_str() {
+            return format!("PayPal {}: {}: {}", status, e, v["error_description"].as_str().unwrap_or(""));
+        }
+        return format!("PayPal {}: {}", status, text.chars().take(200).collect::<String>());
+    }
+    let d = &v["details"][0];
+    let mut out = format!("PayPal {}: {}", status, v["name"].as_str().unwrap_or("ERROR"));
+    if let Some(i) = d["issue"].as_str() {
+        out += &format!(": {}", i);
+    }
+    out += &format!(": {}", d["description"].as_str().or(v["message"].as_str()).unwrap_or(""));
+    if let Some(f) = d["field"].as_str() {
+        out += &format!(" ({})", f);
+    }
+    if let Some(id) = v["debug_id"].as_str() {
+        out += &format!(" [debug_id {}]", id);
+    }
+    out
+}
+
+/// Calls the API: `method`, `path` like "/v2/checkout/orders", `body` a map or null, sent raw when text. `options` may hold `request_id` (PayPal-Request-Id: the same id gives the same result, so a retried POST happens once; one is made when left out), `prefer` ("return=representation", or "return=minimal"), `client_id`, `client_secret`, `base_url` (else PAYPAL_API_URL, else the sandbox). A 401 gets one new token; a 429 or 5xx is tried again up to three times, after its Retry-After. Gives the body, or an error with PayPal's name, issue, description and debug id.
+pub fn paypal_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let c = conn(&options)?;
+    let m = method.to_uppercase();
+    let rid = if m == "POST" || m == "PATCH" { Some(opt(&options, "request_id").unwrap_or_else(request_id)) } else { None };
+    let payload = match &body {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        o => Some(o.to_string()),
+    };
+    let url = format!("{}{}", c.base, path);
+    let mut renewed = false;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let t = token(&c)?;
+        let mut req = agent().request(&m, &url).set("Authorization", &format!("Bearer {}", t)).set("Accept", "application/json");
+        if let Some(id) = &rid {
+            req = req.set("PayPal-Request-Id", id);
+        }
+        if let Some(p) = opt(&options, "prefer") {
+            req = req.set("Prefer", &p);
+        }
+        let r = match &payload {
+            Some(p) => req.set("Content-Type", "application/json").send_string(p),
+            None if m == "POST" => req.set("Content-Type", "application/json").send_string("{}"),
+            None => req.call(),
+        };
+        let (status, retry, text) = match r {
+            Ok(a) => (a.status(), None, a.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(s, a)) => (s, a.header("retry-after").and_then(|x| x.trim().parse::<u64>().ok()), a.into_string().unwrap_or_default()),
+            Err(e) if tries < TRIES => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(200 * tries as u64));
+                continue;
+            }
+            Err(e) => return Err(format!("PayPal: {}", e)),
+        };
+        if (200..300).contains(&status) {
+            return if text.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&text).map_err(|e| format!("PayPal's answer is not JSON: {}", e)) };
+        }
+        if status == 401 && !renewed {
+            renewed = true;
+            forget(&c);
+            continue;
+        }
+        if (status == 429 || status >= 500) && tries < TRIES {
+            std::thread::sleep(Duration::from_millis(retry.unwrap_or(tries as u64).min(30) * 1000));
+            continue;
+        }
+        return Err(problem(status, &text));
+    }
+}
+
+/// An amount as PayPal's API writes it: `paypal_amount("19.9", "usd")` is `{ currency_code: "USD", value: "19.90" }`. Yen, forints and Taiwan dollars take no decimals, and more than a currency has is an error.
+pub fn paypal_amount(value: &str, currency: &str) -> Result<Value, String> {
+    let c = currency.to_uppercase();
+    if c.len() != 3 {
+        return Err(format!("`{}` is not a currency code", currency));
+    }
+    let places = if NO_DECIMALS.contains(&c.as_str()) { 0 } else { 2 };
+    let a = value.trim();
+    let (w, f) = a.split_once('.').unwrap_or((a, ""));
+    if w.is_empty() || !w.bytes().all(|b| b.is_ascii_digit()) || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", value));
+    }
+    let f = f.trim_end_matches('0');
+    if f.len() > places {
+        return Err(format!("{} has {} decimals; {} has {}", value, f.len(), c, places));
+    }
+    let v = if places == 0 { w.to_string() } else { format!("{}.{:0<2}", w, f) };
+    Ok(json!({ "currency_code": c, "value": v }))
+}
+
+/// Creates an order. `order` is PayPal's own body, or the short form `{ amount, currency, reference_id, description, custom_id, invoice_id, intent, return_url, cancel_url }`. Takes `options` as `paypal_request` does; give `request_id` so that a retry after a crash finds the same order. The answer has `id`, `status` and `links`.
+pub fn paypal_order_create(order: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let body = if order.get("purchase_units").is_some() {
+        order
+    } else {
+        let g = |k: &str| order.get(k).filter(|v| !v.is_null()).cloned();
+        let value = match order.get("amount") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => return Err("no amount".into()),
+        };
+        let currency = order.get("currency").and_then(Value::as_str).unwrap_or("USD");
+        let mut unit = json!({ "amount": paypal_amount(&value, currency)? });
+        for k in ["reference_id", "description", "custom_id", "invoice_id"] {
+            if let Some(v) = g(k) {
+                unit[k] = v;
+            }
+        }
+        let mut b = json!({ "intent": g("intent").unwrap_or(json!("CAPTURE")), "purchase_units": [unit] });
+        if g("return_url").is_some() || g("cancel_url").is_some() {
+            b["payment_source"] = json!({ "paypal": { "experience_context": { "return_url": g("return_url"), "cancel_url": g("cancel_url") } } });
+        }
+        b
+    };
+    let mut o = options;
+    if o.get("prefer").is_none() && o.is_object() {
+        o["prefer"] = json!("return=representation");
+    }
+    paypal_request("POST", "/v2/checkout/orders", body, if o.is_object() { o } else { json!({ "prefer": "return=representation" }) })
+}
+
+/// Where to send the buyer: the `approve` or `payer-action` link of an order.
+pub fn paypal_approve_link(order: serde_json::Value) -> Result<String, String> {
+    order["links"].as_array().into_iter().flatten().find(|l| l["rel"] == "approve" || l["rel"] == "payer-action").and_then(|l| l["href"].as_str()).map(str::to_string).ok_or("the order has no approve link".into())
+}
+
+/// An order as it stands.
+pub fn paypal_order_get(order_id: &str, options: serde_json::Value) -> Result<Value, String> {
+    paypal_request("GET", &format!("/v2/checkout/orders/{}", path_part(order_id)?), Value::Null, options)
+}
+
+fn path_part(id: &str) -> Result<&str, String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("`{}` is not a PayPal id", id));
+    }
+    Ok(id)
+}
+
+/// Captures an approved order: the money moves. `options` as in `paypal_request`; a `request_id` makes a second capture give the first answer. Before the buyer approves, this is PayPal's ORDER_NOT_APPROVED.
+pub fn paypal_order_capture(order_id: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut o = options;
+    if o.is_object() && o.get("prefer").is_none() {
+        o["prefer"] = json!("return=representation");
+    }
+    paypal_request("POST", &format!("/v2/checkout/orders/{}/capture", path_part(order_id)?), json!({}), if o.is_object() { o } else { json!({ "prefer": "return=representation" }) })
+}
+
+/// The capture ids inside a captured order, for refunds: first unit's first.
+pub fn paypal_capture_ids(order: serde_json::Value) -> Vec<String> {
+    order["purchase_units"].as_array().into_iter().flatten().flat_map(|u| u["payments"]["captures"].as_array().cloned().unwrap_or_default()).filter_map(|c| c["id"].as_str().map(str::to_string)).collect()
+}
+
+/// A capture as it stands.
+pub fn paypal_capture_get(capture_id: &str, options: serde_json::Value) -> Result<Value, String> {
+    paypal_request("GET", &format!("/v2/payments/captures/{}", path_part(capture_id)?), Value::Null, options)
+}
+
+/// Refunds a capture, all of it when `amount` is null, or `paypal_amount(...)`'s value for part. `note` goes to the buyer. Give `request_id` in `options` so a retried refund pays once.
+pub fn paypal_refund(capture_id: &str, amount: serde_json::Value, note: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut body = json!({});
+    if !amount.is_null() {
+        body["amount"] = amount;
+    }
+    if !note.is_empty() {
+        body["note_to_payer"] = json!(note);
+    }
+    paypal_request("POST", &format!("/v2/payments/captures/{}/refund", path_part(capture_id)?), body, options)
+}
+
+/// A refund as it stands.
+pub fn paypal_refund_get(refund_id: &str, options: serde_json::Value) -> Result<Value, String> {
+    paypal_request("GET", &format!("/v2/payments/refunds/{}", path_part(refund_id)?), Value::Null, options)
+}
+
+fn header<'a>(h: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
+}
+
+/// Checks a webhook through PayPal's own verify call and gives its event. `headers` are the request's, `body` its text exactly as it came, `webhook_id` the id PayPal gave the webhook (empty: PAYPAL_WEBHOOK_ID). The event goes back to PayPal byte for byte, as a re-written one would fail. A missing header or a signature PayPal refuses is an error: answer those with a 401.
+pub fn paypal_webhook_verify(webhook_id: &str, headers: std::collections::HashMap<String, String>, body: &str, options: serde_json::Value) -> Result<Value, String> {
+    let id = if webhook_id.is_empty() { std::env::var("PAYPAL_WEBHOOK_ID").unwrap_or_default() } else { webhook_id.to_string() };
+    if id.is_empty() {
+        return Err("no webhook id, and PAYPAL_WEBHOOK_ID is not set".into());
+    }
+    let event: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    let mut fields = vec![];
+    for (name, head) in [("auth_algo", "paypal-auth-algo"), ("cert_url", "paypal-cert-url"), ("transmission_id", "paypal-transmission-id"), ("transmission_sig", "paypal-transmission-sig"), ("transmission_time", "paypal-transmission-time")] {
+        let v = header(&headers, head).ok_or(format!("the webhook has no {} header", head))?;
+        fields.push(format!("{}:{}", Value::String(name.into()), Value::String(v.into())));
+    }
+    fields.push(format!("\"webhook_id\":{}", Value::String(id)));
+    let raw = format!("{{{},\"webhook_event\":{}}}", fields.join(","), body);
+    let v = paypal_request("POST", "/v1/notifications/verify-webhook-signature", Value::String(raw), options)?;
+    match v["verification_status"].as_str() {
+        Some("SUCCESS") => Ok(event),
+        Some(o) => Err(format!("PayPal says the webhook's signature is {}", o)),
+        None => Err("PayPal's verify answer has no verification_status".into()),
+    }
+}

@@ -1,0 +1,423 @@
+//! CUE sheets read and written: tracks, indexes as mm:ss:ff, performers, FILE lines, gaps and flags, durations given a total length, and the sheet checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+const FPS: i64 = 75;
+const TRACK_TYPES: [&str; 8] = ["AUDIO", "CDG", "MODE1/2048", "MODE1/2352", "MODE2/2336", "MODE2/2352", "CDI/2336", "CDI/2352"];
+const FILE_TYPES: [&str; 6] = ["WAVE", "MP3", "AIFF", "BINARY", "MOTOROLA", "FLAC"];
+const FLAGS: [&str; 5] = ["DCP", "4CH", "PRE", "SCMS", "DATA"];
+
+/// `mm:ss:ff` to frames, 75 to a second. Minutes may pass 99 on long sheets.
+fn frames(t: &str) -> Result<i64, String> {
+    let bad = || format!("`{}` is not mm:ss:ff", t);
+    let p: Vec<&str> = t.trim().split(':').collect();
+    if p.len() != 3 || p.iter().any(|x| x.is_empty() || !x.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(bad());
+    }
+    let (m, s, f): (i64, i64, i64) = (p[0].parse().map_err(|_| bad())?, p[1].parse().map_err(|_| bad())?, p[2].parse().map_err(|_| bad())?);
+    if s >= 60 {
+        return Err(format!("`{}`: seconds stop at 59", t));
+    }
+    if f >= FPS {
+        return Err(format!("`{}`: frames stop at 74", t));
+    }
+    Ok((m * 60 + s) * FPS + f)
+}
+
+fn msf(f: i64) -> String {
+    format!("{:02}:{:02}:{:02}", f / FPS / 60, f / FPS % 60, f % FPS)
+}
+
+fn secs(f: i64) -> f64 {
+    (f as f64 / FPS as f64 * 1e6).round() / 1e6
+}
+
+/// A line's words: quoted text keeps its spaces, and `\"` is a quote some writers use.
+fn words(l: &str) -> Vec<String> {
+    let c: Vec<char> = l.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        if c[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let mut w = String::new();
+        if c[i] == '"' {
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' && c.get(i + 1) == Some(&'"') {
+                    i += 1;
+                }
+                w.push(c[i]);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            while i < c.len() && !c[i].is_whitespace() {
+                w.push(c[i]);
+                i += 1;
+            }
+        }
+        out.push(w);
+    }
+    out
+}
+
+fn decode(b: &[u8]) -> String {
+    if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&b[3..]).into_owned();
+    }
+    if b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]) {
+        let big = b[0] == 0xFE;
+        let u: Vec<u16> = b[2..].chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+        return String::from_utf16_lossy(&u);
+    }
+    // Rippers of the 2000s wrote Windows-1252; Latin-1 is near enough for names.
+    match std::str::from_utf8(b) {
+        Ok(t) => t.to_string(),
+        Err(_) => b.iter().map(|x| *x as char).collect(),
+    }
+}
+
+fn parse(text: &str) -> Result<Value, String> {
+    let mut sheet = Map::new();
+    let mut rem = Map::new();
+    let mut files: Vec<Value> = vec![];
+    let mut tracks: Vec<Value> = vec![];
+    let mut cur: Option<Map<String, Value>> = None;
+    let mut problems: Vec<String> = vec![];
+    let mut file_at: Option<usize> = None;
+    let flush = |cur: &mut Option<Map<String, Value>>, tracks: &mut Vec<Value>| {
+        if let Some(t) = cur.take() {
+            tracks.push(Value::Object(t));
+        }
+    };
+    for (i, raw) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let n = i + 1;
+        let w = words(raw);
+        if w.is_empty() {
+            continue;
+        }
+        let cmd = w[0].to_uppercase();
+        let arg = |k: usize| w.get(k).cloned().ok_or(format!("line {}: {} needs a value", n, cmd));
+        let target = |cur: &mut Option<Map<String, Value>>, sheet: &mut Map<String, Value>, k: &str, v: String| match cur.as_mut() {
+            Some(t) => { t.insert(k.to_string(), json!(v)); }
+            None => { sheet.insert(k.to_string(), json!(v)); }
+        };
+        match cmd.as_str() {
+            "REM" => {
+                if let (Some(k), None) = (w.get(1), &cur) {
+                    let rest = w[2..].join(" ");
+                    rem.insert(k.to_lowercase(), rest.parse::<i64>().map(|x| json!(x)).unwrap_or(json!(rest)));
+                } else if let (Some(k), Some(t)) = (w.get(1), cur.as_mut()) {
+                    t.entry("rem").or_insert(json!({}))[k.to_lowercase()] = json!(w[2..].join(" "));
+                }
+            }
+            "TITLE" => target(&mut cur, &mut sheet, "title", arg(1)?),
+            "PERFORMER" => target(&mut cur, &mut sheet, "performer", arg(1)?),
+            "SONGWRITER" => target(&mut cur, &mut sheet, "songwriter", arg(1)?),
+            "COMPOSER" | "ARRANGER" | "MESSAGE" => target(&mut cur, &mut sheet, &cmd.to_lowercase(), arg(1)?),
+            "CATALOG" => {
+                let v = arg(1)?;
+                if v.len() != 13 || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    problems.push(format!("line {}: a CATALOG number has 13 digits", n));
+                }
+                sheet.insert("catalog".into(), json!(v));
+            }
+            "CDTEXTFILE" => {
+                sheet.insert("cdtextfile".into(), json!(arg(1)?));
+            }
+            "FILE" => {
+                flush(&mut cur, &mut tracks);
+                let name = arg(1)?;
+                let kind = w.get(2).map_or("BINARY".to_string(), |k| k.to_uppercase());
+                if !FILE_TYPES.contains(&kind.as_str()) {
+                    problems.push(format!("line {}: `{}` is not a file type", n, kind));
+                }
+                files.push(json!({ "name": name, "type": kind }));
+                file_at = Some(files.len() - 1);
+            }
+            "TRACK" => {
+                flush(&mut cur, &mut tracks);
+                let num = arg(1)?;
+                let number: i64 = num.parse().map_err(|_| format!("line {}: `{}` is not a track number", n, num))?;
+                if !(1..=99).contains(&number) {
+                    return Err(format!("line {}: track numbers go from 1 to 99", n));
+                }
+                let kind = w.get(2).map_or("AUDIO".to_string(), |k| k.to_uppercase());
+                if !TRACK_TYPES.contains(&kind.as_str()) {
+                    problems.push(format!("line {}: `{}` is not a track type", n, kind));
+                }
+                let Some(f) = file_at else {
+                    return Err(format!("line {}: TRACK before any FILE", n));
+                };
+                let mut t = Map::new();
+                t.insert("number".into(), json!(number));
+                t.insert("type".into(), json!(kind));
+                t.insert("file".into(), files[f]["name"].clone());
+                t.insert("indexes".into(), json!([]));
+                cur = Some(t);
+            }
+            "INDEX" => {
+                let t = cur.as_mut().ok_or(format!("line {}: INDEX outside a track", n))?;
+                let num: i64 = arg(1)?.parse().map_err(|_| format!("line {}: `{}` is not an index number", n, w[1]))?;
+                if !(0..=99).contains(&num) {
+                    return Err(format!("line {}: index numbers go from 0 to 99", n));
+                }
+                let time = arg(2)?;
+                let f = frames(&time).map_err(|e| format!("line {}: {}", n, e))?;
+                t["indexes"].as_array_mut().unwrap().push(json!({ "number": num, "time": msf(f), "frames": f, "seconds": secs(f) }));
+            }
+            "PREGAP" | "POSTGAP" => {
+                let t = cur.as_mut().ok_or(format!("line {}: {} outside a track", n, cmd))?;
+                let time = arg(1)?;
+                let f = frames(&time).map_err(|e| format!("line {}: {}", n, e))?;
+                t.insert(cmd.to_lowercase(), json!(msf(f)));
+            }
+            "ISRC" => {
+                let t = cur.as_mut().ok_or(format!("line {}: ISRC outside a track", n))?;
+                let v = arg(1)?;
+                if v.len() != 12 || !v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    problems.push(format!("line {}: an ISRC has 12 letters and digits", n));
+                }
+                t.insert("isrc".into(), json!(v));
+            }
+            "FLAGS" => {
+                let t = cur.as_mut().ok_or(format!("line {}: FLAGS outside a track", n))?;
+                let list: Vec<String> = w[1..].iter().map(|x| x.to_uppercase()).collect();
+                if let Some(b) = list.iter().find(|x| !FLAGS.contains(&x.as_str())) {
+                    problems.push(format!("line {}: `{}` is not a flag", n, b));
+                }
+                t.insert("flags".into(), json!(list));
+            }
+            o => problems.push(format!("line {}: `{}` is not a CUE command", n, o)),
+        }
+    }
+    flush(&mut cur, &mut tracks);
+    if tracks.is_empty() {
+        return Err("no tracks: not a CUE sheet".to_string());
+    }
+    // Rules across tracks.
+    let mut last = 0;
+    for t in &tracks {
+        let num = t["number"].as_i64().unwrap_or(0);
+        if num != last + 1 && last != 0 {
+            problems.push(format!("track {} follows track {}", num, last));
+        }
+        if num <= last {
+            problems.push(format!("track {} is out of order", num));
+        }
+        last = num;
+        let idx = t["indexes"].as_array().unwrap();
+        if !idx.iter().any(|x| x["number"] == 1) {
+            problems.push(format!("track {} has no INDEX 01", num));
+        }
+        for w in idx.windows(2) {
+            if w[1]["frames"].as_i64() <= w[0]["frames"].as_i64() {
+                problems.push(format!("track {}: index {} does not come after index {}", num, w[1]["number"], w[0]["number"]));
+            }
+        }
+    }
+    for w in tracks.windows(2) {
+        let (a, b) = (start_of(&w[0]), start_of(&w[1]));
+        if w[0]["file"] == w[1]["file"] && b <= a {
+            problems.push(format!("track {} starts before track {} ends", w[1]["number"], w[0]["number"]));
+        }
+    }
+    sheet.insert("rem".into(), Value::Object(rem));
+    sheet.insert("files".into(), json!(files));
+    sheet.insert("tracks".into(), json!(tracks));
+    sheet.insert("problems".into(), json!(problems));
+    Ok(Value::Object(sheet))
+}
+
+fn start_of(t: &Value) -> i64 {
+    t["indexes"].as_array().and_then(|x| x.iter().find(|y| y["number"] == 1)).and_then(|x| x["frames"].as_i64()).unwrap_or(0)
+}
+
+/// Reads a CUE sheet: `{ title, performer, catalog, rem, files, tracks, problems }`, each track with `number`, `type`, `title`, `performer`, `isrc`, `flags`, `pregap`, its `file` and its `indexes` in frames and seconds. Damage a player would stop on is an error; oddities go in `problems`.
+pub fn cue_parse(text: &str) -> Result<Value, String> {
+    parse(text)
+}
+
+/// Reads a sheet from a path; a BOM says UTF-8 or UTF-16, and bytes that are neither are read as Latin-1.
+pub fn cue_read_file(path: &str) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    parse(&decode(&b))
+}
+
+/// `mm:ss:ff` as `{ frames, seconds, text }`, or a number of seconds or frames back into it: `cue_time("03:25:40")`, `cue_time_from_seconds(205.53)`.
+pub fn cue_time(text: &str) -> Result<Value, String> {
+    let f = frames(text)?;
+    Ok(json!({ "frames": f, "seconds": secs(f), "text": msf(f) }))
+}
+
+/// Seconds as `mm:ss:ff`, to the nearest frame.
+pub fn cue_time_from_seconds(seconds: f64) -> Result<String, String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!("{} is not a time", seconds));
+    }
+    Ok(msf((seconds * FPS as f64).round() as i64))
+}
+
+/// Each track's start, end and length, from one INDEX 01 to the next. `lengths` gives each file's length in seconds: a number for one file, or a map by name. The last track of a file ends at it; a pregap (INDEX 00) belongs to the track before.
+pub fn cue_durations(text: &str, lengths: serde_json::Value) -> Result<Value, String> {
+    let s = parse(text)?;
+    let tracks = s["tracks"].as_array().unwrap();
+    let names: Vec<&str> = s["files"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str()).collect();
+    let length_of = |name: &str| -> Result<Option<i64>, String> {
+        let v = match &lengths {
+            Value::Number(_) if names.len() == 1 => Some(&lengths),
+            Value::Number(_) => return Err("several files need a map of lengths".to_string()),
+            Value::Object(m) => m.get(name),
+            Value::Null => None,
+            _ => return Err("`lengths` is a number of seconds, or a map by file".to_string()),
+        };
+        match v.map(|x| x.as_f64().ok_or("a length must be a number of seconds".to_string())) {
+            Some(Ok(x)) if x >= 0.0 => Ok(Some((x * FPS as f64).round() as i64)),
+            Some(Ok(x)) => Err(format!("a length of {}", x)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    };
+    let mut out = vec![];
+    let mut total = 0;
+    let mut known = true;
+    for (i, t) in tracks.iter().enumerate() {
+        let file = t["file"].as_str().unwrap_or("");
+        let start = start_of(t);
+        let next = tracks.get(i + 1).filter(|n| n["file"] == t["file"]);
+        let end = match next {
+            Some(n) => Some(start_of(n)),
+            None => length_of(file)?,
+        };
+        if let Some(e) = end {
+            if e < start {
+                return Err(format!("track {} starts at {}, past the end of {}", t["number"], msf(start), file));
+            }
+        }
+        match end {
+            Some(e) => total += e - start,
+            None => known = false,
+        }
+        let pregap = t["indexes"].as_array().unwrap().iter().find(|x| x["number"] == 0).and_then(|x| x["frames"].as_i64()).map(|p| start - p);
+        out.push(json!({
+            "number": t["number"], "title": t.get("title"), "performer": t.get("performer").or(s.get("performer")), "file": file,
+            "start": msf(start), "start_seconds": secs(start),
+            "end": end.map(msf), "end_seconds": end.map(secs),
+            "length": end.map(|e| msf(e - start)), "seconds": end.map(|e| secs(e - start)),
+            "pregap": pregap.map(msf),
+        }));
+    }
+    Ok(json!({ "tracks": out, "total": if known { json!(msf(total)) } else { Value::Null }, "total_seconds": if known { json!(secs(total)) } else { Value::Null } }))
+}
+
+fn q(s: &str) -> Result<String, String> {
+    if s.contains(['\n', '\r']) {
+        return Err(format!("`{}` has a line break in it", s));
+    }
+    // A sheet has no escape a parser can be relied on for, and most read the first `"` as the end.
+    Ok(format!("\"{}\"", s.replace('"', "'")))
+}
+
+fn time_field(v: &Value, what: &str) -> Result<String, String> {
+    match v {
+        Value::String(t) => Ok(msf(frames(t)?)),
+        Value::Number(n) => Ok(msf(n.as_i64().ok_or(format!("{} in frames must be whole", what))?)),
+        o => Err(format!("{}: {} is not a time", what, o)),
+    }
+}
+
+/// Writes a sheet from `{ title, performer, catalog, rem, files or file, tracks }`, as `cue_parse` gives it; a track's `start` is short for its INDEX 01, `file` starts a new FILE line when it changes, and numbers are made when left out.
+pub fn cue_write(sheet: serde_json::Value) -> Result<String, String> {
+    let mut o = String::new();
+    for (k, v) in sheet.get("rem").and_then(Value::as_object).into_iter().flatten() {
+        let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+        if t.contains(' ') {
+            o.push_str(&format!("REM {} {}\n", k.to_uppercase(), q(&t)?));
+        } else {
+            o.push_str(&format!("REM {} {}\n", k.to_uppercase(), t));
+        }
+    }
+    if let Some(c) = sheet.get("catalog").and_then(Value::as_str) {
+        if c.len() != 13 || !c.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("the catalog `{}` must be 13 digits", c));
+        }
+        o.push_str(&format!("CATALOG {}\n", c));
+    }
+    if let Some(c) = sheet.get("cdtextfile").and_then(Value::as_str) {
+        o.push_str(&format!("CDTEXTFILE {}\n", q(c)?));
+    }
+    for (k, tag) in [("performer", "PERFORMER"), ("songwriter", "SONGWRITER"), ("title", "TITLE")] {
+        if let Some(v) = sheet.get(k).and_then(Value::as_str) {
+            o.push_str(&format!("{} {}\n", tag, q(v)?));
+        }
+    }
+    let tracks = sheet.get("tracks").and_then(Value::as_array).filter(|t| !t.is_empty()).ok_or("a sheet needs `tracks`")?;
+    let default_file = sheet.get("file").and_then(Value::as_str).map(str::to_string).or(sheet.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("name")).and_then(Value::as_str).map(str::to_string));
+    let type_of = |name: &str| -> String {
+        if let Some(f) = sheet.get("files").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x["name"] == name)) {
+            if let Some(t) = f["type"].as_str() {
+                return t.to_string();
+            }
+        }
+        let low = name.to_lowercase();
+        if low.ends_with(".mp3") { "MP3" } else if low.ends_with(".aif") || low.ends_with(".aiff") { "AIFF" } else if low.ends_with(".bin") || low.ends_with(".img") { "BINARY" } else { "WAVE" }.to_string()
+    };
+    let mut current: Option<String> = None;
+    let mut prev = 0;
+    for (i, t) in tracks.iter().enumerate() {
+        let file = t.get("file").and_then(Value::as_str).map(str::to_string).or(default_file.clone()).ok_or(format!("track {}: no file", i + 1))?;
+        if current.as_ref() != Some(&file) {
+            o.push_str(&format!("FILE {} {}\n", q(&file)?, type_of(&file)));
+            current = Some(file);
+        }
+        let number = t.get("number").and_then(Value::as_i64).unwrap_or(prev + 1);
+        if number <= prev || number > 99 {
+            return Err(format!("track {} cannot follow track {}", number, prev));
+        }
+        prev = number;
+        let kind = t.get("type").and_then(Value::as_str).unwrap_or("AUDIO");
+        if !TRACK_TYPES.contains(&kind) {
+            return Err(format!("`{}` is not a track type", kind));
+        }
+        o.push_str(&format!("  TRACK {:02} {}\n", number, kind));
+        for (k, tag) in [("title", "TITLE"), ("performer", "PERFORMER"), ("songwriter", "SONGWRITER")] {
+            if let Some(v) = t.get(k).and_then(Value::as_str) {
+                o.push_str(&format!("    {} {}\n", tag, q(v)?));
+            }
+        }
+        if let Some(v) = t.get("isrc").and_then(Value::as_str) {
+            o.push_str(&format!("    ISRC {}\n", v));
+        }
+        if let Some(l) = t.get("flags").and_then(Value::as_array).filter(|l| !l.is_empty()) {
+            let names: Vec<&str> = l.iter().filter_map(Value::as_str).collect();
+            if let Some(b) = names.iter().find(|x| !FLAGS.contains(x)) {
+                return Err(format!("`{}` is not a flag", b));
+            }
+            o.push_str(&format!("    FLAGS {}\n", names.join(" ")));
+        }
+        if let Some(v) = t.get("pregap") {
+            o.push_str(&format!("    PREGAP {}\n", time_field(v, "pregap")?));
+        }
+        match t.get("indexes").and_then(Value::as_array) {
+            Some(l) => for x in l {
+                let n = x.get("number").and_then(Value::as_i64).ok_or("an index needs a `number`")?;
+                o.push_str(&format!("    INDEX {:02} {}\n", n, time_field(x.get("time").or(x.get("frames")).ok_or("an index needs a `time`")?, "an index")?));
+            },
+            None => {
+                let s = t.get("start").ok_or(format!("track {} needs `start` or `indexes`", number))?;
+                o.push_str(&format!("    INDEX 01 {}\n", time_field(s, "start")?));
+            }
+        }
+        if let Some(v) = t.get("postgap") {
+            o.push_str(&format!("    POSTGAP {}\n", time_field(v, "postgap")?));
+        }
+    }
+    Ok(o)
+}

@@ -1,0 +1,274 @@
+//! MongoDB through the official driver's sync API, on rustls with ring: find with sort, limit, skip and projection, insert, update, replace and delete, aggregation pipelines, indexes, counts and distinct values, documents kept as Extended JSON so that ObjectIds and dates survive the trip both ways, and errors like a duplicate key turned into clear ones.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! mongodb = { version = "=3.9.1", features = ["sync"] }
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use mongodb::bson::{self, Bson, Document};
+use mongodb::error::{ErrorKind, WriteFailure};
+use mongodb::options::{ClientOptions, IndexOptions};
+use mongodb::sync::{Client, Collection};
+use mongodb::IndexModel;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+// MONGODB_URI is the connection string (mongodb://localhost:27017 when not set; mongodb+srv:// works
+// for Atlas), with the user and password in it. MONGODB_DATABASE is the default database, else the
+// one in the URI. A `collection` below is "orders" in that database, or "shop.orders" naming its own.
+//
+// ObjectIds, dates and the like are Extended JSON: `{ "$oid": "..." }`, `{ "$date": "2026-11-01T10:00:00Z" }`,
+// written so in filters and documents, and read back so.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn uri() -> String {
+    env("MONGODB_URI").unwrap_or_else(|| "mongodb://localhost:27017".into())
+}
+
+fn clients() -> &'static Mutex<HashMap<String, Client>> {
+    static C: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One client per URI, keeping its own pool: making one per call would open new connections each time.
+fn client() -> Result<Client, String> {
+    let u = uri();
+    if let Some(c) = clients().lock().unwrap_or_else(|e| e.into_inner()).get(&u) {
+        return Ok(c.clone());
+    }
+    let mut o = ClientOptions::parse(&u).run().map_err(|e| format!("{}: {}", hide(&u), say(e)))?;
+    o.server_selection_timeout = o.server_selection_timeout.or(Some(Duration::from_secs(8)));
+    o.connect_timeout = o.connect_timeout.or(Some(Duration::from_secs(8)));
+    o.app_name = o.app_name.or(Some("quillo".to_string()));
+    let c = Client::with_options(o).map_err(say)?;
+    clients().lock().unwrap_or_else(|e| e.into_inner()).insert(u, c.clone());
+    Ok(c)
+}
+
+fn say(e: mongodb::error::Error) -> String {
+    match e.kind.as_ref() {
+        ErrorKind::Command(c) => format!("MongoDB refused this ({} {}): {}", c.code, c.code_name, c.message),
+        ErrorKind::Write(WriteFailure::WriteError(w)) if w.code == 11000 => format!("duplicate key: {}", w.message),
+        ErrorKind::Write(WriteFailure::WriteError(w)) => format!("the write failed ({}): {}", w.code, w.message),
+        ErrorKind::Write(WriteFailure::WriteConcernError(w)) => format!("the write concern failed ({}): {}", w.code, w.message),
+        ErrorKind::InsertMany(i) => {
+            let first = i.write_errors.as_ref().and_then(|w| w.first());
+            match first {
+                Some(w) if w.code == 11000 => format!("duplicate key in document {}: {}", w.index, w.message),
+                Some(w) => format!("document {} failed ({}): {}", w.index, w.code, w.message),
+                None => format!("the insert failed: {}", e),
+            }
+        }
+        ErrorKind::ServerSelection { message, .. } => format!("cannot reach MongoDB at {}: {}", hide(&uri()), message.lines().next().unwrap_or("")),
+        ErrorKind::Authentication { message, .. } => format!("MongoDB refused the sign-in: {}", message),
+        ErrorKind::InvalidArgument { message, .. } => format!("that is not valid: {}", message),
+        _ => e.to_string(),
+    }
+}
+
+/// A connection string with its password taken out, for an error.
+fn hide(u: &str) -> String {
+    match (u.find("://"), u.rfind('@')) {
+        (Some(a), Some(b)) if b > a => format!("{}{}", &u[..a + 3], &u[b + 1..]),
+        _ => u.to_string(),
+    }
+}
+
+fn database() -> Result<String, String> {
+    if let Some(d) = env("MONGODB_DATABASE") {
+        return Ok(d);
+    }
+    client()?.default_database().map(|d| d.name().to_string()).ok_or("name a database: MONGODB_DATABASE, or \"shop.orders\" as the collection".to_string())
+}
+
+fn coll(name: &str) -> Result<Collection<Document>, String> {
+    if name.is_empty() {
+        return Err("no collection named".into());
+    }
+    let c = client()?;
+    match name.split_once('.') {
+        Some((d, n)) if !d.is_empty() && !n.is_empty() => Ok(c.database(d).collection(n)),
+        _ => Ok(c.database(&database()?).collection(name)),
+    }
+}
+
+fn doc_of(v: Value, what: &str) -> Result<Document, String> {
+    if v.is_null() {
+        return Ok(Document::new());
+    }
+    if !v.is_object() {
+        return Err(format!("{} must be a map", what));
+    }
+    match Bson::try_from(v).map_err(|e| format!("{}: {}", what, e))? {
+        Bson::Document(d) => Ok(d),
+        // A map that is all one Extended JSON value, like { "$oid": ... }, as a whole document.
+        o => Err(format!("{} must be a map of fields, not a value like {}", what, o)),
+    }
+}
+
+fn plain(d: Document) -> Value {
+    Bson::Document(d).into_relaxed_extjson()
+}
+
+fn run_cursor(cur: mongodb::sync::Cursor<Document>, max: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    for d in cur {
+        out.push(plain(d.map_err(say)?));
+        if out.len() as i64 >= max {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Finds documents. `filter` is a map or null; `options`: `sort` (like `{ total: -1 }`), `limit`, `skip`, `projection`, `max` (10000: the most this reads into memory). Gives a list, the driver fetching further batches as it goes.
+pub fn mongodb_find(collection: &str, filter: serde_json::Value, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let c = coll(collection)?;
+    let mut a = c.find(doc_of(filter, "the filter")?);
+    if !options["sort"].is_null() {
+        a = a.sort(doc_of(options["sort"].clone(), "sort")?);
+    }
+    if !options["projection"].is_null() {
+        a = a.projection(doc_of(options["projection"].clone(), "the projection")?);
+    }
+    if let Some(n) = options["limit"].as_i64() {
+        a = a.limit(n);
+    }
+    if let Some(n) = options["skip"].as_u64() {
+        a = a.skip(n);
+    }
+    run_cursor(a.run().map_err(say)?, options["max"].as_i64().unwrap_or(10_000))
+}
+
+/// The first match, or null.
+pub fn mongodb_find_one(collection: &str, filter: serde_json::Value) -> Result<Value, String> {
+    let c = coll(collection)?;
+    Ok(c.find_one(doc_of(filter, "the filter")?).run().map_err(say)?.map_or(Value::Null, plain))
+}
+
+/// Inserts one document and gives its `_id`, an `{ "$oid": ... }` unless it had its own.
+pub fn mongodb_insert(collection: &str, document: serde_json::Value) -> Result<Value, String> {
+    let r = coll(collection)?.insert_one(doc_of(document, "the document")?).run().map_err(say)?;
+    Ok(r.inserted_id.into_relaxed_extjson())
+}
+
+/// Inserts many, in order. With `ordered` true the first failure stops the rest, and is an error naming it. With false the others carry on and the answer says which failed: `{ inserted, failed: [{ index, code, message }] }`.
+pub fn mongodb_insert_many(collection: &str, documents: Vec<serde_json::Value>, ordered: bool) -> Result<Value, String> {
+    let n = documents.len() as i64;
+    let docs = documents.into_iter().map(|d| doc_of(d, "each document")).collect::<Result<Vec<_>, _>>()?;
+    let r = coll(collection)?.insert_many(docs).ordered(ordered).run();
+    match r {
+        Ok(x) => Ok(json!({ "inserted": x.inserted_ids.len(), "failed": [] })),
+        Err(e) if !ordered => {
+            if let ErrorKind::InsertMany(i) = e.kind.as_ref() {
+                let list: Vec<Value> = i.write_errors.iter().flatten().map(|w| json!({ "index": w.index, "code": w.code, "message": w.message })).collect();
+                return Ok(json!({ "inserted": n - list.len() as i64, "failed": list }));
+            }
+            Err(say(e))
+        }
+        Err(e) => Err(say(e)),
+    }
+}
+
+/// Changes documents. `update` holds operators (`$set`, `$inc`...) or is a pipeline list. `options`: `many` (all that match, not only the first), `upsert`. Gives `{ matched, modified, upserted_id }`.
+pub fn mongodb_update(collection: &str, filter: serde_json::Value, update: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let c = coll(collection)?;
+    let f = doc_of(filter, "the filter")?;
+    let m: mongodb::options::UpdateModifications = match update {
+        Value::Array(a) => a.into_iter().map(|s| doc_of(s, "each stage")).collect::<Result<Vec<_>, _>>()?.into(),
+        u => doc_of(u, "the update")?.into(),
+    };
+    if m_is_replacement(&m) {
+        return Err("an update holds operators like $set: use mongodb_replace to replace a document".into());
+    }
+    let upsert = options["upsert"] == true;
+    let r = if options["many"] == true { c.update_many(f, m).upsert(upsert).run() } else { c.update_one(f, m).upsert(upsert).run() }.map_err(say)?;
+    Ok(json!({ "matched": r.matched_count, "modified": r.modified_count, "upserted_id": r.upserted_id.map(|b| b.into_relaxed_extjson()) }))
+}
+
+fn m_is_replacement(m: &mongodb::options::UpdateModifications) -> bool {
+    matches!(m, mongodb::options::UpdateModifications::Document(d) if d.keys().next().map_or(true, |k| !k.starts_with('$')))
+}
+
+/// Replaces the first match with a whole document. `upsert` makes it when none matches. Gives what `mongodb_update` gives.
+pub fn mongodb_replace(collection: &str, filter: serde_json::Value, document: serde_json::Value, upsert: bool) -> Result<Value, String> {
+    let r = coll(collection)?.replace_one(doc_of(filter, "the filter")?, doc_of(document, "the document")?).upsert(upsert).run().map_err(say)?;
+    Ok(json!({ "matched": r.matched_count, "modified": r.modified_count, "upserted_id": r.upserted_id.map(|b| b.into_relaxed_extjson()) }))
+}
+
+/// Deletes the first match, or all of them with `many`. Gives how many went. An empty filter with `many` is refused here, as it would empty the collection.
+pub fn mongodb_delete(collection: &str, filter: serde_json::Value, many: bool) -> Result<i64, String> {
+    let f = doc_of(filter, "the filter")?;
+    if many && f.is_empty() {
+        return Err("an empty filter would delete every document: use { _id: { \"$exists\": true } } if that is meant".into());
+    }
+    let c = coll(collection)?;
+    let r = if many { c.delete_many(f).run() } else { c.delete_one(f).run() }.map_err(say)?;
+    Ok(r.deleted_count as i64)
+}
+
+/// Runs an aggregation pipeline (a list of stages) and gives the results, up to `max` (0 for 10000).
+pub fn mongodb_aggregate(collection: &str, pipeline: Vec<serde_json::Value>, max: i64) -> Result<Vec<Value>, String> {
+    let stages = pipeline.into_iter().map(|s| doc_of(s, "each stage")).collect::<Result<Vec<_>, _>>()?;
+    run_cursor(coll(collection)?.aggregate(stages).run().map_err(say)?, if max > 0 { max } else { 10_000 })
+}
+
+/// How many documents match.
+pub fn mongodb_count(collection: &str, filter: serde_json::Value) -> Result<i64, String> {
+    Ok(coll(collection)?.count_documents(doc_of(filter, "the filter")?).run().map_err(say)? as i64)
+}
+
+/// The different values of a field among those that match.
+pub fn mongodb_distinct(collection: &str, field: &str, filter: serde_json::Value) -> Result<Vec<Value>, String> {
+    Ok(coll(collection)?.distinct(field, doc_of(filter, "the filter")?).run().map_err(say)?.into_iter().map(|b| b.into_relaxed_extjson()).collect())
+}
+
+/// Makes an index on `keys`, like `{ email: 1 }` or `{ day: -1, shop: 1 }`. `options`: `unique`, `name`, `sparse`, `ttl_seconds` (documents go that long after the date in the field). An index already there is fine. Gives its name.
+pub fn mongodb_create_index(collection: &str, keys: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let mut o = IndexOptions::default();
+    o.unique = options["unique"].as_bool();
+    o.sparse = options["sparse"].as_bool();
+    o.name = options["name"].as_str().map(str::to_string);
+    o.expire_after = options["ttl_seconds"].as_u64().map(Duration::from_secs);
+    let m = IndexModel::builder().keys(doc_of(keys, "the keys")?).options(o).build();
+    Ok(coll(collection)?.create_index(m).run().map_err(say)?.index_name)
+}
+
+/// The indexes of a collection: each `{ name, keys, unique }`.
+pub fn mongodb_indexes(collection: &str) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    for i in coll(collection)?.list_indexes().run().map_err(say)? {
+        let i = i.map_err(say)?;
+        let o = i.options.unwrap_or_default();
+        out.push(json!({ "name": o.name, "keys": plain(i.keys), "unique": o.unique.unwrap_or(false) }));
+    }
+    Ok(out)
+}
+
+/// Drops an index by name.
+pub fn mongodb_drop_index(collection: &str, name: &str) -> Result<bool, String> {
+    coll(collection)?.drop_index(name).run().map_err(say)?;
+    Ok(true)
+}
+
+/// The collections of the default database, or of `database` if given.
+pub fn mongodb_collections(database_name: &str) -> Result<Vec<String>, String> {
+    let d = if database_name.is_empty() { database()? } else { database_name.to_string() };
+    client()?.database(&d).list_collection_names().run().map_err(say)
+}
+
+/// Any database command, like `{ ping: 1 }`, in the default database, and gives its answer.
+pub fn mongodb_command(command: serde_json::Value) -> Result<Value, String> {
+    let d = client()?.database(&database()?).run_command(doc_of(command, "the command")?).run().map_err(say)?;
+    Ok(plain(d))
+}
+
+/// A new ObjectId as Extended JSON, for giving a document its `_id` before it is written.
+pub fn mongodb_object_id() -> Value {
+    Bson::ObjectId(bson::oid::ObjectId::new()).into_relaxed_extjson()
+}

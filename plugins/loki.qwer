@@ -1,0 +1,406 @@
+//! Grafana Loki: log lines pushed with their labels, timestamps kept to the nanosecond as text, LogQL range and instant queries with streams flattened into one sorted list and metric results read as series, long ranges read past the limit, labels and series listed, and tenants and auth handled.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn var(n: &str) -> Option<String> {
+    std::env::var(n).ok().filter(|v| !v.is_empty())
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// One request: a tenant in X-Scope-OrgID (option tenant, else LOKI_TENANT), Basic (LOKI_USER, LOKI_PASSWORD) or Bearer (LOKI_TOKEN) auth. 429 and 5xx wait and go again, as Loki's own clients do.
+fn call(method: &str, path: &str, body: Option<&str>, o: &Value) -> Result<String, String> {
+    let base = var("LOKI_API_URL").unwrap_or("http://localhost:3100".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let mut r = agent.request(method, &url);
+        if let Some(t) = o.get("tenant").and_then(|t| t.as_str()).map(str::to_string).or_else(|| var("LOKI_TENANT")) {
+            r = r.set("X-Scope-OrgID", &t);
+        }
+        if let Some(t) = var("LOKI_TOKEN") {
+            r = r.set("Authorization", &format!("Bearer {}", t));
+        } else if let Some(u) = var("LOKI_USER") {
+            r = r.set("Authorization", &format!("Basic {}", b64(format!("{}:{}", u, var("LOKI_PASSWORD").unwrap_or_default()).as_bytes())));
+        }
+        let res = match body {
+            Some(b) => r.set("Content-Type", "application/json").send_string(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(x) => return x.into_string().map_err(|e| e.to_string()),
+            Err(ureq::Error::Status(code, x)) => {
+                let wait = x.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let text = x.into_string().unwrap_or_default();
+                if (code == 429 || code >= 500) && tries < 5 {
+                    std::thread::sleep(wait.map_or(Duration::from_millis(100 << tries), Duration::from_secs));
+                    continue;
+                }
+                // The query API answers errors as text, or as { message } behind a gateway.
+                let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["message"].as_str().map(str::to_string)).unwrap_or_else(|| text.trim().to_string());
+                return Err(format!("Loki {}: {}", code, msg));
+            }
+            Err(e) => return Err(format!("cannot reach Loki at {}: {}", base, e)),
+        }
+    }
+}
+
+fn parse_iso(t: &str) -> Option<i128> {
+    let b = t.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') {
+        return None;
+    }
+    let num = |a: usize, z: usize| t.get(a..z)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, s) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468;
+    let mut ns = (days * 86400 + h * 3600 + mi * 60 + s) as i128 * 1_000_000_000;
+    let mut rest = &t[19..];
+    if let Some(f) = rest.strip_prefix('.') {
+        let digits: String = f.chars().take_while(|c| c.is_ascii_digit()).collect();
+        rest = &f[digits.len()..];
+        ns += format!("{:0<9}", &digits[..digits.len().min(9)]).parse::<i128>().ok()?;
+    }
+    if rest.starts_with('+') || rest.starts_with('-') {
+        let sign = if rest.starts_with('+') { -1 } else { 1 };
+        let hm: Vec<i128> = rest[1..].split(':').filter_map(|x| x.parse().ok()).collect();
+        ns += sign * (hm.first().unwrap_or(&0) * 3600 + hm.get(1).unwrap_or(&0) * 60) * 1_000_000_000;
+    }
+    Some(ns)
+}
+
+/// A time as nanoseconds: a string or number by its size (seconds, ms, µs or ns), or ISO 8601 text. Floats lose nanoseconds, so nanoseconds are best given as text.
+fn to_ns(v: &Value) -> Result<i128, String> {
+    let digits = match v {
+        Value::Number(n) if n.is_f64() => return Ok((n.as_f64().unwrap_or(0.0) * 1e9) as i128),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => s.clone(),
+        Value::String(s) => return parse_iso(s).ok_or(format!("`{}` is not a time", s)),
+        _ => return Err(format!("{} is not a time", v)),
+    };
+    let n: i128 = digits.parse().map_err(|_| format!("`{}` is not a time", digits))?;
+    Ok(match digits.len() {
+        0..=11 => n * 1_000_000_000,
+        12..=14 => n * 1_000_000,
+        15..=17 => n * 1_000,
+        _ => n,
+    })
+}
+
+fn now_ns() -> i128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128)
+}
+
+fn iso_of(ns: i128) -> String {
+    let secs = ns.div_euclid(1_000_000_000) as i64;
+    let frac = ns.rem_euclid(1_000_000_000);
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z", y, m, d, r / 3600, r % 3600 / 60, r % 60, frac)
+}
+
+/// A time as Loki's nanoseconds, as text: `loki_ns("2026-11-01T09:00:00.123456789Z")`. Text, as the number is past what a float keeps.
+pub fn loki_ns(time: serde_json::Value) -> Result<String, String> {
+    Ok(to_ns(&time)?.to_string())
+}
+
+/// Nanoseconds, as text, as an ISO 8601 time with all nine digits.
+pub fn loki_time(ns: &str) -> Result<String, String> {
+    Ok(iso_of(ns.parse::<i128>().map_err(|_| format!("`{}` is not nanoseconds", ns))?))
+}
+
+// ---- Pushing ----
+
+fn check_labels(labels: &Value) -> Result<(), String> {
+    let m = labels.as_object().filter(|m| !m.is_empty()).ok_or("a stream needs at least one label")?;
+    for (k, v) in m {
+        let mut c = k.chars();
+        let first = c.next().unwrap_or('0');
+        if !(first.is_ascii_alphabetic() || first == '_') || !c.all(|x| x.is_ascii_alphanumeric() || x == '_') {
+            return Err(format!("`{}` is not a label name: letters, digits and _, not starting with a digit", k));
+        }
+        if !v.is_string() {
+            return Err(format!("label {} must be text, as Loki's are", k));
+        }
+    }
+    Ok(())
+}
+
+fn entry(line: &Value, count: i128) -> Result<(i128, Value), String> {
+    if let Some(t) = line.as_str() {
+        let ns = now_ns() + count;
+        return Ok((ns, json!([ns.to_string(), t])));
+    }
+    let text = line.get("line").and_then(|l| l.as_str()).ok_or("each line is text, or { line, time, metadata }")?;
+    let ns = match line.get("time").or(line.get("ts")) {
+        Some(t) => to_ns(t)?,
+        None => now_ns() + count,
+    };
+    Ok((ns, match line.get("metadata").filter(|m| m.is_object()) {
+        Some(m) => json!([ns.to_string(), text, m.as_object().unwrap().iter().map(|(k, v)| (k.clone(), json!(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect::<Map<String, Value>>()]),
+        None => json!([ns.to_string(), text]),
+    }))
+}
+
+/// Pushes lines to a stream: `labels` like { app: "shop", env: "prod" }, `lines` a list of text, or of { line, time, metadata }. Lines are sorted by time, which Loki wants within a stream. Gives how many went.
+pub fn loki_push(labels: serde_json::Value, lines: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    check_labels(&labels)?;
+    let list = lines.as_array().ok_or("lines is a list")?;
+    if list.is_empty() {
+        return Ok(0);
+    }
+    let mut values = list.iter().enumerate().map(|(i, l)| entry(l, i as i128)).collect::<Result<Vec<_>, _>>()?;
+    values.sort_by_key(|(n, _)| *n);
+    let body = json!({ "streams": [{ "stream": labels, "values": values.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>() }] });
+    call("POST", "/loki/api/v1/push", Some(&body.to_string()), &options)?;
+    Ok(list.len() as i64)
+}
+
+/// Pushes many lines of mixed labels in one request: `records` is a list of { labels, line, time, metadata }, grouped here into streams. Gives { lines, streams }.
+pub fn loki_push_many(records: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut groups: BTreeMap<String, (Value, Vec<(i128, Value)>)> = BTreeMap::new();
+    let list = records.as_array().ok_or("records is a list")?;
+    for (i, r) in list.iter().enumerate() {
+        let labels = r.get("labels").ok_or("a record needs `labels`")?;
+        check_labels(labels)?;
+        let sorted: BTreeMap<_, _> = labels.as_object().unwrap().iter().collect();
+        let key = serde_json::to_string(&sorted).map_err(|e| e.to_string())?;
+        groups.entry(key).or_insert((labels.clone(), vec![])).1.push(entry(r, i as i128)?);
+    }
+    let streams: Vec<Value> = groups.into_values().map(|(labels, mut v)| {
+        v.sort_by_key(|(n, _)| *n);
+        json!({ "stream": labels, "values": v.into_iter().map(|(_, e)| e).collect::<Vec<_>>() })
+    }).collect();
+    let n = streams.len();
+    if n > 0 {
+        call("POST", "/loki/api/v1/push", Some(&json!({ "streams": streams }).to_string()), &options)?;
+    }
+    Ok(json!({ "lines": list.len(), "streams": n }))
+}
+
+// ---- Querying ----
+
+/// Streams made one list: { ts (text), time, line, labels, metadata }, sorted by time, newest first or last as asked.
+fn flatten(res: &Value, forward: bool) -> Result<Vec<Value>, String> {
+    let mut out: Vec<(i128, Value)> = vec![];
+    for s in res.as_array().ok_or("streams is no list")? {
+        for v in s["values"].as_array().into_iter().flatten() {
+            let ts = v[0].as_str().unwrap_or("0");
+            let ns = ts.parse::<i128>().unwrap_or(0);
+            let mut e = json!({ "ts": ts, "time": iso_of(ns), "line": v[1], "labels": s["stream"] });
+            if v.get(2).is_some_and(|m| m.is_object()) {
+                e["metadata"] = v[2].get("structuredMetadata").cloned().unwrap_or(v[2].clone());
+            }
+            out.push((ns, e));
+        }
+    }
+    out.sort_by_key(|(n, _)| *n);
+    if !forward {
+        out.reverse();
+    }
+    Ok(out.into_iter().map(|(_, e)| e).collect())
+}
+
+fn sample(p: &Value) -> Value {
+    let v = p[1].as_str().unwrap_or("");
+    json!({ "time": p[0], "value": v.parse::<f64>().map(|f| if f.is_finite() { json!(f) } else { json!(v) }).unwrap_or(json!(v)) })
+}
+
+/// A query's `data` as { type, entries } (log lines), { type, series } (a matrix: { metric, values: [{ time, value }] }) or { type, samples } (a vector).
+fn result_of(text: &str, forward: bool) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("Loki: not JSON: {}", e))?;
+    if v["status"] != "success" {
+        return Err(format!("Loki: {}", v["error"].as_str().or(v["message"].as_str()).unwrap_or("the query failed")));
+    }
+    let d = &v["data"];
+    let kind = d["resultType"].as_str().unwrap_or("");
+    let stats = d.pointer("/stats/summary").cloned().unwrap_or(Value::Null);
+    Ok(match kind {
+        "streams" => json!({ "type": "streams", "entries": flatten(&d["result"], forward)?, "stats": stats }),
+        "matrix" => {
+            let series: Vec<Value> = d["result"].as_array().into_iter().flatten().map(|s| json!({ "metric": s["metric"], "values": s["values"].as_array().map(|l| l.iter().map(sample).collect::<Vec<_>>()) })).collect();
+            json!({ "type": "matrix", "series": series, "stats": stats })
+        }
+        "vector" => {
+            let list: Vec<Value> = d["result"].as_array().into_iter().flatten().map(|s| {
+                let mut o = sample(&s["value"]);
+                o["metric"] = s["metric"].clone();
+                o
+            }).collect();
+            json!({ "type": "vector", "samples": list, "stats": stats })
+        }
+        "scalar" => json!({ "type": "scalar", "samples": [sample(&d["result"])], "stats": stats }),
+        other => return Err(format!("Loki sent a result of type `{}`", other)),
+    })
+}
+
+fn range_query(query: &str, o: &Value, start: i128, end: i128, limit: u64) -> String {
+    let mut q = format!("query={}&start={}&end={}&limit={}", enc(query), start, end, limit);
+    if let Some(d) = o.get("direction").and_then(|d| d.as_str()) {
+        q.push_str(&format!("&direction={}", d));
+    }
+    for k in ["step", "interval"] {
+        match o.get(k) {
+            Some(Value::String(s)) => q.push_str(&format!("&{}={}", k, enc(s))),
+            Some(Value::Number(n)) => q.push_str(&format!("&{}={}", k, n)),
+            _ => {}
+        }
+    }
+    q
+}
+
+fn span(o: &Value) -> Result<(i128, i128), String> {
+    let end = match o.get("end") {
+        Some(t) => to_ns(t)?,
+        None => now_ns(),
+    };
+    let start = match o.get("start") {
+        Some(t) => to_ns(t)?,
+        None => end - 3_600_000_000_000,
+    };
+    if start >= end {
+        return Err("`start` must be before `end`".into());
+    }
+    Ok((start, end))
+}
+
+fn is_forward(o: &Value) -> Result<bool, String> {
+    match o.get("direction").and_then(|d| d.as_str()) {
+        None | Some("backward") => Ok(false),
+        Some("forward") => Ok(true),
+        Some(x) => Err(format!("`{}` is not a direction: forward or backward", x)),
+    }
+}
+
+/// A LogQL query over time. Options: start and end (the last hour by default), limit (100), direction (backward), step, interval, tenant. Log queries give { type: "streams", entries: [{ ts, time, line, labels }] } with streams flattened and sorted; metric queries { type: "matrix", series }.
+pub fn loki_query_range(query: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (start, end) = span(&options)?;
+    let forward = is_forward(&options)?;
+    let limit = options.get("limit").and_then(|v| v.as_u64()).unwrap_or(100);
+    result_of(&call("GET", &format!("/loki/api/v1/query_range?{}", range_query(query, &options, start, end, limit)), None, &options)?, forward)
+}
+
+/// Every line of a log query in a range, asking again past each `limit` (option page_size, 1000), up to the option max_lines (100,000). Lines sharing the page's edge time are not lost or doubled. Gives { entries, pages, cut }, `cut` true if max_lines stopped it.
+pub fn loki_query_all(query: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (mut start, mut end) = span(&options)?;
+    let forward = is_forward(&options)?;
+    let size = options.get("page_size").and_then(|v| v.as_u64()).unwrap_or(1000).max(2);
+    let most = options.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(100_000) as usize;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<Value> = vec![];
+    let mut pages = 0;
+    loop {
+        let r = result_of(&call("GET", &format!("/loki/api/v1/query_range?{}", range_query(query, &options, start, end, size)), None, &options)?, forward)?;
+        pages += 1;
+        if r["type"] != "streams" {
+            return Err("loki_query_all reads log queries; a metric query has no pages: use loki_query_range".into());
+        }
+        let got = r["entries"].as_array().cloned().unwrap_or_default();
+        let n = got.len() as u64;
+        let edge = got.last().and_then(|e| e["ts"].as_str()).and_then(|t| t.parse::<i128>().ok());
+        let mut fresh = 0;
+        for e in got {
+            if seen.insert(format!("{}\u{0}{}\u{0}{}", e["ts"], e["labels"], e["line"])) {
+                out.push(e);
+                fresh += 1;
+            }
+        }
+        if out.len() >= most {
+            out.truncate(most);
+            return Ok(json!({ "entries": out, "pages": pages, "cut": true }));
+        }
+        let Some(edge) = edge else { return Ok(json!({ "entries": out, "pages": pages, "cut": false })) };
+        if n < size {
+            return Ok(json!({ "entries": out, "pages": pages, "cut": false }));
+        }
+        if fresh == 0 {
+            // A whole page at one instant: step past it.
+            if forward { start = edge + 1 } else { end = edge }
+            continue;
+        }
+        // The edge's time goes round again, as `end` is exclusive and the page may have cut it.
+        if forward { start = edge } else { end = edge + 1 }
+    }
+}
+
+/// A LogQL metric query at one moment, like `sum by (app) (rate({env="prod"}[5m]))`. Options: time (now), limit, direction. Gives { type: "vector", samples: [{ metric, time, value }] }.
+pub fn loki_query(query: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let forward = is_forward(&options)?;
+    let mut q = format!("query={}", enc(query));
+    if let Some(t) = options.get("time") {
+        q.push_str(&format!("&time={}", to_ns(t)?));
+    }
+    if let Some(l) = options.get("limit").and_then(|l| l.as_u64()) {
+        q.push_str(&format!("&limit={}", l));
+    }
+    result_of(&call("GET", &format!("/loki/api/v1/query?{}", q), None, &options)?, forward)
+}
+
+fn data_list(text: &str) -> Result<Vec<Value>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("Loki: not JSON: {}", e))?;
+    Ok(v["data"].as_array().cloned().unwrap_or_default())
+}
+
+fn times(o: &Value) -> Result<String, String> {
+    let mut q = vec![];
+    for k in ["start", "end"] {
+        if let Some(t) = o.get(k) {
+            q.push(format!("{}={}", k, to_ns(t)?));
+        }
+    }
+    Ok(q.join("&"))
+}
+
+/// The label names seen in a range. Options: start, end.
+pub fn loki_labels(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    data_list(&call("GET", &format!("/loki/api/v1/labels?{}", times(&options)?), None, &options)?)
+}
+
+/// The values a label has. Options: start, end.
+pub fn loki_label_values(name: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    data_list(&call("GET", &format!("/loki/api/v1/label/{}/values?{}", enc(name), times(&options)?), None, &options)?)
+}
+
+/// The streams (label sets) matching a selector like `{app="shop"}`. Options: start, end.
+pub fn loki_series(selector: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    data_list(&call("GET", &format!("/loki/api/v1/series?match[]={}&{}", enc(selector), times(&options)?), None, &options)?)
+}
+
+/// Whether Loki says it is ready.
+pub fn loki_ready(options: serde_json::Value) -> Result<bool, String> {
+    Ok(call("GET", "/ready", None, &options)?.trim() == "ready")
+}

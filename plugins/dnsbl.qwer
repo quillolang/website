@@ -1,0 +1,334 @@
+//! IP and domain blocklist lookups by DNS: addresses reversed (IPv4 octets, IPv6 nibbles), several lists asked at once, return codes named (Spamhaus, SpamCop, Barracuda, SORBS, DBL, SURBL and URIBL bitmasks), TXT reasons read, and a list's refusal told apart from a listing.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::time::Duration;
+
+const A: u16 = 1;
+const TXT: u16 = 16;
+
+// The answers that mean "no verdict": the list refused to answer, so nothing is known.
+const REFUSALS: &[(&str, &str)] = &[
+    ("127.255.255.252", "typing error in the DNSBL name"),
+    ("127.255.255.254", "queries through a public resolver are refused: use your own resolver"),
+    ("127.255.255.255", "too many queries from this address"),
+];
+
+fn known(zone: &str) -> Option<(&'static str, bool, &'static str)> {
+    // zone, takes IPv6, how its codes read: a table name
+    Some(match zone {
+        "zen.spamhaus.org" => ("zen.spamhaus.org", true, "zen"),
+        "bl.spamcop.net" => ("bl.spamcop.net", false, "plain"),
+        "b.barracudacentral.org" => ("b.barracudacentral.org", false, "plain"),
+        "dnsbl.sorbs.net" => ("dnsbl.sorbs.net", true, "sorbs"),
+        "dbl.spamhaus.org" => ("dbl.spamhaus.org", false, "dbl"),
+        "multi.surbl.org" => ("multi.surbl.org", false, "surbl"),
+        "multi.uribl.com" => ("multi.uribl.com", false, "uribl"),
+        _ => return None,
+    })
+}
+
+fn last_octet(code: &str) -> u32 {
+    code.rsplit('.').next().and_then(|o| o.parse().ok()).unwrap_or(0)
+}
+
+fn bitmask(bits: &[(u32, &str)], code: &str) -> String {
+    let n = last_octet(code);
+    let on: Vec<&str> = bits.iter().filter(|(b, _)| n & b != 0).map(|(_, t)| *t).collect();
+    if on.is_empty() { "listed".into() } else { on.join(", ") }
+}
+
+fn meaning_of(table: &str, code: &str) -> String {
+    let n = last_octet(code);
+    match table {
+        "zen" => match n {
+            2 => "SBL: a spam source or spam operation".into(),
+            3 => "CSS: low-reputation spam senders".into(),
+            4..=7 => "XBL: hijacked or exploited machine".into(),
+            9 => "DROP: a hijacked or leased-to-spammers netblock".into(),
+            10 => "PBL: dynamic address, by its ISP".into(),
+            11 => "PBL: dynamic address, by Spamhaus".into(),
+            _ => "listed".into(),
+        },
+        "sorbs" => ["", "", "open HTTP proxy", "open SOCKS proxy", "open proxy of another kind", "open SMTP relay", "spam source", "vulnerable web server", "asked not to be tested", "zombie network", "dynamic address", "misconfigured mail server", "accepts no mail"].get(n as usize).filter(|t| !t.is_empty()).map_or("listed".into(), |t| t.to_string()),
+        "dbl" => match n {
+            2 => "spam domain".into(),
+            4 => "phishing domain".into(),
+            5 => "malware domain".into(),
+            6 => "botnet C&C domain".into(),
+            102 => "abused legitimate domain: spam".into(),
+            103 => "abused legitimate domain: spammed redirector".into(),
+            104 => "abused legitimate domain: phishing".into(),
+            105 => "abused legitimate domain: malware".into(),
+            106 => "abused legitimate domain: botnet C&C".into(),
+            _ => "listed".into(),
+        },
+        "surbl" => bitmask(&[(8, "phishing"), (16, "malware"), (64, "abuse"), (128, "cracked sites")], code),
+        "uribl" => bitmask(&[(2, "black"), (4, "grey"), (8, "red")], code),
+        _ => "listed".into(),
+    }
+}
+
+/// The server to ask: DNSBL_SERVER (ip, or ip:port), else the first nameserver in /etc/resolv.conf.
+fn server() -> Result<SocketAddr, String> {
+    let text = std::env::var("DNSBL_SERVER").ok().filter(|v| !v.is_empty()).or_else(|| {
+        let r = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+        r.lines().find_map(|l| l.trim().strip_prefix("nameserver").map(|a| a.trim().to_string()))
+    }).ok_or("no DNS server: set DNSBL_SERVER")?;
+    if let Ok(a) = text.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    text.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)).map_err(|_| format!("DNSBL_SERVER `{}` is not an address", text))
+}
+
+fn encode_name(name: &str) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(format!("`{}` is not a DNS name", name));
+        }
+        out.push(label.len() as u8);
+        out.extend(label.as_bytes());
+    }
+    out.push(0);
+    if out.len() > 255 {
+        return Err(format!("`{}` is too long for DNS", name));
+    }
+    Ok(out)
+}
+
+fn question(id: u16, name: &str, kind: u16) -> Result<Vec<u8>, String> {
+    let mut p = vec![];
+    p.extend(id.to_be_bytes());
+    p.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    p.extend(encode_name(name)?);
+    p.extend(kind.to_be_bytes());
+    p.extend([0, 1]);
+    Ok(p)
+}
+
+/// Steps over a name, compressed or not.
+fn skip_name(m: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let n = *m.get(at)? as usize;
+        if n & 0xC0 == 0xC0 {
+            return Some(at + 2);
+        }
+        at += 1 + n;
+        if n == 0 {
+            return Some(at);
+        }
+    }
+}
+
+struct Answer {
+    rcode: u8,
+    truncated: bool,
+    values: Vec<String>,
+}
+
+fn parse(m: &[u8], id: u16, kind: u16) -> Result<Answer, String> {
+    if m.len() < 12 || u16::from_be_bytes([m[0], m[1]]) != id || m[2] & 0x80 == 0 {
+        return Err("a DNS answer that does not match the question".into());
+    }
+    let (qd, an) = (u16::from_be_bytes([m[4], m[5]]) as usize, u16::from_be_bytes([m[6], m[7]]) as usize);
+    let mut at = 12;
+    for _ in 0..qd {
+        at = skip_name(m, at).ok_or("a cut-off DNS answer")? + 4;
+    }
+    let mut values = vec![];
+    for _ in 0..an {
+        at = skip_name(m, at).ok_or("a cut-off DNS answer")?;
+        let head = m.get(at..at + 10).ok_or("a cut-off DNS answer")?;
+        let (t, len) = (u16::from_be_bytes([head[0], head[1]]), u16::from_be_bytes([head[8], head[9]]) as usize);
+        let data = m.get(at + 10..at + 10 + len).ok_or("a cut-off DNS answer")?;
+        at += 10 + len;
+        if t != kind {
+            continue;
+        }
+        if t == A && len == 4 {
+            values.push(format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3]));
+        } else if t == TXT {
+            let (mut text, mut i) = (String::new(), 0);
+            while i < data.len() {
+                let n = data[i] as usize;
+                text.push_str(&String::from_utf8_lossy(data.get(i + 1..i + 1 + n).unwrap_or(&[])));
+                i += 1 + n;
+            }
+            values.push(text);
+        }
+    }
+    Ok(Answer { rcode: m[3] & 15, truncated: m[2] & 2 != 0, values })
+}
+
+fn over_tcp(srv: SocketAddr, packet: &[u8], t: Duration) -> Result<Vec<u8>, String> {
+    let mut s = TcpStream::connect_timeout(&srv, t).map_err(|e| format!("TCP to {}: {}", srv, e))?;
+    let _ = s.set_read_timeout(Some(t));
+    let mut out = (packet.len() as u16).to_be_bytes().to_vec();
+    out.extend(packet);
+    s.write_all(&out).map_err(|e| e.to_string())?;
+    let mut len = [0u8; 2];
+    s.read_exact(&mut len).map_err(|e| e.to_string())?;
+    let mut body = vec![0; u16::from_be_bytes(len) as usize];
+    s.read_exact(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// One question, with `tries` over UDP, TCP when the answer was truncated.
+fn lookup(srv: SocketAddr, name: &str, kind: u16, t: Duration, tries: u32) -> Result<Answer, String> {
+    let mut b = [0u8; 2];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    let id = u16::from_be_bytes(b);
+    let p = question(id, name, kind)?;
+    let sock = UdpSocket::bind(if srv.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(t)).map_err(|e| e.to_string())?;
+    sock.connect(srv).map_err(|e| e.to_string())?;
+    for _ in 0..tries.max(1) {
+        sock.send(&p).map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 4096];
+        match sock.recv(&mut buf) {
+            Ok(n) => {
+                let a = match parse(&buf[..n], id, kind) {
+                    Ok(a) => a,
+                    Err(_) => continue, // Someone else's packet: wait out the rest.
+                };
+                if a.truncated {
+                    return parse(&over_tcp(srv, &p, t)?, id, kind);
+                }
+                return Ok(a);
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) => return Err(format!("{}: {}", srv, e)),
+        }
+    }
+    Err(format!("no answer from {} in {} tries", srv, tries.max(1)))
+}
+
+/// An address as a blocklist wants it: `192.0.2.1` is `1.2.0.192`, and an IPv6 address its 32 nibbles backwards.
+pub fn dnsbl_reverse(ip: &str) -> Result<String, String> {
+    match ip.trim().parse::<IpAddr>().map_err(|_| format!("`{}` is not an IP address", ip))? {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            Ok(format!("{}.{}.{}.{}", o[3], o[2], o[1], o[0]))
+        }
+        IpAddr::V6(a) => {
+            let hex: String = a.octets().iter().map(|b| format!("{:02x}", b)).collect();
+            Ok(hex.chars().rev().map(|c| c.to_string()).collect::<Vec<_>>().join("."))
+        }
+    }
+}
+
+/// What a return code means on a list: `dnsbl_code_name("zen.spamhaus.org", "127.0.0.4")`. A list this file does not know reads "listed".
+pub fn dnsbl_code_name(zone: &str, code: &str) -> String {
+    if let Some((_, why)) = REFUSALS.iter().find(|(c, _)| *c == code) {
+        return why.to_string();
+    }
+    meaning_of(known(zone).map_or("plain", |k| k.2), code)
+}
+
+fn norm_list(item: &Value) -> Result<(String, Option<Value>, f64), String> {
+    match item {
+        Value::String(z) => Ok((z.trim().to_ascii_lowercase(), None, 1.0)),
+        Value::Object(m) => {
+            let z = m.get("zone").and_then(|v| v.as_str()).ok_or("a list map needs `zone`")?;
+            Ok((z.to_ascii_lowercase(), m.get("codes").cloned(), m.get("weight").and_then(|w| w.as_f64()).unwrap_or(1.0)))
+        }
+        _ => Err("a list is a zone, or { zone, codes, weight }".into()),
+    }
+}
+
+/// One list's verdict: the question is `name.zone`, NXDOMAIN means not listed, and 127.x answers are looked up, those that mean a refusal being kept apart.
+fn ask(srv: SocketAddr, name: &str, item: &Value, o: &Value) -> Value {
+    let (zone, codes, weight) = match norm_list(item) {
+        Ok(x) => x,
+        Err(e) => return json!({ "zone": item, "listed": false, "error": e }),
+    };
+    let t = Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(1500).clamp(50, 30_000));
+    let tries = o.get("tries").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
+    let full = format!("{}.{}", name, zone);
+    let table = known(&zone).map_or("plain", |k| k.2);
+    match lookup(srv, &full, A, t, tries) {
+        Err(e) => json!({ "zone": zone, "listed": false, "error": e }),
+        Ok(a) if a.rcode == 3 || (a.rcode == 0 && a.values.is_empty()) => json!({ "zone": zone, "listed": false }),
+        Ok(a) if a.rcode != 0 => json!({ "zone": zone, "listed": false, "error": format!("the server answered {}", ["ok", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"].get(a.rcode as usize).unwrap_or(&"an error")) }),
+        Ok(a) => {
+            if let Some((_, why)) = a.values.iter().find_map(|v| REFUSALS.iter().find(|(c, _)| c == v)) {
+                return json!({ "zone": zone, "listed": false, "error": why });
+            }
+            // SURBL and URIBL answer 127.0.0.1 when they refuse a resolver.
+            if (table == "surbl" || table == "uribl") && a.values.iter().all(|v| v == "127.0.0.1") {
+                return json!({ "zone": zone, "listed": false, "error": "this list refused the resolver: use your own, or register" });
+            }
+            let named: Vec<Value> = a.values.iter().map(|c| {
+                let own = codes.as_ref().and_then(|m| m.get(c)).and_then(|v| v.as_str()).map(str::to_string);
+                json!({ "code": c, "meaning": own.unwrap_or_else(|| meaning_of(table, c)) })
+            }).collect();
+            let reason = lookup(srv, &full, TXT, t, tries).ok().and_then(|x| x.values.first().cloned());
+            json!({ "zone": zone, "listed": true, "codes": named, "reason": reason, "weight": weight })
+        }
+    }
+}
+
+fn run_all(name_for: impl Fn(&str) -> Option<String>, lists: &[Value], o: &Value) -> Result<Vec<Value>, String> {
+    let srv = server()?;
+    let mut out: Vec<Value> = vec![Value::Null; lists.len()];
+    std::thread::scope(|s| {
+        let mut jobs = vec![];
+        for (i, item) in lists.iter().enumerate() {
+            let zone = norm_list(item).map(|x| x.0).unwrap_or_default();
+            match name_for(&zone) {
+                Some(name) => jobs.push((i, s.spawn(move || ask(srv, &name, item, o)))),
+                None => out[i] = json!({ "zone": zone, "listed": false, "skipped": "this list takes IPv4 only" }),
+            }
+        }
+        for (i, j) in jobs {
+            out[i] = j.join().unwrap_or(json!({ "listed": false, "error": "the lookup failed" }));
+        }
+    });
+    Ok(out)
+}
+
+fn verdict(subject: &str, results: Vec<Value>) -> Value {
+    let score = results.iter().filter(|r| r["listed"] == true).fold(0.0, |s, r| s + r["weight"].as_f64().unwrap_or(1.0));
+    let hits: Vec<Value> = results.iter().filter(|r| r["listed"] == true).map(|r| r["zone"].clone()).collect();
+    let errors = results.iter().filter(|r| r.get("error").is_some()).count();
+    json!({ "subject": subject, "listed": !hits.is_empty(), "hits": hits, "score": score, "errors": errors, "lists": results })
+}
+
+fn lists_of(o: &Value, default: &[&str]) -> Vec<Value> {
+    o.get("lists").and_then(|l| l.as_array()).cloned().unwrap_or_else(|| default.iter().map(|z| json!(z)).collect())
+}
+
+/// Asks several blocklists about an IP at once. Options: lists (zones, or { zone, codes: { "127.0.0.2": "own words" }, weight }; zen, SpamCop and Barracuda by default), timeout_ms (1500), tries (2). Gives { subject, listed, hits, score, errors, lists: [{ zone, listed, codes: [{ code, meaning }], reason, error, skipped }] }. A list that timed out or refused has `error`: it says nothing either way. IPv6 goes only to lists that take it.
+pub fn dnsbl_check_ip(ip: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let rev = dnsbl_reverse(ip)?;
+    let v6 = ip.contains(':');
+    let lists = lists_of(&options, &["zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org"]);
+    let results = run_all(|z| if v6 && known(z).is_some_and(|k| !k.1) { None } else { Some(rev.clone()) }, &lists, &options)?;
+    Ok(verdict(ip.trim(), results))
+}
+
+/// Asks domain blocklists about a domain, as `dnsbl_check_ip` does an address. Takes lowercase ASCII names (punycode for others). Lists by default: dbl.spamhaus.org, multi.surbl.org, multi.uribl.com.
+pub fn dnsbl_check_domain(domain: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() || !d.contains('.') || !d.is_ascii() {
+        return Err(format!("`{}` is not a domain: IDN names go in punycode, xn--...", domain));
+    }
+    encode_name(&d)?;
+    if d.parse::<IpAddr>().is_ok() {
+        return Err(format!("`{}` is an address: use dnsbl_check_ip", domain));
+    }
+    let lists = lists_of(&options, &["dbl.spamhaus.org", "multi.surbl.org", "multi.uribl.com"]);
+    Ok(verdict(&d, run_all(|_| Some(d.clone()), &lists, &options)?))
+}
+
+/// The lists whose codes this file can name.
+pub fn dnsbl_known_lists() -> Vec<String> {
+    ["zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org", "dnsbl.sorbs.net", "dbl.spamhaus.org", "multi.surbl.org", "multi.uribl.com"].iter().map(|z| z.to_string()).collect()
+}

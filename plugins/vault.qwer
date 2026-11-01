@@ -1,0 +1,361 @@
+//! HashiCorp Vault's HTTP API: KV version 2 secrets with versions, check-and-set, patch, soft delete, undelete and destroy, AppRole sign-in with the token renewed by signing in again, transit encryption, decryption, rewrapping and batches, leases read, renewed and revoked, and Vault's error lists turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// VAULT_API_URL is the server (VAULT_ADDR is read too; http://localhost:8200 when neither is set).
+// VAULT_TOKEN is a token; or VAULT_ROLE_ID with VAULT_SECRET_ID sign in by AppRole (VAULT_APPROLE_MOUNT
+// if it is not at approle). VAULT_NAMESPACE names a namespace, VAULT_KV_MOUNT the KV engine (secret
+// when not set), VAULT_TRANSIT_MOUNT the transit engine (transit when not set).
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("VAULT_API_URL").or(env("VAULT_ADDR")).unwrap_or_else(|| "http://localhost:8200".into()).trim_end_matches('/').to_string()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn enc_path(p: &str) -> Result<String, String> {
+    let t = p.trim_matches('/');
+    if t.is_empty() {
+        return Err("no path given".into());
+    }
+    if t.split('/').any(|x| x == ".." || x == ".") {
+        return Err(format!("{:?}: a path has no . or .. in it", p));
+    }
+    Ok(t.split('/').map(enc).collect::<Vec<_>>().join("/"))
+}
+
+static LOGIN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+struct Reply {
+    status: u16,
+    body: Value,
+    text: String,
+}
+
+fn raw(method: &str, path: &str, token: Option<&str>, body: Option<(&str, String)>) -> Result<Reply, String> {
+    let mut req = ureq::request(method, &format!("{}/v1/{}", base(), path)).timeout(Duration::from_secs(30)).set("X-Vault-Request", "true");
+    if let Some(t) = token {
+        req = req.set("X-Vault-Token", t);
+    }
+    if let Some(n) = env("VAULT_NAMESPACE") {
+        req = req.set("X-Vault-Namespace", &n);
+    }
+    let res = match body {
+        Some((kind, b)) => req.set("Content-Type", kind).send_string(&b),
+        None => req.call(),
+    };
+    let (status, text) = match res {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach Vault at {}: {}", base(), e)),
+    };
+    let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+    Ok(Reply { status, body, text })
+}
+
+fn refused(r: &Reply) -> String {
+    let list: Vec<String> = r.body["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_string)).collect();
+    let what = if list.is_empty() { r.text.trim().chars().take(200).collect() } else { list.join("; ") };
+    let hint = match r.status {
+        403 => " (check the token and its policy)",
+        503 => " (Vault is sealed, or not ready)",
+        _ => "",
+    };
+    format!("Vault answered {}: {}{}", r.status, what, hint)
+}
+
+/// A token from AppRole: role and secret id traded for one, kept until five minutes before it ends.
+fn approle() -> Result<String, String> {
+    let (Some(role), Some(secret)) = (env("VAULT_ROLE_ID"), env("VAULT_SECRET_ID")) else {
+        return Err("set VAULT_TOKEN, or VAULT_ROLE_ID with VAULT_SECRET_ID".into());
+    };
+    let mount = env("VAULT_APPROLE_MOUNT").unwrap_or_else(|| "approle".into());
+    let r = raw("POST", &format!("auth/{}/login", mount), None, Some(("application/json", json!({ "role_id": role, "secret_id": secret }).to_string())))?;
+    if r.status >= 300 {
+        return Err(format!("the AppRole sign-in failed: {}", refused(&r)));
+    }
+    let t = r.body["auth"]["client_token"].as_str().ok_or("Vault gave no client_token")?.to_string();
+    let ttl = r.body["auth"]["lease_duration"].as_i64().unwrap_or(0);
+    *LOGIN.lock().unwrap_or_else(|e| e.into_inner()) = Some((t.clone(), if ttl > 0 { now() + ttl } else { i64::MAX }));
+    Ok(t)
+}
+
+fn token() -> Result<String, String> {
+    if let Some(t) = env("VAULT_TOKEN") {
+        return Ok(t);
+    }
+    if let Some((t, until)) = LOGIN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    approle()
+}
+
+/// With an AppRole token a 403 can mean it was revoked or ended early: one sign-in again.
+fn send(method: &str, path: &str, body: Option<(&str, String)>) -> Result<Reply, String> {
+    let r = raw(method, path, Some(&token()?), body.clone())?;
+    if r.status == 403 && env("VAULT_TOKEN").is_none() {
+        *LOGIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return raw(method, path, Some(&approle()?), body);
+    }
+    Ok(r)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let r = send(method, path, body.map(|b| ("application/json", b.to_string())))?;
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    Ok(r.body)
+}
+
+fn mount() -> String {
+    env("VAULT_KV_MOUNT").unwrap_or_else(|| "secret".into())
+}
+
+fn transit() -> String {
+    env("VAULT_TRANSIT_MOUNT").unwrap_or_else(|| "transit".into())
+}
+
+/// Signs in by AppRole now, from VAULT_ROLE_ID and VAULT_SECRET_ID, and gives `{ ttl_seconds }`. Calls do it themselves when they need to; this is for finding a bad secret id at start.
+pub fn vault_login() -> Result<Value, String> {
+    approle()?;
+    let until = LOGIN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |x| x.1);
+    Ok(json!({ "ttl_seconds": if until == i64::MAX { 0 } else { until - now() } }))
+}
+
+/// Vault's state from /sys/health, which answers by status code: `{ initialized, sealed, standby, version }`, a standby or a sealed server being an answer, not an error.
+pub fn vault_health() -> Result<Value, String> {
+    let r = raw("GET", "sys/health", None, None)?;
+    if !r.body.is_object() {
+        return Err(format!("Vault answered {}: {}", r.status, r.text.chars().take(200).collect::<String>()));
+    }
+    Ok(json!({ "status": r.status, "initialized": r.body["initialized"], "sealed": r.body["sealed"], "standby": r.body["standby"], "version": r.body["version"] }))
+}
+
+/// Reads a KV v2 secret; `version` 0 for the newest. Gives `{ data, version, created_time, deleted_time, destroyed }`, `data` null for a version deleted or destroyed, or null when there is no such secret.
+pub fn vault_kv_get(path: &str, version: i64) -> Result<Value, String> {
+    let q = if version > 0 { format!("?version={}", version) } else { String::new() };
+    let r = send("GET", &format!("{}/data/{}{}", mount(), enc_path(path)?, q), None)?;
+    // A deleted version is a 404 that still carries its metadata.
+    if r.status == 404 {
+        if r.body["data"]["metadata"].is_object() {
+            let m = &r.body["data"]["metadata"];
+            return Ok(json!({ "data": null, "version": m["version"], "created_time": m["created_time"], "deleted_time": m["deletion_time"], "destroyed": m["destroyed"] }));
+        }
+        return Ok(Value::Null);
+    }
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    let (d, m) = (&r.body["data"]["data"], &r.body["data"]["metadata"]);
+    Ok(json!({ "data": d, "version": m["version"], "created_time": m["created_time"], "deleted_time": null, "destroyed": m["destroyed"] }))
+}
+
+/// Writes a new version of a secret (a map). `cas` is -1 for no check, 0 to write only if there is none, or the version it must still be at. Gives `{ version, created_time }`. A failed check is an error saying so.
+pub fn vault_kv_put(path: &str, data: serde_json::Value, cas: i64) -> Result<Value, String> {
+    if !data.is_object() {
+        return Err("a secret is a map".into());
+    }
+    let mut b = json!({ "data": data });
+    if cas >= 0 {
+        b["options"] = json!({ "cas": cas });
+    }
+    let r = call("POST", &format!("{}/data/{}", mount(), enc_path(path)?), Some(&b))?;
+    Ok(json!({ "version": r["data"]["version"], "created_time": r["data"]["created_time"] }))
+}
+
+/// Merges fields into the newest version as a new version, others staying: JSON merge patch, a field given as null being removed. Needs the `patch` capability. Gives `{ version, created_time }`.
+pub fn vault_kv_patch(path: &str, changes: serde_json::Value, cas: i64) -> Result<Value, String> {
+    let mut b = json!({ "data": changes });
+    if cas >= 0 {
+        b["options"] = json!({ "cas": cas });
+    }
+    let r = send("PATCH", &format!("{}/data/{}", mount(), enc_path(path)?), Some(("application/merge-patch+json", b.to_string())))?;
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    Ok(json!({ "version": r.body["data"]["version"], "created_time": r.body["data"]["created_time"] }))
+}
+
+fn versions_of(versions: &Value) -> Result<Value, String> {
+    if !versions.as_array().map_or(false, |a| !a.is_empty() && a.iter().all(|v| v.is_i64())) {
+        return Err("versions are a list of numbers".into());
+    }
+    Ok(json!({ "versions": versions }))
+}
+
+/// Soft-deletes versions (a list), or the newest when `versions` is null. They can come back with `vault_kv_undelete`.
+pub fn vault_kv_delete(path: &str, versions: serde_json::Value) -> Result<bool, String> {
+    let p = enc_path(path)?;
+    if versions.is_null() {
+        call("DELETE", &format!("{}/data/{}", mount(), p), None)?;
+    } else {
+        call("POST", &format!("{}/delete/{}", mount(), p), Some(&versions_of(&versions)?))?;
+    }
+    Ok(true)
+}
+
+/// Brings soft-deleted versions back.
+pub fn vault_kv_undelete(path: &str, versions: serde_json::Value) -> Result<bool, String> {
+    call("POST", &format!("{}/undelete/{}", mount(), enc_path(path)?), Some(&versions_of(&versions)?))?;
+    Ok(true)
+}
+
+/// Destroys versions for good: their data cannot come back.
+pub fn vault_kv_destroy(path: &str, versions: serde_json::Value) -> Result<bool, String> {
+    call("POST", &format!("{}/destroy/{}", mount(), enc_path(path)?), Some(&versions_of(&versions)?))?;
+    Ok(true)
+}
+
+/// A secret's metadata: `{ current_version, oldest_version, versions: { "1": { created_time, deletion_time, destroyed } }, ... }`, or null.
+pub fn vault_kv_metadata(path: &str) -> Result<Value, String> {
+    let r = send("GET", &format!("{}/metadata/{}", mount(), enc_path(path)?), None)?;
+    if r.status == 404 {
+        return Ok(Value::Null);
+    }
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    Ok(r.body["data"].clone())
+}
+
+/// The names under a folder of secrets, folders ending in /. None is an empty list.
+pub fn vault_kv_list(path: &str) -> Result<Value, String> {
+    let p = path.trim_matches('/');
+    let at = if p.is_empty() { format!("{}/metadata", mount()) } else { format!("{}/metadata/{}", mount(), enc_path(p)?) };
+    // GET with list=true is the same call as Vault's LIST method, and passes through proxies.
+    let r = send("GET", &format!("{}?list=true", at), None)?;
+    if r.status == 404 {
+        return Ok(json!([]));
+    }
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    Ok(r.body["data"]["keys"].clone())
+}
+
+fn b64(s: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+}
+
+fn unb64(s: &str) -> Result<String, String> {
+    let b = base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| format!("Vault's plaintext is not base64: {}", e))?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Encrypts text with a transit key, which stays in Vault. `context` is "" or the derivation context of a derived key. Gives `vault:v1:...`, to keep in a database.
+pub fn vault_encrypt(key: &str, plaintext: &str, context: &str) -> Result<String, String> {
+    let mut b = json!({ "plaintext": b64(plaintext) });
+    if !context.is_empty() {
+        b["context"] = json!(b64(context));
+    }
+    let r = call("POST", &format!("{}/encrypt/{}", transit(), enc(key)), Some(&b))?;
+    r["data"]["ciphertext"].as_str().map(str::to_string).ok_or("Vault gave no ciphertext".to_string())
+}
+
+/// Decrypts what `vault_encrypt` gave, back to text.
+pub fn vault_decrypt(key: &str, ciphertext: &str, context: &str) -> Result<String, String> {
+    if !ciphertext.starts_with("vault:v") {
+        return Err("that is not Vault ciphertext: it starts vault:v".into());
+    }
+    let mut b = json!({ "ciphertext": ciphertext });
+    if !context.is_empty() {
+        b["context"] = json!(b64(context));
+    }
+    let r = call("POST", &format!("{}/decrypt/{}", transit(), enc(key)), Some(&b))?;
+    unb64(r["data"]["plaintext"].as_str().ok_or("Vault gave no plaintext")?)
+}
+
+/// Re-encrypts ciphertext under the key's newest version, without showing the plaintext to anyone: for after `vault_rotate`.
+pub fn vault_rewrap(key: &str, ciphertext: &str) -> Result<String, String> {
+    let r = call("POST", &format!("{}/rewrap/{}", transit(), enc(key)), Some(&json!({ "ciphertext": ciphertext })))?;
+    r["data"]["ciphertext"].as_str().map(str::to_string).ok_or("Vault gave no ciphertext".to_string())
+}
+
+/// Encrypts many texts in one call. One bad item does not fail the rest: gives a list in order, each `{ ciphertext }` or `{ error }`.
+pub fn vault_encrypt_many(key: &str, texts: Vec<String>) -> Result<Value, String> {
+    let items: Vec<Value> = texts.iter().map(|t| json!({ "plaintext": b64(t) })).collect();
+    let r = call("POST", &format!("{}/encrypt/{}", transit(), enc(key)), Some(&json!({ "batch_input": items })))?;
+    Ok(r["data"]["batch_results"].clone())
+}
+
+/// Decrypts many ciphertexts in one call: a list in order, each `{ text }` or `{ error }`.
+pub fn vault_decrypt_many(key: &str, ciphertexts: Vec<String>) -> Result<Vec<Value>, String> {
+    let items: Vec<Value> = ciphertexts.iter().map(|t| json!({ "ciphertext": t })).collect();
+    let r = call("POST", &format!("{}/decrypt/{}", transit(), enc(key)), Some(&json!({ "batch_input": items })))?;
+    Ok(r["data"]["batch_results"].as_array().into_iter().flatten().map(|x| {
+        match (x["error"].as_str().filter(|e| !e.is_empty()), x["plaintext"].as_str()) {
+            (Some(e), _) => json!({ "error": e }),
+            (None, Some(p)) => unb64(p).map_or_else(|e| json!({ "error": e }), |t| json!({ "text": t })),
+            _ => json!({ "error": "no plaintext" }),
+        }
+    }).collect())
+}
+
+/// Adds a new version to a transit key: new encryptions use it, and old ciphertext still decrypts.
+pub fn vault_rotate(key: &str) -> Result<bool, String> {
+    call("POST", &format!("{}/keys/{}/rotate", transit(), enc(key)), Some(&json!({})))?;
+    Ok(true)
+}
+
+/// Reads any path, such as `database/creds/readonly` for dynamic credentials: `{ data, lease_id, lease_duration, renewable, warnings }`, or null on a 404.
+pub fn vault_read(path: &str) -> Result<Value, String> {
+    let r = send("GET", &enc_path(path)?, None)?;
+    if r.status == 404 {
+        return Ok(Value::Null);
+    }
+    if r.status >= 300 {
+        return Err(refused(&r));
+    }
+    let b = r.body;
+    Ok(json!({ "data": b["data"], "lease_id": b["lease_id"], "lease_duration": b["lease_duration"], "renewable": b["renewable"], "warnings": b["warnings"] }))
+}
+
+/// Writes to any path with a map, for what this plugin has no function for; gives Vault's answer.
+pub fn vault_write(path: &str, data: serde_json::Value) -> Result<Value, String> {
+    call("POST", &enc_path(path)?, Some(&data))
+}
+
+/// Renews a lease by `increment_seconds` (0 for its default). Gives `{ lease_id, lease_duration, renewable }`: Vault may give less than asked, near its maximum.
+pub fn vault_lease_renew(lease_id: &str, increment_seconds: i64) -> Result<Value, String> {
+    let mut b = json!({ "lease_id": lease_id });
+    if increment_seconds > 0 {
+        b["increment"] = json!(increment_seconds);
+    }
+    let r = call("PUT", "sys/leases/renew", Some(&b))?;
+    Ok(json!({ "lease_id": r["lease_id"], "lease_duration": r["lease_duration"], "renewable": r["renewable"] }))
+}
+
+/// What a lease has left: `{ id, ttl, expire_time, renewable }`.
+pub fn vault_lease_lookup(lease_id: &str) -> Result<Value, String> {
+    let r = call("PUT", "sys/leases/lookup", Some(&json!({ "lease_id": lease_id })))?;
+    let d = &r["data"];
+    Ok(json!({ "id": d["id"], "ttl": d["ttl"], "expire_time": d["expire_time"], "renewable": d["renewable"] }))
+}
+
+/// Ends a lease now, and with it what it stands for, a database user say.
+pub fn vault_lease_revoke(lease_id: &str) -> Result<bool, String> {
+    call("PUT", "sys/leases/revoke", Some(&json!({ "lease_id": lease_id })))?;
+    Ok(true)
+}

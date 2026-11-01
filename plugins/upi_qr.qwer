@@ -1,0 +1,192 @@
+//! India's UPI deep links and QR payloads: upi://pay links built and read, VPAs checked, amounts counted in paise, and an SVG of the code.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+use qrcode::render::svg;
+use qrcode::{EcLevel, QrCode};
+use serde_json::{json, Map, Value};
+
+/// A UPI payment above this is refused by the ordinary limit, one lakh rupees. Some merchant categories go higher: pass `limit_paise`.
+const LIMIT_PAISE: i64 = 10_000_000;
+
+fn enc(x: &str) -> String {
+    x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// `@` stays as it is in a VPA, where apps expect it.
+fn enc_vpa(x: &str) -> String {
+    enc(x).replace("%40", "@")
+}
+
+fn dec(x: &str) -> Result<String, String> {
+    let b = x.as_bytes();
+    let (mut i, mut out) = (0, Vec::with_capacity(b.len()));
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let h = x.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()).ok_or(format!("bad percent escape in `{}`", x))?;
+                out.push(h);
+                i += 3;
+            }
+            b'+' => { out.push(b' '); i += 1; }
+            c => { out.push(c); i += 1; }
+        }
+    }
+    String::from_utf8(out).map_err(|_| format!("`{}` is not UTF-8", x))
+}
+
+/// Why a VPA is not one, or null. It is `handle@bank`: letters, digits, dots, hyphens and underscores before the @, letters and digits after it.
+pub fn upi_qr_vpa_problem(vpa: &str) -> Option<String> {
+    let Some((user, bank)) = vpa.split_once('@') else {
+        return Some(format!("`{}` has no @: a VPA looks like name@bank", vpa));
+    };
+    if user.is_empty() || user.len() > 256 || !user.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)) {
+        return Some(format!("`{}`: the part before the @ takes letters, digits, dots, hyphens and underscores", vpa));
+    }
+    if bank.len() < 2 || bank.len() > 64 || !bank.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Some(format!("`{}`: the bank handle after the @ is letters and digits", vpa));
+    }
+    None
+}
+
+/// Rupees as paise: "12.5" is 1250. Text, or a number; at most two decimals.
+pub fn upi_qr_paise(amount: serde_json::Value) -> Result<i64, String> {
+    let a = match &amount {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        o => return Err(format!("amount {} is neither text nor a number", o)),
+    };
+    let (w, f) = a.split_once('.').unwrap_or((&a, ""));
+    if (w.is_empty() && f.is_empty()) || !w.bytes().all(|b| b.is_ascii_digit()) || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("amount `{}` is not a number", a));
+    }
+    if f.len() > 2 {
+        return Err(format!("amount {} has more than two decimals: a paisa is the smallest unit", a));
+    }
+    let w: i64 = if w.is_empty() { 0 } else { w.parse().map_err(|_| format!("amount `{}` is too large", a))? };
+    w.checked_mul(100).and_then(|x| x.checked_add(format!("{:0<2}", f).parse::<i64>().unwrap_or(0))).ok_or(format!("amount `{}` is too large", a))
+}
+
+/// Paise as the link writes rupees: 1250 is "12.50".
+pub fn upi_qr_rupees(paise: i64) -> String {
+    format!("{}{}.{:02}", if paise < 0 { "-" } else { "" }, paise.abs() / 100, paise.abs() % 100)
+}
+
+fn s(v: &Value, k: &str) -> String {
+    match v.get(k) {
+        Some(Value::String(x)) => x.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn checked_mc(mc: &str) -> Result<(), String> {
+    if mc.is_empty() || (mc.len() == 4 && mc.bytes().all(|b| b.is_ascii_digit())) {
+        Ok(())
+    } else {
+        Err(format!("merchant code `{}` should be four digits", mc))
+    }
+}
+
+/// A `upi://pay` link from `{ vpa, name, amount, paise, note, reference, transaction_id, merchant_code, url, mode, purpose, min_amount, sign, limit_paise }`, written with UPI's short names (pa, pn, am, cu, tn, tr, tid, mc, url, mode, purpose, mam, sign). `vpa` and `name` are needed. With no amount the payer types one. A merchant link (one with `merchant_code`) needs `reference`, as the linking specification asks.
+pub fn upi_qr_build(payment: serde_json::Value) -> Result<String, String> {
+    let vpa = s(&payment, "vpa");
+    if let Some(p) = upi_qr_vpa_problem(&vpa) {
+        return Err(p);
+    }
+    let name = s(&payment, "name");
+    if name.is_empty() {
+        return Err("the payee's name is required".into());
+    }
+    let mut out = format!("upi://pay?pa={}&pn={}", enc_vpa(&vpa), enc(&name));
+    let paise = match (payment.get("paise").and_then(Value::as_i64), payment.get("amount").filter(|a| !a.is_null())) {
+        (Some(p), _) => Some(p),
+        (None, Some(a)) => Some(upi_qr_paise(a.clone())?),
+        _ => None,
+    };
+    if let Some(p) = paise {
+        let limit = payment.get("limit_paise").and_then(Value::as_i64).unwrap_or(LIMIT_PAISE);
+        if p <= 0 {
+            return Err("the amount must be above zero; leave it out for the payer to type one".into());
+        }
+        if p > limit {
+            return Err(format!("{} rupees is over the limit of {} (give limit_paise for a category with a higher one)", upi_qr_rupees(p), upi_qr_rupees(limit)));
+        }
+        out += &format!("&am={}&cu=INR", upi_qr_rupees(p));
+    } else {
+        out += "&cu=INR";
+    }
+    let mc = s(&payment, "merchant_code");
+    checked_mc(&mc)?;
+    let reference = s(&payment, "reference");
+    if !mc.is_empty() && reference.is_empty() {
+        return Err("a merchant's link needs a reference, `tr`, to match the payment".into());
+    }
+    if reference.len() > 35 {
+        return Err(format!("reference `{}` is over 35 characters", reference));
+    }
+    for (key, short) in [("merchant_code", "mc"), ("reference", "tr"), ("transaction_id", "tid"), ("note", "tn"), ("url", "url"), ("mode", "mode"), ("purpose", "purpose"), ("min_amount", "mam"), ("sign", "sign")] {
+        let v = s(&payment, key);
+        if !v.is_empty() {
+            out += &format!("&{}={}", short, enc(&v));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads a UPI link into `{ vpa, name, amount, paise, currency, note, reference, transaction_id, merchant_code, url, mode, purpose, min_amount, sign, other }`. `other` keeps parameters this does not name. Fields are checked as in `upi_qr_build`; a currency other than INR, or a parameter given twice, is an error.
+pub fn upi_qr_parse(link: &str) -> Result<Value, String> {
+    let t = link.trim();
+    let Some((head, query)) = t.split_once('?') else {
+        return Err("a UPI link is upi://pay?pa=...".into());
+    };
+    if !head.eq_ignore_ascii_case("upi://pay") {
+        return Err(format!("`{}` is not upi://pay", head));
+    }
+    let mut seen = Map::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if seen.insert(k.to_string(), json!(dec(v)?)).is_some() {
+            return Err(format!("`{}` is given twice", k));
+        }
+    }
+    let mut take = |k: &str| seen.remove(k).and_then(|v| v.as_str().map(str::to_string)).filter(|x| !x.is_empty());
+    let vpa = take("pa").ok_or("no `pa`: the link names nobody to pay")?;
+    if let Some(p) = upi_qr_vpa_problem(&vpa) {
+        return Err(p);
+    }
+    let amount = take("am");
+    let paise = match &amount {
+        Some(a) => {
+            let p = upi_qr_paise(json!(a))?;
+            if p <= 0 {
+                return Err("the amount must be above zero".into());
+            }
+            Some(p)
+        }
+        None => None,
+    };
+    let currency = take("cu").unwrap_or_else(|| "INR".into());
+    if currency != "INR" {
+        return Err(format!("currency `{}`: UPI links are in INR", currency));
+    }
+    let name = take("pn");
+    let (note, reference, transaction_id, merchant_code) = (take("tn"), take("tr"), take("tid"), take("mc"));
+    checked_mc(merchant_code.as_deref().unwrap_or(""))?;
+    let (url, mode, purpose, min_amount, sign) = (take("url"), take("mode"), take("purpose"), take("mam"), take("sign"));
+    Ok(json!({
+        "vpa": vpa, "name": name, "amount": paise.map(upi_qr_rupees), "paise": paise, "currency": currency, "note": note, "reference": reference,
+        "transaction_id": transaction_id, "merchant_code": merchant_code, "url": url, "mode": mode, "purpose": purpose, "min_amount": min_amount, "sign": sign,
+        "other": seen,
+    }))
+}
+
+/// An SVG of the link as a QR code. `size` is the smallest width in pixels.
+pub fn upi_qr_svg(link: &str, size: i64) -> Result<String, String> {
+    let c = QrCode::with_error_correction_level(link.as_bytes(), EcLevel::M).map_err(|e| e.to_string())?;
+    let px = size.clamp(64, 4096) as u32;
+    Ok(c.render::<svg::Color>().min_dimensions(px, px).build())
+}

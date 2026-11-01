@@ -1,0 +1,702 @@
+//! DNP3 as a master over TCP: link frames with their CRC every 16 bytes, transport segments put together, application requests for class polls and static reads, binary and analog objects with flags and times, IIN bits named, confirmations and multi-fragment answers, control relay and analog output by select before operate, and unsolicited messages kept.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ---- Link layer ----
+
+/// CRC-16/DNP: reflected polynomial 0xA6BC, started at 0, inverted, low byte first on the wire.
+fn crc(data: &[u8]) -> u16 {
+    let mut c = 0u16;
+    for &b in data {
+        c ^= b as u16;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xA6BC } else { c >> 1 };
+        }
+    }
+    !c
+}
+
+/// A DNP3 CRC over hex bytes, as hex in wire order: "0564..." gives two bytes.
+pub fn dnp3_crc(hex_text: &str) -> Result<String, String> {
+    let b = hex::decode(hex_text.split_whitespace().collect::<String>()).map_err(|_| "that is not hex".to_string())?;
+    Ok(hex::encode(crc(&b).to_le_bytes()))
+}
+
+fn link_frame(ctrl: u8, dst: u16, src: u16, user: &[u8]) -> Vec<u8> {
+    let mut h = vec![0x05, 0x64, (user.len() + 5) as u8, ctrl];
+    h.extend(dst.to_le_bytes());
+    h.extend(src.to_le_bytes());
+    h.extend(crc(&h).to_le_bytes());
+    for block in user.chunks(16) {
+        h.extend(block);
+        h.extend(crc(block).to_le_bytes());
+    }
+    h
+}
+
+const F_NAMES: &[(u8, &str)] = &[(0, "RESET_LINK_STATES"), (2, "TEST_LINK_STATES"), (3, "CONFIRMED_USER_DATA"), (4, "UNCONFIRMED_USER_DATA"), (9, "REQUEST_LINK_STATUS")];
+const S_NAMES: &[(u8, &str)] = &[(0, "ACK"), (1, "NACK"), (11, "LINK_STATUS"), (15, "NOT_SUPPORTED")];
+
+/// Parses a frame given as hex, CRCs checked block by block: { dir, prm, function, fcb, fcv, destination, source, data (hex, user data) }. A bad CRC is an error value naming the block.
+pub fn dnp3_parse_frame(hex_text: &str) -> Result<serde_json::Value, String> {
+    let b = hex::decode(hex_text.split_whitespace().collect::<String>()).map_err(|_| "that is not hex".to_string())?;
+    if b.len() < 10 || b[0] != 0x05 || b[1] != 0x64 {
+        return Err("a DNP3 frame starts 05 64, with an 8-byte header and its CRC".into());
+    }
+    if crc(&b[..8]).to_le_bytes() != b[8..10] {
+        return Err("the header's CRC does not match".into());
+    }
+    let n = (b[2] as usize).checked_sub(5).ok_or("the length is under 5")?;
+    let mut data = vec![];
+    let mut at = 10;
+    let mut left = n;
+    let mut block = 0;
+    while left > 0 {
+        let take = left.min(16);
+        let chunk = b.get(at..at + take).ok_or("the frame is cut short")?;
+        let c = b.get(at + take..at + take + 2).ok_or("the frame is cut short")?;
+        if crc(chunk).to_le_bytes() != c {
+            return Err(format!("the CRC of data block {} does not match", block));
+        }
+        data.extend(chunk);
+        at += take + 2;
+        left -= take;
+        block += 1;
+    }
+    let ctrl = b[3];
+    let f = ctrl & 15;
+    let prm = ctrl & 0x40 != 0;
+    let name = if prm { F_NAMES } else { S_NAMES }.iter().find(|x| x.0 == f).map_or("unknown", |x| x.1);
+    Ok(json!({ "dir": ctrl & 0x80 != 0, "prm": prm, "function": name, "fcb": ctrl & 0x20 != 0, "fcv": ctrl & 0x10 != 0, "destination": u16::from_le_bytes([b[4], b[5]]), "source": u16::from_le_bytes([b[6], b[7]]), "data": hex::encode(data) }))
+}
+
+/// Builds a frame as hex: `spec` is { function (like UNCONFIRMED_USER_DATA or REQUEST_LINK_STATUS), master (true: from a master), destination, source, data (hex) }.
+pub fn dnp3_build_frame(spec: serde_json::Value) -> Result<String, String> {
+    let name = spec["function"].as_str().unwrap_or("");
+    let f = F_NAMES.iter().find(|x| x.1 == name).map(|x| x.0).ok_or(format!("`{}` is not a primary function", name))?;
+    let dir = spec.get("master").and_then(|m| m.as_bool()).unwrap_or(true);
+    let data = hex::decode(spec["data"].as_str().unwrap_or("")).map_err(|_| "data is not hex".to_string())?;
+    if data.len() > 250 {
+        return Err("a frame holds at most 250 bytes of user data".into());
+    }
+    Ok(hex::encode(link_frame(if dir { 0xc0 } else { 0x40 } | f, spec["destination"].as_u64().unwrap_or(0) as u16, spec["source"].as_u64().unwrap_or(0) as u16, &data)))
+}
+
+// ---- Application objects ----
+
+const IIN: [(&str, u8, u8); 14] = [
+    ("all_stations", 0, 0), ("class1_events", 0, 1), ("class2_events", 0, 2), ("class3_events", 0, 3), ("need_time", 0, 4), ("local_control", 0, 5), ("device_trouble", 0, 6), ("device_restart", 0, 7),
+    ("no_function_support", 1, 0), ("object_unknown", 1, 1), ("parameter_error", 1, 2), ("event_buffer_overflow", 1, 3), ("already_executing", 1, 4), ("config_corrupt", 1, 5),
+];
+
+fn iin_of(a: u8, b: u8) -> Value {
+    let on: Vec<&str> = IIN.iter().filter(|(_, w, bit)| (if *w == 0 { a } else { b }) >> bit & 1 == 1).map(|x| x.0).collect();
+    json!(on)
+}
+
+fn flags(f: u8) -> Value {
+    json!({ "online": f & 1 != 0, "restart": f & 2 != 0, "comm_lost": f & 4 != 0, "remote_forced": f & 8 != 0, "local_forced": f & 16 != 0 })
+}
+
+/// A 48-bit time in ms since 1970, as ISO.
+fn dnp_time(b: &[u8]) -> Value {
+    let ms = b.iter().rev().fold(0u64, |a, x| a << 8 | *x as u64) as i64;
+    let (d, r) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    let z = d + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dd = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, dd, r / 3_600_000, r / 60_000 % 60, r / 1000 % 60, r % 1000))
+}
+
+/// The size of one object in bytes, 0 for packed bits, or None if it is unknown here.
+fn object_size(g: u8, v: u8) -> Option<usize> {
+    Some(match (g, v) {
+        (1, 1) | (10, 1) => 0,
+        (1, 2) | (2, 1) | (10, 2) => 1,
+        (2, 2) | (4, 2) => 7,
+        (2, 3) | (4, 3) => 3,
+        (4, 1) | (3, 2) => 1,
+        (3, 1) => 0,
+        (12, 1) => 11,
+        (20, 1) | (21, 1) => 5,
+        (20, 2) | (21, 2) => 3,
+        (20, 5) | (21, 5) => 4,
+        (20, 6) | (21, 6) => 2,
+        (22, 1) | (23, 1) => 5,
+        (22, 2) | (23, 2) => 3,
+        (22, 5) | (23, 5) => 11,
+        (22, 6) | (23, 6) => 9,
+        (30, 1) => 5,
+        (30, 2) => 3,
+        (30, 3) => 4,
+        (30, 4) => 2,
+        (30, 5) => 5,
+        (30, 6) => 9,
+        (32, 1) => 5,
+        (32, 2) => 3,
+        (32, 3) => 11,
+        (32, 4) => 9,
+        (32, 5) => 5,
+        (32, 6) => 9,
+        (32, 7) => 11,
+        (32, 8) => 15,
+        (40, 1) => 5,
+        (40, 2) => 3,
+        (40, 3) => 5,
+        (40, 4) => 9,
+        (41, 1) => 5,
+        (41, 2) => 3,
+        (41, 3) => 5,
+        (41, 4) => 9,
+        (50, 1) | (50, 3) => 6,
+        (51, 1) | (51, 2) => 6,
+        (52, 1) | (52, 2) => 2,
+        (80, 1) => 0,
+        _ => return None,
+    })
+}
+
+fn kind_of(g: u8) -> &'static str {
+    match g {
+        1 => "binary", 2 => "binary_event", 3 => "double_bit", 4 => "double_bit_event", 10 => "binary_output", 12 => "crob",
+        20 => "counter", 21 => "frozen_counter", 22 => "counter_event", 23 => "frozen_counter_event", 30 => "analog", 32 => "analog_event", 40 => "analog_output", 41 => "analog_command",
+        50 => "time", 51 => "cto", 52 => "time_delay", 80 => "iin", _ => "unknown",
+    }
+}
+
+fn i32_at(b: &[u8]) -> i64 {
+    i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64
+}
+
+fn i16_at(b: &[u8]) -> i64 {
+    i16::from_le_bytes([b[0], b[1]]) as i64
+}
+
+fn f32_at(b: &[u8]) -> f64 {
+    f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64
+}
+
+fn f64_at(b: &[u8]) -> f64 {
+    f64::from_le_bytes(b.try_into().unwrap_or_default())
+}
+
+const CONTROL_STATUS: &[&str] = &["success", "timeout", "no_select", "format_error", "not_supported", "already_active", "hardware_error", "local", "too_many_ops", "not_authorized", "automation_inhibit", "processing_limited", "out_of_range"];
+
+fn control_status(s: u8) -> String {
+    CONTROL_STATUS.get(s as usize).map_or(format!("status_{}", s), |x| x.to_string())
+}
+
+/// One object's fields.
+fn read_object(g: u8, v: u8, b: &[u8]) -> Value {
+    let u = |x: &[u8]| x.iter().rev().fold(0u64, |a, y| a << 8 | *y as u64);
+    match (g, v) {
+        (1, 2) | (10, 2) => json!({ "value": b[0] & 0x80 != 0, "flags": flags(b[0]) }),
+        (2, 1) => json!({ "value": b[0] & 0x80 != 0, "flags": flags(b[0]) }),
+        (2, 2) => json!({ "value": b[0] & 0x80 != 0, "flags": flags(b[0]), "time": dnp_time(&b[1..7]) }),
+        (2, 3) => json!({ "value": b[0] & 0x80 != 0, "flags": flags(b[0]), "relative_ms": u(&b[1..3]) }),
+        (12, 1) => json!({ "code": b[0], "count": b[1], "on_ms": u(&b[2..6]), "off_ms": u(&b[6..10]), "status": control_status(b[10]) }),
+        (20, 1) | (21, 1) | (22, 1) | (23, 1) => json!({ "value": u(&b[1..5]), "flags": flags(b[0]) }),
+        (20, 2) | (21, 2) | (22, 2) | (23, 2) => json!({ "value": u(&b[1..3]), "flags": flags(b[0]) }),
+        (20, 5) | (21, 5) => json!({ "value": u(&b[..4]) }),
+        (20, 6) | (21, 6) => json!({ "value": u(&b[..2]) }),
+        (22, 5) | (23, 5) => json!({ "value": u(&b[1..5]), "flags": flags(b[0]), "time": dnp_time(&b[5..11]) }),
+        (22, 6) | (23, 6) => json!({ "value": u(&b[1..3]), "flags": flags(b[0]), "time": dnp_time(&b[3..9]) }),
+        (30, 1) | (32, 1) | (40, 1) => json!({ "value": i32_at(&b[1..]), "flags": flags(b[0]) }),
+        (30, 2) | (32, 2) | (40, 2) => json!({ "value": i16_at(&b[1..]), "flags": flags(b[0]) }),
+        (30, 3) => json!({ "value": i32_at(b) }),
+        (30, 4) => json!({ "value": i16_at(b) }),
+        (30, 5) | (32, 5) | (40, 3) => json!({ "value": f32_at(&b[1..]), "flags": flags(b[0]) }),
+        (30, 6) | (32, 6) | (40, 4) => json!({ "value": f64_at(&b[1..9]), "flags": flags(b[0]) }),
+        (32, 3) => json!({ "value": i32_at(&b[1..]), "flags": flags(b[0]), "time": dnp_time(&b[5..11]) }),
+        (32, 4) => json!({ "value": i16_at(&b[1..]), "flags": flags(b[0]), "time": dnp_time(&b[3..9]) }),
+        (32, 7) => json!({ "value": f32_at(&b[1..]), "flags": flags(b[0]), "time": dnp_time(&b[5..11]) }),
+        (32, 8) => json!({ "value": f64_at(&b[1..9]), "flags": flags(b[0]), "time": dnp_time(&b[9..15]) }),
+        (41, 1) => json!({ "value": i32_at(b), "status": control_status(b[4]) }),
+        (41, 2) => json!({ "value": i16_at(b), "status": control_status(b[2]) }),
+        (41, 3) => json!({ "value": f32_at(b), "status": control_status(b[4]) }),
+        (41, 4) => json!({ "value": f64_at(&b[..8]), "status": control_status(b[8]) }),
+        (50, _) | (51, _) => json!({ "time": dnp_time(&b[..6]) }),
+        (52, _) => json!({ "ms": u(&b[..2]) }),
+        _ => json!({ "raw": hex::encode(b) }),
+    }
+}
+
+/// Object headers and their data, all of them: a list of points, each with `group`, `variation`, `kind`, and `index` where there is one.
+fn read_objects(mut b: &[u8]) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    while !b.is_empty() {
+        if b.len() < 3 {
+            return Err("a cut-off object header".into());
+        }
+        let (g, v, q) = (b[0], b[1], b[2]);
+        b = &b[3..];
+        let (mode, prefix, range) = (q >> 4 & 7, q >> 4 & 7, q & 15);
+        let need = |b: &[u8], n: usize| if b.len() < n { Err("a cut-off object".to_string()) } else { Ok(()) };
+        let read_u = |b: &[u8], n: usize| b[..n].iter().rev().fold(0usize, |a, y| a << 8 | *y as usize);
+        let (start, count) = match range {
+            0 | 1 => {
+                let w = 1 << range;
+                need(b, w * 2)?;
+                let (s, e) = (read_u(b, w), read_u(&b[w..], w));
+                b = &b[w * 2..];
+                if e < s {
+                    return Err("an object range that ends before it starts".into());
+                }
+                (Some(s), e - s + 1)
+            }
+            6 => (None, 0),
+            7 | 8 => {
+                let w = range as usize - 6;
+                need(b, w)?;
+                let n = read_u(b, w);
+                b = &b[w..];
+                (None, n)
+            }
+            r => return Err(format!("object range specifier {} is not one this reads", r)),
+        };
+        let _ = mode;
+        let size = object_size(g, v).ok_or(format!("group {} variation {} is not known", g, v))?;
+        let index_bytes = match prefix {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            p => return Err(format!("object prefix {} is not one this reads", p)),
+        };
+        if size == 0 {
+            let bytes = count.div_ceil(8);
+            need(b, bytes)?;
+            for i in 0..count {
+                let bit = b[i / 8] >> (i % 8) & 1 == 1;
+                out.push(json!({ "group": g, "variation": v, "kind": kind_of(g), "index": start.unwrap_or(0) + i, "value": bit }));
+            }
+            b = &b[bytes..];
+            continue;
+        }
+        for i in 0..count {
+            need(b, index_bytes + size)?;
+            let idx = if index_bytes > 0 { read_u(b, index_bytes) } else { start.unwrap_or(0) + i };
+            let mut o = read_object(g, v, &b[index_bytes..index_bytes + size]);
+            o["group"] = json!(g);
+            o["variation"] = json!(v);
+            o["kind"] = json!(kind_of(g));
+            o["index"] = json!(idx);
+            out.push(o);
+            b = &b[index_bytes + size..];
+        }
+    }
+    Ok(out)
+}
+
+/// Reads an application fragment's hex into { fir, fin, con, uns, seq, function, iin, objects }: a response or unsolicited response.
+pub fn dnp3_parse_response(hex_text: &str) -> Result<serde_json::Value, String> {
+    let b = hex::decode(hex_text.split_whitespace().collect::<String>()).map_err(|_| "that is not hex".to_string())?;
+    if b.len() < 4 {
+        return Err("a response has 4 bytes at least".into());
+    }
+    Ok(json!({ "fir": b[0] & 0x80 != 0, "fin": b[0] & 0x40 != 0, "con": b[0] & 0x20 != 0, "uns": b[0] & 0x10 != 0, "seq": b[0] & 15, "function": b[1], "iin": iin_of(b[2], b[3]), "objects": read_objects(&b[4..])? }))
+}
+
+// ---- The master ----
+
+struct Fragment {
+    ac: u8,
+    fc: u8,
+    body: Vec<u8>,
+}
+
+struct Master {
+    s: TcpStream,
+    local: u16,
+    remote: u16,
+    app_seq: u8,
+    tr_seq: u8,
+    timeout: Duration,
+    unsolicited: VecDeque<Value>,
+    partial: Vec<u8>,
+    rx_seq: Option<u8>,
+    buf: Vec<u8>,
+    crc_errors: u64,
+}
+
+type Slot = Arc<Mutex<Master>>;
+static MASTERS: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
+
+fn slot(name: &str) -> Result<Slot, String> {
+    MASTERS.lock().map_err(|e| e.to_string())?.as_ref().and_then(|m| m.get(name)).cloned().ok_or(format!("no connection called `{}`: call dnp3_connect first", name))
+}
+
+impl Master {
+    /// Splits an application fragment into transport segments, each in a link frame with no confirmation.
+    fn send_app(&mut self, app: &[u8]) -> Result<(), String> {
+        let pieces: Vec<&[u8]> = app.chunks(249).collect();
+        let n = pieces.len();
+        let mut out = vec![];
+        for (i, p) in pieces.into_iter().enumerate() {
+            let mut t = vec![if i == 0 { 0x40 } else { 0 } | if i == n - 1 { 0x80 } else { 0 } | self.tr_seq];
+            t.extend(p);
+            self.tr_seq = (self.tr_seq + 1) & 0x3f;
+            out.extend(link_frame(0xc4, self.remote, self.local, &t));
+        }
+        self.s.write_all(&out).map_err(|e| format!("the link broke: {}", e))
+    }
+    /// The next whole link frame's user data, waiting at most `limit`. Frames with bad CRCs are dropped, as a link layer does; a resync looks for 05 64.
+    fn next_frame(&mut self, limit: Instant) -> Result<Option<(u8, Vec<u8>)>, String> {
+        loop {
+            while self.buf.len() >= 2 && !(self.buf[0] == 0x05 && self.buf[1] == 0x64) {
+                self.buf.remove(0);
+            }
+            if self.buf.len() >= 10 {
+                if crc(&self.buf[..8]).to_le_bytes() != self.buf[8..10] {
+                    self.crc_errors += 1;
+                    self.buf.remove(0);
+                    continue;
+                }
+                let n = self.buf[2] as usize;
+                if n < 5 {
+                    self.buf.drain(..10);
+                    continue;
+                }
+                let user = n - 5;
+                let total = 10 + user + user.div_ceil(16) * 2;
+                if self.buf.len() >= total {
+                    let f: Vec<u8> = self.buf.drain(..total).collect();
+                    let dest = u16::from_le_bytes([f[4], f[5]]);
+                    let mut data = vec![];
+                    let mut good = true;
+                    let mut at = 10;
+                    let mut left = user;
+                    while left > 0 {
+                        let k = left.min(16);
+                        if crc(&f[at..at + k]).to_le_bytes() != f[at + k..at + k + 2] {
+                            good = false;
+                            break;
+                        }
+                        data.extend(&f[at..at + k]);
+                        at += k + 2;
+                        left -= k;
+                    }
+                    if !good {
+                        self.crc_errors += 1;
+                        continue;
+                    }
+                    if dest != self.local {
+                        continue;
+                    }
+                    return Ok(Some((f[3], data)));
+                }
+            }
+            let now = Instant::now();
+            if now >= limit {
+                return Ok(None);
+            }
+            let _ = self.s.set_read_timeout(Some((limit - now).max(Duration::from_millis(5))));
+            let mut tmp = [0u8; 2048];
+            match self.s.read(&mut tmp) {
+                Ok(0) => return Err("the outstation closed the connection".into()),
+                Ok(n) => self.buf.extend(&tmp[..n]),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
+                Err(e) => return Err(format!("the link broke: {}", e)),
+            }
+        }
+    }
+    /// The next whole application fragment, its transport segments put back together in order.
+    fn next_fragment(&mut self, limit: Instant) -> Result<Option<Fragment>, String> {
+        loop {
+            let Some((ctrl, data)) = self.next_frame(limit)? else { return Ok(None) };
+            let f = ctrl & 15;
+            if ctrl & 0x40 == 0 {
+                continue; // A secondary frame, as an ACK: nothing waits for one here.
+            }
+            if f == 9 {
+                let answer = link_frame(0x0b | if ctrl & 0x80 == 0 { 0x80 } else { 0 }, self.remote, self.local, &[]);
+                self.s.write_all(&answer).map_err(|e| format!("the link broke: {}", e))?;
+                continue;
+            }
+            if (f != 3 && f != 4) || data.is_empty() {
+                continue;
+            }
+            if f == 3 {
+                let answer = link_frame(0x00, self.remote, self.local, &[]);
+                self.s.write_all(&answer).map_err(|e| format!("the link broke: {}", e))?;
+            }
+            let t = data[0];
+            let (fir, fin, seq) = (t & 0x40 != 0, t & 0x80 != 0, t & 0x3f);
+            if fir {
+                self.partial.clear();
+            } else if self.rx_seq != Some(seq) {
+                self.partial.clear();
+                continue; // A lost segment drops what was gathered, and the request times out.
+            }
+            self.rx_seq = Some((seq + 1) & 0x3f);
+            self.partial.extend(&data[1..]);
+            if fin {
+                let a = std::mem::take(&mut self.partial);
+                if a.len() < 2 {
+                    continue;
+                }
+                return Ok(Some(Fragment { ac: a[0], fc: a[1], body: a[2..].to_vec() }));
+            }
+        }
+    }
+    fn confirm(&mut self, seq: u8, uns: bool) -> Result<(), String> {
+        let ac = 0xc0 | if uns { 0x10 } else { 0 } | (seq & 15);
+        self.send_app(&[ac, 0])
+    }
+    fn keep_unsolicited(&mut self, f: &Fragment) -> Result<(), String> {
+        if f.body.len() < 2 {
+            return Ok(());
+        }
+        let objects = read_objects(&f.body[2..])?;
+        self.unsolicited.push_back(json!({ "seq": f.ac & 15, "iin": iin_of(f.body[0], f.body[1]), "objects": objects }));
+        if f.ac & 0x20 != 0 {
+            self.confirm(f.ac & 15, true)?;
+        }
+        Ok(())
+    }
+    /// One request and all the fragments of its answer: a CON is confirmed, and an unsolicited message on the way is kept for `dnp3_receive`.
+    fn request(&mut self, fc: u8, objects: &[u8]) -> Result<(Value, Vec<Value>), String> {
+        let seq = self.app_seq;
+        self.app_seq = (self.app_seq + 1) & 15;
+        let mut app = vec![0xc0 | seq, fc];
+        app.extend(objects);
+        self.send_app(&app)?;
+        let mut limit = Instant::now() + self.timeout;
+        let mut out = vec![];
+        let mut iin = Value::Null;
+        let mut expect = seq;
+        loop {
+            let Some(f) = self.next_fragment(limit)? else {
+                return Err(format!("no answer from the outstation in {} ms", self.timeout.as_millis()));
+            };
+            if f.fc == 130 {
+                self.keep_unsolicited(&f)?;
+                continue;
+            }
+            if f.fc != 129 || f.ac & 15 != expect {
+                continue;
+            }
+            if f.body.len() < 2 {
+                return Err("a response with no IIN".into());
+            }
+            iin = iin_of(f.body[0], f.body[1]);
+            out.extend(read_objects(&f.body[2..])?);
+            if f.ac & 0x20 != 0 {
+                self.confirm(f.ac & 15, false)?;
+            }
+            if f.ac & 0x40 != 0 {
+                return Ok((iin, out));
+            }
+            expect = (expect + 1) & 15;
+            limit = Instant::now() + self.timeout;
+        }
+    }
+}
+
+/// Connects to an outstation: `options` is { host (else DNP3_HOST, host:port, 20000 by default), master (1), outstation (10), timeout_ms (5000) }. Asks its link status first, so a wrong address is said at once. Gives true.
+pub fn dnp3_connect(name: &str, options: serde_json::Value) -> Result<bool, String> {
+    let host = options.get("host").and_then(|h| h.as_str()).map(str::to_string).or_else(|| std::env::var("DNP3_HOST").ok()).unwrap_or("127.0.0.1:20000".into());
+    let addr = if host.contains(':') { host.clone() } else { format!("{}:20000", host) };
+    let n = |k: &str, d: u64| options.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+    let t = Duration::from_millis(n("timeout_ms", 5000));
+    let sa = addr.to_socket_addrs().map_err(|e| format!("{}: {}", addr, e))?.next().ok_or(format!("{} has no address", addr))?;
+    let s = TcpStream::connect_timeout(&sa, t).map_err(|e| format!("cannot reach the outstation at {}: {}", addr, e))?;
+    s.set_nodelay(true).map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(t)).map_err(|e| e.to_string())?;
+    let mut m = Master { s, local: n("master", 1) as u16, remote: n("outstation", 10) as u16, app_seq: 0, tr_seq: 0, timeout: t, unsolicited: VecDeque::new(), partial: vec![], rx_seq: None, buf: vec![], crc_errors: 0 };
+    let f = link_frame(0xc9, m.remote, m.local, &[]);
+    m.s.write_all(&f).map_err(|e| format!("the link broke: {}", e))?;
+    let limit = Instant::now() + t;
+    loop {
+        match m.next_frame(limit)? {
+            Some((c, _)) if c & 0x40 == 0 && c & 15 == 11 => break,
+            Some(_) => continue,
+            None => return Err(format!("outstation {} gave no link status: is the address right?", m.remote)),
+        }
+    }
+    let mut g = MASTERS.lock().map_err(|e| e.to_string())?;
+    g.get_or_insert_with(HashMap::new).insert(name.to_string(), Arc::new(Mutex::new(m)));
+    Ok(true)
+}
+
+/// Closes a connection.
+pub fn dnp3_close(name: &str) -> Result<bool, String> {
+    Ok(MASTERS.lock().map_err(|e| e.to_string())?.as_mut().and_then(|m| m.remove(name)).is_some())
+}
+
+fn answer(iin: Value, points: Vec<Value>) -> Value {
+    json!({ "iin": iin, "points": points })
+}
+
+/// A class poll: `classes` is a list from 0 to 3, 0 being static data and 1 to 3 events. Gives { iin, points }, the events confirmed. `[1, 2, 3, 0]` is the integrity poll, events first, as a master should do at start.
+pub fn dnp3_read_classes(name: &str, classes: Vec<i64>) -> Result<serde_json::Value, String> {
+    if classes.is_empty() {
+        return Err("name at least one class, 0 to 3".into());
+    }
+    let mut b = vec![];
+    for c in &classes {
+        if !(0..=3).contains(c) {
+            return Err(format!("{} is not a class: 0 to 3", c));
+        }
+        b.extend([60, *c as u8 + 1, 0x06]);
+    }
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let (iin, p) = m.request(1, &b)?;
+    Ok(answer(iin, p))
+}
+
+/// Reads a group and variation, all of it, or `start` to `stop` when those are 0 or more. Variation 0 asks for the outstation's default. Gives { iin, points }; an answer with nothing but object_unknown or parameter_error is an error value.
+pub fn dnp3_read(name: &str, group: i64, variation: i64, start: i64, stop: i64) -> Result<serde_json::Value, String> {
+    let mut b = vec![group as u8, variation as u8];
+    if start >= 0 && stop >= start {
+        if stop > 255 {
+            b.push(0x01);
+            b.extend((start as u16).to_le_bytes());
+            b.extend((stop as u16).to_le_bytes());
+        } else {
+            b.extend([0x00, start as u8, stop as u8]);
+        }
+    } else {
+        b.push(0x06);
+    }
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let (iin, p) = m.request(1, &b)?;
+    // An empty answer that says it could not do this is a refusal, not "no data".
+    if p.is_empty() && iin.as_array().is_some_and(|l| l.iter().any(|x| matches!(x.as_str(), Some("object_unknown" | "parameter_error" | "no_function_support")))) {
+        return Err(format!("the outstation refused group {} variation {}: IIN {}", group, variation, iin));
+    }
+    Ok(answer(iin, p))
+}
+
+fn control(m: &mut Master, objects: &[u8], fc: u8, what: &str) -> Result<Value, String> {
+    let (iin, p) = m.request(fc, objects)?;
+    let status = p.first().map(|x| x["status"].clone()).unwrap_or(Value::Null);
+    if status != "success" {
+        let more = if iin.as_array().is_some_and(|l| !l.is_empty()) { format!(", IIN {}", iin) } else { String::new() };
+        return Err(format!("{} failed: {}{}", what, status.as_str().unwrap_or("no status came back"), more));
+    }
+    Ok(json!({ "status": status, "iin": iin }))
+}
+
+fn sbo(m: &mut Master, objects: &[u8], o: &Value, what: &str) -> Result<Value, String> {
+    if o.get("direct") == Some(&Value::Bool(true)) {
+        return control(m, objects, 5, what);
+    }
+    control(m, objects, 3, &format!("select of {}", what))?;
+    control(m, objects, 4, &format!("operate of {}", what))
+}
+
+/// Operates a control relay, group 12, by select then operate: `action` is latch_on, latch_off, pulse_on, pulse_off, trip or close. Options: direct (true: DIRECT_OPERATE, no select), on_ms, off_ms, count. Gives { status, iin }; any status but success is an error value saying which step.
+pub fn dnp3_operate(name: &str, index: i64, action: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let code = match action {
+        "pulse_on" => 0x01u8,
+        "pulse_off" => 0x02,
+        "latch_on" => 0x03,
+        "latch_off" => 0x04,
+        "close" => 0x41,
+        "trip" => 0x81,
+        x => return Err(format!("`{}` is not an action: latch_on, latch_off, pulse_on, pulse_off, trip or close", x)),
+    };
+    if !(0..=65535).contains(&index) {
+        return Err(format!("{} is not an index", index));
+    }
+    let n = |k: &str, d: u64| options.get(k).and_then(|v| v.as_u64()).unwrap_or(d) as u32;
+    let mut b = vec![12, 1, 0x28, 1, 0];
+    b.extend((index as u16).to_le_bytes());
+    b.push(code);
+    b.push(n("count", 1) as u8);
+    b.extend(n("on_ms", 100).to_le_bytes());
+    b.extend(n("off_ms", 100).to_le_bytes());
+    b.push(0);
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    sbo(&mut m, &b, &options, &format!("relay {}", index))
+}
+
+/// Sets an analog output, group 41: float by default, or the option int: true for 32 bits. Select then operate unless the option direct is true.
+pub fn dnp3_analog_output(name: &str, index: i64, value: f64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let as_int = options.get("int") == Some(&Value::Bool(true));
+    let mut b = vec![41, if as_int { 1 } else { 3 }, 0x28, 1, 0];
+    b.extend((index as u16).to_le_bytes());
+    if as_int {
+        b.extend((value as i32).to_le_bytes());
+    } else {
+        b.extend((value as f32).to_le_bytes());
+    }
+    b.push(0);
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    sbo(&mut m, &b, &options, &format!("analog output {}", index))
+}
+
+/// Clears the outstation's device_restart bit, which a master must do after a restart.
+pub fn dnp3_clear_restart(name: &str) -> Result<serde_json::Value, String> {
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let (iin, _) = m.request(2, &[80, 1, 0, 7, 7, 0])?;
+    Ok(json!({ "iin": iin }))
+}
+
+/// Writes the time to an outstation that asks for it (need_time): `ms` is Unix milliseconds, group 50 variation 1.
+pub fn dnp3_write_time(name: &str, ms: i64) -> Result<serde_json::Value, String> {
+    let mut b = vec![50, 1, 0x07, 1];
+    b.extend(&ms.to_le_bytes()[..6]);
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let (iin, _) = m.request(2, &b)?;
+    Ok(json!({ "iin": iin }))
+}
+
+/// Turns unsolicited reporting on or off for `classes`, 1 to 3.
+pub fn dnp3_unsolicited(name: &str, on: bool, classes: Vec<i64>) -> Result<serde_json::Value, String> {
+    let mut b = vec![];
+    for c in &classes {
+        if !(1..=3).contains(c) {
+            return Err(format!("{} is not an event class: 1 to 3", c));
+        }
+        b.extend([60, *c as u8 + 1, 0x06]);
+    }
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let (iin, _) = m.request(if on { 20 } else { 21 }, &b)?;
+    Ok(json!({ "iin": iin }))
+}
+
+/// Unsolicited messages that came: up to `max`, waiting at most `wait_ms` for the first. Each is { seq, iin, objects }, already confirmed if it asked.
+pub fn dnp3_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+    let s = slot(name)?;
+    let mut m = s.lock().map_err(|e| e.to_string())?;
+    let limit = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    while m.unsolicited.is_empty() {
+        let Some(f) = m.next_fragment(limit)? else { break };
+        if f.fc == 130 {
+            m.keep_unsolicited(&f)?;
+        }
+    }
+    let n = (max.max(0) as usize).min(m.unsolicited.len());
+    Ok(m.unsolicited.drain(..n).collect())
+}
+
+/// How many frames with a bad CRC were dropped: a noisy line shows here.
+pub fn dnp3_crc_errors(name: &str) -> Result<i64, String> {
+    let s = slot(name)?;
+    let m = s.lock().map_err(|e| e.to_string())?;
+    Ok(m.crc_errors as i64)
+}

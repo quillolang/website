@@ -1,0 +1,216 @@
+//! Nominatim, OpenStreetMap's geocoder: places by name or structured address, reverse lookups and OSM ids, address parts tidied, and the public server's usage policy kept by a User-Agent, one request a second, and a cache.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+const PUBLIC: &str = "https://nominatim.openstreetmap.org";
+const TTL: Duration = Duration::from_secs(24 * 3600);
+
+fn base() -> String {
+    std::env::var("NOMINATIM_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or(PUBLIC.to_string()).trim_end_matches('/').to_string()
+}
+
+fn user_agent() -> Result<String, String> {
+    match std::env::var("NOMINATIM_USER_AGENT").ok().filter(|v| !v.trim().is_empty()) {
+        Some(u) => Ok(u),
+        None => Err("set NOMINATIM_USER_AGENT to something naming your application and how to reach you, like `myshop/1.0 (ops@example.com)`: the usage policy requires it, and the public server refuses stock ones".into()),
+    }
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~,".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// The policy asks for one request a second across the whole application, so every thread queues
+// here. Your own Nominatim can set NOMINATIM_MIN_INTERVAL_MS lower.
+static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn wait_turn() {
+    let gap = std::env::var("NOMINATIM_MIN_INTERVAL_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *last {
+        let spent = t.elapsed();
+        if spent < Duration::from_millis(gap) {
+            sleep(Duration::from_millis(gap) - spent);
+        }
+    }
+    *last = Some(Instant::now());
+}
+
+fn cache() -> &'static Mutex<HashMap<String, (Instant, Value)>> {
+    static C: OnceLock<Mutex<HashMap<String, (Instant, Value)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn call(path: &str, params: Vec<(String, String)>) -> Result<Value, String> {
+    let ua = user_agent()?;
+    let q: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect();
+    let url = format!("{}{}?{}", base(), path, q.join("&"));
+    // The policy asks that results be kept; the same question a day later costs the server nothing.
+    if let Some((t, v)) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&url) {
+        if t.elapsed() < TTL {
+            return Ok(v.clone());
+        }
+    }
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).user_agent(&ua).build();
+    for attempt in 0..2 {
+        wait_turn();
+        match agent.get(&url).call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                let v: Value = serde_json::from_str(&t).map_err(|_| format!("Nominatim's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))?;
+                let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+                if c.len() >= 4096 {
+                    c.clear();
+                }
+                c.insert(url, (Instant::now(), v.clone()));
+                return Ok(v);
+            }
+            Err(ureq::Error::Status(429, _)) if attempt == 0 => sleep(Duration::from_secs(2)),
+            Err(ureq::Error::Status(403, _)) => return Err("Nominatim answered 403: the User-Agent was refused, or this address is blocked for too many requests".into()),
+            Err(ureq::Error::Status(429, _)) => return Err("Nominatim answered 429: slow down, the public server takes one request a second".into()),
+            Err(ureq::Error::Status(code, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let msg = serde_json::from_str::<Value>(&t).ok().and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from)).unwrap_or(t.chars().take(200).collect());
+                return Err(format!("Nominatim answered {}: {}", code, msg));
+            }
+            Err(e) => return Err(format!("cannot reach Nominatim: {}", e)),
+        }
+    }
+    Err("Nominatim kept answering 429".into())
+}
+
+const CITY: [&str; 6] = ["city", "town", "village", "hamlet", "municipality", "suburb"];
+
+/// Address parts as one shape, whatever the place: { house_number, road, neighbourhood, city, county, state, postcode, country, country_code }. Nominatim says city, town, village or hamlet by size, so `city` takes the first it finds.
+pub fn nominatim_address(place: serde_json::Value) -> Value {
+    let a = place.get("address").cloned().unwrap_or(place);
+    let text = |k: &str| a.get(k).cloned().unwrap_or(Value::Null);
+    let city = CITY.iter().find_map(|k| a.get(*k)).cloned().unwrap_or(Value::Null);
+    let near = ["neighbourhood", "quarter", "suburb"].iter().find_map(|k| a.get(*k)).cloned().unwrap_or(Value::Null);
+    let house = a.get("house_number").or(a.get("house_name")).cloned().unwrap_or(Value::Null);
+    let road = ["road", "pedestrian", "footway", "path", "cycleway"].iter().find_map(|k| a.get(*k)).cloned().unwrap_or(Value::Null);
+    json!({ "house_number": house, "road": road, "neighbourhood": near, "city": city, "county": text("county"), "state": text("state"), "postcode": text("postcode"), "country": text("country"), "country_code": text("country_code") })
+}
+
+fn num(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::String(s)) => s.parse::<f64>().map(|x| json!(x)).unwrap_or(Value::Null),
+        Some(x) => x.clone(),
+        None => Value::Null,
+    }
+}
+
+// Lat, lon and the box come as strings; here they are numbers, the box as west, south, east, north.
+fn tidy(p: &Value) -> Value {
+    let box_: Option<Vec<f64>> = p.get("boundingbox").and_then(|b| b.as_array()).map(|b| b.iter().filter_map(|x| x.as_str().and_then(|s| s.parse().ok())).collect());
+    let mut o = Map::new();
+    o.insert("name".into(), p.get("name").cloned().unwrap_or(Value::Null));
+    o.insert("display_name".into(), p.get("display_name").cloned().unwrap_or(Value::Null));
+    o.insert("lat".into(), num(p.get("lat")));
+    o.insert("lon".into(), num(p.get("lon")));
+    o.insert("bbox".into(), box_.filter(|b| b.len() == 4).map(|b| json!([b[2], b[0], b[3], b[1]])).unwrap_or(Value::Null));
+    o.insert("category".into(), p.get("category").cloned().unwrap_or(Value::Null));
+    o.insert("type".into(), p.get("type").cloned().unwrap_or(Value::Null));
+    o.insert("importance".into(), p.get("importance").cloned().unwrap_or(Value::Null));
+    let id = match (p.get("osm_type").and_then(|t| t.as_str()), p.get("osm_id")) {
+        (Some(t), Some(i)) => json!(format!("{}{}", t.chars().next().unwrap_or('?').to_ascii_uppercase(), i)),
+        _ => Value::Null,
+    };
+    o.insert("osm_id".into(), id);
+    o.insert("address".into(), if p.get("address").is_some() { nominatim_address(p.clone()) } else { Value::Null });
+    if let Some(x) = p.get("extratags") {
+        o.insert("extratags".into(), x.clone());
+    }
+    o.insert("licence".into(), p.get("licence").cloned().unwrap_or(Value::Null));
+    Value::Object(o)
+}
+
+fn shared(options: &Value, p: &mut Vec<(String, String)>) -> Result<(), String> {
+    p.push(("format".into(), "jsonv2".into()));
+    p.push(("addressdetails".into(), "1".into()));
+    for (k, v) in options.as_object().ok_or("options must be a map")? {
+        let text = v.as_str().map(String::from).unwrap_or(v.to_string());
+        match k.as_str() {
+            "language" => p.push(("accept-language".into(), text)),
+            "limit" | "countrycodes" | "viewbox" | "layer" | "zoom" | "featureType" | "email" | "polygon_threshold" => p.push((k.clone(), text)),
+            "bounded" | "extratags" | "namedetails" | "dedupe" => p.push((k.clone(), if v == &json!(true) { "1".to_string() } else if v == &json!(false) { "0".to_string() } else { text })),
+            o => return Err(format!("no option `{}`; there are language, limit, countrycodes, viewbox, bounded, zoom, layer, featureType, extratags, namedetails, email", o)),
+        }
+    }
+    Ok(())
+}
+
+/// Places by free text, best first: [{ name, display_name, lat, lon, bbox, category, type, importance, osm_id, address, licence }]. `options`: { limit, countrycodes, viewbox, bounded, language, extratags, email }. No match is an empty list. Show the `licence`: OpenStreetMap's attribution is required.
+pub fn nominatim_search(query: &str, options: serde_json::Value) -> Result<Value, String> {
+    if query.trim().is_empty() {
+        return Err("nothing to search for".into());
+    }
+    let mut p = vec![("q".to_string(), query.trim().to_string())];
+    shared(&options, &mut p)?;
+    let v = call("/search", p)?;
+    Ok(json!(v.as_array().map(|a| a.iter().map(tidy).collect::<Vec<_>>()).unwrap_or_default()))
+}
+
+/// Places by a structured address, which finds better than one line: { street, city, county, state, country, postalcode, amenity }, with `street` holding the number and name.
+pub fn nominatim_structured(address: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let a = address.as_object().ok_or("give the address as a map")?;
+    let mut p = vec![];
+    for (k, v) in a {
+        if !["street", "city", "county", "state", "country", "postalcode", "amenity"].contains(&k.as_str()) {
+            return Err(format!("no address part `{}`; there are street, city, county, state, country, postalcode, amenity", k));
+        }
+        p.push((k.clone(), v.as_str().map(String::from).unwrap_or(v.to_string())));
+    }
+    if p.is_empty() {
+        return Err("an empty address".into());
+    }
+    shared(&options, &mut p)?;
+    let v = call("/search", p)?;
+    Ok(json!(v.as_array().map(|a| a.iter().map(tidy).collect::<Vec<_>>()).unwrap_or_default()))
+}
+
+/// The place at a position, or null where there is nothing, as at sea. `options`: { zoom (3 country to 18 building), language, layer }. Not an error, as Nominatim's own `Unable to geocode` is an ordinary answer.
+pub fn nominatim_reverse(lat: f64, lon: f64, options: serde_json::Value) -> Result<Value, String> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(format!("({}, {}) is not a position", lat, lon));
+    }
+    let mut p = vec![("lat".to_string(), lat.to_string()), ("lon".to_string(), lon.to_string())];
+    shared(&options, &mut p)?;
+    let v = call("/reverse", p)?;
+    if v.get("error").is_some() {
+        return Ok(Value::Null);
+    }
+    Ok(tidy(&v))
+}
+
+/// Places by OpenStreetMap id, up to 50: `["W95014", "N240109189", "R146656"]`. An id with no place is left out of the answer.
+pub fn nominatim_lookup(ids: Vec<String>, options: serde_json::Value) -> Result<Value, String> {
+    if ids.is_empty() || ids.len() > 50 {
+        return Err(format!("lookup takes 1 to 50 ids, not {}", ids.len()));
+    }
+    for i in &ids {
+        let ok = i.len() > 1 && matches!(i.as_bytes()[0], b'N' | b'W' | b'R') && i[1..].bytes().all(|b| b.is_ascii_digit());
+        if !ok {
+            return Err(format!("`{}` is no OSM id: N, W or R and a number", i));
+        }
+    }
+    let mut p = vec![("osm_ids".to_string(), ids.join(","))];
+    shared(&options, &mut p)?;
+    let v = call("/lookup", p)?;
+    Ok(json!(v.as_array().map(|a| a.iter().map(tidy).collect::<Vec<_>>()).unwrap_or_default()))
+}
+
+/// The server's health: { ok, message, data_updated, software_version }. For a self-hosted Nominatim; it is not cached by a client that wants the truth, so call it sparingly.
+pub fn nominatim_status() -> Result<Value, String> {
+    let v = call("/status", vec![("format".to_string(), "json".to_string())])?;
+    Ok(json!({ "ok": v.get("status") == Some(&json!(0)), "message": v.get("message"), "data_updated": v.get("data_updated"), "software_version": v.get("software_version") }))
+}

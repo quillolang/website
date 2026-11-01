@@ -1,0 +1,972 @@
+//! Cap'n Proto messages read and written with no generated code, from a schema given as data: segments, struct and list pointers, composite lists, far pointers followed or refused, field layout worked out as capnpc does, defaults by XOR, unions, the packed encoding, and limits against hostile messages.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+// A schema: { root: "Person", structs: { Person: { fields: [...] } }, enums: { Kind: ["a", "b"] } }.
+// A field: { name, type, default }, in ordinal order. Types: void, bool, int8 to int64, uint8 to
+// uint64, float32, float64, text, data, a struct's or enum's name, or { list: type }.
+// Its place in the struct is worked out as capnpc works it out, so that the fields must be given in
+// @ordinal order. A struct with unions needs places given: `capnp compile -ocapnp` prints them, and
+// a field then has `bits: [0, 16]` or `ptr: 0`, with `when: 1` for a union member, and the struct
+// has `data_words`, `pointer_words` and `tag_bits`, the discriminant's bit offset.
+
+const DEFAULT_TRAVERSAL: u64 = 8 << 20; // words, as Cap'n Proto's own default
+const MAX_DEPTH: usize = 64;
+const MAX_UNPACKED: usize = 256 << 20;
+
+#[derive(Clone, Debug)]
+enum Ty {
+    Void,
+    Bool,
+    Int(u32, bool), // bits, signed
+    Float(u32),
+    Text,
+    Data,
+    Enum(String),
+    Struct(String),
+    List(Box<Ty>),
+}
+
+#[derive(Clone, Debug)]
+enum Place {
+    None,
+    Bits(u32),
+    Ptr(u32),
+}
+
+#[derive(Clone, Debug)]
+struct Field {
+    name: String,
+    ty: Ty,
+    place: Place,
+    default: Value,
+    when: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+struct Layout {
+    data_words: u32,
+    pointers: u32,
+    tag_bits: Option<u32>,
+    fields: Vec<Field>,
+}
+
+struct Schema {
+    structs: HashMap<String, Layout>,
+    enums: HashMap<String, Vec<String>>,
+    root: String,
+}
+
+fn parse_type(t: &Value, s: &Value) -> Result<Ty, String> {
+    match t {
+        Value::Object(m) => {
+            let e = m.get("list").ok_or(format!("{} is not a type: a map must be {{ list: type }}", t))?;
+            Ok(Ty::List(Box::new(parse_type(e, s)?)))
+        }
+        Value::String(n) => Ok(match n.as_str() {
+            "void" => Ty::Void,
+            "bool" => Ty::Bool,
+            "int8" => Ty::Int(8, true),
+            "int16" => Ty::Int(16, true),
+            "int32" => Ty::Int(32, true),
+            "int64" => Ty::Int(64, true),
+            "uint8" => Ty::Int(8, false),
+            "uint16" => Ty::Int(16, false),
+            "uint32" => Ty::Int(32, false),
+            "uint64" => Ty::Int(64, false),
+            "float32" => Ty::Float(32),
+            "float64" => Ty::Float(64),
+            "text" => Ty::Text,
+            "data" => Ty::Data,
+            x if s.get("structs").and_then(|v| v.get(x)).is_some() => Ty::Struct(x.to_string()),
+            x if s.get("enums").and_then(|v| v.get(x)).is_some() => Ty::Enum(x.to_string()),
+            x => return Err(format!("`{}` is not a type here", x)),
+        }),
+        _ => Err(format!("{} is not a type", t)),
+    }
+}
+
+// Sizes as log2 of bits: bool 0, byte 3, ... word 6.
+fn lg_size(t: &Ty) -> Option<u32> {
+    match t {
+        Ty::Bool => Some(0),
+        Ty::Int(b, _) | Ty::Float(b) => Some(b.trailing_zeros()),
+        Ty::Enum(_) => Some(4),
+        _ => None,
+    }
+}
+
+// capnpc's hole table: `holes[n]` is the bit offset of a free 2^n-bit slot, in units of that size.
+#[derive(Default)]
+struct Holes {
+    at: [Option<u32>; 6],
+}
+
+impl Holes {
+    fn try_allocate(&mut self, lg: u32) -> Option<u32> {
+        if lg >= 6 {
+            return None;
+        }
+        if let Some(h) = self.at[lg as usize].take() {
+            return Some(h);
+        }
+        let next = self.try_allocate(lg + 1)?;
+        let result = next * 2;
+        self.at[lg as usize] = Some(result + 1);
+        Some(result)
+    }
+}
+
+fn auto_layout(fields: &mut [Field]) -> (u32, u32) {
+    let (mut words, mut pointers) = (0u32, 0u32);
+    let mut holes = Holes::default();
+    for f in fields.iter_mut() {
+        if matches!(f.ty, Ty::Void) {
+            f.place = Place::None;
+            continue;
+        }
+        match lg_size(&f.ty) {
+            Some(lg) => {
+                let offset = match holes.try_allocate(lg) {
+                    Some(o) => o,
+                    None => {
+                        // A new word: the first slot of it is used, the rest are holes.
+                        let w = words;
+                        words += 1;
+                        let mut size = lg;
+                        let mut off = (w << (6 - lg)) + 1;
+                        while size < 6 {
+                            holes.at[size as usize] = Some(off);
+                            off = (off + 1) >> 1;
+                            size += 1;
+                        }
+                        w << (6 - lg)
+                    }
+                };
+                f.place = Place::Bits(offset << lg);
+            }
+            None => {
+                f.place = Place::Ptr(pointers);
+                pointers += 1;
+            }
+        }
+    }
+    (words, pointers)
+}
+
+fn build_schema(s: &Value, root: &str) -> Result<Schema, String> {
+    let list = s.get("structs").and_then(|v| v.as_object()).ok_or("a schema needs `structs`, a map of name to struct")?;
+    let mut structs = HashMap::new();
+    for (name, d) in list {
+        let fl = d.get("fields").and_then(|v| v.as_array()).ok_or(format!("struct {} needs `fields`", name))?;
+        let mut fields = vec![];
+        let mut placed = false;
+        for f in fl {
+            let n = f.get("name").and_then(|v| v.as_str()).ok_or(format!("a field of {} has no `name`", name))?.to_string();
+            let ty = parse_type(f.get("type").ok_or(format!("{}.{} has no `type`", name, n))?, s).map_err(|e| format!("{}.{}: {}", name, n, e))?;
+            let place = if let Some(b) = f.get("bits").and_then(|v| v.as_array()) {
+                placed = true;
+                Place::Bits(b.first().and_then(|x| x.as_u64()).ok_or(format!("{}.{}: `bits` is [start, end]", name, n))? as u32)
+            } else if let Some(p) = f.get("ptr").and_then(|v| v.as_u64()) {
+                placed = true;
+                Place::Ptr(p as u32)
+            } else {
+                Place::None
+            };
+            let when = f.get("when").and_then(|v| v.as_u64()).map(|x| x as u16);
+            fields.push(Field { name: n, ty, place, default: f.get("default").cloned().unwrap_or(Value::Null), when });
+        }
+        let tag_bits = d.get("tag_bits").and_then(|v| v.as_u64()).map(|x| x as u32);
+        let (data_words, pointers) = if placed || d.get("data_words").is_some() {
+            (d.get("data_words").and_then(|v| v.as_u64()).ok_or(format!("{} gives places, so it needs `data_words`", name))? as u32, d.get("pointer_words").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+        } else {
+            if fields.iter().any(|f| f.when.is_some()) {
+                return Err(format!("struct {} has a union: give `bits` and `ptr` from `capnp compile -ocapnp`", name));
+            }
+            auto_layout(&mut fields)
+        };
+        structs.insert(name.clone(), Layout { data_words, pointers, tag_bits, fields });
+    }
+    let mut enums = HashMap::new();
+    if let Some(m) = s.get("enums").and_then(|v| v.as_object()) {
+        for (k, v) in m {
+            let names: Vec<String> = v.as_array().ok_or(format!("enum {} is a list of names", k))?.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            enums.insert(k.clone(), names);
+        }
+    }
+    let root = if root.is_empty() { s.get("root").and_then(|v| v.as_str()).ok_or("say which struct is the root: `root` in the schema or the options")?.to_string() } else { root.to_string() };
+    if !structs.contains_key(&root) {
+        return Err(format!("no struct `{}` in the schema", root));
+    }
+    Ok(Schema { structs, enums, root })
+}
+
+// Reading.
+
+struct Reader {
+    segments: Vec<Vec<u8>>,
+    left: u64, // traversal budget, in words
+    far: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct At {
+    seg: usize,
+    word: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StructRef {
+    seg: usize,
+    data: usize, // word of the data section
+    data_words: u32,
+    ptr: usize, // word of the pointers
+    pointers: u32,
+}
+
+enum ListRef {
+    Empty,
+    Prim { seg: usize, word: usize, size: u8, count: u32 },
+    Composite { seg: usize, word: usize, count: u32, data_words: u32, pointers: u32 },
+}
+
+impl Reader {
+    fn word(&self, a: At) -> Result<u64, String> {
+        let s = self.segments.get(a.seg).ok_or(format!("a pointer into segment {}, which does not exist", a.seg))?;
+        let i = a.word.checked_mul(8).ok_or("a pointer out of range")?;
+        let b = s.get(i..i + 8).ok_or(format!("a pointer past the end of segment {}", a.seg))?;
+        Ok(u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn spend(&mut self, words: u64) -> Result<(), String> {
+        // Lists of void cost nothing in bytes, so count at least one per element elsewhere.
+        if words > self.left {
+            return Err("the message asks for more than the traversal limit: amplified or cyclic pointers".into());
+        }
+        self.left -= words;
+        Ok(())
+    }
+
+    fn check_span(&self, seg: usize, word: i64, words: u64) -> Result<(), String> {
+        let n = self.segments.get(seg).ok_or(format!("a pointer into segment {}, which does not exist", seg))?.len() as u64 / 8;
+        if word < 0 || (word as u64).checked_add(words).map_or(true, |e| e > n) {
+            return Err(format!("a pointer past the end of segment {}", seg));
+        }
+        Ok(())
+    }
+
+    // Follows far pointers: the pointer that counts, and where its offset is measured from.
+    fn resolve(&self, at: At) -> Result<(u64, At, Option<u64>), String> {
+        let p = self.word(at)?;
+        if p & 3 != 2 {
+            return Ok((p, at, None));
+        }
+        if !self.far {
+            return Err("a far pointer, and this reader was told to refuse them".into());
+        }
+        let double = p & 4 != 0;
+        let offset = ((p as u32) >> 3) as usize;
+        let seg = (p >> 32) as usize;
+        let pad = At { seg, word: offset };
+        let land = self.word(pad)?;
+        if !double {
+            if land & 3 == 2 {
+                return Err("a far pointer landing on another far pointer".into());
+            }
+            return Ok((land, pad, None));
+        }
+        // Double-far: the pad's first word is a far pointer to the content, the second its tag.
+        if land & 7 != 2 {
+            return Err("a double-far landing pad of the wrong kind".into());
+        }
+        let tag = self.word(At { seg, word: offset + 1 })?;
+        let content = At { seg: (land >> 32) as usize, word: ((land as u32) >> 3) as usize };
+        Ok((tag, content, Some(1)))
+    }
+
+    fn struct_at(&mut self, at: At) -> Result<Option<StructRef>, String> {
+        let (p, base, direct) = self.resolve(at)?;
+        if p == 0 {
+            return Ok(None);
+        }
+        if p & 3 != 0 {
+            return Err(format!("a struct was expected; the pointer is of kind {}", p & 3));
+        }
+        let off = ((p as u32 as i32) >> 2) as i64;
+        let (dw, pw) = (((p >> 32) & 0xffff) as u32, (p >> 48) as u32);
+        let word = if direct.is_some() { base.word as i64 } else { base.word as i64 + 1 + off };
+        let n = dw as u64 + pw as u64;
+        self.check_span(base.seg, word, n)?;
+        self.spend(n.max(1))?;
+        Ok(Some(StructRef { seg: base.seg, data: word as usize, data_words: dw, ptr: word as usize + dw as usize, pointers: pw }))
+    }
+
+    fn list_at(&mut self, at: At) -> Result<ListRef, String> {
+        let (p, base, direct) = self.resolve(at)?;
+        if p == 0 {
+            return Ok(ListRef::Empty);
+        }
+        if p & 3 != 1 {
+            return Err(format!("a list was expected; the pointer is of kind {}", p & 3));
+        }
+        let off = ((p as u32 as i32) >> 2) as i64;
+        let size = ((p >> 32) & 7) as u8;
+        let count = (p >> 35) as u32;
+        let word = if direct.is_some() { base.word as i64 } else { base.word as i64 + 1 + off };
+        if size == 7 {
+            self.check_span(base.seg, word, count as u64 + 1)?;
+            let tag = self.word(At { seg: base.seg, word: word as usize })?;
+            if tag & 3 != 0 {
+                return Err("a composite list's tag is not a struct pointer".into());
+            }
+            let n = ((tag as u32 as i32) >> 2) as i64;
+            if n < 0 {
+                return Err("a composite list with a negative count".into());
+            }
+            let (dw, pw) = (((tag >> 32) & 0xffff) as u32, (tag >> 48) as u32);
+            if (n as u64) * (dw as u64 + pw as u64) > count as u64 {
+                return Err("a composite list's tag says more than the list holds".into());
+            }
+            // Empty structs cost nothing in bytes: a billion of them must still cost something.
+            self.spend((count as u64 + 1).max(n as u64))?;
+            return Ok(ListRef::Composite { seg: base.seg, word: word as usize + 1, count: n as u32, data_words: dw, pointers: pw });
+        }
+        let bits: u64 = match size {
+            0 => 0,
+            1 => 1,
+            2 => 8,
+            3 => 16,
+            4 => 32,
+            5 | 6 => 64,
+            _ => 0,
+        };
+        let words = (count as u64 * bits + 63) / 64;
+        self.check_span(base.seg, word, words)?;
+        self.spend(words.max(count as u64 / 8).max(1))?;
+        Ok(ListRef::Prim { seg: base.seg, word: word as usize, size, count })
+    }
+
+    fn bytes(&self, seg: usize, word: usize, n: usize) -> Result<&[u8], String> {
+        self.segments[seg].get(word * 8..word * 8 + n).ok_or("a list past the end of its segment".to_string())
+    }
+
+    fn data_bits(&self, r: &StructRef, bit: u32, size: u32) -> Result<u64, String> {
+        // A field past the end of an older struct reads as zero, so its default.
+        if (bit + size) as u64 > r.data_words as u64 * 64 {
+            return Ok(0);
+        }
+        let w = self.word(At { seg: r.seg, word: r.data + (bit / 64) as usize })?;
+        let sh = bit % 64;
+        Ok(if size == 64 { w } else { (w >> sh) & ((1u64 << size) - 1) })
+    }
+
+    fn read_struct(&mut self, s: &Schema, name: &str, r: &StructRef, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err("pointers nested too deep".into());
+        }
+        let l = s.structs.get(name).ok_or(format!("no struct `{}`", name))?.clone();
+        let tag = match l.tag_bits {
+            Some(b) => Some(self.data_bits(r, b, 16)? as u16),
+            None => None,
+        };
+        let mut m = Map::new();
+        for f in &l.fields {
+            if let (Some(w), Some(t)) = (f.when, tag) {
+                if w != t {
+                    continue;
+                }
+                m.insert("which".into(), json!(f.name));
+            }
+            let v = self.read_field(s, f, r, depth)?;
+            m.insert(f.name.clone(), v);
+        }
+        Ok(Value::Object(m))
+    }
+
+    fn read_field(&mut self, s: &Schema, f: &Field, r: &StructRef, depth: usize) -> Result<Value, String> {
+        match (&f.ty, &f.place) {
+            (Ty::Void, _) | (_, Place::None) => Ok(Value::Null),
+            (Ty::Bool, Place::Bits(b)) => {
+                let v = self.data_bits(r, *b, 1)? != 0;
+                Ok(json!(v != f.default.as_bool().unwrap_or(false)))
+            }
+            (Ty::Int(bits, signed), Place::Bits(b)) => {
+                let x = self.data_bits(r, *b, *bits)? ^ default_bits(&f.default, *bits);
+                Ok(int_value(x, *bits, *signed))
+            }
+            (Ty::Float(bits), Place::Bits(b)) => {
+                let x = self.data_bits(r, *b, *bits)?;
+                Ok(if *bits == 32 {
+                    let d = f.default.as_f64().map_or(0, |v| (v as f32).to_bits());
+                    json!(f32::from_bits(x as u32 ^ d) as f64)
+                } else {
+                    let d = f.default.as_f64().map_or(0, |v| v.to_bits());
+                    json!(f64::from_bits(x ^ d))
+                })
+            }
+            (Ty::Enum(n), Place::Bits(b)) => {
+                let d = enum_default(s, n, &f.default);
+                let x = (self.data_bits(r, *b, 16)? as u16) ^ d;
+                Ok(s.enums.get(n).and_then(|l| l.get(x as usize)).map_or(json!(x), |t| json!(t)))
+            }
+            (_, Place::Ptr(i)) => {
+                if *i >= r.pointers {
+                    return Ok(f.default.clone());
+                }
+                let at = At { seg: r.seg, word: r.ptr + *i as usize };
+                if self.word(at)? == 0 {
+                    return Ok(f.default.clone());
+                }
+                self.read_pointer(s, &f.ty, at, depth + 1)
+            }
+            _ => Err(format!("field `{}` has a type that does not fit its place", f.name)),
+        }
+    }
+
+    fn read_pointer(&mut self, s: &Schema, ty: &Ty, at: At, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err("pointers nested too deep".into());
+        }
+        match ty {
+            Ty::Text => match self.list_at(at)? {
+                ListRef::Empty => Ok(Value::Null),
+                ListRef::Prim { seg, word, size: 2, count } => {
+                    if count == 0 {
+                        return Err("text with no NUL at its end".into());
+                    }
+                    let b = self.bytes(seg, word, count as usize)?;
+                    if b[count as usize - 1] != 0 {
+                        return Err("text with no NUL at its end".into());
+                    }
+                    Ok(json!(String::from_utf8_lossy(&b[..count as usize - 1])))
+                }
+                _ => Err("text must be a list of bytes".into()),
+            },
+            Ty::Data => match self.list_at(at)? {
+                ListRef::Empty => Ok(Value::Null),
+                ListRef::Prim { seg, word, size: 2, count } => Ok(json!(hex::encode(self.bytes(seg, word, count as usize)?))),
+                _ => Err("data must be a list of bytes".into()),
+            },
+            Ty::Struct(n) => match self.struct_at(at)? {
+                None => Ok(Value::Null),
+                Some(r) => self.read_struct(s, n, &r, depth),
+            },
+            Ty::List(e) => self.read_list(s, e, at, depth),
+            _ => Err("that type is not behind a pointer".into()),
+        }
+    }
+
+    fn read_list(&mut self, s: &Schema, e: &Ty, at: At, depth: usize) -> Result<Value, String> {
+        let l = self.list_at(at)?;
+        let mut out = vec![];
+        match l {
+            ListRef::Empty => return Ok(Value::Null),
+            ListRef::Composite { seg, word, count, data_words, pointers } => {
+                let Ty::Struct(n) = e else { return Err("a composite list where the schema has primitives".into()) };
+                let step = data_words as usize + pointers as usize;
+                for i in 0..count as usize {
+                    let w = word + i * step;
+                    let r = StructRef { seg, data: w, data_words, ptr: w + data_words as usize, pointers };
+                    out.push(self.read_struct(s, n, &r, depth + 1)?);
+                }
+            }
+            ListRef::Prim { seg, word, size, count } => {
+                let want = element_size(e);
+                // A list may grow from a primitive to a struct; a plain mismatch is an error.
+                if let Ty::Struct(n) = e {
+                    if size == 6 || size == 0 {
+                        for i in 0..count as usize {
+                            let (dw, pw, ptr) = if size == 6 { (0, 1, word + i) } else { (0, 0, word) };
+                            let r = StructRef { seg, data: ptr, data_words: dw, ptr, pointers: pw };
+                            out.push(self.read_struct(s, n, &r, depth + 1)?);
+                        }
+                        return Ok(json!(out));
+                    }
+                }
+                if want != size {
+                    return Err(format!("a list of element size {} where the schema wants size {}", size, want));
+                }
+                for i in 0..count as usize {
+                    out.push(match e {
+                        Ty::Void => Value::Null,
+                        Ty::Bool => {
+                            let b = self.bytes(seg, word, (i / 8) + 1)?[i / 8];
+                            json!(b >> (i % 8) & 1 != 0)
+                        }
+                        Ty::Int(bits, signed) => {
+                            let n = (*bits / 8) as usize;
+                            let b = self.bytes(seg, word, (i + 1) * n)?;
+                            let mut t = [0u8; 8];
+                            t[..n].copy_from_slice(&b[i * n..(i + 1) * n]);
+                            int_value(u64::from_le_bytes(t), *bits, *signed)
+                        }
+                        Ty::Float(32) => {
+                            let b = self.bytes(seg, word, (i + 1) * 4)?;
+                            json!(f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()) as f64)
+                        }
+                        Ty::Float(_) => {
+                            let b = self.bytes(seg, word, (i + 1) * 8)?;
+                            json!(f64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
+                        }
+                        Ty::Enum(n) => {
+                            let b = self.bytes(seg, word, (i + 1) * 2)?;
+                            let x = u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
+                            s.enums.get(n).and_then(|l| l.get(x as usize)).map_or(json!(x), |t| json!(t))
+                        }
+                        other => self.read_pointer(s, other, At { seg, word: word + i }, depth + 1)?,
+                    });
+                }
+            }
+        }
+        Ok(json!(out))
+    }
+}
+
+fn element_size(t: &Ty) -> u8 {
+    match t {
+        Ty::Void => 0,
+        Ty::Bool => 1,
+        Ty::Int(8, _) => 2,
+        Ty::Int(16, _) | Ty::Enum(_) => 3,
+        Ty::Int(32, _) | Ty::Float(32) => 4,
+        Ty::Int(_, _) | Ty::Float(_) => 5,
+        _ => 6,
+    }
+}
+
+fn int_value(x: u64, bits: u32, signed: bool) -> Value {
+    if signed {
+        let sh = 64 - bits;
+        json!(((x << sh) as i64) >> sh)
+    } else {
+        json!(x)
+    }
+}
+
+fn default_bits(d: &Value, bits: u32) -> u64 {
+    let v = d.as_i64().map(|x| x as u64).or(d.as_u64()).unwrap_or(0);
+    if bits == 64 { v } else { v & ((1u64 << bits) - 1) }
+}
+
+fn enum_default(s: &Schema, n: &str, d: &Value) -> u16 {
+    match d {
+        Value::String(t) => s.enums.get(n).and_then(|l| l.iter().position(|x| x == t)).unwrap_or(0) as u16,
+        x => x.as_u64().unwrap_or(0) as u16,
+    }
+}
+
+fn split_message(b: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if b.len() < 8 {
+        return Err("too short for a segment table".into());
+    }
+    let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize + 1;
+    if n > 512 {
+        return Err(format!("a message of {} segments: refused", n));
+    }
+    let table = (4 + n * 4 + 7) / 8 * 8;
+    let head = b.get(..table).ok_or("the segment table is cut off")?;
+    let mut at = table;
+    let mut out = vec![];
+    for i in 0..n {
+        let w = u32::from_le_bytes(head[4 + i * 4..8 + i * 4].try_into().unwrap()) as usize;
+        let e = w.checked_mul(8).and_then(|x| x.checked_add(at)).ok_or("a segment size out of range")?;
+        out.push(b.get(at..e).ok_or(format!("segment {} says {} words, past the end of the message", i, w))?.to_vec());
+        at = e;
+    }
+    Ok(out)
+}
+
+// Writing: objects go in the current segment; `segment_words` can force a new one, which is how
+// far pointers come to be.
+
+struct Writer {
+    segments: Vec<Vec<u64>>,
+    limit: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Loc {
+    seg: usize,
+    word: usize,
+}
+
+impl Writer {
+    fn new_seg(&mut self) -> usize {
+        self.segments.push(vec![]);
+        self.segments.len() - 1
+    }
+
+    fn room(&self, seg: usize, words: usize) -> bool {
+        self.limit == 0 || self.segments[seg].len() + words <= self.limit
+    }
+
+    fn take(&mut self, seg: usize, words: usize) -> usize {
+        let at = self.segments[seg].len();
+        self.segments[seg].resize(at + words, 0);
+        at
+    }
+
+    // Space for an object pointed at from `from`, and the pointer written there: `low` is the
+    // pointer's kind and `high` its upper half.
+    fn place(&mut self, from: Loc, words: usize, low: u64, high: u32) -> Loc {
+        let near = self.room(from.seg, words);
+        if near {
+            let at = self.take(from.seg, words);
+            let off = at as i64 - from.word as i64 - 1;
+            self.segments[from.seg][from.word] = ((high as u64) << 32) | (((off << 2) as u32 as u64) | low);
+            return Loc { seg: from.seg, word: at };
+        }
+        // A single-far pointer: a landing pad in the new segment, just before the object.
+        let mut seg = self.segments.len() - 1;
+        if !self.room(seg, words + 1) || seg == from.seg {
+            seg = self.new_seg();
+        }
+        let pad = self.take(seg, 1);
+        let at = self.take(seg, words);
+        self.segments[seg][pad] = ((high as u64) << 32) | low;
+        self.segments[from.seg][from.word] = ((seg as u64) << 32) | ((pad as u64) << 3) | 2;
+        Loc { seg, word: at }
+    }
+
+    fn put_bits(&mut self, l: Loc, bit: u32, size: u32, v: u64) {
+        let w = l.word + (bit / 64) as usize;
+        let sh = bit % 64;
+        let mask = if size == 64 { u64::MAX } else { ((1u64 << size) - 1) << sh };
+        let cur = self.segments[l.seg][w];
+        self.segments[l.seg][w] = (cur & !mask) | ((v << sh) & mask);
+    }
+
+    fn write_struct(&mut self, s: &Schema, name: &str, v: &Value, at: Loc, depth: usize) -> Result<(), String> {
+        if depth > MAX_DEPTH {
+            return Err("a value nested too deep".into());
+        }
+        let l = s.structs.get(name).ok_or(format!("no struct `{}`", name))?.clone();
+        let m = v.as_object().ok_or(format!("a {} must be a map", name))?;
+        for k in m.keys() {
+            if k != "which" && !l.fields.iter().any(|f| &f.name == k) {
+                return Err(format!("{} has no field `{}`", name, k));
+            }
+        }
+        let ptrs = Loc { seg: at.seg, word: at.word + l.data_words as usize };
+        for f in &l.fields {
+            let val = m.get(&f.name);
+            if let Some(w) = f.when {
+                let chosen = m.get("which").and_then(|x| x.as_str()) == Some(f.name.as_str()) || (m.get("which").is_none() && val.is_some());
+                if !chosen {
+                    continue;
+                }
+                let b = l.tag_bits.ok_or(format!("{} has a union and no `tag_bits`", name))?;
+                self.put_bits(at, b, 16, w as u64);
+            }
+            let Some(val) = val.filter(|x| !x.is_null()) else { continue };
+            self.write_field(s, f, val, at, ptrs, depth)?;
+        }
+        Ok(())
+    }
+
+    fn write_field(&mut self, s: &Schema, f: &Field, v: &Value, at: Loc, ptrs: Loc, depth: usize) -> Result<(), String> {
+        let bad = || format!("`{}`: {} does not fit its type", f.name, v);
+        match (&f.ty, &f.place) {
+            (Ty::Void, _) | (_, Place::None) => {}
+            (Ty::Bool, Place::Bits(b)) => {
+                let x = v.as_bool().ok_or_else(bad)?;
+                self.put_bits(at, *b, 1, (x != f.default.as_bool().unwrap_or(false)) as u64);
+            }
+            (Ty::Int(bits, signed), Place::Bits(b)) => {
+                let x = int_of(v, *bits, *signed).ok_or_else(bad)?;
+                self.put_bits(at, *b, *bits, x ^ default_bits(&f.default, *bits));
+            }
+            (Ty::Float(32), Place::Bits(b)) => {
+                let x = v.as_f64().ok_or_else(bad)? as f32;
+                let d = f.default.as_f64().map_or(0, |y| (y as f32).to_bits());
+                self.put_bits(at, *b, 32, (x.to_bits() ^ d) as u64);
+            }
+            (Ty::Float(_), Place::Bits(b)) => {
+                let x = v.as_f64().ok_or_else(bad)?;
+                let d = f.default.as_f64().map_or(0, |y| y.to_bits());
+                self.put_bits(at, *b, 64, x.to_bits() ^ d);
+            }
+            (Ty::Enum(n), Place::Bits(b)) => {
+                let x = enum_number(s, n, v).ok_or_else(bad)?;
+                self.put_bits(at, *b, 16, (x ^ enum_default(s, n, &f.default)) as u64);
+            }
+            (_, Place::Ptr(i)) => {
+                let from = Loc { seg: ptrs.seg, word: ptrs.word + *i as usize };
+                self.write_pointer(s, &f.ty, v, from, depth + 1).map_err(|e| format!("`{}`: {}", f.name, e))?;
+            }
+            _ => return Err(bad()),
+        }
+        Ok(())
+    }
+
+    fn write_pointer(&mut self, s: &Schema, ty: &Ty, v: &Value, from: Loc, depth: usize) -> Result<(), String> {
+        match ty {
+            Ty::Text => {
+                let t = v.as_str().ok_or(format!("{} is not text", v))?;
+                let mut b = t.as_bytes().to_vec();
+                b.push(0);
+                self.write_bytes(&b, from)
+            }
+            Ty::Data => {
+                let b = hex::decode(v.as_str().ok_or("data is hex")?).map_err(|_| "data is hex".to_string())?;
+                self.write_bytes(&b, from)
+            }
+            Ty::Struct(n) => {
+                let l = s.structs.get(n).ok_or(format!("no struct `{}`", n))?;
+                let (dw, pw) = (l.data_words, l.pointers);
+                let at = self.place(from, (dw + pw) as usize, 0, dw | pw << 16);
+                self.write_struct(s, n, v, at, depth)
+            }
+            Ty::List(e) => self.write_list(s, e, v, from, depth),
+            _ => Err("that type is not behind a pointer".into()),
+        }
+    }
+
+    fn write_bytes(&mut self, b: &[u8], from: Loc) -> Result<(), String> {
+        let at = self.place(from, (b.len() + 7) / 8, 1, 2 | (b.len() as u32) << 3);
+        for (i, c) in b.chunks(8).enumerate() {
+            let mut t = [0u8; 8];
+            t[..c.len()].copy_from_slice(c);
+            self.segments[at.seg][at.word + i] = u64::from_le_bytes(t);
+        }
+        Ok(())
+    }
+
+    fn write_list(&mut self, s: &Schema, e: &Ty, v: &Value, from: Loc, depth: usize) -> Result<(), String> {
+        let items = v.as_array().ok_or(format!("{} is not a list", v))?;
+        let n = items.len();
+        if let Ty::Struct(name) = e {
+            let l = s.structs.get(name).ok_or(format!("no struct `{}`", name))?;
+            let (dw, pw) = (l.data_words as usize, l.pointers as usize);
+            let total = n * (dw + pw);
+            let at = self.place(from, total + 1, 1, 7 | (total as u32) << 3);
+            self.segments[at.seg][at.word] = ((pw as u64) << 48) | ((dw as u64) << 32) | ((n as u64) << 2);
+            for (i, x) in items.iter().enumerate() {
+                self.write_struct(s, name, x, Loc { seg: at.seg, word: at.word + 1 + i * (dw + pw) }, depth + 1)?;
+            }
+            return Ok(());
+        }
+        let size = element_size(e);
+        let bits: usize = match size {
+            0 => 0,
+            1 => 1,
+            2 => 8,
+            3 => 16,
+            4 => 32,
+            _ => 64,
+        };
+        let at = self.place(from, (n * bits + 63) / 64, 1, size as u32 | (n as u32) << 3);
+        for (i, x) in items.iter().enumerate() {
+            let bit = (i * bits) as u32;
+            let here = Loc { seg: at.seg, word: at.word };
+            let bad = || format!("{} does not fit the list", x);
+            match e {
+                Ty::Void => {}
+                Ty::Bool => self.put_bits(here, bit, 1, x.as_bool().ok_or_else(bad)? as u64),
+                Ty::Int(b, sg) => self.put_bits(here, bit, *b, int_of(x, *b, *sg).ok_or_else(bad)?),
+                Ty::Float(32) => self.put_bits(here, bit, 32, (x.as_f64().ok_or_else(bad)? as f32).to_bits() as u64),
+                Ty::Float(_) => self.put_bits(here, bit, 64, x.as_f64().ok_or_else(bad)?.to_bits()),
+                Ty::Enum(nm) => self.put_bits(here, bit, 16, enum_number(s, nm, x).ok_or_else(bad)? as u64),
+                other => self.write_pointer(s, other, x, Loc { seg: at.seg, word: at.word + i }, depth + 1)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn int_of(v: &Value, bits: u32, signed: bool) -> Option<u64> {
+    if signed {
+        let n = v.as_i64()?;
+        if bits < 64 && (n < -(1i64 << (bits - 1)) || n >= 1i64 << (bits - 1)) {
+            return None;
+        }
+        Some(if bits == 64 { n as u64 } else { (n as u64) & ((1u64 << bits) - 1) })
+    } else {
+        let n = v.as_u64()?;
+        if bits < 64 && n >= 1u64 << bits {
+            return None;
+        }
+        Some(n)
+    }
+}
+
+fn enum_number(s: &Schema, n: &str, v: &Value) -> Option<u16> {
+    match v {
+        Value::String(t) => s.enums.get(n)?.iter().position(|x| x == t).map(|i| i as u16),
+        x => x.as_u64().map(|i| i as u16),
+    }
+}
+
+fn pack(b: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    let words: Vec<&[u8]> = b.chunks(8).collect();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let mut tag = 0u8;
+        for (k, x) in w.iter().enumerate() {
+            if *x != 0 {
+                tag |= 1 << k;
+            }
+        }
+        out.push(tag);
+        out.extend(w.iter().filter(|x| **x != 0));
+        i += 1;
+        if tag == 0 {
+            let mut n = 0;
+            while i < words.len() && n < 255 && words[i].iter().all(|x| *x == 0) {
+                n += 1;
+                i += 1;
+            }
+            out.push(n as u8);
+        } else if tag == 0xff {
+            // Words that would not shrink are copied whole: fewer than two zero bytes each.
+            let start = i;
+            while i < words.len() && i - start < 255 && words[i].iter().filter(|x| **x == 0).count() < 2 {
+                i += 1;
+            }
+            out.push((i - start) as u8);
+            for x in &words[start..i] {
+                out.extend(*x);
+            }
+        }
+    }
+    out
+}
+
+fn unpack(b: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let tag = b[i];
+        i += 1;
+        for k in 0..8 {
+            if tag & (1 << k) != 0 {
+                out.push(*b.get(i).ok_or("packed data cut off inside a word")?);
+                i += 1;
+            } else {
+                out.push(0);
+            }
+        }
+        if tag == 0 {
+            let n = *b.get(i).ok_or("packed data cut off after a zero tag")? as usize;
+            i += 1;
+            out.resize(out.len() + n * 8, 0);
+        } else if tag == 0xff {
+            let n = *b.get(i).ok_or("packed data cut off after an 0xff tag")? as usize * 8;
+            i += 1;
+            out.extend(b.get(i..i + n).ok_or("packed data cut off inside copied words")?);
+            i += n;
+        }
+        if out.len() > MAX_UNPACKED {
+            return Err("packed data unpacks to more than 256 MiB".into());
+        }
+    }
+    Ok(out)
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex".to_string()),
+        _ => Err("give bytes as hex or a list of numbers".into()),
+    }
+}
+
+/// Encodes a value as a message by a schema, as hex, segment table first. Options: `root`, `packed`, `segment_words` (a segment's size in words; past it, far pointers lead to the next).
+pub fn capnp_encode(schema: serde_json::Value, value: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let s = build_schema(&schema, options.get("root").and_then(|v| v.as_str()).unwrap_or(""))?;
+    let limit = options.get("segment_words").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mut w = Writer { segments: vec![vec![0]], limit };
+    let root = s.root.clone();
+    let l = &s.structs[&root];
+    let (dw, pw) = (l.data_words, l.pointers);
+    let at = w.place(Loc { seg: 0, word: 0 }, (dw + pw) as usize, 0, dw | pw << 16);
+    w.write_struct(&s, &root, &value, at, 0)?;
+    let mut out = vec![];
+    out.extend(((w.segments.len() - 1) as u32).to_le_bytes());
+    for seg in &w.segments {
+        out.extend((seg.len() as u32).to_le_bytes());
+    }
+    if out.len() % 8 != 0 {
+        out.extend([0u8; 4]);
+    }
+    for seg in &w.segments {
+        for x in seg {
+            out.extend(x.to_le_bytes());
+        }
+    }
+    Ok(hex::encode(if options.get("packed").and_then(|v| v.as_bool()).unwrap_or(false) { pack(&out) } else { out }))
+}
+
+/// Decodes a message (hex or bytes) by a schema. Options: `root`, `packed`, `far: "refuse"` (followed unless so), `traversal_words` (8 million, Cap'n Proto's own default), against messages built to expand. Bad pointers are errors. A field the writer did not know reads as its default, and one this schema does not know is skipped.
+pub fn capnp_decode(schema: serde_json::Value, data: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let s = build_schema(&schema, options.get("root").and_then(|v| v.as_str()).unwrap_or(""))?;
+    let mut b = bytes_of(&data)?;
+    if options.get("packed").and_then(|v| v.as_bool()).unwrap_or(false) {
+        b = unpack(&b)?;
+    }
+    let segments = split_message(&b)?;
+    if segments.first().map_or(true, |x| x.is_empty()) {
+        return Err("a message with no root pointer".into());
+    }
+    let mut r = Reader { segments, left: options.get("traversal_words").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TRAVERSAL), far: options.get("far").and_then(|v| v.as_str()) != Some("refuse") };
+    match r.struct_at(At { seg: 0, word: 0 })? {
+        Some(x) => {
+            let root = s.root.clone();
+            r.read_struct(&s, &root, &x, 0)
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// The packed encoding of a message (hex to hex).
+pub fn capnp_pack(data: serde_json::Value) -> Result<String, String> {
+    let b = bytes_of(&data)?;
+    if b.len() % 8 != 0 {
+        return Err("packing works on whole words: 8 bytes at a time".into());
+    }
+    Ok(hex::encode(pack(&b)))
+}
+
+/// A packed message back to plain bytes (hex to hex), refused past 256 MiB as a bomb.
+pub fn capnp_unpack(data: serde_json::Value) -> Result<String, String> {
+    Ok(hex::encode(unpack(&bytes_of(&data)?)?))
+}
+
+/// Where each field of a struct lies, as capnpc lays it out: `{ data_words, pointer_words, fields: [{ name, bits }, { name, ptr }] }`, to compare with `capnp compile -ocapnp`.
+pub fn capnp_layout(schema: serde_json::Value, name: &str) -> Result<Value, String> {
+    let s = build_schema(&schema, name)?;
+    let l = &s.structs[name];
+    let fields: Vec<Value> = l.fields.iter().map(|f| match f.place {
+        Place::Bits(b) => json!({ "name": f.name, "bits": b }),
+        Place::Ptr(p) => json!({ "name": f.name, "ptr": p }),
+        Place::None => json!({ "name": f.name }),
+    }).collect();
+    Ok(json!({ "data_words": l.data_words, "pointer_words": l.pointers, "fields": fields }))
+}
+
+/// The shape of a message without a schema: `{ segments: [words], total_words, root: { kind, ... } }`, for looking at one.
+pub fn capnp_inspect(data: serde_json::Value) -> Result<Value, String> {
+    let b = bytes_of(&data)?;
+    let segs = split_message(&b)?;
+    let sizes: Vec<usize> = segs.iter().map(|s| s.len() / 8).collect();
+    let root = match segs.first().and_then(|s| s.get(..8)) {
+        Some(x) => u64::from_le_bytes(x.try_into().unwrap()),
+        None => 0,
+    };
+    let desc = match root & 3 {
+        _ if root == 0 => json!({ "kind": "null" }),
+        0 => json!({ "kind": "struct", "offset": (root as u32 as i32) >> 2, "data_words": (root >> 32) & 0xffff, "pointer_words": root >> 48 }),
+        1 => json!({ "kind": "list", "offset": (root as u32 as i32) >> 2, "element_size": (root >> 32) & 7, "count": root >> 35 }),
+        2 => json!({ "kind": "far", "double": root & 4 != 0, "offset": (root as u32) >> 3, "segment": root >> 32 }),
+        _ => json!({ "kind": "capability" }),
+    };
+    Ok(json!({ "segments": sizes, "total_words": sizes.iter().sum::<usize>(), "root": desc }))
+}

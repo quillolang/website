@@ -1,0 +1,401 @@
+//! Files to and from an SFTP server, on the pure-Rust russh and russh-sftp with ring: folders listed with sizes, times and kinds, files read and written as text or from disk with their SHA-256, uploads that appear whole by a rename, renames, removes and folders, sign-in by key or password, and the server's host key pinned before anything is sent.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! russh = { version = "=0.65.0", default-features = false, features = ["ring", "rsa"] }
+//! russh-sftp = "=3.0.1"
+//! tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use russh::client;
+use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// SFTP_HOST is the server, host or host:port. SFTP_USER signs in, with SFTP_KEY_FILE (a private key's
+// path) or SFTP_KEY (its text), SFTP_KEY_PASSPHRASE if it has one, or SFTP_PASSWORD. SFTP_HOST_KEY
+// pins the server: its fingerprint (SHA256:...) or public key line, comma separated if it has
+// several. With none set nothing connects, and the error says the key the server offered.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a tokio runtime"))
+}
+
+fn fingerprint_of(key: &PublicKey) -> String {
+    key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+fn pins() -> Result<Vec<String>, String> {
+    let mut out = vec![];
+    for p in env("SFTP_HOST_KEY").unwrap_or_default().split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if p.starts_with("SHA256:") {
+            out.push(p.trim_end_matches('=').to_string());
+        } else {
+            let k = PublicKey::from_openssh(p).map_err(|e| format!("SFTP_HOST_KEY: {:?} is neither a fingerprint nor a public key: {}", p, e))?;
+            out.push(fingerprint_of(&k));
+        }
+    }
+    Ok(out)
+}
+
+struct Pin {
+    allowed: Option<Vec<String>>,
+    seen: Arc<Mutex<Option<String>>>,
+}
+
+impl client::Handler for Pin {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, key: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        let f = match key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => fingerprint_of(key),
+            russh::keys::PublicKeyOrCertificate::Certificate(c) => c.public_key().fingerprint(HashAlg::Sha256).to_string(),
+        };
+        let ok = self.allowed.as_ref().map_or(true, |a| a.contains(&f));
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        Ok(ok)
+    }
+}
+
+fn host_port() -> Result<(String, u16), String> {
+    let h = env("SFTP_HOST").ok_or("SFTP_HOST is not set")?;
+    match h.rsplit_once(':') {
+        Some((n, p)) if !n.contains(':') => Ok((n.to_string(), p.parse().map_err(|_| format!("{}: a bad port", h))?)),
+        _ => Ok((h, 22)),
+    }
+}
+
+async fn dial(allowed: Option<Vec<String>>) -> Result<(client::Handle<Pin>, Arc<Mutex<Option<String>>>), String> {
+    let (name, port) = host_port()?;
+    let seen = Arc::new(Mutex::new(None));
+    let handler = Pin { allowed, seen: seen.clone() };
+    let config = Arc::new(client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() });
+    match tokio::time::timeout(Duration::from_secs(15), client::connect(config, (name.as_str(), port), handler)).await {
+        Err(_) => Err(format!("{}:{} did not answer within 15 s", name, port)),
+        Ok(Err(russh::Error::UnknownKey)) => {
+            let f = seen.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+            Err(format!("the host key of {}:{} is {}, which SFTP_HOST_KEY does not hold: refused. Check it with the server's owner before adding it", name, port, f))
+        }
+        Ok(Err(e)) => Err(format!("cannot reach {}:{}: {}", name, port, e)),
+        Ok(Ok(h)) => Ok((h, seen)),
+    }
+}
+
+async fn sign_in(h: &mut client::Handle<Pin>) -> Result<(), String> {
+    let user = env("SFTP_USER").ok_or("SFTP_USER is not set")?;
+    let text = match (env("SFTP_KEY"), env("SFTP_KEY_FILE")) {
+        (Some(t), _) => Some(t),
+        (None, Some(p)) => Some(std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?),
+        _ => None,
+    };
+    let mut tried = vec![];
+    if let Some(t) = text {
+        let key = decode_secret_key(&t, env("SFTP_KEY_PASSPHRASE").as_deref()).map_err(|e| format!("the private key: {}", e))?;
+        let hash = h.best_supported_rsa_hash().await.map_err(|e| e.to_string())?.flatten();
+        if h.authenticate_publickey(user.clone(), PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(|e| format!("the sign-in broke off: {}", e))?.success() {
+            return Ok(());
+        }
+        tried.push("key");
+    }
+    if let Some(p) = env("SFTP_PASSWORD") {
+        if h.authenticate_password(user.clone(), p.clone()).await.map_err(|e| format!("the sign-in broke off: {}", e))?.success() {
+            return Ok(());
+        }
+        // Many servers take passwords only through keyboard-interactive.
+        let mut step = h.authenticate_keyboard_interactive_start(user.clone(), None).await.map_err(|e| e.to_string())?;
+        for _ in 0..4 {
+            match step {
+                client::KeyboardInteractiveAuthResponse::Success => return Ok(()),
+                client::KeyboardInteractiveAuthResponse::Failure { .. } => break,
+                client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                    let answers = prompts.iter().map(|_| p.clone()).collect();
+                    step = h.authenticate_keyboard_interactive_respond(answers).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        tried.push("password");
+    }
+    if tried.is_empty() {
+        return Err("set SFTP_KEY_FILE, SFTP_KEY or SFTP_PASSWORD".into());
+    }
+    Err(format!("the server refused {} by {}", user, tried.join(" and ")))
+}
+
+struct Conn {
+    ssh: client::Handle<Pin>,
+    sftp: SftpSession,
+}
+
+static CONN: Mutex<Option<Arc<Conn>>> = Mutex::new(None);
+
+/// The one kept connection, made again when the server has dropped it.
+async fn session() -> Result<Arc<Conn>, String> {
+    if let Some(c) = CONN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if !c.ssh.is_closed() {
+            return Ok(c.clone());
+        }
+    }
+    let (mut ssh, _) = dial(Some(pins()?)).await?;
+    sign_in(&mut ssh).await?;
+    let channel = ssh.channel_open_session().await.map_err(|e| e.to_string())?;
+    channel.request_subsystem(true, "sftp").await.map_err(|e| format!("the server has no sftp subsystem: {}", e))?;
+    let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| format!("SFTP would not start: {}", e))?;
+    sftp.set_timeout(60);
+    let c = Arc::new(Conn { ssh, sftp });
+    *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
+    Ok(c)
+}
+
+fn says(e: SftpError, path: &str) -> String {
+    match e {
+        SftpError::Status(s) if s.status_code == StatusCode::NoSuchFile => format!("no such file: {}", path),
+        SftpError::Status(s) if s.status_code == StatusCode::PermissionDenied => format!("permission denied: {}", path),
+        SftpError::Status(s) => format!("{}: {}", path, s.error_message),
+        o => format!("{}: {}", path, o),
+    }
+}
+
+fn missing(e: &SftpError) -> bool {
+    matches!(e, SftpError::Status(s) if s.status_code == StatusCode::NoSuchFile)
+}
+
+fn kind_of(a: &FileAttributes) -> &'static str {
+    match a.file_type() {
+        FileType::Dir => "dir",
+        FileType::File => "file",
+        FileType::Symlink => "symlink",
+        FileType::Other => "other",
+    }
+}
+
+fn entry(name: &str, path: &str, a: &FileAttributes) -> Value {
+    json!({ "name": name, "path": path, "kind": kind_of(a), "size": a.size, "modified": a.mtime, "mode": a.permissions.map(|p| format!("{:o}", p & 0o7777)) })
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') { format!("{}{}", dir, name) } else { format!("{}/{}", dir, name) }
+}
+
+fn block<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    runtime().block_on(f)
+}
+
+/// What is in a folder: each `{ name, path, kind, size, modified, mode }`, `kind` "file", "dir", "symlink" or "other", `modified` a Unix time, folders first, then by name. `.` and `..` are left out.
+pub fn sftp_list(path: &str) -> Result<Vec<Value>, String> {
+    block(async {
+        let c = session().await?;
+        let dir = c.sftp.read_dir(path).await.map_err(|e| says(e, path))?;
+        let mut out: Vec<Value> = dir.into_iter().filter(|e| { let n = e.file_name(); n != "." && n != ".." }).map(|e| { let n = e.file_name(); entry(&n, &join(path, &n), &e.metadata()) }).collect();
+        out.sort_by_key(|e| (e["kind"] != "dir", e["name"].as_str().unwrap_or("").to_string()));
+        Ok(out)
+    })
+}
+
+/// One path as `sftp_list` gives it, or null when there is none. A symlink is reported as itself, not what it points to.
+pub fn sftp_stat(path: &str) -> Result<Value, String> {
+    block(async {
+        let c = session().await?;
+        match c.sftp.symlink_metadata(path).await {
+            Ok(a) => Ok(entry(path.rsplit('/').next().unwrap_or(path), path, &a)),
+            Err(e) if missing(&e) => Ok(Value::Null),
+            Err(e) => Err(says(e, path)),
+        }
+    })
+}
+
+/// A file's content as text, invalid UTF-8 replaced, refused above `max_bytes` (0 for 64 MB). For anything else use `sftp_get_file`.
+pub fn sftp_get(path: &str, max_bytes: i64) -> Result<String, String> {
+    let limit = if max_bytes > 0 { max_bytes as u64 } else { 64 * 1024 * 1024 };
+    block(async {
+        let c = session().await?;
+        let mut f = c.sftp.open(path).await.map_err(|e| says(e, path))?;
+        let mut buf = Vec::new();
+        let n = (&mut f).take(limit + 1).read_to_end(&mut buf).await.map_err(|e| format!("{}: {}", path, e))?;
+        let _ = f.shutdown().await;
+        if n as u64 > limit {
+            return Err(format!("{} is over {} bytes", path, limit));
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })
+}
+
+/// Saves a remote file to a local path, in pieces, so it can be of any size or kind. Gives `{ bytes, sha256 }`.
+pub fn sftp_get_file(path: &str, local: &str) -> Result<Value, String> {
+    block(async {
+        let c = session().await?;
+        let mut f = c.sftp.open(path).await.map_err(|e| says(e, path))?;
+        let mut out = std::fs::File::create(local).map_err(|e| format!("{}: {}", local, e))?;
+        let (mut hash, mut total, mut buf) = (Sha256::new(), 0u64, vec![0u8; 64 * 1024]);
+        loop {
+            let n = f.read(&mut buf).await.map_err(|e| format!("{}: {}", path, e))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| format!("{}: {}", local, e))?;
+            hash.update(&buf[..n]);
+            total += n as u64;
+        }
+        let _ = f.shutdown().await;
+        Ok(json!({ "bytes": total, "sha256": hex::encode(hash.finalize()) }))
+    })
+}
+
+fn mode_of(v: &Value) -> Result<Option<u32>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => u32::from_str_radix(s, 8).map(Some).map_err(|_| format!("{:?} is not an octal mode, like \"640\"", s)),
+        _ => Err("a mode is octal text, like \"640\"".into()),
+    }
+}
+
+/// Puts the bytes at `target`. With `atomic` they go to `target.part` first and are renamed over it,
+/// so that a reader polling the folder never sees half a file.
+async fn store(c: &Conn, target: &str, source: &mut (dyn Read + Send), options: &Value) -> Result<Value, String> {
+    let atomic = options["atomic"] != false;
+    let mode = mode_of(&options["mode"])?;
+    let at = if atomic { format!("{}.part", target) } else { target.to_string() };
+    if options["overwrite"] == false && c.sftp.symlink_metadata(target).await.is_ok() {
+        return Err(format!("{} exists", target));
+    }
+    let mut f = c.sftp.open_with_flags(at.as_str(), OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE).await.map_err(|e| says(e, target))?;
+    let (mut hash, mut total, mut buf) = (Sha256::new(), 0u64, vec![0u8; 64 * 1024]);
+    loop {
+        let n = source.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n]).await.map_err(|e| format!("{}: {}", target, e))?;
+        hash.update(&buf[..n]);
+        total += n as u64;
+    }
+    f.flush().await.map_err(|e| format!("{}: {}", target, e))?;
+    f.shutdown().await.map_err(|e| format!("{}: {}", target, e))?;
+    if let Some(m) = mode {
+        let mut a = FileAttributes::empty();
+        a.permissions = Some(m);
+        c.sftp.set_metadata(at.as_str(), a).await.map_err(|e| says(e, target))?;
+    }
+    if atomic {
+        replace(c, &at, target).await?;
+    }
+    Ok(json!({ "bytes": total, "sha256": hex::encode(hash.finalize()) }))
+}
+
+/// SFTP's rename refuses a target that exists, and russh-sftp lacks OpenSSH's posix-rename, so a file in the way goes first.
+async fn replace(c: &Conn, from: &str, to: &str) -> Result<(), String> {
+    match c.sftp.rename(from, to).await {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if c.sftp.symlink_metadata(to).await.is_err() {
+                return Err(says(first, from));
+            }
+            c.sftp.remove_file(to).await.map_err(|e| says(e, to))?;
+            c.sftp.rename(from, to).await.map_err(|e| says(e, from))
+        }
+    }
+}
+
+/// Writes text to a remote file. `options`: `atomic` (true by default: written to `path.part` and renamed, so it appears whole; some servers forbid renames, then give false), `overwrite` (false refuses a file that exists), `mode` (octal text, like "640"). Gives `{ bytes, sha256 }`.
+pub fn sftp_put(path: &str, text: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut src = std::io::Cursor::new(text.as_bytes().to_vec());
+    block(async {
+        let c = session().await?;
+        store(&c, path, &mut src, &options).await
+    })
+}
+
+/// Uploads a local file, in pieces, options as for `sftp_put`. Gives `{ bytes, sha256 }`.
+pub fn sftp_put_file(local: &str, path: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut src = std::fs::File::open(local).map_err(|e| format!("{}: {}", local, e))?;
+    block(async {
+        let c = session().await?;
+        store(&c, path, &mut src, &options).await
+    })
+}
+
+/// Renames or moves within the server. With `overwrite` a file at the target goes first; without it, a target that exists is an error.
+pub fn sftp_rename(from: &str, to: &str, overwrite: bool) -> Result<bool, String> {
+    block(async {
+        let c = session().await?;
+        if overwrite {
+            replace(&c, from, to).await?;
+        } else {
+            c.sftp.rename(from, to).await.map_err(|e| says(e, from))?;
+        }
+        Ok(true)
+    })
+}
+
+/// Removes a file; false when there was none.
+pub fn sftp_remove(path: &str) -> Result<bool, String> {
+    block(async {
+        let c = session().await?;
+        match c.sftp.remove_file(path).await {
+            Ok(()) => Ok(true),
+            Err(e) if missing(&e) => Ok(false),
+            Err(e) => Err(says(e, path)),
+        }
+    })
+}
+
+/// Makes a folder and any missing above it; false when it was there.
+pub fn sftp_mkdir(path: &str) -> Result<bool, String> {
+    block(async {
+        let c = session().await?;
+        if c.sftp.metadata(path).await.is_ok() {
+            return Ok(false);
+        }
+        let mut at = if path.starts_with('/') { String::new() } else { ".".to_string() };
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            at = format!("{}/{}", at, part);
+            if c.sftp.metadata(at.as_str()).await.is_err() {
+                c.sftp.create_dir(at.as_str()).await.map_err(|e| says(e, &at))?;
+            }
+        }
+        Ok(true)
+    })
+}
+
+/// Removes an empty folder; false when there was none.
+pub fn sftp_rmdir(path: &str) -> Result<bool, String> {
+    block(async {
+        let c = session().await?;
+        match c.sftp.remove_dir(path).await {
+            Ok(()) => Ok(true),
+            Err(e) if missing(&e) => Ok(false),
+            Err(e) => Err(says(e, path)),
+        }
+    })
+}
+
+/// The full path of a path as the server sees it, `.` being the folder it starts in.
+pub fn sftp_home(path: &str) -> Result<String, String> {
+    block(async {
+        let c = session().await?;
+        c.sftp.canonicalize(if path.is_empty() { "." } else { path }).await.map_err(|e| says(e, path))
+    })
+}
+
+/// The fingerprint the server offers, without signing in, for setting SFTP_HOST_KEY once it is checked: `SHA256:...`.
+pub fn sftp_fingerprint() -> Result<String, String> {
+    block(async {
+        let (h, seen) = dial(None).await?;
+        let f = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let _ = h.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+        f.ok_or("the server showed no key".to_string())
+    })
+}

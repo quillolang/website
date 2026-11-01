@@ -1,0 +1,644 @@
+//! TopoJSON read and written: arcs decoded with their quantization and delta encoding, objects turned into GeoJSON, GeoJSON turned into shared arcs, and neighbours and borders found from the topology.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+type Pt = (f64, f64);
+
+struct Topo<'a> {
+    t: &'a Value,
+    arcs: Vec<Vec<Vec<f64>>>,
+}
+
+fn clean(x: f64) -> f64 {
+    let r = (x * 1e9).round() / 1e9;
+    if r == 0.0 { 0.0 } else { r }
+}
+
+fn topo_of(t: &Value) -> Result<Topo<'_>, String> {
+    if t.get("type").and_then(|v| v.as_str()) != Some("Topology") {
+        return Err("that is not a TopoJSON topology: its `type` must be Topology".into());
+    }
+    let raw = t.get("arcs").and_then(|v| v.as_array()).ok_or("a topology has `arcs`")?;
+    let tr = t.get("transform");
+    let pair = |k: &str| -> Result<Option<(f64, f64)>, String> {
+        match tr.and_then(|x| x.get(k)) {
+            None => Ok(None),
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 2).ok_or(format!("`transform.{}` is two numbers", k))?;
+                Ok(Some((a[0].as_f64().ok_or("not a number")?, a[1].as_f64().ok_or("not a number")?)))
+            }
+        }
+    };
+    let (scale, translate) = (pair("scale")?, pair("translate")?);
+    if tr.is_some() && (scale.is_none() || translate.is_none()) {
+        return Err("a transform has both `scale` and `translate`".into());
+    }
+    let mut arcs = Vec::with_capacity(raw.len());
+    for (i, a) in raw.iter().enumerate() {
+        let pts = a.as_array().ok_or(format!("arc {} is not a list", i))?;
+        if pts.len() < 2 {
+            return Err(format!("arc {} has fewer than two points", i));
+        }
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut out = Vec::with_capacity(pts.len());
+        for p in pts {
+            let c = p.as_array().filter(|c| c.len() >= 2).ok_or(format!("arc {} has a bad position", i))?;
+            let (a, b) = (c[0].as_f64().ok_or("a position is numbers")?, c[1].as_f64().ok_or("a position is numbers")?);
+            let mut rest: Vec<f64> = c[2..].iter().filter_map(|v| v.as_f64()).collect();
+            let q = match (scale, translate) {
+                (Some(s), Some(t)) => {
+                    x += a;
+                    y += b;
+                    vec![clean(x * s.0 + t.0), clean(y * s.1 + t.1)]
+                }
+                _ => vec![a, b],
+            };
+            let mut q = q;
+            q.append(&mut rest);
+            out.push(q);
+        }
+        arcs.push(out);
+    }
+    Ok(Topo { t, arcs })
+}
+
+impl<'a> Topo<'a> {
+    fn point(&self, v: &Value) -> Result<Vec<f64>, String> {
+        let c = v.as_array().filter(|c| c.len() >= 2).ok_or("a position is a list of numbers")?;
+        let (a, b) = (c[0].as_f64().ok_or("a position is numbers")?, c[1].as_f64().ok_or("a position is numbers")?);
+        Ok(match self.t.get("transform") {
+            Some(tr) => {
+                let n = |k: &str, i: usize| tr[k][i].as_f64().unwrap_or(0.0);
+                vec![clean(a * n("scale", 0) + n("translate", 0)), clean(b * n("scale", 1) + n("translate", 1))]
+            }
+            None => vec![a, b],
+        })
+    }
+    // Arcs joined into one line; ~i is arc i backwards, and joints appear once.
+    fn line(&self, list: &Value) -> Result<Vec<Vec<f64>>, String> {
+        let ids = list.as_array().ok_or("a line is a list of arc indexes")?;
+        let mut out: Vec<Vec<f64>> = vec![];
+        for id in ids {
+            let i = id.as_i64().ok_or("an arc index is an int")?;
+            let (at, back) = if i < 0 { ((!i) as usize, true) } else { (i as usize, false) };
+            let arc = self.arcs.get(at).ok_or(format!("arc {} does not exist; there are {}", at, self.arcs.len()))?;
+            if !out.is_empty() {
+                out.pop();
+            }
+            if back {
+                out.extend(arc.iter().rev().cloned());
+            } else {
+                out.extend(arc.iter().cloned());
+            }
+        }
+        Ok(out)
+    }
+    fn ring(&self, list: &Value) -> Result<Vec<Vec<f64>>, String> {
+        let r = self.line(list)?;
+        if r.len() < 4 || r.first() != r.last() {
+            return Err("a polygon's ring must close and have at least four positions".into());
+        }
+        Ok(r)
+    }
+    fn geometry(&self, g: &Value) -> Result<Value, String> {
+        let kind = g.get("type").and_then(|v| v.as_str()).ok_or("a geometry has a `type`")?;
+        let arcs = g.get("arcs");
+        let need = || arcs.ok_or(format!("a {} has `arcs`", kind));
+        let coords = g.get("coordinates");
+        let geom = match kind {
+            "Point" => json!({ "type": kind, "coordinates": self.point(coords.ok_or("a Point has `coordinates`")?)? }),
+            "MultiPoint" => {
+                let pts = coords.and_then(|c| c.as_array()).ok_or("a MultiPoint has `coordinates`")?;
+                json!({ "type": kind, "coordinates": pts.iter().map(|p| self.point(p)).collect::<Result<Vec<_>, _>>()? })
+            }
+            "LineString" => json!({ "type": kind, "coordinates": self.line(need()?)? }),
+            "MultiLineString" => json!({ "type": kind, "coordinates": need()?.as_array().ok_or("bad arcs")?.iter().map(|l| self.line(l)).collect::<Result<Vec<_>, _>>()? }),
+            "Polygon" => json!({ "type": kind, "coordinates": need()?.as_array().ok_or("bad arcs")?.iter().map(|l| self.ring(l)).collect::<Result<Vec<_>, _>>()? }),
+            "MultiPolygon" => {
+                let mut polys = vec![];
+                for p in need()?.as_array().ok_or("bad arcs")? {
+                    polys.push(p.as_array().ok_or("bad arcs")?.iter().map(|l| self.ring(l)).collect::<Result<Vec<_>, _>>()?);
+                }
+                json!({ "type": kind, "coordinates": polys })
+            }
+            "GeometryCollection" => {
+                let list = g.get("geometries").and_then(|v| v.as_array()).ok_or("a GeometryCollection has `geometries`")?;
+                return Ok(json!({ "type": "FeatureCollection", "features": list.iter().map(|x| self.feature(x)).collect::<Result<Vec<_>, _>>()? }));
+            }
+            o => return Err(format!("`{}` is no TopoJSON geometry", o)),
+        };
+        Ok(geom)
+    }
+    fn feature(&self, g: &Value) -> Result<Value, String> {
+        let geom = if g.get("type").and_then(|v| v.as_str()) == Some("GeometryCollection") { json!({ "type": "GeometryCollection", "geometries": g["geometries"].as_array().ok_or("bad collection")?.iter().map(|x| self.geometry(x)).collect::<Result<Vec<_>, _>>()? }) } else if g.get("type").and_then(|v| v.as_str()).map(|t| t.is_empty()).unwrap_or(true) { Value::Null } else { self.geometry(g)? };
+        let mut f = Map::new();
+        f.insert("type".into(), json!("Feature"));
+        if let Some(i) = g.get("id") {
+            f.insert("id".into(), i.clone());
+        }
+        if let Some(b) = g.get("bbox") {
+            f.insert("bbox".into(), b.clone());
+        }
+        f.insert("properties".into(), g.get("properties").cloned().unwrap_or(json!({})));
+        f.insert("geometry".into(), geom);
+        Ok(Value::Object(f))
+    }
+}
+
+fn object<'a>(t: &'a Value, name: &str) -> Result<&'a Value, String> {
+    let objs = t.get("objects").and_then(|v| v.as_object()).ok_or("a topology has `objects`")?;
+    if name.is_empty() {
+        if objs.len() == 1 {
+            return Ok(objs.values().next().unwrap());
+        }
+        return Err(format!("name an object: there are {}", objs.keys().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    objs.get(name).ok_or(format!("no object `{}`; there are {}", name, objs.keys().cloned().collect::<Vec<_>>().join(", ")))
+}
+
+fn input(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::String(s) => serde_json::from_str(s).map_err(|e| format!("that is not JSON: {}", e)),
+        o => Ok(o.clone()),
+    }
+}
+
+/// What a topology holds: { objects: [{ name, type, geometries }], arcs, points, quantized, scale, translate, bbox, bytes }. Takes the topology as a map or as JSON text.
+pub fn topo_info(topology: serde_json::Value) -> Result<Value, String> {
+    let t = input(&topology)?;
+    let topo = topo_of(&t)?;
+    let objs = t.get("objects").and_then(|v| v.as_object()).ok_or("a topology has `objects`")?;
+    let list: Vec<Value> = objs.iter().map(|(k, o)| json!({ "name": k, "type": o.get("type"), "geometries": o.get("geometries").and_then(|g| g.as_array()).map(|g| g.len()).unwrap_or(1) })).collect();
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for a in &topo.arcs {
+        for p in a {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+    }
+    let bbox = t.get("bbox").cloned().unwrap_or(if topo.arcs.is_empty() { Value::Null } else { json!([x0, y0, x1, y1]) });
+    Ok(json!({
+        "objects": list, "arcs": topo.arcs.len(), "points": topo.arcs.iter().map(|a| a.len()).sum::<usize>(), "quantized": t.get("transform").is_some(),
+        "scale": t.get("transform").and_then(|x| x.get("scale")), "translate": t.get("transform").and_then(|x| x.get("translate")), "bbox": bbox,
+    }))
+}
+
+/// An object as GeoJSON: a FeatureCollection for a GeometryCollection, else one Feature, its id and properties kept. `name` may be "" when the topology has one object.
+pub fn topo_to_geojson(topology: serde_json::Value, name: &str) -> Result<Value, String> {
+    let t = input(&topology)?;
+    let topo = topo_of(&t)?;
+    let o = object(&t, name)?;
+    if o.get("type").and_then(|v| v.as_str()) == Some("GeometryCollection") {
+        topo.geometry(o)
+    } else {
+        topo.feature(o)
+    }
+}
+
+/// The arcs as absolute positions, quantization and deltas undone, for drawing borders without their polygons.
+pub fn topo_arcs(topology: serde_json::Value) -> Result<Value, String> {
+    let t = input(&topology)?;
+    Ok(json!(topo_of(&t)?.arcs))
+}
+
+fn arc_ids(g: &Value, out: &mut Vec<usize>) {
+    match g {
+        Value::Array(a) => a.iter().for_each(|x| arc_ids(x, out)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                out.push(if i < 0 { (!i) as usize } else { i as usize });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn geoms(o: &Value) -> Vec<&Value> {
+    match o.get("geometries").and_then(|g| g.as_array()) {
+        Some(g) => g.iter().collect(),
+        None => vec![o],
+    }
+}
+
+/// Which geometries of an object touch along an arc: a list with, for each geometry, the positions of its neighbours. As topojson's `neighbors`: for a map's colouring or "the regions beside this one".
+pub fn topo_neighbors(topology: serde_json::Value, name: &str) -> Result<Value, String> {
+    let t = input(&topology)?;
+    topo_of(&t)?;
+    let list = geoms(object(&t, name)?);
+    let mut by_arc: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, g) in list.iter().enumerate() {
+        let mut ids = vec![];
+        if let Some(a) = g.get("arcs") {
+            arc_ids(a, &mut ids);
+        }
+        for a in ids {
+            let e = by_arc.entry(a).or_default();
+            if !e.contains(&i) {
+                e.push(i);
+            }
+        }
+    }
+    let mut out: Vec<Vec<usize>> = vec![vec![]; list.len()];
+    for sharing in by_arc.values() {
+        for a in sharing {
+            for b in sharing {
+                if a != b && !out[*a].contains(b) {
+                    out[*a].push(*b);
+                }
+            }
+        }
+    }
+    out.iter_mut().for_each(|x| x.sort());
+    Ok(json!(out))
+}
+
+/// A MultiLineString of an object's borders, each shared arc once. `which`: all, interior (between two geometries) or exterior (the outline).
+pub fn topo_mesh(topology: serde_json::Value, name: &str, which: &str) -> Result<Value, String> {
+    if !matches!(which, "all" | "interior" | "exterior") {
+        return Err(format!("no mesh `{}`; there are all, interior and exterior", which));
+    }
+    let t = input(&topology)?;
+    let topo = topo_of(&t)?;
+    let list = geoms(object(&t, name)?);
+    let mut uses: Vec<(usize, usize)> = vec![];
+    let mut count: HashMap<usize, usize> = HashMap::new();
+    for g in &list {
+        let mut ids = vec![];
+        if let Some(a) = g.get("arcs") {
+            arc_ids(a, &mut ids);
+        }
+        ids.sort();
+        ids.dedup();
+        for a in ids {
+            *count.entry(a).or_insert(0) += 1;
+            uses.push((a, 0));
+        }
+    }
+    let mut seen: Vec<usize> = uses.iter().map(|u| u.0).collect();
+    seen.sort();
+    seen.dedup();
+    let lines: Vec<&Vec<Vec<f64>>> = seen.iter().filter(|a| match which {
+        "interior" => count[*a] > 1,
+        "exterior" => count[*a] == 1,
+        _ => true,
+    }).map(|a| &topo.arcs[*a]).collect();
+    Ok(json!({ "type": "MultiLineString", "coordinates": lines }))
+}
+
+// Reading GeoJSON: what must become arcs, with their place kept.
+#[derive(Clone)]
+enum Shape {
+    Pts(Vec<Pt>, bool),
+    Line(usize),
+    Multi(Vec<usize>),
+    Poly(Vec<usize>),
+    MultiPoly(Vec<Vec<usize>>),
+    Coll(Vec<(Shape, Map<String, Value>)>),
+}
+
+struct Build {
+    lines: Vec<(Vec<Pt>, bool)>, // Positions, and whether a closed ring.
+}
+
+fn pos(v: &Value) -> Result<Pt, String> {
+    let a = v.as_array().filter(|a| a.len() >= 2).ok_or("a position is [x, y]")?;
+    Ok((a[0].as_f64().ok_or("a position is numbers")?, a[1].as_f64().ok_or("a position is numbers")?))
+}
+
+fn read_line(v: &Value, ring: bool, b: &mut Build) -> Result<usize, String> {
+    let pts = v.as_array().ok_or("a line is a list of positions")?.iter().map(pos).collect::<Result<Vec<_>, _>>()?;
+    if pts.len() < 2 {
+        return Err("a line has at least two positions".into());
+    }
+    if ring && pts.first() != pts.last() {
+        return Err("a polygon's ring must end where it starts".into());
+    }
+    b.lines.push((pts, ring));
+    Ok(b.lines.len() - 1)
+}
+
+fn read_geom(g: &Value, b: &mut Build) -> Result<Shape, String> {
+    let kind = g.get("type").and_then(|v| v.as_str()).ok_or("a geometry has a `type`")?;
+    let c = || g.get("coordinates").ok_or(format!("a {} has `coordinates`", kind));
+    let list = |v: &Value| v.as_array().cloned().ok_or("bad coordinates".to_string());
+    Ok(match kind {
+        "Point" => Shape::Pts(vec![pos(c()?)?], false),
+        "MultiPoint" => Shape::Pts(list(c()?)?.iter().map(pos).collect::<Result<_, _>>()?, true),
+        "LineString" => Shape::Line(read_line(c()?, false, b)?),
+        "MultiLineString" => Shape::Multi(list(c()?)?.iter().map(|l| read_line(l, false, b)).collect::<Result<_, _>>()?),
+        "Polygon" => Shape::Poly(list(c()?)?.iter().map(|l| read_line(l, true, b)).collect::<Result<_, _>>()?),
+        "MultiPolygon" => {
+            let mut p = vec![];
+            for x in list(c()?)? {
+                p.push(list(&x)?.iter().map(|l| read_line(l, true, b)).collect::<Result<Vec<_>, _>>()?);
+            }
+            Shape::MultiPoly(p)
+        }
+        "GeometryCollection" => {
+            let items = g.get("geometries").and_then(|v| v.as_array()).ok_or("a GeometryCollection has `geometries`")?;
+            Shape::Coll(items.iter().map(|x| Ok((read_geom(x, b)?, Map::new()))).collect::<Result<_, String>>()?)
+        }
+        o => return Err(format!("`{}` is no GeoJSON geometry", o)),
+    })
+}
+
+fn read_any(g: &Value, b: &mut Build) -> Result<(Shape, Map<String, Value>), String> {
+    let kind = g.get("type").and_then(|v| v.as_str()).ok_or("GeoJSON has a `type`")?;
+    match kind {
+        "Feature" => {
+            let mut extra = Map::new();
+            if let Some(i) = g.get("id") {
+                extra.insert("id".into(), i.clone());
+            }
+            if let Some(p) = g.get("properties").filter(|p| !p.is_null()) {
+                extra.insert("properties".into(), p.clone());
+            }
+            let geo = g.get("geometry").filter(|x| !x.is_null()).ok_or("a Feature has no geometry")?;
+            Ok((read_geom(geo, b)?, extra))
+        }
+        "FeatureCollection" => {
+            let fs = g.get("features").and_then(|v| v.as_array()).ok_or("a FeatureCollection has `features`")?;
+            Ok((Shape::Coll(fs.iter().map(|f| read_any(f, b)).collect::<Result<_, _>>()?), Map::new()))
+        }
+        _ => Ok((read_geom(g, b)?, Map::new())),
+    }
+}
+
+type Key = (i64, i64);
+
+fn key(p: Pt) -> Key {
+    (p.0.to_bits() as i64, p.1.to_bits() as i64)
+}
+
+// Each ring starts at a junction where it has one, so that shared borders cut the same way.
+fn cut(lines: &[(Vec<Pt>, bool)]) -> Vec<Vec<Vec<Pt>>> {
+    // Which neighbours each point has been seen with: a second, different pair makes a junction.
+    let mut seen: HashMap<Key, (Option<Key>, Option<Key>)> = HashMap::new();
+    let mut junction: HashMap<Key, bool> = HashMap::new();
+    let mut touch = |p: Pt, a: Option<Pt>, b: Option<Pt>| {
+        let (ka, kb) = (a.map(key), b.map(key));
+        let pair = if ka <= kb { (ka, kb) } else { (kb, ka) };
+        match seen.get(&key(p)) {
+            None => {
+                seen.insert(key(p), pair);
+            }
+            Some(old) if *old != pair => {
+                junction.insert(key(p), true);
+            }
+            _ => {}
+        }
+    };
+    for (pts, ring) in lines {
+        let n = pts.len();
+        if *ring {
+            let m = n - 1;
+            for i in 0..m {
+                touch(pts[i], Some(pts[(i + m - 1) % m]), Some(pts[(i + 1) % m]));
+            }
+        } else {
+            for i in 0..n {
+                touch(pts[i], i.checked_sub(1).map(|j| pts[j]), pts.get(i + 1).copied());
+            }
+        }
+    }
+    let is_j = |p: Pt| junction.contains_key(&key(p));
+    let mut out = vec![];
+    for (pts, ring) in lines {
+        let mut parts: Vec<Vec<Pt>> = vec![];
+        if *ring {
+            let m = pts.len() - 1;
+            let start = (0..m).find(|i| is_j(pts[*i]));
+            match start {
+                None => parts.push(pts.clone()),
+                Some(s) => {
+                    let mut cur = vec![pts[s]];
+                    for k in 1..=m {
+                        let p = pts[(s + k) % m];
+                        cur.push(p);
+                        if is_j(p) {
+                            parts.push(std::mem::replace(&mut cur, vec![p]));
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut cur = vec![pts[0]];
+            for (i, p) in pts.iter().enumerate().skip(1) {
+                cur.push(*p);
+                if is_j(*p) && i + 1 < pts.len() {
+                    parts.push(std::mem::replace(&mut cur, vec![*p]));
+                }
+            }
+            parts.push(cur);
+        }
+        out.push(parts);
+    }
+    out
+}
+
+fn canon(a: &[Pt]) -> Vec<Key> {
+    a.iter().map(|p| key(*p)).collect()
+}
+
+// A ring with no junction may start anywhere: the same ring turned must still match.
+fn ring_key(a: &[Pt]) -> Vec<Key> {
+    let m = a.len() - 1;
+    let k = canon(&a[..m]);
+    let s = (0..m).min_by_key(|i| k[*i]).unwrap_or(0);
+    (0..m).map(|i| k[(s + i) % m]).collect()
+}
+
+struct Arcs {
+    list: Vec<Vec<Pt>>,
+    index: HashMap<Vec<Key>, i64>,
+    rings: HashMap<Vec<Key>, i64>,
+}
+
+impl Arcs {
+    fn add(&mut self, a: Vec<Pt>) -> i64 {
+        let closed = a.len() > 3 && a.first() == a.last();
+        if closed {
+            let k = ring_key(&a);
+            if let Some(i) = self.rings.get(&k) {
+                return *i;
+            }
+            let mut rev = a.clone();
+            rev.reverse();
+            if let Some(i) = self.rings.get(&ring_key(&rev)) {
+                return !*i;
+            }
+            let i = self.list.len() as i64;
+            self.rings.insert(k, i);
+            self.list.push(a);
+            return i;
+        }
+        let k = canon(&a);
+        if let Some(i) = self.index.get(&k) {
+            return *i;
+        }
+        let mut r = k.clone();
+        r.reverse();
+        if let Some(i) = self.index.get(&r) {
+            return !*i;
+        }
+        let i = self.list.len() as i64;
+        self.index.insert(k, i);
+        self.list.push(a);
+        i
+    }
+}
+
+fn scale_all(b: &mut Build, shape: &mut (Shape, Map<String, Value>), q: i64) -> Option<(f64, f64, f64, f64)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut seen = |p: &Pt| {
+        x0 = x0.min(p.0);
+        y0 = y0.min(p.1);
+        x1 = x1.max(p.0);
+        y1 = y1.max(p.1);
+    };
+    for (pts, _) in &b.lines {
+        pts.iter().for_each(&mut seen);
+    }
+    fn each_point(s: &mut (Shape, Map<String, Value>), f: &mut dyn FnMut(&mut Pt)) {
+        match &mut s.0 {
+            Shape::Pts(p, _) => p.iter_mut().for_each(|x| f(x)),
+            Shape::Coll(c) => c.iter_mut().for_each(|x| each_point(x, f)),
+            _ => {}
+        }
+    }
+    each_point(shape, &mut |p: &mut Pt| seen(p));
+    if x0 > x1 {
+        return None;
+    }
+    if q <= 1 {
+        return Some((1.0, 1.0, x0, y0));
+    }
+    let kx = if x1 > x0 { (x1 - x0) / (q - 1) as f64 } else { 1.0 };
+    let ky = if y1 > y0 { (y1 - y0) / (q - 1) as f64 } else { 1.0 };
+    let quant = |p: &mut Pt| {
+        p.0 = ((p.0 - x0) / kx).round();
+        p.1 = ((p.1 - y0) / ky).round();
+    };
+    for (pts, _) in b.lines.iter_mut() {
+        pts.iter_mut().for_each(quant);
+        pts.dedup();
+    }
+    each_point(shape, &mut |p: &mut Pt| quant(p));
+    Some((kx, ky, x0, y0))
+}
+
+fn write_shape(s: &(Shape, Map<String, Value>), made: &[Vec<i64>]) -> Value {
+    let ring = |i: &usize| json!(made[*i]);
+    let mut o = Map::new();
+    match &s.0 {
+        Shape::Pts(p, many) => {
+            let pt = |x: &Pt| json!([x.0, x.1]);
+            if *many {
+                o.insert("type".into(), json!("MultiPoint"));
+                o.insert("coordinates".into(), json!(p.iter().map(pt).collect::<Vec<_>>()));
+            } else {
+                o.insert("type".into(), json!("Point"));
+                o.insert("coordinates".into(), pt(&p[0]));
+            }
+        }
+        Shape::Line(i) => {
+            o.insert("type".into(), json!("LineString"));
+            o.insert("arcs".into(), ring(i));
+        }
+        Shape::Multi(l) => {
+            o.insert("type".into(), json!("MultiLineString"));
+            o.insert("arcs".into(), json!(l.iter().map(ring).collect::<Vec<_>>()));
+        }
+        Shape::Poly(l) => {
+            o.insert("type".into(), json!("Polygon"));
+            o.insert("arcs".into(), json!(l.iter().map(ring).collect::<Vec<_>>()));
+        }
+        Shape::MultiPoly(ps) => {
+            o.insert("type".into(), json!("MultiPolygon"));
+            o.insert("arcs".into(), json!(ps.iter().map(|p| p.iter().map(ring).collect::<Vec<_>>()).collect::<Vec<_>>()));
+        }
+        Shape::Coll(c) => {
+            o.insert("type".into(), json!("GeometryCollection"));
+            o.insert("geometries".into(), json!(c.iter().map(|x| write_shape(x, made)).collect::<Vec<_>>()));
+        }
+    }
+    for (k, v) in &s.1 {
+        o.insert(k.clone(), v.clone());
+    }
+    Value::Object(o)
+}
+
+/// GeoJSON made into a topology: borders that two features share become one arc. `options`: { name (of the object, default `collection`), quantization (default 100000; 0 keeps the coordinates exact) }. Takes any GeoJSON, as a map or text. A position must match to the bit to count as shared, so unquantized data from different sources may not join.
+pub fn topo_from_geojson(geojson: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let g = input(&geojson)?;
+    let name = options.get("name").and_then(|v| v.as_str()).unwrap_or("collection").to_string();
+    let q = options.get("quantization").and_then(|v| v.as_i64()).unwrap_or(100_000);
+    if q < 0 || q == 1 {
+        return Err("quantization is 0 for none, or at least 2".into());
+    }
+    let mut b = Build { lines: vec![] };
+    let mut shape = read_any(&g, &mut b)?;
+    let tr = if q > 0 { scale_all(&mut b, &mut shape, q) } else { None };
+    if q > 0 {
+        if let Some(bad) = b.lines.iter().position(|l| l.0.len() < 2 || (l.1 && l.0.len() < 4)) {
+            return Err(format!("line {} collapses at that quantization: use a higher one", bad + 1));
+        }
+    }
+    let parts = cut(&b.lines);
+    let mut arcs = Arcs { list: vec![], index: HashMap::new(), rings: HashMap::new() };
+    let made: Vec<Vec<i64>> = parts.into_iter().map(|p| p.into_iter().map(|a| arcs.add(a)).collect()).collect();
+    let quantized = q > 0 && tr.is_some();
+    let encoded: Vec<Value> = arcs.list.iter().map(|a| {
+        if quantized {
+            let (mut x, mut y) = (0.0, 0.0);
+            json!(a.iter().map(|p| {
+                let d = json!([(p.0 - x) as i64, (p.1 - y) as i64]);
+                x = p.0;
+                y = p.1;
+                d
+            }).collect::<Vec<_>>())
+        } else {
+            json!(a.iter().map(|p| json!([p.0, p.1])).collect::<Vec<_>>())
+        }
+    }).collect();
+    let mut objects = Map::new();
+    // Points are integers once quantized.
+    fn ints(v: &mut Value) {
+        match v {
+            Value::Array(a) => a.iter_mut().for_each(ints),
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    if k == "coordinates" || k == "geometries" {
+                        ints(x);
+                    }
+                }
+            }
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    *v = json!(f as i64);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut written = write_shape(&shape, &made);
+    if quantized {
+        ints(&mut written);
+    }
+    objects.insert(name, written);
+    let mut t = Map::new();
+    t.insert("type".into(), json!("Topology"));
+    if let (Some((kx, ky, x0, y0)), true) = (tr, quantized) {
+        t.insert("transform".into(), json!({ "scale": [kx, ky], "translate": [x0, y0] }));
+    }
+    t.insert("objects".into(), Value::Object(objects));
+    t.insert("arcs".into(), Value::Array(encoded));
+    Ok(Value::Object(t))
+}

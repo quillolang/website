@@ -1,0 +1,195 @@
+//! The WhatsApp Cloud API: text and template messages, read receipts, the webhook's verify handshake and X-Hub-Signature-256 check, and webhook bodies flattened into the messages and statuses they hold.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::time::Duration;
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+// Numbers are sent as digits with the country code, no + or spaces.
+fn digits(to: &str) -> Result<String, String> {
+    let d: String = to.chars().filter(|c| c.is_ascii_digit()).collect();
+    if d.len() < 8 || d.len() > 15 || d.starts_with('0') {
+        return Err(format!("{:?} is not a number with its country code, like 15551234567", to));
+    }
+    Ok(d)
+}
+
+fn error_text(status: u16, body: &str) -> (i64, String) {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let e = &v["error"];
+    let code = e["code"].as_i64().unwrap_or(0);
+    let msg = e["message"].as_str().map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let details = e.pointer("/error_data/details").and_then(|d| d.as_str()).map(|d| format!(": {}", d)).unwrap_or_default();
+    let hint = match code {
+        131047 => " (over 24 hours since the customer last wrote: send a template)",
+        131026 => " (the number cannot be reached on WhatsApp)",
+        131030 => " (in test mode only numbers on the allowed list can be sent to)",
+        132000 => " (the template's parameters do not match it)",
+        132001 => " (no approved template has this name and language)",
+        190 => " (the access token is wrong or has expired)",
+        100 => " (a parameter is wrong)",
+        _ => "",
+    };
+    (code, format!("WhatsApp {} (code {}): {}{}{}", status, code, msg, details, hint))
+}
+
+fn post(path: &str, body: &Value, o: &Value) -> Result<Value, String> {
+    let token = opt(o, "token", "WHATSAPP_TOKEN").ok_or("no access token: set WHATSAPP_TOKEN, or give the option token")?;
+    let phone = opt(o, "phone_number_id", "WHATSAPP_PHONE_NUMBER_ID").ok_or("no sender: set WHATSAPP_PHONE_NUMBER_ID, or give the option phone_number_id")?;
+    let base = opt(o, "base_url", "WHATSAPP_API_URL").unwrap_or_else(|| "https://graph.facebook.com".into());
+    let version = opt(o, "version", "WHATSAPP_API_VERSION").unwrap_or_else(|| "v23.0".into());
+    let url = format!("{}/{}/{}/{}", base.trim_end_matches('/'), version, phone, path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut tries = 0;
+    loop {
+        let res = agent.post(&url).set("Authorization", &format!("Bearer {}", token)).set("Content-Type", "application/json").send_string(&body.to_string());
+        let (status, text) = match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("WhatsApp's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+            Err(e) => return Err(format!("cannot reach WhatsApp at {}: {}", base, e)),
+        };
+        let (code, msg) = error_text(status, &text);
+        // 130429 is the number's message rate; 131056 too many to one person. Both pass in moments.
+        if (status == 429 || code == 130429 || code == 131056 || code == 80007) && tries < 2 {
+            std::thread::sleep(Duration::from_millis(500 * 4u64.pow(tries)));
+            tries += 1;
+            continue;
+        }
+        return Err(msg);
+    }
+}
+
+/// Sends any message: `message` holds `type` and its part ({ type: "image", image: { link } }, "document", "location", "interactive"...), with messaging_product added. Options: token (else WHATSAPP_TOKEN), phone_number_id (else WHATSAPP_PHONE_NUMBER_ID), base_url (else WHATSAPP_API_URL), version (else WHATSAPP_API_VERSION), reply_to (a message id). Gives { id, wa_id, status }.
+pub fn whatsapp_send(to: &str, message: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut body = if message.is_object() { message } else { return Err("the message is a map with a `type`".into()) };
+    if body.get("type").and_then(|t| t.as_str()).is_none() {
+        return Err("the message needs a `type`".into());
+    }
+    body["messaging_product"] = json!("whatsapp");
+    body["recipient_type"] = json!("individual");
+    body["to"] = json!(digits(to)?);
+    if let Some(r) = options.get("reply_to").and_then(|r| r.as_str()) {
+        body["context"] = json!({ "message_id": r });
+    }
+    let r = post("messages", &body, &options)?;
+    Ok(json!({ "id": r.pointer("/messages/0/id"), "wa_id": r.pointer("/contacts/0/wa_id"), "status": r.pointer("/messages/0/message_status") }))
+}
+
+/// A text message of up to 4096 characters. It reaches someone only within 24 hours of their last message; outside that send a template. `options` add preview_url (true shows a link's preview) to whatsapp_send's.
+pub fn whatsapp_text(to: &str, text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let n = text.chars().count();
+    if n == 0 || n > 4096 {
+        return Err(format!("a text message is 1 to 4096 characters, not {}", n));
+    }
+    let preview = options.get("preview_url").and_then(|p| p.as_bool()).unwrap_or(false);
+    whatsapp_send(to, json!({ "type": "text", "text": { "body": text, "preview_url": preview } }), options)
+}
+
+/// A template message, the one way to start a conversation: `name` and `language` ("en_US") as approved in WhatsApp Manager, `components` from whatsapp_body and whatsapp_button or as the API documents them ([] when it has no variables).
+pub fn whatsapp_template(to: &str, name: &str, language: &str, components: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut t = json!({ "name": name, "language": { "code": language } });
+    if !components.is_empty() {
+        t["components"] = json!(components);
+    }
+    whatsapp_send(to, json!({ "type": "template", "template": t }), options)
+}
+
+fn text_params(values: Vec<String>) -> Vec<Value> {
+    values.into_iter().map(|v| json!({ "type": "text", "text": v })).collect()
+}
+
+/// The body component of a template, filling {{1}}, {{2}}... with `values`.
+pub fn whatsapp_body(values: Vec<String>) -> serde_json::Value {
+    json!({ "type": "body", "parameters": text_params(values) })
+}
+
+/// The header component of a template, with an image at `link`.
+pub fn whatsapp_header_image(link: &str) -> serde_json::Value {
+    json!({ "type": "header", "parameters": [{ "type": "image", "image": { "link": link } }] })
+}
+
+/// A template's button component: `index` 0 onward, `sub_type` "url" (value fills the URL's {{1}}) or "quick_reply" (value is the payload that comes back).
+pub fn whatsapp_button(index: i64, sub_type: &str, value: &str) -> Result<serde_json::Value, String> {
+    let p = match sub_type {
+        "url" => json!({ "type": "text", "text": value }),
+        "quick_reply" => json!({ "type": "payload", "payload": value }),
+        o => return Err(format!("a button's sub_type is url or quick_reply, not {:?}", o)),
+    };
+    Ok(json!({ "type": "button", "sub_type": sub_type, "index": index.to_string(), "parameters": [p] }))
+}
+
+/// Marks a received message as read, which shows blue ticks.
+pub fn whatsapp_mark_read(message_id: &str, options: serde_json::Value) -> Result<bool, String> {
+    let r = post("messages", &json!({ "messaging_product": "whatsapp", "status": "read", "message_id": message_id }), &options)?;
+    Ok(r["success"] == true)
+}
+
+/// Answers Meta's webhook check: `query` is the GET's, with hub.mode, hub.verify_token, hub.challenge. Gives the challenge, to send back as plain text, or an error for a 403.
+pub fn whatsapp_verify(query: std::collections::HashMap<String, serde_json::Value>, verify_token: &str) -> Result<String, String> {
+    let q = |k: &str| query.get(k).map(|v| v.as_str().map(str::to_string).unwrap_or(v.to_string()));
+    if q("hub.mode").as_deref() != Some("subscribe") {
+        return Err("hub.mode is not subscribe".into());
+    }
+    let got = q("hub.verify_token").unwrap_or_default();
+    if verify_token.is_empty() || !same(&got, verify_token) {
+        return Err("hub.verify_token does not match".into());
+    }
+    q("hub.challenge").ok_or("no hub.challenge".to_string())
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn signature(secret: &str, body: &str) -> String {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    format!("sha256={}", hex::encode(m.finalize().into_bytes()))
+}
+
+/// Whether a webhook POST is really Meta's: the raw `body` and its X-Hub-Signature-256 header, an HMAC-SHA256 with the app secret (else WHATSAPP_APP_SECRET), compared in constant time.
+pub fn whatsapp_signature_ok(body: &str, header: &str, app_secret: &str) -> bool {
+    let secret = if app_secret.is_empty() { std::env::var("WHATSAPP_APP_SECRET").unwrap_or_default() } else { app_secret.to_string() };
+    !secret.is_empty() && same(&signature(&secret, body), &header.to_ascii_lowercase())
+}
+
+/// What a webhook body holds, flattened: { messages: [{ id, from, name, timestamp, type, text, button, phone_number_id, raw }], statuses: [{ id, status, recipient, timestamp, errors, phone_number_id }] }. A body can carry several of each; statuses come out of order, so judge by timestamp.
+pub fn whatsapp_read_webhook(body: &str) -> Result<serde_json::Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    if v["object"] != "whatsapp_business_account" {
+        return Err(format!("this is not a WhatsApp webhook: object is {}", v["object"]));
+    }
+    let (mut messages, mut statuses) = (vec![], vec![]);
+    for entry in v["entry"].as_array().into_iter().flatten() {
+        for change in entry["changes"].as_array().into_iter().flatten() {
+            let val = &change["value"];
+            let phone = val.pointer("/metadata/phone_number_id").cloned().unwrap_or(Value::Null);
+            let contacts = val["contacts"].as_array().cloned().unwrap_or_default();
+            for m in val["messages"].as_array().into_iter().flatten() {
+                let name = contacts.iter().find(|c| c["wa_id"] == m["from"]).and_then(|c| c.pointer("/profile/name")).cloned().unwrap_or(Value::Null);
+                let text = m.pointer("/text/body").or(m.pointer("/interactive/button_reply/title")).or(m.pointer("/interactive/list_reply/title")).or(m.pointer("/button/text")).or(m.pointer("/image/caption")).cloned().unwrap_or(Value::Null);
+                let button = m.pointer("/button/payload").or(m.pointer("/interactive/button_reply/id")).or(m.pointer("/interactive/list_reply/id")).cloned().unwrap_or(Value::Null);
+                messages.push(json!({ "id": m["id"], "from": m["from"], "name": name, "timestamp": m["timestamp"], "type": m["type"], "text": text, "button": button, "phone_number_id": phone, "raw": m }));
+            }
+            for s in val["statuses"].as_array().into_iter().flatten() {
+                statuses.push(json!({ "id": s["id"], "status": s["status"], "recipient": s["recipient_id"], "timestamp": s["timestamp"], "errors": s.get("errors").cloned().unwrap_or(json!([])), "phone_number_id": phone }));
+            }
+        }
+    }
+    Ok(json!({ "messages": messages, "statuses": statuses }))
+}

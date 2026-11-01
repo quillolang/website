@@ -1,0 +1,445 @@
+//! Let's Encrypt's ACME v2 by hand: account, order, HTTP-01 and DNS-01 values, JWS with ES256, nonces kept and retried, finalize with a CSR made here, and the certificate downloaded, in pure Rust.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! ureq = "2"
+//! base64 = "0.22"
+//! sha2 = "0.10"
+//! p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "pkcs8", "pem"] }
+//! getrandom = "0.2"
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Let's Encrypt's staging directory, used when none is given: its certificates are not trusted, and its limits are kind.
+const STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+const BAD_NONCE_TRIES: usize = 5;
+
+static DIRECTORIES: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
+static NONCES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
+fn b64(x: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(x)
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
+}
+
+fn directory_url(given: &str) -> String {
+    if !given.is_empty() {
+        return given.to_string();
+    }
+    std::env::var("ACME_DIRECTORY").ok().filter(|x| !x.is_empty()).unwrap_or_else(|| STAGING.to_string())
+}
+
+fn load_key(pem: &str) -> Result<SigningKey, String> {
+    SigningKey::from_pkcs8_pem(pem).map_err(|e| format!("the key is not a PKCS#8 P-256 PEM: {}", e))
+}
+
+/// A new P-256 key as a PKCS#8 PEM, for the account or for a certificate. Keep the two apart, and keep the account's for good.
+pub fn acme_new_key() -> Result<String, String> {
+    loop {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+        if let Ok(k) = SigningKey::from_slice(&b) {
+            return k.to_pkcs8_pem(LineEnding::LF).map(|p| p.to_string()).map_err(|e| e.to_string());
+        }
+    }
+}
+
+fn point(k: &SigningKey) -> (Vec<u8>, Vec<u8>) {
+    let p = k.verifying_key().to_encoded_point(false);
+    (p.x().unwrap().to_vec(), p.y().unwrap().to_vec())
+}
+
+fn jwk(k: &SigningKey) -> Value {
+    let (x, y) = point(k);
+    json!({ "crv": "P-256", "kty": "EC", "x": b64(&x), "y": b64(&y) })
+}
+
+fn thumb(k: &SigningKey) -> String {
+    let (x, y) = point(k);
+    // RFC 7638: the required members, in order, with no spaces.
+    let text = format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}", b64(&x), b64(&y));
+    b64(&Sha256::digest(text.as_bytes()))
+}
+
+/// The account key's RFC 7638 thumbprint, base64url.
+pub fn acme_thumbprint(key: &str) -> Result<String, String> {
+    Ok(thumb(&load_key(key)?))
+}
+
+fn token_ok(token: &str) -> Result<(), String> {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("`{}` is not a challenge token", token));
+    }
+    Ok(())
+}
+
+/// For HTTP-01: `{ path, body }`, what must be served at `http://<domain>/.well-known/acme-challenge/<token>`, as text, on port 80.
+pub fn acme_http01(key: &str, token: &str) -> Result<Value, String> {
+    token_ok(token)?;
+    let k = load_key(key)?;
+    Ok(json!({ "path": format!("/.well-known/acme-challenge/{}", token), "body": format!("{}.{}", token, thumb(&k)) }))
+}
+
+/// For DNS-01: `{ name, value }`, the TXT record to publish. A wildcard's name loses its `*.`.
+pub fn acme_dns01(key: &str, domain: &str, token: &str) -> Result<Value, String> {
+    token_ok(token)?;
+    let k = load_key(key)?;
+    let auth = format!("{}.{}", token, thumb(&k));
+    Ok(json!({ "name": format!("_acme-challenge.{}", domain.trim_start_matches("*.")), "value": b64(&Sha256::digest(auth.as_bytes())) }))
+}
+
+/// One line from an RFC 7807 problem: its short type, detail and subproblems.
+fn problem(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let kind = v["type"].as_str().unwrap_or("").trim_start_matches("urn:ietf:params:acme:error:");
+    let mut out = format!("ACME {}: {}: {}", status, if kind.is_empty() { "error" } else { kind }, v["detail"].as_str().unwrap_or(&text.chars().take(200).collect::<String>()));
+    for s in v["subproblems"].as_array().into_iter().flatten() {
+        out += &format!("; {}: {}", s["identifier"]["value"].as_str().unwrap_or(""), s["detail"].as_str().unwrap_or(""));
+    }
+    out
+}
+
+/// The directory of a server: `newNonce`, `newAccount`, `newOrder`, `revokeCert`, `meta`. `url` empty: ACME_DIRECTORY, else Let's Encrypt's staging.
+pub fn acme_directory(url: &str) -> Result<Value, String> {
+    let u = directory_url(url);
+    if let Some(d) = DIRECTORIES.lock().unwrap().as_ref().and_then(|c| c.get(&u)) {
+        return Ok(d.clone());
+    }
+    let text = agent().get(&u).call().map_err(|e| format!("{}: {}", u, e))?.into_string().map_err(|e| e.to_string())?;
+    let d: Value = serde_json::from_str(&text).map_err(|e| format!("{}: not JSON: {}", u, e))?;
+    for k in ["newNonce", "newAccount", "newOrder"] {
+        if !d[k].is_string() {
+            return Err(format!("{}: no {} in the directory", u, k));
+        }
+    }
+    DIRECTORIES.lock().unwrap().get_or_insert_with(HashMap::new).insert(u, d.clone());
+    Ok(d)
+}
+
+fn keep_nonce(dir: &str, n: Option<&str>) {
+    if let Some(n) = n.filter(|x| !x.is_empty()) {
+        let mut g = NONCES.lock().unwrap();
+        let pool = g.get_or_insert_with(HashMap::new).entry(dir.to_string()).or_default();
+        pool.push(n.to_string());
+        let extra = pool.len().saturating_sub(16);
+        pool.drain(..extra);
+    }
+}
+
+fn nonce(dir: &str, d: &Value) -> Result<String, String> {
+    if let Some(n) = NONCES.lock().unwrap().as_mut().and_then(|m| m.get_mut(dir)).and_then(Vec::pop) {
+        return Ok(n);
+    }
+    let url = d["newNonce"].as_str().unwrap();
+    let r = agent().head(url).call().map_err(|e| format!("{}: {}", url, e))?;
+    r.header("replay-nonce").map(str::to_string).ok_or("the server gave no Replay-Nonce".into())
+}
+
+struct Answer {
+    status: u16,
+    location: Option<String>,
+    link: Vec<String>,
+    retry: Option<u64>,
+    text: String,
+}
+
+/// Signed POST. `payload` null is POST-as-GET, an empty payload. A `badNonce` is tried again with the nonce it came with, as RFC 8555 says.
+fn post(dir: &str, url: &str, payload: Option<&Value>, k: &SigningKey, kid: Option<&str>) -> Result<Answer, String> {
+    let d = acme_directory(dir)?;
+    let body = match payload {
+        Some(p) => b64(p.to_string().as_bytes()),
+        None => String::new(),
+    };
+    for attempt in 0..BAD_NONCE_TRIES {
+        let mut protected = json!({ "alg": "ES256", "nonce": nonce(dir, &d)?, "url": url });
+        match kid {
+            Some(id) => protected["kid"] = json!(id),
+            None => protected["jwk"] = jwk(k),
+        }
+        let head = b64(protected.to_string().as_bytes());
+        let sig: Signature = k.sign(format!("{}.{}", head, body).as_bytes());
+        let jws = json!({ "protected": head, "payload": body, "signature": b64(&sig.to_bytes()) });
+        let r = agent().post(url).set("Content-Type", "application/jose+json").send_string(&jws.to_string());
+        let (status, a) = match r {
+            Ok(a) => (a.status(), a),
+            Err(ureq::Error::Status(s, a)) => (s, a),
+            Err(e) => return Err(format!("{}: {}", url, e)),
+        };
+        keep_nonce(dir, a.header("replay-nonce"));
+        let location = a.header("location").map(str::to_string);
+        let retry = a.header("retry-after").and_then(|x| x.trim().parse().ok());
+        let link: Vec<String> = a.all("link").iter().map(|x| x.to_string()).collect();
+        let text = a.into_string().map_err(|e| e.to_string())?;
+        if status == 400 && text.contains("urn:ietf:params:acme:error:badNonce") && attempt + 1 < BAD_NONCE_TRIES {
+            continue;
+        }
+        if status >= 400 {
+            let mut e = problem(status, &text);
+            if status == 429 {
+                e += &format!(" (try again after {} seconds)", retry.unwrap_or(60));
+            }
+            return Err(e);
+        }
+        return Ok(Answer { status, location, link, retry, text });
+    }
+    Err("the server refused every nonce".into())
+}
+
+fn json_of(a: &Answer) -> Result<Value, String> {
+    serde_json::from_str(&a.text).map_err(|e| format!("the server's answer is not JSON: {}", e))
+}
+
+/// Makes the account, or finds the one this key has. `options`: `contact` (a list, `mailto:you@example.com`), `terms_agreed` (true is needed, having read them), `only_existing` (no new account). Gives `{ url, status, created, contact }`; `url` is the account's id, the `kid` the other calls take.
+pub fn acme_account(directory: &str, key: &str, options: serde_json::Value) -> Result<Value, String> {
+    let d = acme_directory(directory)?;
+    let k = load_key(key)?;
+    let mut p = json!({});
+    if let Some(c) = options.get("contact") {
+        p["contact"] = c.clone();
+    }
+    if options["terms_agreed"].as_bool().unwrap_or(false) {
+        p["termsOfServiceAgreed"] = json!(true);
+    }
+    if options["only_existing"].as_bool().unwrap_or(false) {
+        p["onlyReturnExisting"] = json!(true);
+    }
+    let a = post(directory, d["newAccount"].as_str().unwrap(), Some(&p), &k, None)?;
+    let url = a.location.clone().ok_or("the server gave no account URL")?;
+    let v = json_of(&a)?;
+    Ok(json!({ "url": url, "status": v["status"], "created": a.status == 201, "contact": v["contact"] }))
+}
+
+fn domain_ok(x: &str) -> Result<(), String> {
+    let t = x.strip_prefix("*.").unwrap_or(x);
+    if t.is_empty() || t.len() > 253 || !t.contains('.') || !t.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !l.starts_with('-') && !l.ends_with('-')) {
+        return Err(format!("`{}` is not a domain in lower case and punycode", x));
+    }
+    Ok(())
+}
+
+/// Starts an order for `domains`, a wildcard (`*.example.com`) among them if DNS-01 will prove it. Gives the order with its `url`: `status`, `authorizations`, `finalize`.
+pub fn acme_order(directory: &str, key: &str, kid: &str, domains: Vec<String>) -> Result<Value, String> {
+    if domains.is_empty() {
+        return Err("no domains".into());
+    }
+    for x in &domains {
+        domain_ok(x)?;
+    }
+    let d = acme_directory(directory)?;
+    let k = load_key(key)?;
+    let ids: Vec<Value> = domains.iter().map(|x| json!({ "type": "dns", "value": x })).collect();
+    let a = post(directory, d["newOrder"].as_str().unwrap(), Some(&json!({ "identifiers": ids })), &k, Some(kid))?;
+    let mut v = json_of(&a)?;
+    v["url"] = json!(a.location.ok_or("the server gave no order URL")?);
+    Ok(v)
+}
+
+/// Any object by a signed POST-as-GET: an order or an authorization or a challenge. Gives its JSON, with `url`.
+pub fn acme_get(directory: &str, key: &str, kid: &str, url: &str) -> Result<Value, String> {
+    let k = load_key(key)?;
+    let a = post(directory, url, None, &k, Some(kid))?;
+    let mut v = json_of(&a)?;
+    v["url"] = json!(url);
+    Ok(v)
+}
+
+/// An authorization with what proves it: `{ domain, wildcard, status, challenges: [{ type, url, token, status, ...}] }`, an HTTP-01 challenge having `path` and `body`, a DNS-01 one `name` and `value`.
+pub fn acme_authorization(directory: &str, key: &str, kid: &str, url: &str) -> Result<Value, String> {
+    let mut a = acme_get(directory, key, kid, url)?;
+    let domain = a["identifier"]["value"].as_str().unwrap_or("").to_string();
+    let empty = vec![];
+    let mut list = vec![];
+    for c in a["challenges"].as_array().unwrap_or(&empty) {
+        let mut x = c.clone();
+        let token = c["token"].as_str().unwrap_or("");
+        let extra = match c["type"].as_str() {
+            Some("http-01") => Some(acme_http01(key, token)?),
+            Some("dns-01") => Some(acme_dns01(key, &domain, token)?),
+            _ => None,
+        };
+        if let Some(Value::Object(m)) = extra {
+            for (k, v) in m {
+                x[k] = v;
+            }
+        }
+        list.push(x);
+    }
+    a["domain"] = json!(domain);
+    a["wildcard"] = json!(a["wildcard"].as_bool().unwrap_or(false));
+    a["challenges"] = Value::Array(list);
+    Ok(a)
+}
+
+/// Tells the server the proof is in place, once the file is served or the record has spread. Then wait with `acme_wait`.
+pub fn acme_ready(directory: &str, key: &str, kid: &str, challenge_url: &str) -> Result<Value, String> {
+    let k = load_key(key)?;
+    let a = post(directory, challenge_url, Some(&json!({})), &k, Some(kid))?;
+    json_of(&a)
+}
+
+/// Polls an order or an authorization, as its Retry-After says, until its status is one of `want`, up to `timeout_ms`. `invalid` ends it with the server's reason, the failed challenge's for an authorization.
+pub fn acme_wait(directory: &str, key: &str, kid: &str, url: &str, want: Vec<String>, timeout_ms: i64) -> Result<Value, String> {
+    let k = load_key(key)?;
+    let until = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let a = post(directory, url, None, &k, Some(kid))?;
+        let mut v = json_of(&a)?;
+        v["url"] = json!(url);
+        let status = v["status"].as_str().unwrap_or("").to_string();
+        if want.iter().any(|w| *w == status) {
+            return Ok(v);
+        }
+        if status == "invalid" || status == "revoked" || status == "expired" || status == "deactivated" {
+            let e = v["challenges"].as_array().into_iter().flatten().find(|c| c["status"] == "invalid").map(|c| c["error"].clone()).or(v.get("error").cloned()).unwrap_or(Value::Null);
+            return Err(format!("{}: {}: {}", status, e["type"].as_str().unwrap_or("").trim_start_matches("urn:ietf:params:acme:error:"), e["detail"].as_str().unwrap_or("no reason given")));
+        }
+        if Instant::now() >= until {
+            return Err(format!("still `{}` after {} ms", status, timeout_ms));
+        }
+        let wait = a.retry.map(|s| s.saturating_mul(1000)).unwrap_or(500).min(10_000);
+        std::thread::sleep(Duration::from_millis(wait).min(until.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn der(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let n: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = vec![tag];
+    if n < 128 {
+        out.push(n as u8);
+    } else if n < 256 {
+        out.extend_from_slice(&[0x81, n as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]);
+    }
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// A PKCS#10 request for `domains`, base64url of its DER as `finalize` wants, signed with the certificate's key. All go in subjectAltName, the first also as common name when it fits 64 characters.
+pub fn acme_csr(cert_key: &str, domains: Vec<String>) -> Result<String, String> {
+    if domains.is_empty() {
+        return Err("no domains".into());
+    }
+    for x in &domains {
+        domain_ok(x)?;
+    }
+    let k = load_key(cert_key)?;
+    const CN: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
+    let subject = if domains[0].len() <= 64 {
+        let attr = der(0x30, &[CN, &der(0x0c, &[domains[0].as_bytes()])]);
+        der(0x30, &[&der(0x31, &[&attr])])
+    } else {
+        der(0x30, &[])
+    };
+    let (x, y) = point(&k);
+    const ALGORITHM: &[u8] = &[0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    let spki = der(0x30, &[ALGORITHM, &der(0x03, &[&[0, 4], &x, &y])]);
+    let names: Vec<Vec<u8>> = domains.iter().map(|d| der(0x82, &[d.as_bytes()])).collect();
+    let refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+    let san = der(0x30, &refs);
+    let ext = der(0x30, &[&[0x06, 0x03, 0x55, 0x1d, 0x11], &der(0x04, &[&san])]);
+    let attribute = der(0x30, &[&[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e], &der(0x31, &[&der(0x30, &[&ext])])]);
+    let info = der(0x30, &[&[0x02, 0x01, 0x00], &subject, &spki, &der(0xa0, &[&attribute])]);
+    let sig: Signature = k.sign(&info);
+    let csr = der(0x30, &[&info, &[0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02], &der(0x03, &[&[0], sig.to_der().as_bytes()])]);
+    Ok(b64(&csr))
+}
+
+/// Finalizes a ready order, given the `order` map: a CSR is made for its identifiers with `cert_key`. Gives the order; then `acme_wait` for "valid". Called early it is the server's `orderNotReady`.
+pub fn acme_finalize(directory: &str, key: &str, kid: &str, order: serde_json::Value, cert_key: &str) -> Result<Value, String> {
+    let domains: Vec<String> = order["identifiers"].as_array().into_iter().flatten().filter_map(|i| i["value"].as_str().map(str::to_string)).collect();
+    acme_finalize_csr(directory, key, kid, order, &acme_csr(cert_key, domains)?)
+}
+
+/// As `acme_finalize`, with a CSR of your own, as `acme_csr` gives it.
+pub fn acme_finalize_csr(directory: &str, key: &str, kid: &str, order: serde_json::Value, csr: &str) -> Result<Value, String> {
+    let k = load_key(key)?;
+    let url = order["finalize"].as_str().ok_or("the order has no finalize URL")?;
+    let a = post(directory, url, Some(&json!({ "csr": csr })), &k, Some(kid))?;
+    let mut v = json_of(&a)?;
+    v["url"] = order["url"].clone();
+    Ok(v)
+}
+
+/// Downloads the certificate of a valid order, or from its URL: `{ pem, alternates }`, the leaf first and then the chain, `alternates` being other chains' URLs from the Link header.
+pub fn acme_certificate(directory: &str, key: &str, kid: &str, order: serde_json::Value) -> Result<Value, String> {
+    let k = load_key(key)?;
+    let url = order.as_str().or(order["certificate"].as_str()).ok_or("the order has no certificate yet: wait for status valid")?;
+    let a = post(directory, url, None, &k, Some(kid))?;
+    if !a.text.starts_with("-----BEGIN CERTIFICATE-----") {
+        return Err("the server's answer is not a PEM certificate".into());
+    }
+    let alternates: Vec<String> = a.link.iter().filter(|l| l.contains("rel=\"alternate\"")).filter_map(|l| l.split('<').nth(1)?.split('>').next().map(str::to_string)).collect();
+    Ok(json!({ "pem": a.text, "alternates": alternates }))
+}
+
+fn der_walk(d: &[u8], p: usize) -> Option<(u8, &[u8], usize)> {
+    let tag = *d.get(p)?;
+    let first = *d.get(p + 1)? as usize;
+    let (n, at) = if first < 0x80 {
+        (first, p + 2)
+    } else {
+        let c = first & 0x7f;
+        (d.get(p + 2..p + 2 + c)?.iter().fold(0usize, |a, b| a << 8 | *b as usize), p + 2 + c)
+    };
+    Some((tag, d.get(at..at + n)?, at + n))
+}
+
+fn pem_der(pem: &str) -> Result<Vec<u8>, String> {
+    let body: String = pem.lines().skip_while(|l| !l.starts_with("-----BEGIN")).skip(1).take_while(|l| !l.starts_with("-----END")).collect();
+    STANDARD.decode(body).map_err(|_| "the PEM is not base64".to_string())
+}
+
+/// When a certificate stops being valid: `{ not_before, not_after }` as `2026-11-01T12:00:00Z`, from the first certificate in a PEM. Renew about 30 days before.
+pub fn acme_validity(pem: &str) -> Result<Value, String> {
+    let d = pem_der(pem)?;
+    let bad = || "the PEM is not an X.509 certificate".to_string();
+    let (_, whole, _) = der_walk(&d, 0).ok_or_else(bad)?;
+    let (_, tbs, _) = der_walk(whole, 0).ok_or_else(bad)?;
+    let mut p = 0;
+    let (tag, _, next) = der_walk(tbs, p).ok_or_else(bad)?;
+    if tag == 0xa0 {
+        p = next;
+    }
+    for _ in 0..3 {
+        p = der_walk(tbs, p).ok_or_else(bad)?.2;
+    }
+    let (_, validity, _) = der_walk(tbs, p).ok_or_else(bad)?;
+    let time = |t: u8, b: &[u8]| -> Option<String> {
+        let s = std::str::from_utf8(b).ok()?;
+        let (year, rest) = if t == 0x17 {
+            let y: u32 = s.get(..2)?.parse().ok()?;
+            (if y >= 50 { 1900 + y } else { 2000 + y }, s.get(2..)?)
+        } else {
+            (s.get(..4)?.parse().ok()?, s.get(4..)?)
+        };
+        Some(format!("{}-{}-{}T{}:{}:{}Z", year, rest.get(..2)?, rest.get(2..4)?, rest.get(4..6)?, rest.get(6..8)?, rest.get(8..10)?))
+    };
+    let (a, x, n) = der_walk(validity, 0).ok_or_else(bad)?;
+    let (b, y, _) = der_walk(validity, n).ok_or_else(bad)?;
+    Ok(json!({ "not_before": time(a, x).ok_or_else(bad)?, "not_after": time(b, y).ok_or_else(bad)? }))
+}
+
+/// Revokes a certificate, given its PEM. `reason` is an RFC 5280 code: 0 unspecified, 1 key compromise, 4 superseded, 5 no longer used.
+pub fn acme_revoke(directory: &str, key: &str, kid: &str, pem: &str, reason: i64) -> Result<(), String> {
+    let d = acme_directory(directory)?;
+    let url = d["revokeCert"].as_str().ok_or("the server has no revokeCert")?;
+    let k = load_key(key)?;
+    post(directory, url, Some(&json!({ "certificate": b64(&pem_der(pem)?), "reason": reason })), &k, Some(kid))?;
+    Ok(())
+}

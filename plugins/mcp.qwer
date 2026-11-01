@@ -1,0 +1,328 @@
+//! A Model Context Protocol client over streamable HTTP, with JSON and event-stream answers and paged lists, for tools and resources on another server; and the JSON-RPC answers a route gives to serve those requests itself.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! getrandom = "0.2"
+
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader};
+use std::time::Duration;
+
+// The newest revision this plugin speaks, then the older ones it can also answer.
+const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
+
+fn txt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn timeout(s: &Value) -> Duration {
+    Duration::from_millis(s.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(30_000).clamp(100, 600_000) as u64)
+}
+
+fn next_id() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static N: AtomicI64 = AtomicI64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+fn prepare(s: &Value, method: &str) -> Result<ureq::Request, String> {
+    let url = txt(s, "url").ok_or("the session has no url: use what mcp_connect gave")?;
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(timeout(s)).build();
+    let mut r = agent.request(method, &url).set("Accept", "application/json, text/event-stream").set("User-Agent", "quillo-mcp/1.0");
+    if let Some(t) = txt(s, "token") {
+        r = r.set("Authorization", &format!("Bearer {}", t));
+    }
+    if let Some(i) = txt(s, "session_id") {
+        r = r.set("Mcp-Session-Id", &i);
+    }
+    if let Some(v) = txt(s, "protocol_version") {
+        r = r.set("MCP-Protocol-Version", &v);
+    }
+    if let Some(Value::Object(h)) = s.get("headers") {
+        for (k, v) in h {
+            if let Some(t) = v.as_str() {
+                r = r.set(k, t);
+            }
+        }
+    }
+    Ok(r)
+}
+
+fn transport_error(s: &Value, e: ureq::Error) -> String {
+    let url = txt(s, "url").unwrap_or_default();
+    match e {
+        ureq::Error::Status(404, _) if txt(s, "session_id").is_some() => "the server no longer knows this session: connect again".into(),
+        ureq::Error::Status(401, _) => format!("{} answered 401: this server wants a token (the option `token`)", url),
+        ureq::Error::Status(code, r) => format!("{} answered {}: {}", url, code, r.into_string().unwrap_or_default().chars().take(300).collect::<String>()),
+        e => format!("cannot reach {}: {}", url, e),
+    }
+}
+
+// An answer is one JSON message, or an event stream that ends with the message of this id.
+fn read_answer(resp: ureq::Response, id: i64) -> Result<Value, String> {
+    let ctype = resp.content_type().to_string();
+    if ctype == "text/event-stream" {
+        let mut lines = BufReader::new(resp.into_reader());
+        let mut line = String::new();
+        let mut data = String::new();
+        loop {
+            line.clear();
+            let n = lines.read_line(&mut line).map_err(|e| format!("the stream broke: {}", e))?;
+            let t = line.trim_end_matches(['\r', '\n']);
+            if n == 0 || t.is_empty() {
+                if !data.is_empty() {
+                    let v: Value = serde_json::from_str(&data).map_err(|e| format!("a message on the stream is not JSON: {}", e))?;
+                    data.clear();
+                    // Progress notes and the server's own requests may come first.
+                    if v["id"] == json!(id) && v.get("method").is_none() {
+                        return Ok(v);
+                    }
+                }
+                if n == 0 {
+                    return Err("the stream ended with no answer to the request".into());
+                }
+                continue;
+            }
+            if let Some(d) = t.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(d.strip_prefix(' ').unwrap_or(d));
+            }
+        }
+    }
+    let t = resp.into_string().map_err(|e| format!("reading the answer: {}", e))?;
+    serde_json::from_str(&t).map_err(|_| format!("the answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+}
+
+fn rpc(s: &Value, method: &str, params: Value) -> Result<Value, String> {
+    let id = next_id();
+    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    let resp = prepare(s, "POST")?.set("Content-Type", "application/json").send_string(&msg.to_string()).map_err(|e| transport_error(s, e))?;
+    result_of(read_answer(resp, id)?, method)
+}
+
+fn result_of(v: Value, method: &str) -> Result<Value, String> {
+    if let Some(e) = v.get("error") {
+        return Err(format!("{}: {} ({})", method, e["message"].as_str().unwrap_or("error"), e["code"]));
+    }
+    v.get("result").cloned().ok_or(format!("the answer to {} has no result", method))
+}
+
+fn notify(s: &Value, method: &str) -> Result<(), String> {
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    prepare(s, "POST")?.set("Content-Type", "application/json").send_string(&msg.to_string()).map_err(|e| transport_error(s, e))?;
+    Ok(())
+}
+
+/// Connects to the server at `url`: the initialize handshake and the `initialized` note. Options: token (a Bearer token), headers (a map), client_name, client_version, capabilities, protocol_version, timeout_ms. Gives a session to pass to the other functions: { url, session_id, protocol_version, server, capabilities, instructions, ... }.
+pub fn mcp_connect(url: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut s = json!({ "url": url });
+    for k in ["token", "headers", "timeout_ms"] {
+        if let Some(v) = options.get(k) {
+            s[k] = v.clone();
+        }
+    }
+    let want = txt(&options, "protocol_version").unwrap_or_else(|| VERSIONS[0].to_string());
+    let id = next_id();
+    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
+        "protocolVersion": want,
+        "capabilities": options.get("capabilities").cloned().unwrap_or(json!({})),
+        "clientInfo": { "name": txt(&options, "client_name").unwrap_or_else(|| "quillo".into()), "version": txt(&options, "client_version").unwrap_or_else(|| "1.0.0".into()) },
+    } });
+    let resp = prepare(&s, "POST")?.set("Content-Type", "application/json").send_string(&msg.to_string()).map_err(|e| transport_error(&s, e))?;
+    let session = resp.header("mcp-session-id").map(str::to_string);
+    let r = result_of(read_answer(resp, id)?, "initialize")?;
+    let got = r["protocolVersion"].as_str().unwrap_or("").to_string();
+    if !VERSIONS.contains(&got.as_str()) {
+        return Err(format!("the server speaks MCP {:?}; this plugin speaks {}", got, VERSIONS.join(", ")));
+    }
+    s["protocol_version"] = json!(got);
+    if let Some(i) = session {
+        s["session_id"] = json!(i);
+    }
+    s["server"] = r["serverInfo"].clone();
+    s["capabilities"] = r["capabilities"].clone();
+    s["instructions"] = r.get("instructions").cloned().unwrap_or(Value::Null);
+    notify(&s, "notifications/initialized")?;
+    Ok(s)
+}
+
+// Follows nextCursor to the end of a list.
+fn all(s: &Value, method: &str, key: &str) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut cursor: Option<String> = None;
+    for _ in 0..1000 {
+        let params = cursor.as_ref().map(|c| json!({ "cursor": c })).unwrap_or(json!({}));
+        let r = rpc(s, method, params)?;
+        out.extend(r[key].as_array().cloned().unwrap_or_default());
+        match r["nextCursor"].as_str() {
+            Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
+            _ => return Ok(out),
+        }
+    }
+    Err(format!("{} never ended", method))
+}
+
+/// Every tool on the server, all pages: { name, description, inputSchema, ... }.
+pub fn mcp_tools(session: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    all(&session, "tools/list", "tools")
+}
+
+/// Calls a tool. Gives { text, content, structured, is_error }: a tool that failed answers with is_error true and says why in `text`, while an unknown tool or bad arguments is a protocol error, an error value here.
+pub fn mcp_call(session: serde_json::Value, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
+    let args = if arguments.is_null() { json!({}) } else { arguments };
+    let r = rpc(&session, "tools/call", json!({ "name": name, "arguments": args }))?;
+    let text: Vec<&str> = r["content"].as_array().map(|l| l.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect()).unwrap_or_default();
+    Ok(json!({ "text": text.join("\n"), "content": r["content"], "structured": r.get("structuredContent").cloned().unwrap_or(Value::Null), "is_error": r["isError"] == true }))
+}
+
+/// Every resource on the server, all pages: { uri, name, mimeType, ... }.
+pub fn mcp_resources(session: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    all(&session, "resources/list", "resources")
+}
+
+/// Every resource template (URIs with holes), all pages.
+pub fn mcp_resource_templates(session: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    all(&session, "resources/templates/list", "resourceTemplates")
+}
+
+/// Reads a resource. Gives { text, contents }, `text` joining the text parts; binary parts stay as `blob` (base64) in `contents`.
+pub fn mcp_read(session: serde_json::Value, uri: &str) -> Result<serde_json::Value, String> {
+    let r = rpc(&session, "resources/read", json!({ "uri": uri }))?;
+    let text: Vec<&str> = r["contents"].as_array().map(|l| l.iter().filter_map(|b| b["text"].as_str()).collect()).unwrap_or_default();
+    Ok(json!({ "text": text.join("\n"), "contents": r["contents"] }))
+}
+
+/// Every prompt the server offers, all pages.
+pub fn mcp_prompts(session: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    all(&session, "prompts/list", "prompts")
+}
+
+/// One prompt filled in with `arguments` (texts): { description, messages }.
+pub fn mcp_prompt(session: serde_json::Value, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
+    let args = if arguments.is_null() { json!({}) } else { arguments };
+    rpc(&session, "prompts/get", json!({ "name": name, "arguments": args }))
+}
+
+/// Asks the server whether it is alive.
+pub fn mcp_ping(session: serde_json::Value) -> Result<bool, String> {
+    rpc(&session, "ping", json!({})).map(|_| true)
+}
+
+/// Ends the session on the server. A server may answer 405 to say it does not let clients do that; that counts as closed.
+pub fn mcp_close(session: serde_json::Value) -> Result<bool, String> {
+    if txt(&session, "session_id").is_none() {
+        return Ok(true);
+    }
+    match prepare(&session, "DELETE")?.call() {
+        Ok(_) | Err(ureq::Error::Status(405, _)) | Err(ureq::Error::Status(404, _)) => Ok(true),
+        Err(e) => Err(transport_error(&session, e)),
+    }
+}
+
+// The serving side: a route gives these the body it got and answers with what comes back.
+
+/// Reads a posted JSON-RPC message: { kind: "request", id, method, params }, { kind: "notification", method, params }, { kind: "response" }, or { kind: "invalid", answer }, `answer` being the JSON-RPC error to send with a 400. A batch is refused: MCP has none since 2025-06-18.
+pub fn mcp_parse(body: &str) -> serde_json::Value {
+    let bad = |code: i64, msg: &str, id: Value| json!({ "kind": "invalid", "answer": { "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } } });
+    let Ok(v) = serde_json::from_str::<Value>(body) else { return bad(-32700, "Parse error", Value::Null) };
+    if !v.is_object() {
+        return bad(-32600, "Invalid Request: send one JSON-RPC message", Value::Null);
+    }
+    let id = v.get("id").cloned().unwrap_or(Value::Null);
+    if v["jsonrpc"] != "2.0" {
+        return bad(-32600, "Invalid Request: jsonrpc must be \"2.0\"", id);
+    }
+    // MCP's ids are strings or integers, never null.
+    let id_ok = id.is_string() || id.is_i64() || id.is_u64();
+    match (v.get("method").and_then(|m| m.as_str()), v.get("id")) {
+        (Some(m), None) => json!({ "kind": "notification", "method": m, "params": v.get("params").cloned().unwrap_or(json!({})) }),
+        (Some(m), Some(_)) if id_ok => json!({ "kind": "request", "id": id, "method": m, "params": v.get("params").cloned().unwrap_or(json!({})) }),
+        (Some(_), Some(_)) => bad(-32600, "Invalid Request: an id is a string or an integer", Value::Null),
+        (None, Some(_)) if v.get("result").is_some() || v.get("error").is_some() => json!({ "kind": "response", "id": id }),
+        _ => bad(-32600, "Invalid Request: no method", id),
+    }
+}
+
+/// The JSON-RPC answer with `result`.
+pub fn mcp_result(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// The JSON-RPC error answer: -32601 method not found, -32602 invalid params, -32603 internal error, -32002 resource not found.
+pub fn mcp_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// The answer to `initialize`: the client's version when this plugin knows it, else the newest; `server` is { name, version, instructions, tools, resources, prompts } (true for each the route answers).
+pub fn mcp_initialize(id: serde_json::Value, params: serde_json::Value, server: serde_json::Value) -> serde_json::Value {
+    let asked = params["protocolVersion"].as_str().unwrap_or("");
+    let version = if VERSIONS.contains(&asked) { asked } else { VERSIONS[0] };
+    let mut caps = json!({});
+    for k in ["tools", "resources", "prompts"] {
+        if server[k] == true {
+            caps[k] = json!({});
+        }
+    }
+    let mut r = json!({
+        "protocolVersion": version,
+        "capabilities": caps,
+        "serverInfo": { "name": server["name"].as_str().unwrap_or("quillo"), "version": server["version"].as_str().unwrap_or("1.0.0") },
+    });
+    if let Some(i) = txt(&server, "instructions") {
+        r["instructions"] = json!(i);
+    }
+    mcp_result(id, r)
+}
+
+/// An entry for mcp_tools_result: a tool's name, what it does, and a JSON Schema of its input.
+pub fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> serde_json::Value {
+    let schema = if input_schema.is_null() { json!({ "type": "object" }) } else { input_schema };
+    json!({ "name": name, "description": description, "inputSchema": schema })
+}
+
+/// The answer to `tools/list`.
+pub fn mcp_tools_result(id: serde_json::Value, tools: Vec<serde_json::Value>) -> serde_json::Value {
+    mcp_result(id, json!({ "tools": tools }))
+}
+
+/// The answer to `tools/call`: `value` a text, or anything else as JSON (given also as structuredContent when a map). `is_error` true tells the model the tool failed, and it can try again.
+pub fn mcp_call_result(id: serde_json::Value, value: serde_json::Value, is_error: bool) -> serde_json::Value {
+    let text = match &value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut r = json!({ "content": [{ "type": "text", "text": text }] });
+    if value.is_object() {
+        r["structuredContent"] = value;
+    }
+    if is_error {
+        r["isError"] = json!(true);
+    }
+    mcp_result(id, r)
+}
+
+/// The answer to `resources/list`: `resources` are { uri, name, mimeType, description }.
+pub fn mcp_resources_result(id: serde_json::Value, resources: Vec<serde_json::Value>) -> serde_json::Value {
+    mcp_result(id, json!({ "resources": resources }))
+}
+
+/// The answer to `resources/read` with one text resource.
+pub fn mcp_read_result(id: serde_json::Value, uri: &str, mime_type: &str, text: &str) -> serde_json::Value {
+    mcp_result(id, json!({ "contents": [{ "uri": uri, "mimeType": mime_type, "text": text }] }))
+}
+
+/// A hard to guess session id for a server that keeps sessions, in the visible ASCII the protocol allows: give it as the Mcp-Session-Id header of the initialize answer.
+pub fn mcp_new_session() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(b.iter().map(|x| format!("{:02x}", x)).collect())
+}
+
+/// Whether a request's Origin header may reach this server, which the protocol asks a server to check so a web page cannot talk to a local one. No Origin (not a browser) passes; `allowed` lists exact origins.
+pub fn mcp_origin_ok(origin: &str, allowed: Vec<String>) -> bool {
+    origin.is_empty() || allowed.iter().any(|a| a == origin)
+}

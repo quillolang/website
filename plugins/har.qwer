@@ -1,0 +1,363 @@
+//! HTTP Archive (HAR 1.2) files read: pages, entries, timings and sizes, the slowest and largest requests, totals by host and type, and secrets redacted from headers, cookies, query strings and bodies.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+const MASK: &str = "[redacted]";
+const SECRET_HEADERS: [&str; 12] = ["authorization", "proxy-authorization", "cookie", "set-cookie", "set-cookie2", "x-api-key", "api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token", "x-amz-security-token", "x-goog-api-key"];
+const SECRET_PARAMS: [&str; 15] = ["password", "passwd", "pwd", "secret", "token", "access_token", "refresh_token", "id_token", "api_key", "apikey", "client_secret", "auth", "session", "sessionid", "signature"];
+
+fn load(text: &str) -> Result<Value, String> {
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("not JSON: {}", e))?;
+    let log = v.get_mut("log").map(Value::take).ok_or("not a HAR file: it has no `log`")?;
+    if !log.get("entries").map_or(false, Value::is_array) {
+        return Err("not a HAR file: `log.entries` must be a list".to_string());
+    }
+    Ok(log)
+}
+
+/// -1 in a HAR means "does not apply"; a missing number means the same.
+fn num(v: Option<&Value>) -> Option<f64> {
+    v.and_then(Value::as_f64).filter(|n| *n >= 0.0)
+}
+
+fn int(v: Option<&Value>) -> Option<i64> {
+    v.and_then(Value::as_i64).filter(|n| *n >= 0)
+}
+
+fn round(n: f64) -> f64 {
+    (n * 1000.0).round() / 1000.0 + 0.0
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |x| x.1);
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or(auth);
+    auth.to_lowercase()
+}
+
+fn header<'a>(list: Option<&'a Value>, name: &str) -> Option<&'a str> {
+    list?.as_array()?.iter().find(|h| h.get("name").and_then(Value::as_str).map_or(false, |n| n.eq_ignore_ascii_case(name)))?.get("value")?.as_str()
+}
+
+fn timings(e: &Value) -> Value {
+    let t = e.get("timings");
+    let g = |k: &str| num(t.and_then(|x| x.get(k)));
+    // `ssl` is inside `connect` from HAR 1.2 on, so it is not added again.
+    let parts = ["blocked", "dns", "connect", "send", "wait", "receive"];
+    let sum: f64 = parts.iter().filter_map(|k| g(k)).sum();
+    json!({ "blocked": g("blocked"), "dns": g("dns"), "connect": g("connect"), "ssl": g("ssl"), "send": g("send"), "wait": g("wait"), "receive": g("receive"), "sum": round(sum) })
+}
+
+fn flat(e: &Value, i: usize) -> Value {
+    let req = e.get("request");
+    let res = e.get("response");
+    let content = res.and_then(|r| r.get("content"));
+    let url = req.and_then(|r| r.get("url")).and_then(Value::as_str).unwrap_or("");
+    let t = timings(e);
+    let time = num(e.get("time")).unwrap_or_else(|| t["sum"].as_f64().unwrap_or(0.0));
+    let body = int(res.and_then(|r| r.get("bodySize")));
+    let head = int(res.and_then(|r| r.get("headersSize")));
+    let size = int(content.and_then(|c| c.get("size")));
+    let status = res.and_then(|r| r.get("status")).and_then(Value::as_i64).unwrap_or(0);
+    // Nothing sent and status 0: blocked or cancelled. 304 and the cache: nothing crossed the wire.
+    let cached = e.get("_fromCache").is_some() || status == 304 || body == Some(0) && size.unwrap_or(0) > 0;
+    let mime = content.and_then(|c| c.get("mimeType")).and_then(Value::as_str).map(|m| m.split(';').next().unwrap_or("").trim().to_lowercase()).filter(|m| !m.is_empty());
+    let saved = content.and_then(|c| c.get("compression")).and_then(Value::as_i64).or_else(|| match (size, body) {
+        (Some(s), Some(b)) if b > 0 => Some(s - b),
+        _ => None,
+    });
+    json!({
+        "index": i, "page": e.get("pageref"), "started": e.get("startedDateTime"),
+        "method": req.and_then(|r| r.get("method")), "url": url, "host": host_of(url), "http": res.and_then(|r| r.get("httpVersion")),
+        "status": status, "status_text": res.and_then(|r| r.get("statusText")), "mime": mime,
+        "time": round(time), "timings": t,
+        "request_bytes": int(req.and_then(|r| r.get("headersSize"))).unwrap_or(0) + int(req.and_then(|r| r.get("bodySize"))).unwrap_or(0),
+        "response_headers": head, "response_body": body, "content_size": size, "saved": saved,
+        "wire": head.unwrap_or(0) + body.unwrap_or(0),
+        "cached": cached, "redirect": res.and_then(|r| r.get("redirectURL")).and_then(Value::as_str).filter(|u| !u.is_empty()),
+        "server": e.get("serverIPAddress"),
+        "type": e.get("_resourceType"),
+        "request_id": header(req.and_then(|r| r.get("headers")), "x-request-id").or(header(res.and_then(|r| r.get("headers")), "x-request-id")),
+    })
+}
+
+fn entries(log: &Value) -> Vec<Value> {
+    log["entries"].as_array().unwrap().iter().enumerate().map(|(i, e)| flat(e, i)).collect()
+}
+
+/// Reads a HAR: `{ version, creator, browser, pages, entries }`, each entry flat, with times in ms and sizes in bytes, and -1 given as null.
+pub fn har_read(text: &str) -> Result<Value, String> {
+    let log = load(text)?;
+    Ok(json!({
+        "version": log.get("version"),
+        "creator": log.get("creator").map(|c| format!("{} {}", c.get("name").and_then(Value::as_str).unwrap_or(""), c.get("version").and_then(Value::as_str).unwrap_or("")).trim().to_string()),
+        "browser": log.get("browser").and_then(|c| c.get("name")),
+        "pages": pages_of(&log),
+        "entries": entries(&log),
+    }))
+}
+
+/// Reads a HAR file from a path, as `har_read` does.
+pub fn har_read_file(path: &str) -> Result<Value, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    har_read(&t)
+}
+
+fn pages_of(log: &Value) -> Vec<Value> {
+    let all = entries(log);
+    log.get("pages").and_then(Value::as_array).into_iter().flatten().map(|p| {
+        let id = p.get("id").and_then(Value::as_str).unwrap_or("");
+        let mine: Vec<&Value> = all.iter().filter(|e| e["page"].as_str() == Some(id)).collect();
+        let failed = mine.iter().filter(|e| { let s = e["status"].as_i64().unwrap_or(0); s == 0 || s >= 400 }).count();
+        let timing = p.get("pageTimings");
+        json!({
+            "id": id, "title": p.get("title"), "started": p.get("startedDateTime"),
+            "on_content_load": num(timing.and_then(|t| t.get("onContentLoad"))),
+            "on_load": num(timing.and_then(|t| t.get("onLoad"))),
+            "requests": mine.len(), "failed": failed,
+            "wire": mine.iter().filter_map(|e| e["wire"].as_i64()).sum::<i64>(),
+            "content": mine.iter().filter_map(|e| e["content_size"].as_i64()).sum::<i64>(),
+        })
+    }).collect()
+}
+
+fn top(all: Vec<Value>, key: &str, n: i64) -> Vec<Value> {
+    let mut all = all;
+    all.sort_by(|a, b| b[key].as_f64().unwrap_or(0.0).partial_cmp(&a[key].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal).then(a["index"].as_i64().cmp(&b["index"].as_i64())));
+    all.truncate(n.max(0) as usize);
+    all.into_iter().map(|e| json!({ "method": e["method"], "url": e["url"], "status": e["status"], "time": e["time"], "wire": e["wire"], "content_size": e["content_size"], "wait": e["timings"]["wait"] })).collect()
+}
+
+/// The `count` slowest requests, by total time.
+pub fn har_slowest(text: &str, count: i64) -> Result<Vec<Value>, String> {
+    Ok(top(entries(&load(text)?), "time", count))
+}
+
+/// The `count` largest requests, by bytes as they came over the wire; `content_size` says what they were unpacked.
+pub fn har_largest(text: &str, count: i64) -> Result<Vec<Value>, String> {
+    Ok(top(entries(&load(text)?), "wire", count))
+}
+
+/// Totals: requests, bytes, time span, and counts by host, type and status class, failed requests named.
+pub fn har_summary(text: &str) -> Result<Value, String> {
+    let log = load(text)?;
+    let all = entries(&log);
+    let mut hosts: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut mimes: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut statuses: BTreeMap<String, i64> = BTreeMap::new();
+    for e in &all {
+        let wire = e["wire"].as_i64().unwrap_or(0);
+        let h = hosts.entry(e["host"].as_str().unwrap_or("").to_string()).or_default();
+        h.0 += 1;
+        h.1 += wire;
+        let m = mimes.entry(e["mime"].as_str().unwrap_or("(none)").to_string()).or_default();
+        m.0 += 1;
+        m.1 += wire;
+        let s = e["status"].as_i64().unwrap_or(0);
+        *statuses.entry(if s == 0 { "failed".to_string() } else { format!("{}xx", s / 100) }).or_default() += 1;
+    }
+    let list = |m: BTreeMap<String, (i64, i64)>, key: &str| {
+        let mut v: Vec<(String, (i64, i64))> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(&b.0)));
+        v.into_iter().map(|(k, (n, b))| {
+            let mut o = Map::new();
+            o.insert(key.to_string(), json!(k));
+            o.insert("requests".into(), json!(n));
+            o.insert("wire".into(), json!(b));
+            Value::Object(o)
+        }).collect::<Vec<_>>()
+    };
+    let failed: Vec<Value> = all.iter().filter(|e| { let s = e["status"].as_i64().unwrap_or(0); s == 0 || s >= 400 }).map(|e| json!({ "url": e["url"], "status": e["status"] })).collect();
+    Ok(json!({
+        "requests": all.len(),
+        "wire": all.iter().filter_map(|e| e["wire"].as_i64()).sum::<i64>(),
+        "content": all.iter().filter_map(|e| e["content_size"].as_i64()).sum::<i64>(),
+        "cached": all.iter().filter(|e| e["cached"] == json!(true)).count(),
+        "statuses": statuses, "hosts": list(hosts, "host"), "types": list(mimes, "mime"), "failed": failed,
+    }))
+}
+
+fn secret_name(name: &str, extra: &[String]) -> bool {
+    let n = name.to_lowercase();
+    SECRET_PARAMS.contains(&n.as_str()) || extra.iter().any(|x| x.eq_ignore_ascii_case(&n))
+}
+
+fn secret_header(name: &str, extra: &[String]) -> bool {
+    let n = name.to_lowercase();
+    SECRET_HEADERS.contains(&n.as_str()) || extra.iter().any(|x| x.eq_ignore_ascii_case(&n))
+}
+
+/// Masks `value` of each `{ name, value }` in a list when `is` says so, and says what it did.
+fn mask_list(list: Option<&mut Value>, place: &str, found: &mut Vec<Value>, is: &dyn Fn(&str) -> bool) {
+    for item in list.and_then(Value::as_array_mut).into_iter().flatten() {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        if is(&name) && item.get("value").is_some() {
+            item["value"] = json!(MASK);
+            found.push(json!({ "where": place, "name": name }));
+        }
+    }
+}
+
+/// `a=1&token=x` with the secret values masked, for query strings and form bodies.
+fn mask_query(q: &str, place: &str, found: &mut Vec<Value>, extra: &[String]) -> String {
+    q.split('&').map(|p| match p.split_once('=') {
+        Some((k, v)) if secret_name(&decode(k), extra) && v != MASK => {
+            found.push(json!({ "where": place, "name": decode(k) }));
+            format!("{}={}", k, MASK)
+        }
+        _ => p.to_string(),
+    }).collect::<Vec<_>>().join("&")
+}
+
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(x) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(x);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn mask_url(url: &str, found: &mut Vec<Value>, extra: &[String]) -> String {
+    // A password in the address: https://user:pw@host/
+    let mut url = url.to_string();
+    if let Some((scheme, rest)) = url.clone().split_once("://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some((cred, host)) = rest[..end].rsplit_once('@') {
+            if let Some((user, _)) = cred.split_once(':') {
+                found.push(json!({ "where": "url", "name": "password" }));
+                url = format!("{}://{}:{}@{}{}", scheme, user, MASK, host, &rest[end..]);
+            }
+        }
+    }
+    let (head, frag) = match url.split_once('#') {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (url.clone(), None),
+    };
+    let out = match head.split_once('?') {
+        Some((a, q)) => format!("{}?{}", a, mask_query(q, "url", found, extra)),
+        None => head,
+    };
+    match frag {
+        // Implicit OAuth answers: #access_token=...
+        Some(f) if f.contains('=') => format!("{}#{}", out, mask_query(&f, "url", found, extra)),
+        Some(f) => format!("{}#{}", out, f),
+        None => out,
+    }
+}
+
+/// Walks JSON and masks the values of secret keys, for request and response bodies.
+fn mask_json(v: &mut Value, place: &str, found: &mut Vec<Value>, extra: &[String], depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if secret_name(k, extra) && !x.is_object() && !x.is_array() {
+                    *x = json!(MASK);
+                    found.push(json!({ "where": place, "name": k }));
+                } else {
+                    mask_json(x, place, found, extra, depth + 1);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| mask_json(x, place, found, extra, depth + 1)),
+        _ => {}
+    }
+}
+
+fn mask_body(text: &mut Value, mime: &str, place: &str, found: &mut Vec<Value>, extra: &[String]) {
+    let t = match text.as_str() {
+        Some(t) => t.to_string(),
+        None => return,
+    };
+    if mime.contains("json") {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&t) {
+            let before = found.len();
+            mask_json(&mut v, place, found, extra, 0);
+            if found.len() != before {
+                *text = json!(v.to_string());
+            }
+        }
+    } else if mime.contains("x-www-form-urlencoded") {
+        *text = json!(mask_query(&t, place, found, extra));
+    }
+}
+
+fn redact(log: &mut Value, extra: &[String]) -> Vec<Value> {
+    let mut found = vec![];
+    let hdr = |n: &str| secret_header(n, extra);
+    let param = |n: &str| secret_name(n, extra);
+    for e in log["entries"].as_array_mut().unwrap() {
+        if let Some(r) = e.get_mut("request") {
+            mask_list(r.get_mut("headers"), "request header", &mut found, &hdr);
+            mask_list(r.get_mut("cookies"), "request cookie", &mut found, &|_| true);
+            mask_list(r.get_mut("queryString"), "query", &mut found, &param);
+            if let Some(u) = r.get("url").and_then(Value::as_str).map(str::to_string) {
+                let mut quiet = vec![];
+                r["url"] = json!(mask_url(&u, &mut quiet, extra));
+                // The query list above already named those; a password in the address is new.
+                found.extend(quiet.into_iter().filter(|q| q["name"] == "password" || !r.get("queryString").map_or(false, |x| x.as_array().map_or(false, |l| !l.is_empty()))));
+            }
+            if let Some(p) = r.get_mut("postData") {
+                let mime = p.get("mimeType").and_then(Value::as_str).unwrap_or("").to_string();
+                mask_list(p.get_mut("params"), "form field", &mut found, &param);
+                if let Some(t) = p.get_mut("text") {
+                    mask_body(t, &mime, "request body", &mut found, extra);
+                }
+            }
+        }
+        if let Some(r) = e.get_mut("response") {
+            mask_list(r.get_mut("headers"), "response header", &mut found, &hdr);
+            mask_list(r.get_mut("cookies"), "response cookie", &mut found, &|_| true);
+            if let Some(u) = r.get("redirectURL").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string) {
+                r["redirectURL"] = json!(mask_url(&u, &mut found, extra));
+            }
+            if let Some(c) = r.get_mut("content") {
+                let mime = c.get("mimeType").and_then(Value::as_str).unwrap_or("").to_string();
+                let base64 = c.get("encoding").and_then(Value::as_str) == Some("base64");
+                if let (Some(t), false) = (c.get_mut("text"), base64) {
+                    mask_body(t, &mime, "response body", &mut found, extra);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The file with secrets masked, safe to attach to a ticket: auth headers, all cookies, secret query, form and JSON values. `extra` names more headers and fields.
+pub fn har_redact(text: &str, extra: Vec<String>) -> Result<String, String> {
+    let mut log = load(text)?;
+    redact(&mut log, &extra);
+    serde_json::to_string_pretty(&json!({ "log": log })).map_err(|e| e.to_string())
+}
+
+/// What `har_redact` would mask: `[{ where, name, count }]`, never a value.
+pub fn har_secrets(text: &str, extra: Vec<String>) -> Result<Vec<Value>, String> {
+    let mut log = load(text)?;
+    let found = redact(&mut log, &extra);
+    let mut seen: Vec<(String, String, i64)> = vec![];
+    for f in found {
+        let (w, n) = (f["where"].as_str().unwrap_or("").to_string(), f["name"].as_str().unwrap_or("").to_string());
+        match seen.iter_mut().find(|x| x.0 == w && x.1.eq_ignore_ascii_case(&n)) {
+            Some(x) => x.2 += 1,
+            None => seen.push((w, n, 1)),
+        }
+    }
+    Ok(seen.into_iter().map(|(w, n, c)| json!({ "where": w, "name": n, "count": c })).collect())
+}

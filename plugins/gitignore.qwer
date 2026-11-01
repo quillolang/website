@@ -1,0 +1,474 @@
+//! .gitignore rules matched exactly as git does: negation, anchoring, directories, `**`, nested files, which rule decided, and a tree walked as `git status` would.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+#[derive(Clone, Debug)]
+struct Rule {
+    line: usize,
+    source: String,
+    text: String,
+    pattern: Vec<char>,
+    negated: bool,
+    dir_only: bool,
+    no_slash: bool,
+}
+
+/// Unescaped trailing spaces go; tabs stay, as in git's trim_trailing_spaces.
+fn trim_spaces(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut last_space: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' => {
+                if last_space.is_none() {
+                    last_space = Some(i);
+                }
+            }
+            b'\\' => {
+                i += 1;
+                last_space = None;
+            }
+            _ => last_space = None,
+        }
+        i += 1;
+    }
+    match last_space {
+        Some(p) => &s[..p],
+        None => s,
+    }
+}
+
+fn parse(text: &str, source: &str) -> Vec<Rule> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut out = vec![];
+    for (i, raw) in text.split('\n').enumerate() {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if raw.is_empty() || raw.starts_with('#') {
+            continue;
+        }
+        let line = trim_spaces(raw);
+        let mut p = line;
+        let negated = p.starts_with('!');
+        if negated {
+            p = &p[1..];
+        }
+        let dir_only = p.ends_with('/');
+        if dir_only {
+            p = &p[..p.len() - 1];
+        }
+        if p.is_empty() {
+            continue;
+        }
+        out.push(Rule { line: i + 1, source: source.to_string(), text: raw.to_string(), no_slash: !p.contains('/'), pattern: p.chars().collect(), negated, dir_only });
+    }
+    out
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum W {
+    Match,
+    No,
+    AbortAll,
+    AbortStar,
+}
+
+fn class_named(name: &str, c: char) -> Option<bool> {
+    Some(match name {
+        "alnum" => c.is_ascii_alphanumeric(),
+        "alpha" => c.is_ascii_alphabetic(),
+        "blank" => c == ' ' || c == '\t',
+        "cntrl" => c.is_ascii_control(),
+        "digit" => c.is_ascii_digit(),
+        "graph" => c.is_ascii_graphic(),
+        "lower" => c.is_ascii_lowercase(),
+        "print" => c.is_ascii_graphic() || c == ' ',
+        "punct" => c.is_ascii_punctuation(),
+        "space" => matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'),
+        "upper" => c.is_ascii_uppercase(),
+        "xdigit" => c.is_ascii_hexdigit(),
+        _ => return None,
+    })
+}
+
+/// git's wildmatch, step by step, with the same results for `**` and the same early stops.
+fn dowild(p: &[char], t: &[char], pathname: bool) -> W {
+    let mut pi = 0;
+    let mut ti = 0;
+    while pi < p.len() {
+        let pc = p[pi];
+        if ti >= t.len() && pc != '*' {
+            return W::AbortAll;
+        }
+        match pc {
+            '\\' => {
+                pi += 1;
+                if pi >= p.len() || t[ti] != p[pi] {
+                    return W::No;
+                }
+            }
+            '?' => {
+                if pathname && t[ti] == '/' {
+                    return W::No;
+                }
+            }
+            '*' => {
+                let match_slash;
+                let prev = pi;
+                pi += 1;
+                if pi < p.len() && p[pi] == '*' {
+                    while pi < p.len() && p[pi] == '*' {
+                        pi += 1;
+                    }
+                    let at_start = prev == 0 || p[prev - 1] == '/';
+                    if !pathname {
+                        match_slash = true;
+                    } else if at_start && (pi >= p.len() || p[pi] == '/' || (p[pi] == '\\' && p.get(pi + 1) == Some(&'/'))) {
+                        if pi < p.len() && p[pi] == '/' && dowild(&p[pi + 1..], &t[ti..], pathname) == W::Match {
+                            return W::Match;
+                        }
+                        match_slash = true;
+                    } else {
+                        match_slash = false;
+                    }
+                } else {
+                    match_slash = !pathname;
+                }
+                if pi >= p.len() {
+                    if !match_slash && t[ti..].contains(&'/') {
+                        return W::AbortStar;
+                    }
+                    return W::Match;
+                } else if !match_slash && p[pi] == '/' {
+                    match t[ti..].iter().position(|c| *c == '/') {
+                        None => return W::AbortAll,
+                        Some(n) => ti += n,
+                    }
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                loop {
+                    if ti >= t.len() {
+                        break;
+                    }
+                    let m = dowild(&p[pi..], &t[ti..], pathname);
+                    if m != W::No {
+                        if !match_slash || m != W::AbortStar {
+                            return m;
+                        }
+                    } else if !match_slash && t[ti] == '/' {
+                        return W::AbortStar;
+                    }
+                    ti += 1;
+                }
+                return W::AbortAll;
+            }
+            '[' => {
+                pi += 1;
+                if pi >= p.len() {
+                    return W::AbortAll;
+                }
+                let tc = t[ti];
+                let negate = p[pi] == '!' || p[pi] == '^';
+                if negate {
+                    pi += 1;
+                }
+                let mut hit = false;
+                let mut prev: Option<char> = None;
+                let mut first = true;
+                loop {
+                    if pi >= p.len() {
+                        return W::AbortAll;
+                    }
+                    let mut c = p[pi];
+                    if c == ']' && !first {
+                        break;
+                    }
+                    first = false;
+                    if c == '\\' {
+                        pi += 1;
+                        if pi >= p.len() {
+                            return W::AbortAll;
+                        }
+                        c = p[pi];
+                        if tc == c {
+                            hit = true;
+                        }
+                    } else if c == '-' && prev.is_some() && pi + 1 < p.len() && p[pi + 1] != ']' {
+                        pi += 1;
+                        let mut hi = p[pi];
+                        if hi == '\\' {
+                            pi += 1;
+                            if pi >= p.len() {
+                                return W::AbortAll;
+                            }
+                            hi = p[pi];
+                        }
+                        if let Some(lo) = prev {
+                            if lo <= tc && tc <= hi {
+                                hit = true;
+                            }
+                        }
+                        c = '\0';
+                    } else if c == '[' && p.get(pi + 1) == Some(&':') {
+                        let start = pi + 2;
+                        let mut j = start;
+                        while j < p.len() && p[j] != ']' {
+                            j += 1;
+                        }
+                        if j >= p.len() {
+                            return W::AbortAll;
+                        }
+                        if j == start || p[j - 1] != ':' {
+                            // A plain `[` in the set.
+                            if tc == '[' {
+                                hit = true;
+                            }
+                        } else {
+                            let name: String = p[start..j - 1].iter().collect();
+                            match class_named(&name, tc) {
+                                Some(true) => hit = true,
+                                Some(false) => {}
+                                None => return W::AbortAll,
+                            }
+                            pi = j;
+                            c = '\0';
+                        }
+                    } else if tc == c {
+                        hit = true;
+                    }
+                    prev = if c == '\0' { None } else { Some(c) };
+                    pi += 1;
+                }
+                if hit == negate || (pathname && tc == '/') {
+                    return W::No;
+                }
+            }
+            c => {
+                if t[ti] != c {
+                    return W::No;
+                }
+            }
+        }
+        pi += 1;
+        ti += 1;
+    }
+    if ti < t.len() { W::No } else { W::Match }
+}
+
+fn wild(p: &[char], t: &[char], pathname: bool) -> bool {
+    dowild(p, t, pathname) == W::Match
+}
+
+fn matches(r: &Rule, rel: &str, is_dir: bool) -> bool {
+    if r.dir_only && !is_dir {
+        return false;
+    }
+    if r.no_slash {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        return wild(&r.pattern, &base.chars().collect::<Vec<_>>(), false);
+    }
+    let p: &[char] = if r.pattern.first() == Some(&'/') { &r.pattern[1..] } else { &r.pattern };
+    wild(p, &rel.chars().collect::<Vec<_>>(), true)
+}
+
+/// A set of rule lists by the folder each sits in, deepest looked at first.
+struct Levels {
+    list: Vec<(String, Vec<Rule>)>,
+}
+
+impl Levels {
+    fn decide(&self, path: &str, is_dir: bool) -> Option<&Rule> {
+        let mut levels: Vec<&(String, Vec<Rule>)> = self.list.iter().filter(|(d, _)| d.is_empty() || path.starts_with(&format!("{}/", d))).collect();
+        levels.sort_by_key(|(d, _)| std::cmp::Reverse(if d.is_empty() { 0 } else { d.matches('/').count() + 1 }));
+        for (dir, rules) in levels {
+            let rel = if dir.is_empty() { path } else { &path[dir.len() + 1..] };
+            if let Some(r) = rules.iter().rev().find(|r| matches(r, rel, is_dir)) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// As git: walking down, an excluded folder ends the matter, for nothing below it can come back.
+    fn check(&self, path: &str, is_dir: bool) -> (bool, Option<&Rule>) {
+        let parts: Vec<&str> = path.split('/').collect();
+        for n in 1..parts.len() {
+            let parent = parts[..n].join("/");
+            if let Some(r) = self.decide(&parent, true) {
+                if !r.negated {
+                    return (true, Some(r));
+                }
+            }
+        }
+        let r = self.decide(path, is_dir);
+        (r.map_or(false, |x| !x.negated), r)
+    }
+}
+
+fn clean(path: &str) -> Result<(String, bool), String> {
+    let dir = path.ends_with('/');
+    let p = path.replace('\\', "/");
+    let mut parts = vec![];
+    for x in p.split('/') {
+        match x {
+            "" | "." => {}
+            ".." => return Err(format!("`{}` leaves the tree", path)),
+            x => parts.push(x),
+        }
+    }
+    if parts.is_empty() {
+        return Err("an empty path".to_string());
+    }
+    Ok((parts.join("/"), dir))
+}
+
+fn verdict(path: &str, is_dir: bool, ans: (bool, Option<&Rule>)) -> Value {
+    let (ignored, r) = ans;
+    json!({
+        "path": path, "ignored": ignored, "directory": is_dir,
+        "rule": r.map(|x| x.text.clone()), "line": r.map(|x| x.line), "source": r.map(|x| x.source.clone()),
+        "negated": r.map(|x| x.negated),
+    })
+}
+
+/// The rules of one file: `[{ line, pattern, negated, directory_only, anchored }]`, comments and blanks gone.
+pub fn gitignore_parse(text: &str) -> Vec<Value> {
+    parse(text, ".gitignore").iter().map(|r| {
+        let p: String = r.pattern.iter().collect();
+        json!({ "line": r.line, "pattern": p.trim_start_matches('/'), "negated": r.negated, "directory_only": r.dir_only, "anchored": !r.no_slash })
+    }).collect()
+}
+
+/// Whether one file's rules ignore a path, and which rule decided: `{ path, ignored, rule, line, source, negated }`. A path ending in `/` is a directory.
+pub fn gitignore_check(text: &str, path: &str) -> Result<Value, String> {
+    let (p, dir) = clean(path)?;
+    let l = Levels { list: vec![(String::new(), parse(text, ".gitignore"))] };
+    Ok(verdict(&p, dir, l.check(&p, dir)))
+}
+
+/// The paths one file's rules do not ignore, in the order given.
+pub fn gitignore_filter(text: &str, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let l = Levels { list: vec![(String::new(), parse(text, ".gitignore"))] };
+    let mut out = vec![];
+    for path in paths {
+        let (p, dir) = clean(&path)?;
+        if !l.check(&p, dir).0 {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn levels_from_map(files: &serde_json::Map<String, Value>) -> Result<Levels, String> {
+    let mut list = vec![];
+    for (k, v) in files {
+        let text = v.as_str().ok_or(format!("{} must be text", k))?;
+        let (p, _) = clean(k)?;
+        let dir = match p.rsplit_once('/') {
+            Some((d, f)) if f == ".gitignore" => d.to_string(),
+            None if p == ".gitignore" => String::new(),
+            _ => return Err(format!("{} is not a .gitignore", k)),
+        };
+        list.push((dir, parse(text, &p)));
+    }
+    Ok(Levels { list })
+}
+
+/// Several `.gitignore` files given as a map from path to text, a deeper file overriding a shallower one: the verdict for each path.
+pub fn gitignore_check_nested(files: serde_json::Value, paths: Vec<String>) -> Result<Vec<Value>, String> {
+    let map = files.as_object().ok_or("`files` must be a map of path to text")?;
+    let l = levels_from_map(map)?;
+    let mut out = vec![];
+    for path in paths {
+        let (p, dir) = clean(&path)?;
+        out.push(verdict(&p, dir, l.check(&p, dir)));
+    }
+    Ok(out)
+}
+
+/// Reads every `.gitignore` under `root` that git would, and `.git/info/exclude`, staying out of ignored folders.
+fn read_levels(root: &Path) -> Result<Levels, String> {
+    let mut l = Levels { list: vec![] };
+    if let Ok(t) = std::fs::read_to_string(root.join(".git/info/exclude")) {
+        l.list.push((String::new(), parse(&t, ".git/info/exclude")));
+    }
+    let mut stack = vec![String::new()];
+    while let Some(dir) = stack.pop() {
+        let full = if dir.is_empty() { root.to_path_buf() } else { root.join(&dir) };
+        if let Ok(t) = std::fs::read_to_string(full.join(".gitignore")) {
+            let src = if dir.is_empty() { ".gitignore".to_string() } else { format!("{}/.gitignore", dir) };
+            let rules = parse(&t, &src);
+            // At the root, .git/info/exclude ranks below .gitignore, so it goes first in one list.
+            if dir.is_empty() && !l.list.is_empty() {
+                l.list[0].1.extend(rules);
+            } else {
+                l.list.push((dir.clone(), rules));
+            }
+        }
+        let mut names: Vec<(String, bool)> = std::fs::read_dir(&full).map_err(|e| format!("cannot read {}: {}", full.display(), e))?.flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().map_or(false, |t| t.is_dir())))
+            .filter(|(n, d)| *d && n != ".git").collect();
+        names.sort();
+        for (n, _) in names {
+            let p = if dir.is_empty() { n } else { format!("{}/{}", dir, n) };
+            if !l.check(&p, true).0 {
+                stack.push(p);
+            }
+        }
+    }
+    Ok(l)
+}
+
+/// Whether a path under a real folder is ignored, reading its `.gitignore` files and `.git/info/exclude`; a folder is noticed on disk.
+pub fn gitignore_check_path(root: &str, path: &str) -> Result<Value, String> {
+    let (p, slash) = clean(path)?;
+    let r = Path::new(root);
+    let is_dir = slash || r.join(&p).is_dir();
+    let l = read_levels(r)?;
+    Ok(verdict(&p, is_dir, l.check(&p, is_dir)))
+}
+
+/// The files under `root` that git would see, ignoring what is ignored and never entering `.git`, sorted; `limit` stops a huge tree.
+pub fn gitignore_walk(root: &str, limit: i64) -> Result<Value, String> {
+    let r = Path::new(root);
+    if !r.is_dir() {
+        return Err(format!("{} is not a folder", root));
+    }
+    let l = read_levels(r)?;
+    let mut files = BTreeMap::new();
+    let mut skipped = vec![];
+    let mut stack = vec![String::new()];
+    let max = if limit <= 0 { usize::MAX } else { limit as usize };
+    let mut cut = false;
+    while let Some(dir) = stack.pop() {
+        let full = if dir.is_empty() { r.to_path_buf() } else { r.join(&dir) };
+        for e in std::fs::read_dir(&full).map_err(|e| format!("cannot read {}: {}", full.display(), e))?.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
+                continue;
+            }
+            let p = if dir.is_empty() { name } else { format!("{}/{}", dir, name) };
+            let is_dir = e.file_type().map_or(false, |t| t.is_dir());
+            let ignored = l.check(&p, is_dir).0;
+            if is_dir && !ignored {
+                stack.push(p);
+            } else if ignored {
+                skipped.push(if is_dir { format!("{}/", p) } else { p });
+            } else if files.len() < max {
+                files.insert(p, ());
+            } else {
+                cut = true;
+            }
+        }
+    }
+    skipped.sort();
+    Ok(json!({ "files": files.keys().collect::<Vec<_>>(), "ignored": skipped, "cut_short": cut }))
+}

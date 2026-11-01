@@ -1,0 +1,32 @@
+REM GENRE "Ambient Folk"
+REM DATE 1998
+REM DISCID 860B640B
+REM COMMENT "ExactAudioCopy v1.3"
+CATALOG 0602527899123
+PERFORMER "The Faux Band"
+TITLE "Live in Tromsø"
+SONGWRITER "A. Writer"
+FILE "side a.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "Opening \"Night\""
+    PERFORMER "The Faux Band"
+    ISRC NOABC2600001
+    FLAGS DCP PRE
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Second Song"
+    PERFORMER "Guest Singer"
+    PREGAP 00:02:00
+    INDEX 00 03:25:40
+    INDEX 01 03:27:40
+    INDEX 02 05:00:00
+  TRACK 03 AUDIO
+    TITLE "Closer"
+    INDEX 01 07:10:74
+    POSTGAP 00:01:00
+FILE "side b.flac" FLAC
+  TRACK 04 AUDIO
+    TITLE "Other Side"
+    REM COMPOSER Somebody Else
+    INDEX 00 00:00:00
+    INDEX 01 00:00:33

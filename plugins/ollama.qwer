@@ -1,0 +1,273 @@
+//! A local Ollama server: generate and chat with their streams collected, tool calls, embeddings, the models installed and running, and pulls, with timings turned into tokens per second.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader};
+use std::time::Duration;
+
+fn txt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+// OLLAMA_HOST is what Ollama itself reads: `0.0.0.0:11434`, `box.local`, `http://box:11434`.
+fn base(o: &Value) -> String {
+    let h = txt(o, "host").or_else(|| std::env::var("OLLAMA_HOST").ok().filter(|v| !v.is_empty())).unwrap_or_else(|| "127.0.0.1:11434".into());
+    let h = h.trim_end_matches('/');
+    let (scheme, rest) = match h.split_once("://") {
+        Some((s, r)) => (s.to_string(), r.to_string()),
+        None => ("http".to_string(), h.to_string()),
+    };
+    // 0.0.0.0 is where the server listens, not an address to call.
+    let rest = rest.replacen("0.0.0.0", "127.0.0.1", 1);
+    let has_port = rest.rsplit_once(':').map(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).unwrap_or(false);
+    if has_port || scheme == "https" { format!("{}://{}", scheme, rest) } else { format!("{}://{}:11434", scheme, rest) }
+}
+
+fn agent(o: &Value) -> ureq::Agent {
+    // A model can take minutes to load before its first byte.
+    let ms = o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(600_000).clamp(100, 3_600_000) as u64;
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout_read(Duration::from_millis(ms)).build()
+}
+
+fn send(o: &Value, method: &str, path: &str, body: Option<&Value>) -> Result<ureq::Response, String> {
+    let b = base(o);
+    let r = agent(o).request(method, &format!("{}{}", b, path));
+    let res = match body {
+        Some(v) => r.set("Content-Type", "application/json").send_string(&v.to_string()),
+        None => r.call(),
+    };
+    match res {
+        Ok(resp) => Ok(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let t = resp.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            let msg = v["error"].as_str().map(str::to_string).unwrap_or(t);
+            let hint = if code == 404 && msg.contains("not found") { " (run `ollama pull` for it, or use ollama_pull)" } else { "" };
+            Err(format!("Ollama answered {}: {}{}", code, msg.trim(), hint))
+        }
+        Err(e) => Err(format!("cannot reach Ollama at {}: {} (is `ollama serve` running?)", b, e)),
+    }
+}
+
+fn get(o: &Value, path: &str) -> Result<Value, String> {
+    let t = send(o, "GET", path, None)?.into_string().map_err(|e| e.to_string())?;
+    serde_json::from_str(&t).map_err(|e| format!("Ollama's answer is not JSON: {}", e))
+}
+
+fn post(o: &Value, path: &str, body: &Value) -> Result<Value, String> {
+    let t = send(o, "POST", path, Some(body))?.into_string().map_err(|e| e.to_string())?;
+    if t.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&t).map_err(|e| format!("Ollama's answer is not JSON: {}", e))
+}
+
+// Sampling goes under `options`; the other settings beside the model.
+fn apply(body: &mut Value, o: &Value) {
+    for k in ["format", "keep_alive", "think", "raw", "suffix", "system", "template"] {
+        if let Some(v) = o.get(k) {
+            body[k] = v.clone();
+        }
+    }
+    let mut opts = Map::new();
+    if let Some(Value::Object(m)) = o.get("options") {
+        opts = m.clone();
+    }
+    for k in ["temperature", "seed", "top_k", "top_p", "num_ctx", "num_predict", "stop"] {
+        if let Some(v) = o.get(k) {
+            opts.insert(k.into(), v.clone());
+        }
+    }
+    if !opts.is_empty() {
+        body["options"] = Value::Object(opts);
+    }
+}
+
+fn timings(last: &Value) -> Value {
+    let n = |k: &str| last[k].as_i64().unwrap_or(0);
+    let ms = |ns: i64| ns as f64 / 1_000_000.0;
+    let (eval, dur) = (n("eval_count"), n("eval_duration"));
+    json!({
+        "prompt_tokens": n("prompt_eval_count"),
+        "output_tokens": eval,
+        "total_ms": ms(n("total_duration")),
+        "load_ms": ms(n("load_duration")),
+        "tokens_per_second": if dur > 0 { (eval as f64 * 1e9 / dur as f64 * 100.0).round() / 100.0 } else { 0.0 },
+    })
+}
+
+// Each line of the stream is a JSON object, the last with done:true; an error can come on any line.
+fn each_line(resp: ureq::Response, mut f: impl FnMut(&Value)) -> Result<Value, String> {
+    let mut last = Value::Null;
+    let mut lines = BufReader::new(resp.into_reader());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).map_err(|e| format!("the stream broke: {}", e))? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line.trim()).map_err(|e| format!("a line of the stream is not JSON: {}", e))?;
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+            return Err(format!("Ollama failed part way: {}", e));
+        }
+        f(&v);
+        last = v;
+    }
+    if last["done"] != true {
+        return Err("the stream ended before done".into());
+    }
+    Ok(last)
+}
+
+fn model_of(model: &str) -> Result<String, String> {
+    if !model.is_empty() {
+        return Ok(model.to_string());
+    }
+    std::env::var("OLLAMA_MODEL").ok().filter(|m| !m.is_empty()).ok_or("no model: pass one, or set OLLAMA_MODEL".to_string())
+}
+
+/// /api/generate, streamed and collected: `model` ("" for OLLAMA_MODEL), `prompt`, and options: system, format ("json" or a JSON Schema), keep_alive, think, raw, temperature, seed, top_k, top_p, num_ctx, num_predict, stop, options (the rest), host (else OLLAMA_HOST), timeout_ms. Gives { text, thinking, done_reason, model, stats }.
+pub fn ollama_generate(model: &str, prompt: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut body = json!({ "model": model_of(model)?, "prompt": prompt, "stream": true });
+    apply(&mut body, &options);
+    let resp = send(&options, "POST", "/api/generate", Some(&body))?;
+    let (mut text, mut thinking) = (String::new(), String::new());
+    let last = each_line(resp, |v| {
+        text.push_str(v["response"].as_str().unwrap_or(""));
+        thinking.push_str(v["thinking"].as_str().unwrap_or(""));
+    })?;
+    Ok(json!({ "text": text, "thinking": thinking, "done_reason": last["done_reason"], "model": last["model"], "stats": timings(&last) }))
+}
+
+/// /api/chat, streamed and collected: `messages` are { role, content, images? } (or one question as text), options as for ollama_generate plus `tools`. Gives { text, thinking, tool_calls, message, done_reason, model, stats }; send `message` back in the next turn.
+pub fn ollama_chat(model: &str, messages: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = match messages {
+        Value::String(s) => json!([{ "role": "user", "content": s }]),
+        Value::Array(l) if !l.is_empty() => Value::Array(l),
+        _ => return Err("messages must be a list of { role, content }, or the text of one question".into()),
+    };
+    let mut body = json!({ "model": model_of(model)?, "messages": list, "stream": true });
+    apply(&mut body, &options);
+    if let Some(t) = options.get("tools") {
+        body["tools"] = t.clone();
+    }
+    let resp = send(&options, "POST", "/api/chat", Some(&body))?;
+    let (mut text, mut thinking) = (String::new(), String::new());
+    let mut calls: Vec<Value> = vec![];
+    let last = each_line(resp, |v| {
+        text.push_str(v.pointer("/message/content").and_then(|c| c.as_str()).unwrap_or(""));
+        thinking.push_str(v.pointer("/message/thinking").and_then(|c| c.as_str()).unwrap_or(""));
+        if let Some(l) = v.pointer("/message/tool_calls").and_then(|c| c.as_array()) {
+            calls.extend(l.iter().cloned());
+        }
+    })?;
+    let mut message = json!({ "role": "assistant", "content": text });
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    let tool_calls: Vec<Value> = calls.iter().map(|c| json!({ "name": c.pointer("/function/name"), "arguments": c.pointer("/function/arguments") })).collect();
+    Ok(json!({ "text": text, "thinking": thinking, "tool_calls": tool_calls, "message": message, "done_reason": last["done_reason"], "model": last["model"], "stats": timings(&last) }))
+}
+
+/// One question and the text of its answer, through /api/chat, with a `system` prompt or "".
+pub fn ollama_ask(model: &str, question: &str, system: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut messages = vec![];
+    if !system.is_empty() {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": question }));
+    let r = ollama_chat(model, Value::Array(messages), options)?;
+    Ok(r["text"].as_str().unwrap_or("").to_string())
+}
+
+/// A function for `tools`: its name, what it does, and a JSON Schema of its arguments.
+pub fn ollama_tool(name: &str, description: &str, parameters: serde_json::Value) -> serde_json::Value {
+    json!({ "type": "function", "function": { "name": name, "description": description, "parameters": parameters } })
+}
+
+/// /api/embed: a text or a list of texts. Options: truncate (false: an error rather than cutting a long text), keep_alive, dimensions. Gives { vectors, model, prompt_tokens }.
+pub fn ollama_embed(model: &str, input: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !(input.is_string() || input.is_array()) {
+        return Err("the input is a text or a list of texts".into());
+    }
+    let mut body = json!({ "model": model_of(model)?, "input": input });
+    for k in ["truncate", "keep_alive", "dimensions"] {
+        if let Some(v) = options.get(k) {
+            body[k] = v.clone();
+        }
+    }
+    let r = post(&options, "/api/embed", &body)?;
+    Ok(json!({ "vectors": r["embeddings"], "model": r["model"], "prompt_tokens": r["prompt_eval_count"] }))
+}
+
+/// The models installed (/api/tags): each { name, size, size_gb, family, quantization, parameters, modified_at }.
+pub fn ollama_models(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let r = get(&options, "/api/tags")?;
+    Ok(r["models"].as_array().map(|l| l.iter().map(|m| {
+        let size = m["size"].as_f64().unwrap_or(0.0);
+        json!({
+            "name": m["name"], "size": m["size"], "size_gb": (size / 1e7).round() / 100.0,
+            "family": m.pointer("/details/family"), "quantization": m.pointer("/details/quantization_level"),
+            "parameters": m.pointer("/details/parameter_size"), "modified_at": m["modified_at"],
+        })
+    }).collect()).unwrap_or_default())
+}
+
+/// Whether a model is installed; a name with no tag means `:latest`, as Ollama reads it.
+pub fn ollama_has(model: &str, options: serde_json::Value) -> Result<bool, String> {
+    let want = if model.contains(':') { model.to_string() } else { format!("{}:latest", model) };
+    let r = get(&options, "/api/tags")?;
+    Ok(r["models"].as_array().map(|l| l.iter().any(|m| m["name"].as_str() == Some(&want))).unwrap_or(false))
+}
+
+/// The models loaded in memory now (/api/ps): { name, size, size_vram, expires_at }.
+pub fn ollama_running(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    Ok(get(&options, "/api/ps")?["models"].as_array().cloned().unwrap_or_default())
+}
+
+/// One model's details (/api/show): { details, parameters, capabilities, context_length }; the licence and template are left out.
+pub fn ollama_show(model: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = post(&options, "/api/show", &json!({ "model": model_of(model)? }))?;
+    let family = r.pointer("/details/family").and_then(|f| f.as_str()).unwrap_or("");
+    let ctx = r.pointer(&format!("/model_info/{}.context_length", family)).cloned().unwrap_or(Value::Null);
+    Ok(json!({ "details": r["details"], "parameters": r["parameters"], "capabilities": r["capabilities"], "context_length": ctx }))
+}
+
+/// Downloads a model (/api/pull), blocking until it is done; gives the statuses it passed through.
+pub fn ollama_pull(model: &str, options: serde_json::Value) -> Result<Vec<String>, String> {
+    let resp = send(&options, "POST", "/api/pull", Some(&json!({ "model": model_of(model)?, "stream": true })))?;
+    let mut seen: Vec<String> = vec![];
+    let mut lines = BufReader::new(resp.into_reader());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).map_err(|e| format!("the stream broke: {}", e))? == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if let Some(e) = v["error"].as_str() {
+            return Err(format!("the pull failed: {}", e));
+        }
+        if let Some(s) = v["status"].as_str() {
+            if seen.last().map(String::as_str) != Some(s) {
+                seen.push(s.to_string());
+            }
+        }
+    }
+    if seen.last().map(String::as_str) != Some("success") {
+        return Err(format!("the pull ended without success, after {:?}", seen.last()));
+    }
+    Ok(seen)
+}
+
+/// The server's version (/api/version), a cheap way to see that it is up.
+pub fn ollama_version(options: serde_json::Value) -> Result<String, String> {
+    Ok(get(&options, "/api/version")?["version"].as_str().unwrap_or("").to_string())
+}

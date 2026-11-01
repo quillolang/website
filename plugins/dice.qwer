@@ -1,0 +1,595 @@
+//! Dice notation parsed and rolled from a seed: `4d6kh3`, exploding and rerolled dice, success counts, advantage and disadvantage, Fudge dice and arithmetic, with the exact distribution of an expression worked out rather than sampled.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_DICE: i64 = 1000;
+const MAX_SIDES: i64 = 1_000_000;
+const MAX_EXPLODE: usize = 100;
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    // No modulo bias: a value in the top slack is drawn again.
+    fn below(&mut self, n: u64) -> u64 {
+        let zone = u64::MAX - u64::MAX % n;
+        loop {
+            let x = self.next();
+            if x < zone {
+                return x % n;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Cmp {
+    Eq,
+    Ge,
+    Le,
+    Gt,
+    Lt,
+}
+
+impl Cmp {
+    fn test(self, x: i64, y: i64) -> bool {
+        match self {
+            Cmp::Eq => x == y,
+            Cmp::Ge => x >= y,
+            Cmp::Le => x <= y,
+            Cmp::Gt => x > y,
+            Cmp::Lt => x < y,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Keep {
+    High(i64),
+    Low(i64),
+}
+
+#[derive(Clone, Debug)]
+struct Dice {
+    count: i64,
+    sides: i64, // 0 for Fudge dice, whose faces are -1, 0 and 1.
+    keep: Option<Keep>,
+    explode: Option<(Cmp, i64)>,
+    compound: bool,
+    reroll: Option<(Cmp, i64, bool)>, // The bool: once only.
+    success: Option<(Cmp, i64)>,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+enum Node {
+    Num(i64),
+    Roll(Dice),
+    Neg(Box<Node>),
+    Add(Box<Node>, Box<Node>),
+    Sub(Box<Node>, Box<Node>),
+    Mul(Box<Node>, Box<Node>),
+    Div(Box<Node>, Box<Node>),
+}
+
+struct Parser {
+    c: Vec<char>,
+    i: usize,
+    depth: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<char> {
+        self.c.get(self.i).copied()
+    }
+    fn number(&mut self) -> Option<i64> {
+        let s = self.i;
+        while self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            self.i += 1;
+        }
+        if s == self.i { None } else { self.c[s..self.i].iter().collect::<String>().parse().ok() }
+    }
+    fn word(&mut self, w: &str) -> bool {
+        let n: Vec<char> = w.chars().collect();
+        if self.c.len() >= self.i + n.len() && self.c[self.i..self.i + n.len()] == n[..] {
+            self.i += n.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn cmp(&mut self) -> Option<Cmp> {
+        if self.word(">=") {
+            Some(Cmp::Ge)
+        } else if self.word("<=") {
+            Some(Cmp::Le)
+        } else if self.word(">") {
+            Some(Cmp::Gt)
+        } else if self.word("<") {
+            Some(Cmp::Lt)
+        } else if self.word("=") {
+            Some(Cmp::Eq)
+        } else {
+            None
+        }
+    }
+    fn expr(&mut self) -> Result<Node, String> {
+        let mut a = self.term()?;
+        loop {
+            match self.peek() {
+                Some('+') => {
+                    self.i += 1;
+                    a = Node::Add(Box::new(a), Box::new(self.term()?));
+                }
+                Some('-') => {
+                    self.i += 1;
+                    a = Node::Sub(Box::new(a), Box::new(self.term()?));
+                }
+                _ => return Ok(a),
+            }
+        }
+    }
+    fn term(&mut self) -> Result<Node, String> {
+        let mut a = self.factor()?;
+        loop {
+            match self.peek() {
+                Some('*') | Some('×') => {
+                    self.i += 1;
+                    a = Node::Mul(Box::new(a), Box::new(self.factor()?));
+                }
+                Some('/') => {
+                    self.i += 1;
+                    a = Node::Div(Box::new(a), Box::new(self.factor()?));
+                }
+                _ => return Ok(a),
+            }
+        }
+    }
+    fn factor(&mut self) -> Result<Node, String> {
+        match self.peek() {
+            Some('(') => {
+                self.depth += 1;
+                if self.depth > 32 {
+                    return Err("too many brackets".into());
+                }
+                self.i += 1;
+                let a = self.expr()?;
+                if self.peek() != Some(')') {
+                    return Err("a `(` with no `)`".into());
+                }
+                self.i += 1;
+                self.depth -= 1;
+                Ok(a)
+            }
+            Some('-') => {
+                self.i += 1;
+                Ok(Node::Neg(Box::new(self.factor()?)))
+            }
+            Some(c) if c.is_ascii_digit() || c == 'd' => self.roll(),
+            Some(c) => Err(format!("`{}` at position {} makes no sense here", c, self.i + 1)),
+            None => Err("the expression ends too soon".into()),
+        }
+    }
+    fn roll(&mut self) -> Result<Node, String> {
+        let start = self.i;
+        let n = self.number();
+        if self.peek() != Some('d') {
+            return Ok(Node::Num(n.unwrap_or(0)));
+        }
+        self.i += 1;
+        let (sides, percent) = match self.peek() {
+            Some('%') => {
+                self.i += 1;
+                (100, true)
+            }
+            Some('F') | Some('f') => {
+                self.i += 1;
+                (0, false)
+            }
+            _ => (self.number().ok_or(format!("dice need a number of sides at position {}", self.i + 1))?, false),
+        };
+        let _ = percent;
+        let count = n.unwrap_or(1);
+        if !(1..=MAX_DICE).contains(&count) {
+            return Err(format!("{} dice: 1 to {} can be rolled at once", count, MAX_DICE));
+        }
+        if sides != 0 && !(1..=MAX_SIDES).contains(&sides) {
+            return Err(format!("a die has 1 to {} sides, not {}", MAX_SIDES, sides));
+        }
+        let mut d = Dice { count, sides, keep: None, explode: None, compound: false, reroll: None, success: None, text: String::new() };
+        let top = if sides == 0 { 1 } else { sides };
+        // Modifiers, in any order.
+        loop {
+            if self.word("kh") {
+                d.keep = Some(Keep::High(self.number().unwrap_or(1)));
+            } else if self.word("kl") {
+                d.keep = Some(Keep::Low(self.number().unwrap_or(1)));
+            } else if self.word("dh") {
+                let k = self.number().unwrap_or(1);
+                d.keep = Some(Keep::Low(count - k));
+            } else if self.word("dl") {
+                let k = self.number().unwrap_or(1);
+                d.keep = Some(Keep::High(count - k));
+            } else if self.word("!!") || self.word("!") {
+                d.compound = self.c[self.i - 2] == '!' && self.i >= 2 && self.i - start >= 2;
+                let (c, v) = match self.cmp() {
+                    Some(c) => (c, self.number().ok_or("a comparison needs a number")?),
+                    None => (Cmp::Eq, top),
+                };
+                d.explode = Some((c, v));
+            } else if self.word("ro") || self.word("r") {
+                let once = self.c[self.i - 1] == 'o';
+                let c = self.cmp().unwrap_or(Cmp::Eq);
+                let v = self.number().unwrap_or(1);
+                d.reroll = Some((c, v, once));
+            } else if let Some(c) = self.cmp() {
+                d.success = Some((c, self.number().ok_or("a comparison needs a number")?));
+            } else if self.word("adv") {
+                if count != 1 {
+                    return Err("advantage is for one die: write d20adv, not 2d20adv".into());
+                }
+                d.count = 2;
+                d.keep = Some(Keep::High(1));
+            } else if self.word("dis") {
+                if count != 1 {
+                    return Err("disadvantage is for one die: write d20dis".into());
+                }
+                d.count = 2;
+                d.keep = Some(Keep::Low(1));
+            } else {
+                break;
+            }
+        }
+        if let Some(Keep::High(k)) | Some(Keep::Low(k)) = &d.keep {
+            if *k < 0 || *k > d.count {
+                return Err(format!("keeping {} of {} dice", k, d.count));
+            }
+        }
+        if let Some((c, v)) = d.explode {
+            if c.test(if sides == 0 { -1 } else { 1 }, v) && c.test(top, v) {
+                return Err("every face explodes, so that roll never ends".into());
+            }
+        }
+        if let Some((c, v, false)) = d.reroll {
+            let low = if sides == 0 { -1 } else { 1 };
+            if (low..=top).filter(|f| *f != 0 || sides == 0).all(|f| c.test(f, v)) {
+                return Err("every face is rerolled, so that roll never ends".into());
+            }
+        }
+        d.text = self.c[start..self.i].iter().collect();
+        Ok(Node::Roll(d))
+    }
+}
+
+fn parse(text: &str) -> Result<Node, String> {
+    let c: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if c.is_empty() {
+        return Err("an empty expression".into());
+    }
+    if c.len() > 512 {
+        return Err("that expression is too long".into());
+    }
+    let mut p = Parser { c, i: 0, depth: 0 };
+    let n = p.expr()?;
+    if p.i < p.c.len() {
+        return Err(format!("`{}` at position {} makes no sense here", p.c[p.i], p.i + 1));
+    }
+    Ok(n)
+}
+
+fn face(d: &Dice, r: &mut Rng) -> i64 {
+    if d.sides == 0 { r.below(3) as i64 - 1 } else { r.below(d.sides as u64) as i64 + 1 }
+}
+
+fn one_die(d: &Dice, r: &mut Rng) -> i64 {
+    let mut v = face(d, r);
+    if let Some((c, x, once)) = d.reroll {
+        let mut tries = 0;
+        while c.test(v, x) && tries < 1000 {
+            v = face(d, r);
+            tries += 1;
+            if once {
+                break;
+            }
+        }
+    }
+    v
+}
+
+fn roll_dice(d: &Dice, r: &mut Rng, log: &mut Vec<Value>) -> i64 {
+    let mut rolls = vec![];
+    let mut exploded = 0;
+    for _ in 0..d.count {
+        let mut v = one_die(d, r);
+        if let Some((c, x)) = d.explode {
+            let mut more = 0;
+            let mut last = v;
+            while c.test(last, x) && more < MAX_EXPLODE {
+                last = one_die(d, r);
+                more += 1;
+                exploded += 1;
+                if d.compound {
+                    v += last;
+                } else {
+                    rolls.push(v);
+                    v = last;
+                }
+            }
+        }
+        rolls.push(v);
+    }
+    let mut idx: Vec<usize> = (0..rolls.len()).collect();
+    idx.sort_by_key(|i| rolls[*i]);
+    let keep: Vec<usize> = match &d.keep {
+        None => (0..rolls.len()).collect(),
+        Some(Keep::High(k)) => idx[idx.len() - (*k as usize).min(idx.len())..].to_vec(),
+        Some(Keep::Low(k)) => idx[..(*k as usize).min(idx.len())].to_vec(),
+    };
+    let kept: Vec<i64> = (0..rolls.len()).filter(|i| keep.contains(i)).map(|i| rolls[i]).collect();
+    let dropped: Vec<i64> = (0..rolls.len()).filter(|i| !keep.contains(i)).map(|i| rolls[i]).collect();
+    let total = match d.success {
+        Some((c, x)) => kept.iter().filter(|v| c.test(**v, x)).count() as i64,
+        None => kept.iter().sum(),
+    };
+    log.push(json!({ "dice": d.text, "rolls": rolls, "kept": kept, "dropped": dropped, "exploded": exploded, "total": total }));
+    total
+}
+
+fn eval(n: &Node, r: &mut Rng, log: &mut Vec<Value>) -> Result<i64, String> {
+    Ok(match n {
+        Node::Num(x) => *x,
+        Node::Roll(d) => roll_dice(d, r, log),
+        Node::Neg(a) => -eval(a, r, log)?,
+        Node::Add(a, b) => eval(a, r, log)?.saturating_add(eval(b, r, log)?),
+        Node::Sub(a, b) => eval(a, r, log)?.saturating_sub(eval(b, r, log)?),
+        Node::Mul(a, b) => eval(a, r, log)?.saturating_mul(eval(b, r, log)?),
+        Node::Div(a, b) => {
+            let (x, y) = (eval(a, r, log)?, eval(b, r, log)?);
+            if y == 0 {
+                return Err("division by zero".into());
+            }
+            x.div_euclid(y)
+        }
+    })
+}
+
+fn seed_of(seed: &Value) -> Result<u64, String> {
+    match seed {
+        Value::Null => Ok(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)),
+        Value::Number(n) => n.as_i64().map(|x| x as u64).ok_or("the seed is an int".to_string()),
+        Value::String(s) => Ok(s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))),
+        _ => Err("the seed is an int, text or null".into()),
+    }
+}
+
+/// An expression rolled: { expression, total, dice: [{ dice, rolls, kept, dropped, exploded, total }], seed_used }. `seed` is an int or text; the same seed rolls the same dice, and null takes the clock. Reads `2d6+3`, `4d6kh3`, `4d6dl1`, `d20adv`, `d20dis`, `3d6!`, `3d6!!`, `2d10!>=9`, `4d6r1`, `4d6ro<3`, `6d10>=7` counting successes, `4dF`, `d%`, and `(2d6+1)*2`, division rounding down.
+pub fn dice_roll(expression: &str, seed: serde_json::Value) -> Result<Value, String> {
+    let n = parse(expression)?;
+    let s = seed_of(&seed)?;
+    let mut r = Rng(s);
+    let mut log = vec![];
+    let total = eval(&n, &mut r, &mut log)?;
+    Ok(json!({ "expression": expression.trim(), "total": total, "dice": log }))
+}
+
+/// Several rolls of one expression from a seed: { rolls, min, max, mean }, as many as `times` up to 100000: a stat block, or a check on the distribution.
+pub fn dice_roll_many(expression: &str, times: i64, seed: serde_json::Value) -> Result<Value, String> {
+    if !(1..=100_000).contains(&times) {
+        return Err(format!("times is 1 to 100000, not {}", times));
+    }
+    let n = parse(expression)?;
+    let mut r = Rng(seed_of(&seed)?);
+    let mut rolls = Vec::with_capacity(times as usize);
+    for _ in 0..times {
+        rolls.push(eval(&n, &mut r, &mut vec![])?);
+    }
+    let sum: i128 = rolls.iter().map(|x| *x as i128).sum();
+    Ok(json!({ "rolls": rolls, "min": rolls.iter().min(), "max": rolls.iter().max(), "mean": sum as f64 / times as f64 }))
+}
+
+/// The expression as it was understood: a tree of { op, ... } and { dice, count, sides, keep, explode, reroll, success }. To check a form field before rolling.
+pub fn dice_parse(expression: &str) -> Result<Value, String> {
+    fn tree(n: &Node) -> Value {
+        let two = |op: &str, a: &Node, b: &Node| json!({ "op": op, "left": tree(a), "right": tree(b) });
+        match n {
+            Node::Num(x) => json!(x),
+            Node::Neg(a) => json!({ "op": "negate", "value": tree(a) }),
+            Node::Add(a, b) => two("add", a, b),
+            Node::Sub(a, b) => two("subtract", a, b),
+            Node::Mul(a, b) => two("multiply", a, b),
+            Node::Div(a, b) => two("divide", a, b),
+            Node::Roll(d) => json!({
+                "dice": d.text, "count": d.count, "sides": if d.sides == 0 { json!("fudge") } else { json!(d.sides) },
+                "keep": match &d.keep { Some(Keep::High(k)) => json!({ "highest": k }), Some(Keep::Low(k)) => json!({ "lowest": k }), None => Value::Null },
+                "explode": d.explode.map(|(_, v)| v), "compound": d.compound,
+                "reroll": d.reroll.map(|(_, v, once)| json!({ "value": v, "once": once })),
+                "success": d.success.map(|(_, v)| v),
+            }),
+        }
+    }
+    Ok(tree(&parse(expression)?))
+}
+
+type Dist = BTreeMap<i64, f64>;
+
+fn die_dist(d: &Dice) -> Result<Dist, String> {
+    let (lo, hi) = if d.sides == 0 { (-1, 1) } else { (1, d.sides) };
+    let p = 1.0 / (hi - lo + 1) as f64;
+    let mut m: Dist = (lo..=hi).map(|f| (f, p)).collect();
+    if let Some((c, x, once)) = d.reroll {
+        let bad: f64 = m.iter().filter(|(k, _)| c.test(**k, x)).map(|(_, v)| *v).sum();
+        let base = m.clone();
+        m = BTreeMap::new();
+        for (k, v) in &base {
+            if !c.test(*k, x) {
+                *m.entry(*k).or_insert(0.0) += if once { *v } else { *v / (1.0 - bad) };
+            } else if once {
+                // The first roll was bad: the second stands, whatever it is.
+                for (k2, v2) in &base {
+                    *m.entry(*k2).or_insert(0.0) += *v * *v2;
+                }
+            }
+        }
+    }
+    Ok(m)
+}
+
+// An exploding die's total, cut off after 12 explosions; what is left is tiny and goes to the last.
+fn explode_dist(base: &Dist, c: Cmp, x: i64) -> Dist {
+    let mut out: Dist = BTreeMap::new();
+    let mut live: Dist = BTreeMap::from([(0, 1.0)]);
+    for depth in 0..12 {
+        let mut next: Dist = BTreeMap::new();
+        for (sum, p) in &live {
+            for (f, q) in base {
+                let t = sum + f;
+                if c.test(*f, x) && depth < 11 {
+                    *next.entry(t).or_insert(0.0) += p * q;
+                } else {
+                    *out.entry(t).or_insert(0.0) += p * q;
+                }
+            }
+        }
+        live = next;
+        if live.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+fn combine(a: &Dist, b: &Dist, f: impl Fn(i64, i64) -> Result<i64, String>) -> Result<Dist, String> {
+    if a.len() * b.len() > 4_000_000 {
+        return Err("that distribution is too large to work out exactly".into());
+    }
+    let mut o: Dist = BTreeMap::new();
+    for (x, p) in a {
+        for (y, q) in b {
+            *o.entry(f(*x, *y)?).or_insert(0.0) += p * q;
+        }
+    }
+    prune(&mut o);
+    Ok(o)
+}
+
+fn prune(d: &mut Dist) {
+    d.retain(|_, p| *p > 0.0);
+}
+
+fn keep_dist(d: &Dice, face: &Dist) -> Result<Dist, String> {
+    // Only the kept dice matter: the state is their sorted values.
+    let (k, high) = match d.keep {
+        Some(Keep::High(k)) => (k as usize, true),
+        Some(Keep::Low(k)) => (k as usize, false),
+        None => unreachable!(),
+    };
+    let mut states: HashMap<Vec<i64>, f64> = HashMap::from([(vec![], 1.0)]);
+    for _ in 0..d.count {
+        let mut next: HashMap<Vec<i64>, f64> = HashMap::new();
+        for (s, p) in &states {
+            for (f, q) in face {
+                let mut t = s.clone();
+                let at = t.partition_point(|x| x < f);
+                t.insert(at, *f);
+                if t.len() > k {
+                    if high { t.remove(0); } else { t.pop(); }
+                }
+                *next.entry(t).or_insert(0.0) += p * q;
+            }
+        }
+        if next.len() > 300_000 {
+            return Err("that many kept dice is too large to work out exactly".into());
+        }
+        states = next;
+    }
+    let mut o: Dist = BTreeMap::new();
+    for (s, p) in states {
+        *o.entry(s.iter().sum()).or_insert(0.0) += p;
+    }
+    Ok(o)
+}
+
+fn dist_of(n: &Node) -> Result<Dist, String> {
+    Ok(match n {
+        Node::Num(x) => BTreeMap::from([(*x, 1.0)]),
+        Node::Neg(a) => dist_of(a)?.into_iter().map(|(k, v)| (-k, v)).collect(),
+        Node::Add(a, b) => combine(&dist_of(a)?, &dist_of(b)?, |x, y| Ok(x + y))?,
+        Node::Sub(a, b) => combine(&dist_of(a)?, &dist_of(b)?, |x, y| Ok(x - y))?,
+        Node::Mul(a, b) => combine(&dist_of(a)?, &dist_of(b)?, |x, y| Ok(x * y))?,
+        Node::Div(a, b) => combine(&dist_of(a)?, &dist_of(b)?, |x, y| if y == 0 { Err("division by zero".to_string()) } else { Ok(x.div_euclid(y)) })?,
+        Node::Roll(d) => {
+            if d.explode.is_some() && !d.compound && d.keep.is_some() {
+                return Err("an exploding roll with kept dice has no exact form here".into());
+            }
+            let mut face = die_dist(d)?;
+            if let Some((c, x)) = d.explode {
+                face = explode_dist(&face, c, x);
+            }
+            if let Some((c, x)) = d.success {
+                let hit: f64 = face.iter().filter(|(k, _)| c.test(**k, x)).map(|(_, v)| *v).sum();
+                face = BTreeMap::from([(0, 1.0 - hit), (1, hit)]);
+                prune(&mut face);
+            }
+            if d.keep.is_some() {
+                keep_dist(d, &face)?
+            } else {
+                let mut o: Dist = BTreeMap::from([(0, 1.0)]);
+                for _ in 0..d.count {
+                    o = combine(&o, &face, |x, y| Ok(x + y))?;
+                }
+                o
+            }
+        }
+    })
+}
+
+fn r4(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// The exact chance of each total, by convolution rather than sampling: { min, max, mean, stddev, median, mode, outcomes: [{ value, chance, at_least }] }. Exploding dice are cut off at 12 explosions, so their tail is a hair short.
+pub fn dice_distribution(expression: &str) -> Result<Value, String> {
+    let d = dist_of(&parse(expression)?)?;
+    let total: f64 = d.values().sum();
+    let mean: f64 = d.iter().map(|(k, p)| *k as f64 * p).sum::<f64>() / total;
+    let var: f64 = d.iter().map(|(k, p)| (*k as f64 - mean).powi(2) * p).sum::<f64>() / total;
+    let mode = d.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|x| *x.0);
+    let mut run = 0.0;
+    let mut median = None;
+    let mut rows = vec![];
+    let mut left = total;
+    for (k, p) in &d {
+        run += p;
+        if median.is_none() && run >= total / 2.0 {
+            median = Some(*k);
+        }
+        rows.push(json!({ "value": k, "chance": r4(p / total), "at_least": r4(left / total) }));
+        left -= p;
+    }
+    Ok(json!({ "min": d.keys().next(), "max": d.keys().last(), "mean": r4(mean), "stddev": r4(var.sqrt()), "median": median, "mode": mode, "outcomes": rows }))
+}
+
+/// The exact chance that an expression meets a target: `dice_chance("d20adv+5", ">=", 15)` for a hit against AC 15. `op` is `>=`, `>`, `<=`, `<` or `=`.
+pub fn dice_chance(expression: &str, op: &str, target: i64) -> Result<f64, String> {
+    let c = match op {
+        ">=" => Cmp::Ge,
+        ">" => Cmp::Gt,
+        "<=" => Cmp::Le,
+        "<" => Cmp::Lt,
+        "=" | "==" => Cmp::Eq,
+        o => return Err(format!("no comparison `{}`", o)),
+    };
+    let d = dist_of(&parse(expression)?)?;
+    Ok(r4(d.iter().filter(|(k, _)| c.test(**k, target)).map(|(_, p)| *p).sum::<f64>() / d.values().sum::<f64>()))
+}

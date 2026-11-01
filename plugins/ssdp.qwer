@@ -1,0 +1,458 @@
+//! SSDP and UPnP discovery: M-SEARCH sent and answers gathered, NOTIFY messages parsed and listened for on the multicast group, device description XML fetched and read with services and sub-devices, service descriptions, and SOAP actions called with their faults turned into errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! roxmltree = "0.20"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const PORT: u16 = 1900;
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
+}
+
+fn opt_str<'a>(o: &'a Value, k: &str, d: &'a str) -> &'a str {
+    o.get(k).and_then(|v| v.as_str()).unwrap_or(d)
+}
+
+// A header's value must stay on its line.
+fn one_line(v: &str, what: &str) -> Result<(), String> {
+    if v.contains(['\r', '\n']) {
+        return Err(format!("{} cannot hold a line break", what));
+    }
+    Ok(())
+}
+
+/// The text of an M-SEARCH: `st` (ssdp:all), `mx` (2 seconds), `user_agent`, for sending it yourself.
+pub fn ssdp_search_text(options: serde_json::Value) -> Result<String, String> {
+    let st = opt_str(&options, "st", "ssdp:all");
+    let mx = opt_u64(&options, "mx", 2);
+    if !(1..=5).contains(&mx) {
+        return Err("MX should be 1 to 5 seconds".into());
+    }
+    one_line(st, "st")?;
+    let ua = opt_str(&options, "user_agent", "Quillo/1.0 UPnP/1.1 quillo-ssdp/1.0");
+    one_line(ua, "user_agent")?;
+    Ok(format!("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: {}\r\nST: {}\r\nUSER-AGENT: {}\r\n\r\n", mx, st, ua))
+}
+
+/// Reads an SSDP message: a NOTIFY, an M-SEARCH or a search answer. Answers `{ kind, headers, nt, nts, st, usn, location, server, max_age, uuid }`, the alive, byebye and update kinds named in `event`.
+pub fn ssdp_parse(message: &str) -> Result<Value, String> {
+    let head = message.split("\r\n\r\n").next().unwrap_or(message);
+    let mut lines = head.lines();
+    let first = lines.next().unwrap_or("").trim();
+    let kind = if first.starts_with("NOTIFY ") {
+        "notify"
+    } else if first.starts_with("M-SEARCH ") {
+        "search"
+    } else if first.starts_with("HTTP/1.1 200") || first.starts_with("HTTP/1.0 200") {
+        "response"
+    } else {
+        return Err(format!("`{}` does not start an SSDP message", first.chars().take(40).collect::<String>()));
+    };
+    let mut h = Map::new();
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            h.insert(k.trim().to_lowercase(), json!(v.trim()));
+        }
+    }
+    let get = |k: &str| h.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut m = json!({ "kind": kind });
+    for k in ["nt", "st", "usn", "location", "server"] {
+        let v = get(k);
+        if !v.is_empty() {
+            m[k] = json!(v);
+        }
+    }
+    let nts = get("nts");
+    if !nts.is_empty() {
+        m["event"] = json!(nts.trim_start_matches("ssdp:"));
+    }
+    let cc = get("cache-control").to_lowercase();
+    if let Some(a) = cc.split("max-age").nth(1) {
+        if let Ok(n) = a.trim_start_matches(|c: char| c == ' ' || c == '=').split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<u64>() {
+            m["max_age"] = json!(n);
+        }
+    }
+    let usn = get("usn");
+    if let Some(u) = usn.strip_prefix("uuid:") {
+        m["uuid"] = json!(u.split("::").next().unwrap_or(u));
+    }
+    if kind == "search" {
+        m["man"] = json!(get("man"));
+        m["mx"] = json!(get("mx").parse::<u64>().ok());
+    }
+    m["headers"] = Value::Object(h);
+    Ok(m)
+}
+
+/// Sends an M-SEARCH and gathers one answer per USN: `{ st, usn, uuid, location, server, max_age, from, location_on_sender }`. Options: `st`, `mx`, `wait_ms` (MX plus a little), `sends` (2, as UDP gets lost), `to` (host:port instead of the multicast group), `ttl`. `location_on_sender` is false when a device's LOCATION names another machine: look before fetching it.
+pub fn ssdp_search(options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let text = ssdp_search_text(options.clone())?;
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_multicast_ttl_v4(opt_u64(&options, "ttl", 2) as u32).map_err(|e| e.to_string())?;
+    let to: SocketAddr = match options.get("to").and_then(|v| v.as_str()) {
+        Some(t) => t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.next().ok_or(format!("{}: no address", t))?,
+        None => SocketAddr::from((GROUP, PORT)),
+    };
+    let mx = opt_u64(&options, "mx", 2);
+    let wait = opt_u64(&options, "wait_ms", mx * 1000 + 300);
+    let sends = opt_u64(&options, "sends", 2).max(1);
+    sock.send_to(text.as_bytes(), to).map_err(|e| format!("cannot send to {}: {}", to, e))?;
+    let mut sent = 1;
+    let start = Instant::now();
+    let end = start + Duration::from_millis(wait);
+    let gap = Duration::from_millis((wait / (sends + 1)).max(50));
+    let mut out: Vec<Value> = vec![];
+    let mut buf = [0u8; 4096];
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            return Ok(out);
+        }
+        let next = start + gap * sent as u32;
+        if sent < sends && now >= next {
+            let _ = sock.send_to(text.as_bytes(), to);
+            sent += 1;
+            continue;
+        }
+        let until = if sent < sends { next.min(end) } else { end };
+        sock.set_read_timeout(Some(until.saturating_duration_since(now).max(Duration::from_millis(1)))).map_err(|e| e.to_string())?;
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                let Ok(mut m) = ssdp_parse(&String::from_utf8_lossy(&buf[..n])) else { continue };
+                if m["kind"] != "response" {
+                    continue;
+                }
+                let usn = m["usn"].clone();
+                if out.iter().any(|x| x["usn"] == usn) {
+                    continue;
+                }
+                m["from"] = json!(from.ip().to_string());
+                let host = m["location"].as_str().map(url_host).unwrap_or_default();
+                m["location_on_sender"] = json!(host == from.ip().to_string());
+                if let Some(o) = m.as_object_mut() {
+                    o.remove("kind");
+                    o.remove("headers");
+                }
+                out.push(m);
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+fn url_host(u: &str) -> String {
+    let rest = u.split("://").nth(1).unwrap_or(u);
+    let auth = rest.split('/').next().unwrap_or(rest);
+    auth.rsplit_once(':').map_or(auth, |x| x.0).to_string()
+}
+
+fn origin(u: &str) -> String {
+    match u.find("://") {
+        Some(i) => match u[i + 3..].find('/') {
+            Some(j) => u[..i + 3 + j].to_string(),
+            None => u.to_string(),
+        },
+        None => u.to_string(),
+    }
+}
+
+fn join_url(base: &str, href: &str) -> String {
+    let h = href.trim();
+    if h.is_empty() {
+        return String::new();
+    }
+    if h.starts_with("http://") || h.starts_with("https://") {
+        return h.to_string();
+    }
+    if h.starts_with('/') {
+        return format!("{}{}", origin(base), h);
+    }
+    let path_end = base.find(['?', '#']).unwrap_or(base.len());
+    let b = &base[..path_end];
+    match b.rfind('/') {
+        Some(i) if i > base.find("://").map_or(0, |x| x + 2) => format!("{}/{}", &b[..i], h),
+        _ => format!("{}/{}", b, h),
+    }
+}
+
+fn agent(o: &Value) -> ureq::Agent {
+    let t = Duration::from_millis(opt_u64(o, "timeout_ms", 5000));
+    ureq::AgentBuilder::new().timeout_connect(t).timeout(t).build()
+}
+
+fn http_url(u: &str) -> Result<(), String> {
+    if u.starts_with("http://") || u.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!("`{}` is not an http URL", u))
+    }
+}
+
+fn get_text(url: &str, o: &Value) -> Result<String, String> {
+    http_url(url)?;
+    match agent(o).get(url).call() {
+        Ok(r) => r.into_string().map_err(|e| format!("{}: {}", url, e)),
+        Err(ureq::Error::Status(c, _)) => Err(format!("{} answered {}", url, c)),
+        Err(e) => Err(format!("cannot fetch {}: {}", url, e)),
+    }
+}
+
+fn kid<'a>(n: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
+    n.children().find(|c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn field(n: roxmltree::Node<'_, '_>, name: &str) -> Value {
+    match kid(n, name).and_then(|c| c.text()).map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        Some(t) => json!(t),
+        None => Value::Null,
+    }
+}
+
+fn device(n: roxmltree::Node<'_, '_>, base: &str, depth: usize) -> Value {
+    let mut m = Map::new();
+    for (from, to) in [("deviceType", "type"), ("friendlyName", "name"), ("manufacturer", "manufacturer"), ("manufacturerURL", "manufacturer_url"), ("modelName", "model"), ("modelNumber", "model_number"), ("modelDescription", "description"), ("serialNumber", "serial"), ("UDN", "udn"), ("presentationURL", "presentation_url")] {
+        let v = field(n, from);
+        if !v.is_null() {
+            m.insert(to.into(), if to.ends_with("_url") { json!(join_url(base, v.as_str().unwrap_or(""))) } else { v });
+        }
+    }
+    let mut services = vec![];
+    if let Some(list) = kid(n, "serviceList") {
+        for s in list.children().filter(|c| c.tag_name().name() == "service") {
+            let url = |k: &str| json!(join_url(base, field(s, k).as_str().unwrap_or("")));
+            services.push(json!({ "type": field(s, "serviceType"), "id": field(s, "serviceId"), "control_url": url("controlURL"), "event_url": url("eventSubURL"), "description_url": url("SCPDURL") }));
+        }
+    }
+    m.insert("services".into(), json!(services));
+    if let Some(list) = kid(n, "iconList") {
+        let icons: Vec<Value> = list.children().filter(|c| c.tag_name().name() == "icon").map(|i| json!({ "mime": field(i, "mimetype"), "width": field(i, "width"), "url": join_url(base, field(i, "url").as_str().unwrap_or("")) })).collect();
+        if !icons.is_empty() {
+            m.insert("icons".into(), json!(icons));
+        }
+    }
+    if depth < 6 {
+        if let Some(list) = kid(n, "deviceList") {
+            let d: Vec<Value> = list.children().filter(|c| c.tag_name().name() == "device").map(|x| device(x, base, depth + 1)).collect();
+            if !d.is_empty() {
+                m.insert("devices".into(), json!(d));
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+/// Reads device description XML: name, manufacturer, model, serial, UDN, services with their URLs made absolute against `URLBase` or `location`, icons, and sub-devices.
+pub fn ssdp_description(xml: &str, location: &str) -> Result<Value, String> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("not a device description: {}", e))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "root" {
+        return Err(format!("not a device description: the root is <{}>", root.tag_name().name()));
+    }
+    let d = kid(root, "device").ok_or("not a device description: no <device>")?;
+    let base = field(root, "URLBase");
+    let base = base.as_str().unwrap_or(location).to_string();
+    let spec = kid(root, "specVersion").map(|s| format!("{}.{}", field(s, "major").as_str().unwrap_or("1"), field(s, "minor").as_str().unwrap_or("0")));
+    let mut m = device(d, &base, 0);
+    m["upnp"] = json!(spec);
+    Ok(m)
+}
+
+/// Fetches a device's description from its LOCATION and reads it; a device that does not answer, or answers something else, is an error saying so.
+pub fn ssdp_describe(location: &str, options: serde_json::Value) -> Result<Value, String> {
+    ssdp_description(&get_text(location, &options)?, location)
+}
+
+/// Fetches a service's description (SCPD): `{ actions: [{ name, in, out }], variables: [{ name, type, allowed, events }] }`.
+pub fn ssdp_service(description_url: &str, options: serde_json::Value) -> Result<Value, String> {
+    let xml = get_text(description_url, &options)?;
+    let doc = roxmltree::Document::parse(&xml).map_err(|e| format!("not a service description: {}", e))?;
+    let root = doc.root_element();
+    let mut actions = vec![];
+    if let Some(list) = kid(root, "actionList") {
+        for a in list.children().filter(|c| c.tag_name().name() == "action") {
+            let (mut i, mut o) = (vec![], vec![]);
+            if let Some(args) = kid(a, "argumentList") {
+                for x in args.children().filter(|c| c.tag_name().name() == "argument") {
+                    if field(x, "direction") == "in" {
+                        i.push(field(x, "name"));
+                    } else {
+                        o.push(field(x, "name"));
+                    }
+                }
+            }
+            actions.push(json!({ "name": field(a, "name"), "in": i, "out": o }));
+        }
+    }
+    let mut vars = vec![];
+    if let Some(list) = kid(root, "serviceStateTable") {
+        for v in list.children().filter(|c| c.tag_name().name() == "stateVariable") {
+            let allowed: Vec<&str> = kid(v, "allowedValueList").map(|l| l.children().filter_map(|c| if c.is_element() { c.text() } else { None }).collect()).unwrap_or_default();
+            vars.push(json!({ "name": field(v, "name"), "type": field(v, "dataType"), "allowed": allowed, "events": v.attribute("sendEvents") == Some("yes") }));
+        }
+    }
+    Ok(json!({ "actions": actions, "variables": vars }))
+}
+
+fn xml_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Calls a SOAP action: `ssdp_action(service.control_url, service.type, "GetExternalIPAddress", {}, {})`. Answers the out arguments as a map; a UPnP fault is an error with its code and description.
+pub fn ssdp_action(control_url: &str, service_type: &str, action: &str, arguments: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    http_url(control_url)?;
+    if !action.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') || action.is_empty() {
+        return Err(format!("`{}` is not an action name", action));
+    }
+    one_line(service_type, "service_type")?;
+    let mut args = String::new();
+    for (k, v) in arguments.as_object().into_iter().flatten() {
+        if !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            return Err(format!("`{}` is not an argument name", k));
+        }
+        let t = match v {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => if *b { "1".into() } else { "0".into() },
+            x => x.to_string(),
+        };
+        args.push_str(&format!("<{0}>{1}</{0}>", k, xml_text(&t)));
+    }
+    let body = format!("<?xml version=\"1.0\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:{a} xmlns:u=\"{t}\">{args}</u:{a}></s:Body></s:Envelope>", a = action, t = xml_text(service_type), args = args);
+    let call = agent(&options).post(control_url).set("Content-Type", "text/xml; charset=\"utf-8\"").set("SOAPACTION", &format!("\"{}#{}\"", service_type, action)).send_string(&body);
+    let (status, text) = match call {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach {}: {}", control_url, e)),
+    };
+    let doc = roxmltree::Document::parse(&text).map_err(|_| format!("{} answered {} with no XML", control_url, status))?;
+    if let Some(f) = doc.descendants().find(|n| n.tag_name().name() == "UPnPError") {
+        return Err(format!("{} failed: UPnP error {}: {}", action, field(f, "errorCode").as_str().unwrap_or("?"), field(f, "errorDescription").as_str().unwrap_or("")));
+    }
+    if status >= 300 {
+        return Err(format!("{} answered {}", control_url, status));
+    }
+    let want = format!("{}Response", action);
+    let r = doc.descendants().find(|n| n.tag_name().name() == want).ok_or(format!("the answer has no <{}>", want))?;
+    let mut out = Map::new();
+    for c in r.children().filter(|c| c.is_element()) {
+        out.insert(c.tag_name().name().to_string(), json!(c.text().unwrap_or("")));
+    }
+    Ok(Value::Object(out))
+}
+
+/// The text of a NOTIFY for a device of your own: `{ nt, usn, location, event: "alive", "byebye" or "update", max_age, server }`.
+pub fn ssdp_notify_text(notice: serde_json::Value) -> Result<String, String> {
+    let need = |k: &str| notice.get(k).and_then(|v| v.as_str()).ok_or(format!("a notice needs `{}`", k));
+    let event = opt_str(&notice, "event", "alive");
+    if !["alive", "byebye", "update"].contains(&event) {
+        return Err(format!("`{}` is not an event: alive, byebye or update", event));
+    }
+    let (nt, usn) = (need("nt")?, need("usn")?);
+    one_line(nt, "nt")?;
+    one_line(usn, "usn")?;
+    let mut t = format!("NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nNT: {}\r\nNTS: ssdp:{}\r\nUSN: {}\r\n", nt, event, usn);
+    if event != "byebye" {
+        let loc = need("location")?;
+        one_line(loc, "location")?;
+        t.push_str(&format!("CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n", opt_u64(&notice, "max_age", 1800), loc, opt_str(&notice, "server", "Quillo/1.0 UPnP/1.1 quillo-ssdp/1.0")));
+    }
+    t.push_str("\r\n");
+    Ok(t)
+}
+
+/// The answer to an M-SEARCH for a device of your own: `{ st, usn, location, max_age, server }`.
+pub fn ssdp_response_text(answer: serde_json::Value) -> Result<String, String> {
+    let need = |k: &str| answer.get(k).and_then(|v| v.as_str()).ok_or(format!("an answer needs `{}`", k));
+    let (st, usn, loc) = (need("st")?, need("usn")?, need("location")?);
+    one_line(st, "st")?;
+    one_line(usn, "usn")?;
+    one_line(loc, "location")?;
+    Ok(format!("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age={}\r\nEXT:\r\nLOCATION: {}\r\nSERVER: {}\r\nST: {}\r\nUSN: {}\r\n\r\n", opt_u64(&answer, "max_age", 1800), loc, opt_str(&answer, "server", "Quillo/1.0 UPnP/1.1 quillo-ssdp/1.0"), st, usn))
+}
+
+struct Listener {
+    stop: Arc<AtomicBool>,
+    queue: Arc<(Mutex<Vec<Value>>, Condvar)>,
+}
+
+fn listeners() -> &'static Mutex<HashMap<String, Listener>> {
+    static L: OnceLock<Mutex<HashMap<String, Listener>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Listens for NOTIFY messages on a thread of its own, joining the multicast group on port 1900 unless `options.port` (a plain UDP port, 0 for any) says otherwise. Answers the port. Drain with `ssdp_receive`; the newest 1000 are kept.
+pub fn ssdp_listen(name: &str, options: serde_json::Value) -> Result<i64, String> {
+    let port = opt_u64(&options, "port", PORT as u64) as u16;
+    let sock = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| format!("cannot listen on UDP port {}: {}", port, e))?;
+    if port == PORT {
+        sock.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED).map_err(|e| format!("cannot join the SSDP group: {}", e))?;
+    }
+    sock.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let bound = sock.local_addr().map_err(|e| e.to_string())?.port() as i64;
+    let stop = Arc::new(AtomicBool::new(false));
+    let queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let (s2, q2) = (stop.clone(), queue.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while !s2.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                if let Ok(mut m) = ssdp_parse(&String::from_utf8_lossy(&buf[..n])) {
+                    if m["kind"] != "notify" {
+                        continue;
+                    }
+                    if let IpAddr::V4(ip) = from.ip() {
+                        m["from"] = json!(ip.to_string());
+                    }
+                    let mut g = q2.0.lock().unwrap();
+                    if g.len() >= 1000 {
+                        g.remove(0);
+                    }
+                    g.push(m);
+                    q2.1.notify_all();
+                }
+            }
+        }
+    });
+    if let Some(old) = listeners().lock().map_err(|_| "lock")?.insert(name.to_string(), Listener { stop, queue }) {
+        old.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(bound)
+}
+
+/// Up to `max` NOTIFY messages a listener has heard, waiting up to `wait_ms` for the first.
+pub fn ssdp_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let q = listeners().lock().map_err(|_| "lock")?.get(name).map(|l| l.queue.clone()).ok_or(format!("no listener `{}`: call ssdp_listen first", name))?;
+    let end = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    let mut g = q.0.lock().map_err(|_| "lock")?;
+    while g.is_empty() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(vec![]);
+        }
+        g = q.1.wait_timeout(g, left).map_err(|_| "lock")?.0;
+    }
+    let n = (max.max(0) as usize).min(g.len());
+    Ok(g.drain(..n).collect())
+}
+
+/// Stops a listener; true when there was one.
+pub fn ssdp_stop(name: &str) -> Result<bool, String> {
+    Ok(match listeners().lock().map_err(|_| "lock")?.remove(name) {
+        Some(l) => {
+            l.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    })
+}

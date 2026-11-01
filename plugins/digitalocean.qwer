@@ -1,0 +1,238 @@
+//! DigitalOcean's API: droplets listed, made and destroyed, power and snapshot actions waited on, domains and DNS records, Spaces access keys, every list paged by following its links, and 429s waited out by the rate-limit headers.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static RATE: Mutex<Value> = Mutex::new(Value::Null);
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn base() -> String {
+    std::env::var("DIGITALOCEAN_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or("https://api.digitalocean.com".into()).trim_end_matches('/').to_string()
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// One call. A 429 waits for RateLimit-Reset, at most the option max_wait_s (10), and goes again; 5xx on a GET goes again too. An API error becomes `DigitalOcean 404 not_found: ...`.
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let token = std::env::var("DIGITALOCEAN_TOKEN").ok().filter(|v| !v.is_empty()).ok_or("no token: set DIGITALOCEAN_TOKEN")?;
+    let url = if path.starts_with("http") { path.to_string() } else { format!("{}{}", base(), path) };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let most = o.get("max_wait_s").and_then(|v| v.as_u64()).unwrap_or(10);
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => r.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => r.call(),
+        };
+        let resp = match res {
+            Ok(x) => x,
+            Err(ureq::Error::Status(_, x)) => x,
+            Err(e) => return Err(format!("cannot reach DigitalOcean: {}", e)),
+        };
+        let status = resp.status();
+        let limit = |n: &str| resp.header(n).and_then(|h| h.trim().parse::<i64>().ok());
+        let (lim, left, reset) = (limit("ratelimit-limit"), limit("ratelimit-remaining"), limit("ratelimit-reset"));
+        if lim.is_some() {
+            if let Ok(mut g) = RATE.lock() {
+                *g = json!({ "limit": lim, "remaining": left, "reset": reset });
+            }
+        }
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        if (status == 429 || (status >= 500 && method == "GET")) && tries < 5 {
+            let wait = if status == 429 { reset.map(|r| (r - now() as i64).max(1) as u64).unwrap_or(1) } else { tries };
+            if wait <= most {
+                std::thread::sleep(Duration::from_secs(wait));
+                continue;
+            }
+        }
+        if status >= 300 {
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return Err(format!("DigitalOcean {} {}: {}", status, v["id"].as_str().unwrap_or("error"), v["message"].as_str().map(str::to_string).unwrap_or_else(|| text.chars().take(160).collect())));
+        }
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(|e| format!("DigitalOcean: not JSON: {}", e));
+    }
+}
+
+/// What the last answer said of the rate limit: { limit, remaining, reset }.
+pub fn digitalocean_rate() -> serde_json::Value {
+    RATE.lock().map(|g| g.clone()).unwrap_or(Value::Null)
+}
+
+/// Any call: `method`, `path` like /v2/account, `body` or null. Gives the JSON answer, null for a 204.
+pub fn digitalocean_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+/// Every item of a list under `key` (droplets, domains...), following `links.pages.next`.
+pub fn digitalocean_all(path: &str, key: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let size = options.get("per_page").and_then(|v| v.as_u64()).unwrap_or(200);
+    let mut next = format!("{}{}per_page={}", path, if path.contains('?') { "&" } else { "?" }, size);
+    let mut out = vec![];
+    loop {
+        let v = call("GET", &next, None, &options)?;
+        out.extend(v[key].as_array().cloned().unwrap_or_default());
+        match v.pointer("/links/pages/next").and_then(|n| n.as_str()) {
+            // The link names the real host: stay on the one configured.
+            Some(n) => next = n.find("/v2/").map_or(n.to_string(), |i| n[i..].to_string()),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Waits for an action to end: { id, status, type, ... }. `errored` is an error value. Options: wait_ms (5 min), every_ms (2 s).
+pub fn digitalocean_action_wait(id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let limit = Duration::from_millis(options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(300_000));
+    let every = Duration::from_millis(options.get("every_ms").and_then(|v| v.as_u64()).unwrap_or(2_000));
+    let start = Instant::now();
+    loop {
+        let a = call("GET", &format!("/v2/actions/{}", id), None, &options)?["action"].clone();
+        match a["status"].as_str() {
+            Some("completed") => return Ok(a),
+            Some("errored") => return Err(format!("action {} ({}) ended in an error", id, a["type"].as_str().unwrap_or("?"))),
+            _ => {}
+        }
+        if start.elapsed() > limit {
+            return Err(format!("action {} is still {} after {} ms", id, a["status"].as_str().unwrap_or("?"), limit.as_millis()));
+        }
+        std::thread::sleep(every);
+    }
+}
+
+fn plain(d: &Value) -> Value {
+    let mut out = d.clone();
+    let ip = |kind: &str| d.pointer("/networks/v4").and_then(|n| n.as_array()).and_then(|l| l.iter().find(|a| a["type"] == kind)).map(|a| a["ip_address"].clone());
+    out["public_ip"] = ip("public").unwrap_or(Value::Null);
+    out["private_ip"] = ip("private").unwrap_or(Value::Null);
+    out
+}
+
+/// All droplets, each with `public_ip` and `private_ip` picked out. Option tag limits them to a tag.
+pub fn digitalocean_droplets(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = options.get("tag").and_then(|t| t.as_str()).map_or("/v2/droplets".to_string(), |t| format!("/v2/droplets?tag_name={}", enc(t)));
+    Ok(digitalocean_all(&path, "droplets", options)?.iter().map(plain).collect())
+}
+
+/// One droplet.
+pub fn digitalocean_droplet(id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(plain(&call("GET", &format!("/v2/droplets/{}", id), None, &options)?["droplet"]))
+}
+
+/// Makes a droplet: `spec` is { name, region, size, image, ssh_keys, tags, user_data, ... }. With the option wait, waits for its create action and gives it again, by then with addresses.
+pub fn digitalocean_droplet_create(spec: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["name", "region", "size", "image"] {
+        if spec.get(k).is_none() {
+            return Err(format!("the droplet needs `{}`", k));
+        }
+    }
+    let r = call("POST", "/v2/droplets", Some(&spec), &options)?;
+    let d = &r["droplet"];
+    if options.get("wait") == Some(&Value::Bool(true)) {
+        let act = r.pointer("/links/actions/0/id").and_then(|i| i.as_i64()).ok_or("the answer names no create action")?;
+        digitalocean_action_wait(act, options.clone())?;
+        return digitalocean_droplet(d["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(plain(d))
+}
+
+/// Destroys a droplet.
+pub fn digitalocean_droplet_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/droplets/{}", id), None, &options)?;
+    Ok(true)
+}
+
+/// Starts an action on a droplet: `kind` is reboot, power_off, power_on, shutdown, snapshot, resize...; `args` the action's own fields or null. With the option wait, waits for it. Gives the action.
+pub fn digitalocean_droplet_action(id: i64, kind: &str, args: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut body = if args.is_object() { args } else { json!({}) };
+    body["type"] = json!(kind);
+    let a = call("POST", &format!("/v2/droplets/{}/actions", id), Some(&body), &options)?["action"].clone();
+    if options.get("wait") == Some(&Value::Bool(true)) {
+        return digitalocean_action_wait(a["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(a)
+}
+
+/// All domains.
+pub fn digitalocean_domains(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    digitalocean_all("/v2/domains", "domains", options)
+}
+
+/// Adds a domain, with an A record at the apex when `ip` is given.
+pub fn digitalocean_domain_create(name: &str, ip: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let body = if ip.is_empty() { json!({ "name": name }) } else { json!({ "name": name, "ip_address": ip }) };
+    Ok(call("POST", "/v2/domains", Some(&body), &options)?["domain"].clone())
+}
+
+/// Removes a domain and its records.
+pub fn digitalocean_domain_delete(name: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/domains/{}", enc(name)), None, &options)?;
+    Ok(true)
+}
+
+/// A domain's records, all pages. Options: type and name (the whole name, like www.example.com) filter them.
+pub fn digitalocean_records(domain: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut path = format!("/v2/domains/{}/records", enc(domain));
+    let mut q = vec![];
+    for k in ["type", "name"] {
+        if let Some(v) = options.get(k).and_then(|v| v.as_str()) {
+            q.push(format!("{}={}", k, enc(v)));
+        }
+    }
+    if !q.is_empty() {
+        path = format!("{}?{}", path, q.join("&"));
+    }
+    digitalocean_all(&path, "domain_records", options)
+}
+
+/// Adds a record: { type, name, data, ttl, priority, port, weight, flags, tag }. `name` is relative, `@` the apex.
+pub fn digitalocean_record_create(domain: &str, record: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &format!("/v2/domains/{}/records", enc(domain)), Some(&record), &options)?["domain_record"].clone())
+}
+
+/// Changes fields of a record.
+pub fn digitalocean_record_update(domain: &str, id: i64, changes: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("PATCH", &format!("/v2/domains/{}/records/{}", enc(domain), id), Some(&changes), &options)?["domain_record"].clone())
+}
+
+/// Removes a record.
+pub fn digitalocean_record_delete(domain: &str, id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/domains/{}/records/{}", enc(domain), id), None, &options)?;
+    Ok(true)
+}
+
+/// The account's Spaces access keys, without their secrets.
+pub fn digitalocean_spaces_keys(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    digitalocean_all("/v2/spaces/keys", "keys", options)
+}
+
+/// Makes a Spaces key: `grants` is [{ bucket, permission }], permission being read, readwrite or fullaccess (bucket "" for fullaccess). Gives { name, access_key, secret_key, grants }: the secret is shown this once.
+pub fn digitalocean_spaces_key_create(name: &str, grants: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for g in grants.as_array().ok_or("grants is a list of { bucket, permission }")? {
+        let p = g["permission"].as_str().unwrap_or("");
+        if !["read", "readwrite", "fullaccess"].contains(&p) {
+            return Err(format!("`{}` is not a permission: read, readwrite or fullaccess", p));
+        }
+    }
+    Ok(call("POST", "/v2/spaces/keys", Some(&json!({ "name": name, "grants": grants })), &options)?["key"].clone())
+}
+
+/// Revokes a Spaces key by its access key.
+pub fn digitalocean_spaces_key_delete(access_key: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/spaces/keys/{}", enc(access_key)), None, &options)?;
+    Ok(true)
+}

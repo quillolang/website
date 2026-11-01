@@ -1,0 +1,667 @@
+//! NetFlow v5 and v9 and IPFIX collected from routers: packets decoded into flows with named fields, templates remembered per exporter and domain, data sets that came before their template held and read when it arrives, options templates, variable-length fields, sequence gaps counted as loss, and a UDP collector on a thread drained with `netflow_receive`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const MAX_HELD_SETS: usize = 256;
+const MAX_TEMPLATES: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct Field {
+    id: u16,
+    enterprise: Option<u32>,
+    len: u16,
+}
+
+#[derive(Clone, Debug)]
+struct Template {
+    fields: Vec<Field>,
+    scope: usize, // how many of the first fields are scope fields
+    options: bool,
+}
+
+#[derive(Default)]
+struct Exporter {
+    templates: HashMap<(u32, u16), Template>,
+    held: VecDeque<Held>,
+    next_seq: HashMap<(u16, u32), u32>,
+    lost: u64,
+    dropped_sets: u64,
+}
+
+struct Held {
+    version: u16,
+    domain: u32,
+    set: u16,
+    data: Vec<u8>,
+    boot_ms: Option<i64>,
+}
+
+type Book = HashMap<String, Exporter>;
+
+fn name_of(id: u16) -> Option<&'static str> {
+    Some(match id {
+        1 => "bytes", 2 => "packets", 3 => "flows", 4 => "protocol", 5 => "tos", 6 => "tcp_flags", 7 => "src_port", 8 => "src_addr", 9 => "src_mask",
+        10 => "input", 11 => "dst_port", 12 => "dst_addr", 13 => "dst_mask", 14 => "output", 15 => "next_hop", 16 => "src_as", 17 => "dst_as",
+        18 => "bgp_next_hop", 21 => "last_switched", 22 => "first_switched", 23 => "out_bytes", 24 => "out_packets", 27 => "src_addr", 28 => "dst_addr",
+        29 => "src_mask", 30 => "dst_mask", 31 => "flow_label", 32 => "icmp_type", 34 => "sampling_interval", 35 => "sampling_algorithm", 38 => "engine_type",
+        39 => "engine_id", 56 => "src_mac", 57 => "out_dst_mac", 58 => "src_vlan", 59 => "dst_vlan", 60 => "ip_version", 61 => "direction", 62 => "next_hop",
+        80 => "dst_mac", 136 => "end_reason", 150 => "start_secs", 151 => "end_secs", 152 => "start_ms", 153 => "end_ms", 154 => "start_us", 155 => "end_us",
+        148 => "flow_id", 149 => "observation_domain", 176 => "icmp_type", 177 => "icmp_code", 225 => "post_nat_src_addr", 226 => "post_nat_dst_addr",
+        227 => "post_nat_src_port", 228 => "post_nat_dst_port", 233 => "firewall_event", 239 => "biflow_direction", 256 => "ether_type", 352 => "layer2_bytes",
+        _ => return None,
+    })
+}
+
+fn is_addr(id: u16) -> bool {
+    matches!(id, 8 | 12 | 15 | 18 | 27 | 28 | 62 | 225 | 226)
+}
+
+fn is_mac(id: u16) -> bool {
+    matches!(id, 56 | 57 | 80 | 81)
+}
+
+fn be(b: &[u8]) -> u64 {
+    b.iter().take(8).fold(0u64, |a, x| (a << 8) | *x as u64)
+}
+
+fn value_of(f: &Field, d: &[u8]) -> Value {
+    if f.enterprise.is_some() {
+        return json!(hexish(d));
+    }
+    if is_addr(f.id) {
+        if d.len() == 4 {
+            return json!(Ipv4Addr::new(d[0], d[1], d[2], d[3]).to_string());
+        }
+        if d.len() == 16 {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(d);
+            return json!(Ipv6Addr::from(a).to_string());
+        }
+    }
+    if is_mac(f.id) && d.len() == 6 {
+        return json!(d.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":"));
+    }
+    if d.len() <= 8 {
+        return json!(be(d));
+    }
+    text_or_hex(d)
+}
+
+fn text_or_hex(d: &[u8]) -> Value {
+    match std::str::from_utf8(d) {
+        Ok(t) if t.chars().all(|c| !c.is_control() || c == '\0') => json!(t.trim_end_matches('\0')),
+        _ => json!(hexish(d)),
+    }
+}
+
+fn hexish(d: &[u8]) -> String {
+    d.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn protocol_name(p: u64) -> Value {
+    match p {
+        1 => json!("icmp"),
+        2 => json!("igmp"),
+        6 => json!("tcp"),
+        17 => json!("udp"),
+        47 => json!("gre"),
+        50 => json!("esp"),
+        58 => json!("icmpv6"),
+        n => json!(n),
+    }
+}
+
+fn flag_text(f: u64) -> String {
+    [(0x20, 'U'), (0x10, 'A'), (0x08, 'P'), (0x04, 'R'), (0x02, 'S'), (0x01, 'F')].iter().filter(|(b, _)| f & b != 0).map(|x| x.1).collect()
+}
+
+fn finish(m: &mut Map<String, Value>, boot_ms: Option<i64>) {
+    if let Some(p) = m.get("protocol").and_then(|v| v.as_u64()) {
+        m.insert("protocol_name".into(), protocol_name(p));
+    }
+    if let Some(f) = m.get("tcp_flags").and_then(|v| v.as_u64()) {
+        m.insert("flags".into(), json!(flag_text(f)));
+    }
+    // Times relative to the router's boot become wall clock, wrap of the 32-bit uptime included.
+    if let Some(b) = boot_ms {
+        for (from, to) in [("first_switched", "start_ms"), ("last_switched", "end_ms")] {
+            if let Some(v) = m.get(from).and_then(|v| v.as_i64()) {
+                m.insert(to.into(), json!(b + v));
+            }
+        }
+    }
+    let secs = |x: Option<&Value>| x.and_then(|v| v.as_i64()).map(|v| v * 1000);
+    if let Some(v) = secs(m.get("start_secs")) {
+        m.insert("start_ms".into(), json!(v));
+    }
+    if let Some(v) = secs(m.get("end_secs")) {
+        m.insert("end_ms".into(), json!(v));
+    }
+    if let (Some(a), Some(b)) = (m.get("start_ms").and_then(|v| v.as_i64()), m.get("end_ms").and_then(|v| v.as_i64())) {
+        m.insert("duration_ms".into(), json!(b - a));
+    }
+}
+
+fn records(t: &Template, d: &[u8], version: u16, boot_ms: Option<i64>) -> Vec<Value> {
+    let min: usize = t.fields.iter().map(|f| if f.len == 65535 { 1 } else { f.len as usize }).sum();
+    let mut out = vec![];
+    let mut i = 0;
+    while min > 0 && i + min <= d.len() {
+        let mut m = Map::new();
+        let mut ok = true;
+        for (n, f) in t.fields.iter().enumerate() {
+            let mut len = f.len as usize;
+            if f.len == 65535 {
+                // Variable length: one byte, or 255 and two more.
+                let Some(l) = d.get(i) else { ok = false; break };
+                i += 1;
+                len = *l as usize;
+                if len == 255 {
+                    let Some(x) = d.get(i..i + 2) else { ok = false; break };
+                    len = (x[0] as usize) << 8 | x[1] as usize;
+                    i += 2;
+                }
+            }
+            let Some(v) = d.get(i..i + len) else { ok = false; break };
+            i += len;
+            let key = match (f.enterprise, name_of(f.id)) {
+                (Some(e), _) => format!("e{}_{}", e, f.id),
+                (None, Some(k)) => k.to_string(),
+                (None, None) => format!("field_{}", f.id),
+            };
+            // NetFlow v9 numbers its scopes on their own; IPFIX scopes are ordinary fields.
+            let key = if t.options && n < t.scope && version == 9 {
+                format!("scope_{}", match f.id { 1 => "system", 2 => "interface", 3 => "line_card", 4 => "cache", 5 => "template", _ => "other" })
+            } else if t.options && n < t.scope {
+                format!("scope_{}", key)
+            } else {
+                key
+            };
+            let val = if f.len == 65535 { text_or_hex(v) } else { value_of(f, v) };
+            m.insert(key, val);
+        }
+        if !ok {
+            break;
+        }
+        finish(&mut m, boot_ms);
+        if t.options {
+            m.insert("options".into(), json!(true));
+        }
+        m.insert("version".into(), json!(version));
+        out.push(Value::Object(m));
+    }
+    out
+}
+
+fn fields_v9(d: &[u8], at: &mut usize, n: usize) -> Option<Vec<Field>> {
+    let mut f = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x = d.get(*at..*at + 4)?;
+        f.push(Field { id: u16::from_be_bytes([x[0], x[1]]), enterprise: None, len: u16::from_be_bytes([x[2], x[3]]) });
+        *at += 4;
+    }
+    Some(f)
+}
+
+fn fields_ipfix(d: &[u8], at: &mut usize, n: usize) -> Option<Vec<Field>> {
+    let mut f = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x = d.get(*at..*at + 4)?;
+        let raw = u16::from_be_bytes([x[0], x[1]]);
+        let len = u16::from_be_bytes([x[2], x[3]]);
+        *at += 4;
+        let enterprise = if raw & 0x8000 != 0 {
+            let e = d.get(*at..*at + 4)?;
+            *at += 4;
+            Some(u32::from_be_bytes([e[0], e[1], e[2], e[3]]))
+        } else {
+            None
+        };
+        f.push(Field { id: raw & 0x7fff, enterprise, len });
+    }
+    Some(f)
+}
+
+fn add_template(e: &mut Exporter, domain: u32, id: u16, t: Template) {
+    if e.templates.len() < MAX_TEMPLATES || e.templates.contains_key(&(domain, id)) {
+        e.templates.insert((domain, id), t);
+    }
+}
+
+// Reads a template set; answers the ids defined.
+fn template_set(e: &mut Exporter, version: u16, kind: u16, d: &[u8], domain: u32) -> Vec<u16> {
+    let mut i = 0;
+    let mut got = vec![];
+    while i + 4 <= d.len() {
+        let id = u16::from_be_bytes([d[i], d[i + 1]]);
+        let count = u16::from_be_bytes([d[i + 2], d[i + 3]]) as usize;
+        if id == 0 {
+            break; // padding
+        }
+        i += 4;
+        let options = (version == 9 && kind == 1) || (version == 10 && kind == 3);
+        if version == 10 && count == 0 {
+            // IPFIX withdraws a template with a field count of zero.
+            e.templates.remove(&(domain, id));
+            continue;
+        }
+        let t = if options && version == 9 {
+            let scope_bytes = count; // v9 gives lengths in bytes here
+            let Some(x) = d.get(i..i + 2) else { break };
+            let opt_bytes = u16::from_be_bytes([x[0], x[1]]) as usize;
+            i += 2;
+            let Some(mut f) = fields_v9(d, &mut i, scope_bytes / 4) else { break };
+            let scope = f.len();
+            let Some(o) = fields_v9(d, &mut i, opt_bytes / 4) else { break };
+            f.extend(o);
+            Template { fields: f, scope, options: true }
+        } else if options {
+            let Some(x) = d.get(i..i + 2) else { break };
+            let scope = u16::from_be_bytes([x[0], x[1]]) as usize;
+            i += 2;
+            let Some(f) = fields_ipfix(d, &mut i, count) else { break };
+            Template { fields: f, scope, options: true }
+        } else if version == 9 {
+            let Some(f) = fields_v9(d, &mut i, count) else { break };
+            Template { fields: f, scope: 0, options: false }
+        } else {
+            let Some(f) = fields_ipfix(d, &mut i, count) else { break };
+            Template { fields: f, scope: 0, options: false }
+        };
+        add_template(e, domain, id, t);
+        got.push(id);
+    }
+    got
+}
+
+fn replay(e: &mut Exporter, defined: &[u16], domain: u32, flows: &mut Vec<Value>) {
+    let mut keep = VecDeque::new();
+    while let Some(h) = e.held.pop_front() {
+        if h.domain == domain && defined.contains(&h.set) {
+            if let Some(t) = e.templates.get(&(domain, h.set)) {
+                flows.extend(records(t, &h.data, h.version, h.boot_ms));
+                continue;
+            }
+        }
+        keep.push_back(h);
+    }
+    e.held = keep;
+}
+
+fn data_set(e: &mut Exporter, version: u16, set: u16, d: &[u8], domain: u32, boot_ms: Option<i64>, flows: &mut Vec<Value>) -> u64 {
+    match e.templates.get(&(domain, set)) {
+        Some(t) => {
+            let r = records(t, d, version, boot_ms);
+            let n = r.len() as u64;
+            flows.extend(r);
+            n
+        }
+        None => {
+            if e.held.len() >= MAX_HELD_SETS {
+                e.held.pop_front();
+                e.dropped_sets += 1;
+            }
+            e.held.push_back(Held { version, domain, set, data: d.to_vec(), boot_ms });
+            0
+        }
+    }
+}
+
+fn track(e: &mut Exporter, version: u16, domain: u32, seq: u32, next: u32) -> u64 {
+    let k = (version, domain);
+    let mut gap = 0;
+    if let Some(want) = e.next_seq.get(&k) {
+        let d = seq.wrapping_sub(*want);
+        // A small step forward is loss; a step back is reordering or a restart, not counted.
+        if d != 0 && d < 1 << 24 {
+            gap = d as u64;
+            e.lost += gap;
+        }
+    }
+    e.next_seq.insert(k, next);
+    gap
+}
+
+fn v5(e: &mut Exporter, p: &[u8]) -> Result<Value, String> {
+    if p.len() < 24 {
+        return Err("a NetFlow v5 header is 24 bytes".into());
+    }
+    let count = u16::from_be_bytes([p[2], p[3]]) as usize;
+    if count > 30 {
+        return Err(format!("NetFlow v5 holds at most 30 flows, not {}", count));
+    }
+    if p.len() < 24 + count * 48 {
+        return Err(format!("the header says {} flows; {} bytes came", count, p.len()));
+    }
+    let u32at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    let uptime = u32at(4);
+    let secs = u32at(8);
+    let nsecs = u32at(12);
+    let seq = u32at(16);
+    let boot = secs as i64 * 1000 + (nsecs / 1_000_000) as i64 - uptime as i64;
+    let gap = track(e, 5, 0, seq, seq.wrapping_add(count as u32));
+    let sampling = u16::from_be_bytes([p[22], p[23]]);
+    let mut flows = vec![];
+    for n in 0..count {
+        let r = 24 + n * 48;
+        let be32 = |i: usize| u32::from_be_bytes([p[r + i], p[r + i + 1], p[r + i + 2], p[r + i + 3]]);
+        let be16 = |i: usize| u16::from_be_bytes([p[r + i], p[r + i + 1]]);
+        let mut m = Map::new();
+        m.insert("src_addr".into(), json!(Ipv4Addr::from(be32(0)).to_string()));
+        m.insert("dst_addr".into(), json!(Ipv4Addr::from(be32(4)).to_string()));
+        m.insert("next_hop".into(), json!(Ipv4Addr::from(be32(8)).to_string()));
+        m.insert("input".into(), json!(be16(12)));
+        m.insert("output".into(), json!(be16(14)));
+        m.insert("packets".into(), json!(be32(16)));
+        m.insert("bytes".into(), json!(be32(20)));
+        m.insert("first_switched".into(), json!(be32(24)));
+        m.insert("last_switched".into(), json!(be32(28)));
+        m.insert("src_port".into(), json!(be16(32)));
+        m.insert("dst_port".into(), json!(be16(34)));
+        m.insert("tcp_flags".into(), json!(p[r + 37]));
+        m.insert("protocol".into(), json!(p[r + 38]));
+        m.insert("tos".into(), json!(p[r + 39]));
+        m.insert("src_as".into(), json!(be16(40)));
+        m.insert("dst_as".into(), json!(be16(42)));
+        m.insert("src_mask".into(), json!(p[r + 44]));
+        m.insert("dst_mask".into(), json!(p[r + 45]));
+        finish(&mut m, Some(boot));
+        m.insert("version".into(), json!(5));
+        flows.push(Value::Object(m));
+    }
+    Ok(json!({ "version": 5, "sequence": seq, "export_secs": secs, "sampling": sampling & 0x3fff, "gap": gap, "flows": flows }))
+}
+
+fn v9(e: &mut Exporter, p: &[u8]) -> Result<Value, String> {
+    if p.len() < 20 {
+        return Err("a NetFlow v9 header is 20 bytes".into());
+    }
+    let u32at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    let uptime = u32at(4);
+    let secs = u32at(8);
+    let seq = u32at(12);
+    let domain = u32at(16);
+    let boot = secs as i64 * 1000 - uptime as i64;
+    let gap = track(e, 9, domain, seq, seq.wrapping_add(1));
+    let mut flows = vec![];
+    let mut i = 20;
+    while i + 4 <= p.len() {
+        let set = u16::from_be_bytes([p[i], p[i + 1]]);
+        let len = u16::from_be_bytes([p[i + 2], p[i + 3]]) as usize;
+        if len < 4 || i + len > p.len() {
+            return Err(format!("the FlowSet at byte {} says {} bytes, which the packet does not hold", i, len));
+        }
+        let d = &p[i + 4..i + len];
+        if set <= 1 {
+            let ids = template_set(e, 9, set, d, domain);
+            replay(e, &ids, domain, &mut flows);
+        } else if set >= 256 {
+            data_set(e, 9, set, d, domain, Some(boot), &mut flows);
+        }
+        i += len;
+    }
+    Ok(json!({ "version": 9, "sequence": seq, "export_secs": secs, "source_id": domain, "gap": gap, "flows": flows }))
+}
+
+fn ipfix(e: &mut Exporter, p: &[u8]) -> Result<Value, String> {
+    if p.len() < 16 {
+        return Err("an IPFIX header is 16 bytes".into());
+    }
+    let total = u16::from_be_bytes([p[2], p[3]]) as usize;
+    if total > p.len() || total < 16 {
+        return Err(format!("the header says {} bytes; {} came", total, p.len()));
+    }
+    let u32at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    let secs = u32at(4);
+    let seq = u32at(8);
+    let domain = u32at(12);
+    let mut flows = vec![];
+    let mut records_seen = 0u64;
+    let mut i = 16;
+    while i + 4 <= total {
+        let set = u16::from_be_bytes([p[i], p[i + 1]]);
+        let len = u16::from_be_bytes([p[i + 2], p[i + 3]]) as usize;
+        if len < 4 || i + len > total {
+            return Err(format!("the Set at byte {} says {} bytes, which the message does not hold", i, len));
+        }
+        let d = &p[i + 4..i + len];
+        if set == 2 || set == 3 {
+            let ids = template_set(e, 10, set, d, domain);
+            let before = flows.len();
+            replay(e, &ids, domain, &mut flows);
+            records_seen += (flows.len() - before) as u64;
+        } else if set >= 256 {
+            records_seen += data_set(e, 10, set, d, domain, None, &mut flows);
+        }
+        i += len;
+    }
+    // IPFIX counts data records, so the next message's number follows from this one's.
+    let gap = track(e, 10, domain, seq, seq.wrapping_add(records_seen as u32));
+    Ok(json!({ "version": 10, "sequence": seq, "export_secs": secs, "domain": domain, "gap": gap, "flows": flows }))
+}
+
+fn decode_into(book: &mut Book, exporter: &str, p: &[u8]) -> Result<Value, String> {
+    if p.len() < 2 {
+        return Err("a packet of less than two bytes".into());
+    }
+    let e = book.entry(exporter.to_string()).or_default();
+    match u16::from_be_bytes([p[0], p[1]]) {
+        5 => v5(e, p),
+        9 => v9(e, p),
+        10 => ipfix(e, p),
+        v => Err(format!("version {} is not NetFlow 5 or 9, or IPFIX", v)),
+    }
+}
+
+fn shared() -> &'static Mutex<Book> {
+    static B: OnceLock<Mutex<Book>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => {
+            let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            if t.len() % 2 != 0 || !t.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err("not hex".into());
+            }
+            Ok((0..t.len() / 2).map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect())
+        }
+        _ => Err("give a packet as hex or a list of numbers".into()),
+    }
+}
+
+/// Decodes one packet (hex, or `p.bytes` from `udp.listen`) from `exporter`, a name of your choosing that keeps its templates apart from other routers'. Answers `{ version, sequence, gap, flows }`; a data set whose template has not come is held, and its flows come with the packet that brings the template.
+pub fn netflow_decode(packet: serde_json::Value, exporter: &str) -> Result<Value, String> {
+    let p = bytes_of(&packet)?;
+    decode_into(&mut *shared().lock().map_err(|_| "lock")?, exporter, &p)
+}
+
+/// The templates known for an exporter: `[{ domain, id, options, fields: [names] }]`.
+pub fn netflow_templates(exporter: &str) -> Result<Vec<Value>, String> {
+    let g = shared().lock().map_err(|_| "lock")?;
+    Ok(templates_of(&g, exporter))
+}
+
+fn templates_of(book: &Book, exporter: &str) -> Vec<Value> {
+    let mut out = vec![];
+    if let Some(e) = book.get(exporter) {
+        let mut keys: Vec<&(u32, u16)> = e.templates.keys().collect();
+        keys.sort();
+        for k in keys {
+            let t = &e.templates[k];
+            let names: Vec<String> = t.fields.iter().map(|f| match (f.enterprise, name_of(f.id)) {
+                (Some(x), _) => format!("e{}_{}", x, f.id),
+                (None, Some(n)) => n.to_string(),
+                (None, None) => format!("field_{}", f.id),
+            }).collect();
+            out.push(json!({ "domain": k.0, "id": k.1, "options": t.options, "fields": names }));
+        }
+    }
+    out
+}
+
+struct Collector {
+    stop: Arc<AtomicBool>,
+    queue: Arc<(Mutex<VecDeque<Value>>, Condvar)>,
+    stats: Arc<Mutex<Stats>>,
+    book: Arc<Mutex<Book>>,
+}
+
+#[derive(Default)]
+struct Stats {
+    packets: u64,
+    flows: u64,
+    errors: u64,
+    dropped: u64,
+    last_error: Option<String>,
+    by_version: HashMap<u16, u64>,
+}
+
+fn collectors() -> &'static Mutex<HashMap<String, Arc<Collector>>> {
+    static C: OnceLock<Mutex<HashMap<String, Arc<Collector>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn collector(name: &str) -> Result<Arc<Collector>, String> {
+    collectors().lock().map_err(|_| "lock")?.get(name).cloned().ok_or(format!("no collector `{}`: call netflow_collect first", name))
+}
+
+/// Listens for exports on a UDP port (2055 is the custom) on a thread of its own, one exporter per source address. Flows wait in a queue, the oldest going when it holds more than `max_queue` (100000), counted in `dropped`. Options: `host`, `max_queue`. Answers the port.
+pub fn netflow_collect(name: &str, port: i64, options: serde_json::Value) -> Result<i64, String> {
+    let host = options.get("host").and_then(|v| v.as_str()).unwrap_or("0.0.0.0").to_string();
+    let limit = options.get("max_queue").and_then(|v| v.as_u64()).unwrap_or(100_000) as usize;
+    let sock = UdpSocket::bind((host.as_str(), port as u16)).map_err(|e| format!("cannot listen on UDP {}:{}: {}", host, port, e))?;
+    sock.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let bound = sock.local_addr().map_err(|e| e.to_string())?.port() as i64;
+    let c = Arc::new(Collector { stop: Arc::new(AtomicBool::new(false)), queue: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())), stats: Arc::new(Mutex::new(Stats::default())), book: Arc::new(Mutex::new(HashMap::new())) });
+    let c2 = c.clone();
+    std::thread::Builder::new()
+        .name(format!("netflow-{}", name))
+        .spawn(move || {
+            let mut buf = [0u8; 65535];
+            while !c2.stop.load(Ordering::Relaxed) {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                let exporter: String = match from.ip() {
+                    IpAddr::V4(a) => a.to_string(),
+                    IpAddr::V6(a) => a.to_string(),
+                };
+                let got = {
+                    let mut b = c2.book.lock().unwrap();
+                    decode_into(&mut b, &exporter, &buf[..n])
+                };
+                let mut s = c2.stats.lock().unwrap();
+                s.packets += 1;
+                match got {
+                    Ok(v) => {
+                        *s.by_version.entry(v["version"].as_u64().unwrap_or(0) as u16).or_default() += 1;
+                        let flows = v["flows"].as_array().cloned().unwrap_or_default();
+                        s.flows += flows.len() as u64;
+                        let mut q = c2.queue.0.lock().unwrap();
+                        for mut f in flows {
+                            if q.len() >= limit {
+                                q.pop_front();
+                                s.dropped += 1;
+                            }
+                            f["exporter"] = json!(exporter);
+                            q.push_back(f);
+                        }
+                        c2.queue.1.notify_all();
+                    }
+                    Err(e) => {
+                        s.errors += 1;
+                        s.last_error = Some(format!("{}: {}", exporter, e));
+                    }
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some(old) = collectors().lock().map_err(|_| "lock")?.insert(name.to_string(), c) {
+        old.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(bound)
+}
+
+/// Up to `max` flows a collector has taken, waiting up to `wait_ms` for the first. Drain it from an `every` tick or a route.
+pub fn netflow_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let c = collector(name)?;
+    let end = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    let mut q = c.queue.0.lock().map_err(|_| "lock")?;
+    while q.is_empty() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(vec![]);
+        }
+        q = c.queue.1.wait_timeout(q, left).map_err(|_| "lock")?.0;
+    }
+    let n = (max.max(0) as usize).min(q.len());
+    Ok(q.drain(..n).collect())
+}
+
+/// What a collector has seen: `{ packets, flows, errors, last_error, lost, held_sets, dropped, versions, exporters: [{ address, templates, lost, held_sets }] }`. `lost` adds up sequence gaps; `dropped` is what the queue let go.
+pub fn netflow_stats(name: &str) -> Result<Value, String> {
+    let c = collector(name)?;
+    let s = c.stats.lock().map_err(|_| "lock")?;
+    let b = c.book.lock().map_err(|_| "lock")?;
+    let mut versions = Map::new();
+    for (k, v) in &s.by_version {
+        versions.insert(k.to_string(), json!(v));
+    }
+    let mut names: Vec<&String> = b.keys().collect();
+    names.sort();
+    let exporters: Vec<Value> = names.iter().map(|n| {
+        let e = &b[*n];
+        json!({ "address": n, "templates": templates_of(&b, n).len(), "lost": e.lost, "held_sets": e.held.len() })
+    }).collect();
+    Ok(json!({
+        "packets": s.packets, "flows": s.flows, "errors": s.errors, "last_error": s.last_error,
+        "lost": b.values().map(|e| e.lost).sum::<u64>(), "held_sets": b.values().map(|e| e.held.len()).sum::<usize>(),
+        "dropped": s.dropped, "versions": versions, "exporters": exporters,
+    }))
+}
+
+/// The templates a collector knows for one exporter's address.
+pub fn netflow_collector_templates(name: &str, address: &str) -> Result<Vec<Value>, String> {
+    let c = collector(name)?;
+    let b = c.book.lock().map_err(|_| "lock")?;
+    Ok(templates_of(&b, address))
+}
+
+/// Stops a collector; true when there was one.
+pub fn netflow_stop(name: &str) -> Result<bool, String> {
+    Ok(match collectors().lock().map_err(|_| "lock")?.remove(name) {
+        Some(c) => {
+            c.stop.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Adds up flows by a field: `netflow_top(flows, "src_addr", "bytes", 10)` is the ten biggest talkers, as `[{ key, total, flows }]`.
+pub fn netflow_top(flows: Vec<serde_json::Value>, by: &str, sum: &str, limit: i64) -> Vec<Value> {
+    let mut t: HashMap<String, (u64, u64)> = HashMap::new();
+    for f in &flows {
+        let k = match f.get(by) {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) if !v.is_null() => v.to_string(),
+            _ => continue,
+        };
+        let e = t.entry(k).or_default();
+        e.0 += f.get(sum).and_then(|v| v.as_u64()).unwrap_or(0);
+        e.1 += 1;
+    }
+    let mut l: Vec<(String, (u64, u64))> = t.into_iter().collect();
+    l.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    l.into_iter().take(limit.max(0) as usize).map(|(k, v)| json!({ "key": k, "total": v.0, "flows": v.1 })).collect()
+}

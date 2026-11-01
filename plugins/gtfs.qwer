@@ -1,0 +1,753 @@
+//! GTFS transit feeds: the zip read and checked, next departures from a stop with calendars, exceptions, overnight trips and frequencies, trips stop by stop, and GTFS-Realtime protobuf decoded by hand and laid over the timetable.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! zip = { version = "2", default-features = false, features = ["deflate"] }
+//! ureq = "2"
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+const MAX_FILE: u64 = 1 << 30;
+const MAX_FEED: u64 = 64 << 20;
+
+type Row = HashMap<String, String>;
+
+#[derive(Clone)]
+struct StopTime {
+    trip: usize,
+    stop: String,
+    arrive: i64,
+    depart: i64,
+    sequence: i64,
+    pickup: i64,
+    drop_off: i64,
+    headsign: String,
+}
+
+struct Trip {
+    id: String,
+    route: String,
+    service: String,
+    headsign: String,
+    direction: String,
+    times: Vec<usize>,
+}
+
+struct Frequency {
+    trip: usize,
+    start: i64,
+    end: i64,
+    headway: i64,
+}
+
+struct Feed {
+    agency: Vec<Row>,
+    stops: BTreeMap<String, Row>,
+    routes: BTreeMap<String, Row>,
+    trips: Vec<Trip>,
+    by_id: HashMap<String, usize>,
+    times: Vec<StopTime>,
+    at_stop: HashMap<String, Vec<usize>>,
+    calendar: HashMap<String, Row>,
+    exceptions: HashMap<String, Vec<(String, i64)>>,
+    frequencies: Vec<Frequency>,
+    info: Option<Row>,
+    missing: Vec<String>,
+    problems: Vec<String>,
+}
+
+static FEEDS: Mutex<Option<HashMap<String, (SystemTime, Arc<Feed>)>>> = Mutex::new(None);
+
+/// RFC 4180 rows from a GTFS text file, BOM taken off; keys are trimmed, as feeds vary.
+fn csv(name: &str, text: &str) -> Result<Vec<Row>, String> {
+    let t = text.trim_start_matches('\u{feff}');
+    let mut rows: Vec<Vec<String>> = vec![];
+    let (mut row, mut cell, mut quoted) = (vec![], String::new(), false);
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') { cell.push('"'); chars.next(); } else { quoted = false; }
+            } else {
+                cell.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => quoted = true,
+            ',' => row.push(std::mem::take(&mut cell)),
+            '\r' => {}
+            '\n' => {
+                row.push(std::mem::take(&mut cell));
+                rows.push(std::mem::take(&mut row));
+            }
+            o => cell.push(o),
+        }
+    }
+    if !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        rows.push(row);
+    }
+    let mut it = rows.into_iter();
+    let head: Vec<String> = it.next().ok_or(format!("{} is empty", name))?.iter().map(|h| h.trim().to_string()).collect();
+    Ok(it.filter(|r| r.iter().any(|c| !c.is_empty())).map(|r| head.iter().cloned().zip(r.into_iter().map(|c| c.trim().to_string())).collect()).collect())
+}
+
+/// Seconds after noon minus 12 hours of `HH:MM:SS`; hours may pass 24, a trip that runs into the next day.
+fn clock(x: &str) -> Option<i64> {
+    let mut p = x.trim().split(':');
+    let (h, m, s) = (p.next()?, p.next()?, p.next()?);
+    let (h, m, s): (i64, i64, i64) = (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?);
+    if m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
+fn clock_text(x: i64) -> String {
+    format!("{:02}:{:02}:{:02}", x / 3600, x / 60 % 60, x % 60)
+}
+
+/// Days since 1970 of a civil date, and back: Howard Hinnant's algorithms.
+fn days(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn date_of(z: i64) -> String {
+    let (y, m, d) = civil(z);
+    format!("{:04}{:02}{:02}", y, m, d)
+}
+
+/// `20261225` or `2026-12-25`.
+fn parse_date(x: &str) -> Result<i64, String> {
+    let t: String = x.chars().filter(|c| *c != '-').collect();
+    let bad = || format!("`{}` is not a date like 2026-12-25", x);
+    if t.len() != 8 || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let (y, m, d): (i64, i64, i64) = (t[..4].parse().unwrap(), t[4..6].parse().unwrap(), t[6..].parse().unwrap());
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(bad());
+    }
+    Ok(days(y, m, d))
+}
+
+fn load(path: &str) -> Result<Feed, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut z = zip::ZipArchive::new(f).map_err(|e| format!("{} is not a zip: {}", path, e))?;
+    let mut files: HashMap<String, String> = HashMap::new();
+    for i in 0..z.len() {
+        let mut e = z.by_index(i).map_err(|e| e.to_string())?;
+        let name = e.name().rsplit('/').next().unwrap_or("").to_string();
+        if !name.ends_with(".txt") {
+            continue;
+        }
+        if e.size() > MAX_FILE {
+            return Err(format!("{} is over a gigabyte unpacked", name));
+        }
+        let mut text = String::new();
+        (&mut e).take(MAX_FILE).read_to_string(&mut text).map_err(|x| format!("{}: not UTF-8 text: {}", name, x))?;
+        files.insert(name, text);
+    }
+    let mut missing = vec![];
+    for need in ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"] {
+        if !files.contains_key(need) {
+            missing.push(need.to_string());
+        }
+    }
+    if !files.contains_key("calendar.txt") && !files.contains_key("calendar_dates.txt") {
+        missing.push("calendar.txt or calendar_dates.txt".into());
+    }
+    let table = |n: &str| -> Result<Vec<Row>, String> { files.get(n).map_or(Ok(vec![]), |t| csv(n, t)) };
+    let mut problems = vec![];
+    let get = |r: &Row, k: &str| r.get(k).cloned().unwrap_or_default();
+    let stops: BTreeMap<String, Row> = table("stops.txt")?.into_iter().map(|r| (get(&r, "stop_id"), r)).collect();
+    let routes: BTreeMap<String, Row> = table("routes.txt")?.into_iter().map(|r| (get(&r, "route_id"), r)).collect();
+    let mut trips = vec![];
+    let mut by_id = HashMap::new();
+    for r in table("trips.txt")? {
+        let id = get(&r, "trip_id");
+        if !routes.contains_key(&get(&r, "route_id")) {
+            problems.push(format!("trip {} names route {}, which is not in routes.txt", id, get(&r, "route_id")));
+        }
+        by_id.insert(id.clone(), trips.len());
+        trips.push(Trip { id, route: get(&r, "route_id"), service: get(&r, "service_id"), headsign: get(&r, "trip_headsign"), direction: get(&r, "direction_id"), times: vec![] });
+    }
+    let mut times = vec![];
+    for r in table("stop_times.txt")? {
+        let tid = get(&r, "trip_id");
+        let Some(&trip) = by_id.get(&tid) else {
+            problems.push(format!("stop_times names trip {}, which is not in trips.txt", tid));
+            continue;
+        };
+        let stop = get(&r, "stop_id");
+        if !stops.contains_key(&stop) {
+            problems.push(format!("trip {} calls at {}, which is not in stops.txt", tid, stop));
+        }
+        let arrive = clock(&get(&r, "arrival_time")).unwrap_or(-1);
+        let depart = clock(&get(&r, "departure_time")).unwrap_or(arrive);
+        trips[trip].times.push(times.len());
+        times.push(StopTime { trip, stop, arrive, depart, sequence: get(&r, "stop_sequence").parse().unwrap_or(0), pickup: get(&r, "pickup_type").parse().unwrap_or(0), drop_off: get(&r, "drop_off_type").parse().unwrap_or(0), headsign: get(&r, "stop_headsign") });
+    }
+    for t in &mut trips {
+        t.times.sort_by_key(|i| times[*i].sequence);
+        // Only timepoints need a time: those between are shared out evenly, as riders' apps do.
+        let order = t.times.clone();
+        let known: Vec<usize> = (0..order.len()).filter(|k| times[order[*k]].depart >= 0).collect();
+        for w in known.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (from, to) = (times[order[a]].depart, times[order[b]].arrive);
+            for k in a + 1..b {
+                let at = from + (to - from) * (k - a) as i64 / (b - a) as i64;
+                times[order[k]].arrive = at;
+                times[order[k]].depart = at;
+            }
+        }
+    }
+    let mut at_stop: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, s) in times.iter().enumerate() {
+        at_stop.entry(s.stop.clone()).or_default().push(i);
+    }
+    let calendar: HashMap<String, Row> = table("calendar.txt")?.into_iter().map(|r| (get(&r, "service_id"), r)).collect();
+    let mut exceptions: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    for r in table("calendar_dates.txt")? {
+        exceptions.entry(get(&r, "service_id")).or_default().push((get(&r, "date"), get(&r, "exception_type").parse().unwrap_or(0)));
+    }
+    let mut frequencies = vec![];
+    for r in table("frequencies.txt")? {
+        let Some(&trip) = by_id.get(&get(&r, "trip_id")) else { continue };
+        if let (Some(start), Some(end), Ok(headway)) = (clock(&get(&r, "start_time")), clock(&get(&r, "end_time")), get(&r, "headway_secs").parse::<i64>()) {
+            if headway > 0 {
+                frequencies.push(Frequency { trip, start, end, headway });
+            }
+        }
+    }
+    let info = table("feed_info.txt")?.into_iter().next();
+    Ok(Feed { agency: table("agency.txt")?, stops, routes, trips, by_id, times, at_stop, calendar, exceptions, frequencies, info, missing, problems })
+}
+
+fn feed(path: &str) -> Result<Arc<Feed>, String> {
+    let stamp = std::fs::metadata(path).and_then(|m| m.modified()).map_err(|e| format!("{}: {}", path, e))?;
+    if let Some((t, f)) = FEEDS.lock().unwrap().as_ref().and_then(|m| m.get(path)) {
+        if *t == stamp {
+            return Ok(f.clone());
+        }
+    }
+    let f = Arc::new(load(path)?);
+    FEEDS.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_string(), (stamp, f.clone()));
+    Ok(f)
+}
+
+/// Whether a service runs on a day, by calendar.txt and then its exceptions, which win.
+fn runs(f: &Feed, service: &str, day: i64) -> bool {
+    let date = date_of(day);
+    if let Some(x) = f.exceptions.get(service).and_then(|l| l.iter().find(|e| e.0 == date)) {
+        return x.1 == 1;
+    }
+    let Some(c) = f.calendar.get(service) else { return false };
+    const NAMES: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    let weekday = NAMES[(day + 3).rem_euclid(7) as usize];
+    let field = |k: &str| c.get(k).map_or("", |s| s.as_str());
+    let inside = parse_date(field("start_date")).is_ok_and(|s| day >= s) && parse_date(field("end_date")).is_ok_and(|e| day <= e);
+    inside && field(weekday) == "1"
+}
+
+fn row_json(r: &Row, keys: &[&str]) -> Value {
+    let m: serde_json::Map<String, Value> = keys.iter().map(|k| (k.to_string(), r.get(*k).filter(|v| !v.is_empty()).map_or(Value::Null, |v| json!(v)))).collect();
+    Value::Object(m)
+}
+
+/// Opens a feed and says what it is: `{ agencies, stops, routes, trips, stop_times, services, version, valid_from, valid_to, missing, problems }`. It is read once and kept until the file changes. `missing` lists required files, `problems` references to nothing.
+pub fn gtfs_open(path: &str) -> Result<Value, String> {
+    let f = feed(path)?;
+    let services: std::collections::BTreeSet<&String> = f.trips.iter().map(|t| &t.service).collect();
+    let info = f.info.as_ref();
+    let g = |k: &str| info.and_then(|i| i.get(k)).map_or(Value::Null, |v| json!(v));
+    Ok(json!({
+        "agencies": f.agency.iter().map(|a| row_json(a, &["agency_name", "agency_url", "agency_timezone"])).collect::<Vec<_>>(),
+        "stops": f.stops.len(), "routes": f.routes.len(), "trips": f.trips.len(), "stop_times": f.times.len(), "services": services.len(),
+        "version": g("feed_version"), "valid_from": g("feed_start_date"), "valid_to": g("feed_end_date"), "missing": f.missing, "problems": f.problems,
+    }))
+}
+
+fn stop_json(id: &str, r: &Row) -> Value {
+    let num = |k: &str| r.get(k).and_then(|v| v.parse::<f64>().ok());
+    json!({ "id": id, "name": r.get("stop_name"), "latitude": num("stop_lat"), "longitude": num("stop_lon"), "platform": r.get("platform_code").filter(|v| !v.is_empty()), "station": r.get("parent_station").filter(|v| !v.is_empty()), "is_station": r.get("location_type").map(|v| v == "1") })
+}
+
+/// Stops whose name holds `query`, any case; empty for all, at most 200. Each `{ id, name, latitude, longitude, platform, station, is_station }`.
+pub fn gtfs_stops(path: &str, query: &str) -> Result<Vec<Value>, String> {
+    let f = feed(path)?;
+    let q = query.to_lowercase();
+    Ok(f.stops.iter().filter(|(_, r)| r.get("stop_name").is_some_and(|n| n.to_lowercase().contains(&q))).take(200).map(|(id, r)| stop_json(id, r)).collect())
+}
+
+/// Stops within `radius_m` of a place, nearest first, each with `distance_m`.
+pub fn gtfs_stops_near(path: &str, latitude: f64, longitude: f64, radius_m: f64) -> Result<Vec<Value>, String> {
+    let f = feed(path)?;
+    let mut out: Vec<(f64, Value)> = vec![];
+    for (id, r) in &f.stops {
+        let (Some(a), Some(b)) = (r.get("stop_lat").and_then(|v| v.parse::<f64>().ok()), r.get("stop_lon").and_then(|v| v.parse::<f64>().ok())) else { continue };
+        let (p1, p2) = (latitude.to_radians(), a.to_radians());
+        let (dp, dl) = ((a - latitude).to_radians(), (b - longitude).to_radians());
+        let h = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+        let d = 2.0 * 6371008.8 * h.sqrt().asin();
+        if d <= radius_m {
+            let mut v = stop_json(id, r);
+            v["distance_m"] = json!(d.round());
+            out.push((d, v));
+        }
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(out.into_iter().map(|x| x.1).collect())
+}
+
+/// The routes: `[{ route_id, route_short_name, route_long_name, route_type, route_color, mode }]`.
+pub fn gtfs_routes(path: &str) -> Result<Vec<Value>, String> {
+    let f = feed(path)?;
+    Ok(f.routes.values().map(|r| {
+        let mut v = row_json(r, &["route_id", "route_short_name", "route_long_name", "route_type", "route_color"]);
+        v["mode"] = json!(match r.get("route_type").map(|s| s.as_str()) { Some("0") => "tram", Some("1") => "metro", Some("2") => "rail", Some("3") => "bus", Some("4") => "ferry", Some("5") => "cable tram", Some("6") => "aerial lift", Some("7") => "funicular", Some("11") => "trolleybus", Some("12") => "monorail", _ => "other" });
+        v
+    }).collect())
+}
+
+/// Which services run on a day, and whether by rule or by exception: `{ date, weekday, services }`.
+pub fn gtfs_services(path: &str, date: &str) -> Result<Value, String> {
+    let f = feed(path)?;
+    let day = parse_date(date)?;
+    let d = date_of(day);
+    let mut seen: Vec<&String> = f.trips.iter().map(|t| &t.service).collect();
+    seen.sort();
+    seen.dedup();
+    let list: Vec<Value> = seen.into_iter().filter(|s| runs(&f, s, day)).map(|s| {
+        let by = if f.exceptions.get(s).is_some_and(|l| l.iter().any(|e| e.0 == d)) { "exception" } else { "calendar" };
+        json!({ "service": s, "by": by })
+    }).collect();
+    const NAMES: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    Ok(json!({ "date": format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..]), "weekday": NAMES[(day + 3).rem_euclid(7) as usize], "services": list }))
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` in the feed's local time.
+fn parse_when(w: &str) -> Result<(i64, i64), String> {
+    let (d, t) = w.split_once(['T', ' ']).ok_or(format!("`{}` is not a time like 2026-11-02T08:15:00", w))?;
+    Ok((parse_date(d)?, clock(t.trim_end_matches('Z')).ok_or(format!("`{}` is not a time like 2026-11-02T08:15:00", w))?))
+}
+
+/// The next departures from a stop, or from all of a station's platforms, at the feed's local time `when`: `[{ time, date, minutes, trip_id, route, route_type, headsign, stop_id, platform, stop_sequence, last_stop }]`. A trip of last night past 24:00 counts on today's clock. `horizon_min` limits how far to look. Stops where nobody may board, and a trip's last stop, are left out; repeating trips of `frequencies.txt` give one row each.
+pub fn gtfs_departures(path: &str, stop: &str, when: &str, limit: i64, horizon_min: i64) -> Result<Vec<Value>, String> {
+    let f = feed(path)?;
+    let (day, now) = parse_when(when)?;
+    if !f.stops.contains_key(stop) {
+        return Err(format!("no stop with id {}", stop));
+    }
+    let mut ids: Vec<&str> = vec![stop];
+    ids.extend(f.stops.iter().filter(|(_, r)| r.get("parent_station").is_some_and(|p| p == stop)).map(|(k, _)| k.as_str()));
+    let horizon = horizon_min.max(1) * 60;
+    let mut out: Vec<(i64, Value)> = vec![];
+    for id in &ids {
+        for i in f.at_stop.get(*id).into_iter().flatten() {
+            let s = &f.times[*i];
+            let t = &f.trips[s.trip];
+            if s.pickup == 1 || t.times.last().is_some_and(|l| l == i) {
+                continue;
+            }
+            let repeats: Vec<&Frequency> = f.frequencies.iter().filter(|x| x.trip == s.trip).collect();
+            let first = t.times.first().map_or(0, |x| f.times[*x].depart);
+            let offset = s.depart - first;
+            // Today's service, yesterday's, whose late trips run into today, and tomorrow's when the hours looked at run past midnight.
+            for (service_day, shift) in [(day, 0), (day - 1, -86400), (day + 1, 86400)] {
+                if !runs(&f, &t.service, service_day) {
+                    continue;
+                }
+                let mut starts = vec![];
+                if repeats.is_empty() {
+                    starts.push(s.depart);
+                }
+                for fq in &repeats {
+                    let mut x = fq.start;
+                    while x < fq.end {
+                        starts.push(x + offset);
+                        x += fq.headway;
+                    }
+                }
+                for at in starts {
+                    let local = at + shift;
+                    if local >= now && local <= now + horizon {
+                        let r = f.routes.get(&t.route);
+                        let (y, m, d) = civil(service_day);
+                        out.push((local, json!({
+                            "time": clock_text(local.rem_euclid(86400)), "date": format!("{:04}-{:02}-{:02}", y, m, d), "gtfs_time": clock_text(at), "minutes": (local - now) / 60,
+                            "trip_id": t.id, "route": r.and_then(|x| x.get("route_short_name")), "route_type": r.and_then(|x| x.get("route_type")),
+                            "headsign": if s.headsign.is_empty() { &t.headsign } else { &s.headsign }, "direction": t.direction, "stop_id": s.stop,
+                            "platform": f.stops.get(&s.stop).and_then(|x| x.get("platform_code")).filter(|v| !v.is_empty()), "stop_sequence": s.sequence,
+                        })));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|x| x.0);
+    out.truncate(limit.clamp(1, 500) as usize);
+    Ok(out.into_iter().map(|x| x.1).collect())
+}
+
+/// A trip stop by stop: `{ trip_id, route, headsign, service, stops: [{ sequence, stop_id, name, arrive, depart, boarding, alighting }] }`.
+pub fn gtfs_trip(path: &str, trip_id: &str) -> Result<Value, String> {
+    let f = feed(path)?;
+    let &i = f.by_id.get(trip_id).ok_or(format!("no trip with id {}", trip_id))?;
+    let t = &f.trips[i];
+    let kind = |n: i64| match n { 0 => "regular", 1 => "none", 2 => "phone the agency", 3 => "ask the driver", _ => "regular" };
+    let stops: Vec<Value> = t.times.iter().map(|x| {
+        let s = &f.times[*x];
+        json!({ "sequence": s.sequence, "stop_id": s.stop, "name": f.stops.get(&s.stop).and_then(|r| r.get("stop_name")), "arrive": clock_text(s.arrive), "depart": clock_text(s.depart), "boarding": kind(s.pickup), "alighting": kind(s.drop_off) })
+    }).collect();
+    Ok(json!({ "trip_id": t.id, "route": f.routes.get(&t.route).and_then(|r| r.get("route_short_name")), "headsign": t.headsign, "service": t.service, "stops": stops }))
+}
+
+/// A protobuf message's fields: (number, value).
+enum Wire<'a> {
+    Int(u64),
+    Bytes(&'a [u8]),
+    Fixed32(u32),
+    Fixed64(u64),
+}
+
+fn varint(b: &[u8], p: &mut usize) -> Result<u64, String> {
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let c = *b.get(*p).ok_or("the protobuf ends inside a number")?;
+        *p += 1;
+        if shift >= 64 {
+            return Err("a protobuf number runs on too long".into());
+        }
+        v |= ((c & 0x7f) as u64) << shift;
+        if c & 0x80 == 0 {
+            return Ok(v);
+        }
+        shift += 7;
+    }
+}
+
+fn fields(b: &[u8]) -> Result<Vec<(u64, Wire<'_>)>, String> {
+    let mut p = 0;
+    let mut out = vec![];
+    while p < b.len() {
+        let k = varint(b, &mut p)?;
+        let (n, wire) = (k >> 3, k & 7);
+        let v = match wire {
+            0 => Wire::Int(varint(b, &mut p)?),
+            1 => { let s = b.get(p..p + 8).ok_or("the protobuf ends early")?; p += 8; Wire::Fixed64(u64::from_le_bytes(s.try_into().unwrap())) }
+            2 => { let n = varint(b, &mut p)? as usize; let end = p.checked_add(n).filter(|e| *e <= b.len()).ok_or("a protobuf field runs off the end")?; let s = &b[p..end]; p = end; Wire::Bytes(s) }
+            5 => { let s = b.get(p..p + 4).ok_or("the protobuf ends early")?; p += 4; Wire::Fixed32(u32::from_le_bytes(s.try_into().unwrap())) }
+            o => return Err(format!("protobuf wire type {} is not one this reads", o)),
+        };
+        out.push((n, v));
+    }
+    Ok(out)
+}
+
+fn text(v: &Wire) -> Value {
+    if let Wire::Bytes(b) = v { json!(String::from_utf8_lossy(b)) } else { Value::Null }
+}
+
+fn int(v: &Wire) -> i64 {
+    match v { Wire::Int(x) => *x as i64, Wire::Fixed32(x) => *x as i64, Wire::Fixed64(x) => *x as i64, _ => 0 }
+}
+
+/// A plain int32 is sign-extended to ten bytes; two's complement undoes it.
+fn int32(v: &Wire) -> i64 {
+    int(v) as i32 as i64
+}
+
+fn float(v: &Wire) -> Value {
+    match v {
+        Wire::Fixed32(x) => json!((f32::from_bits(*x) as f64 * 1e6).round() / 1e6),
+        Wire::Fixed64(x) => json!(f64::from_bits(*x)),
+        _ => Value::Null,
+    }
+}
+
+fn msg<'a>(v: &'a Wire<'a>) -> &'a [u8] {
+    if let Wire::Bytes(b) = v { b } else { &[] }
+}
+
+fn trip_descriptor(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({});
+    for (n, v) in fields(b)? {
+        match n {
+            1 => o["trip_id"] = text(&v),
+            2 => o["start_time"] = text(&v),
+            3 => o["start_date"] = text(&v),
+            4 => o["schedule_relationship"] = json!(match int(&v) { 0 => "SCHEDULED", 1 => "ADDED", 2 => "UNSCHEDULED", 3 => "CANCELED", 5 => "REPLACEMENT", 6 => "DUPLICATED", 7 => "DELETED", _ => "UNKNOWN" }),
+            5 => o["route_id"] = text(&v),
+            6 => o["direction_id"] = json!(int(&v)),
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn vehicle_descriptor(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({});
+    for (n, v) in fields(b)? {
+        match n {
+            1 => o["id"] = text(&v),
+            2 => o["label"] = text(&v),
+            3 => o["license_plate"] = text(&v),
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn stop_time_event(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({});
+    for (n, v) in fields(b)? {
+        match n {
+            1 => o["delay"] = json!(int32(&v)),
+            2 => o["time"] = json!(int(&v)),
+            3 => o["uncertainty"] = json!(int32(&v)),
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn trip_update(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({ "stop_time_updates": [] });
+    for (n, v) in fields(b)? {
+        match n {
+            1 => o["trip"] = trip_descriptor(msg(&v))?,
+            3 => o["vehicle"] = vehicle_descriptor(msg(&v))?,
+            4 => o["timestamp"] = json!(int(&v)),
+            5 => o["delay"] = json!(int32(&v)),
+            2 => {
+                let mut s = json!({});
+                for (k, x) in fields(msg(&v))? {
+                    match k {
+                        1 => s["stop_sequence"] = json!(int(&x)),
+                        2 => s["arrival"] = stop_time_event(msg(&x))?,
+                        3 => s["departure"] = stop_time_event(msg(&x))?,
+                        4 => s["stop_id"] = text(&x),
+                        5 => s["schedule_relationship"] = json!(match int(&x) { 0 => "SCHEDULED", 1 => "SKIPPED", 2 => "NO_DATA", 3 => "UNSCHEDULED", _ => "UNKNOWN" }),
+                        _ => {}
+                    }
+                }
+                o["stop_time_updates"].as_array_mut().unwrap().push(s);
+            }
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn vehicle(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({});
+    for (n, v) in fields(b)? {
+        match n {
+            1 => o["trip"] = trip_descriptor(msg(&v))?,
+            8 => o["vehicle"] = vehicle_descriptor(msg(&v))?,
+            2 => {
+                let mut p = json!({});
+                for (k, x) in fields(msg(&v))? {
+                    match k {
+                        1 => p["latitude"] = float(&x),
+                        2 => p["longitude"] = float(&x),
+                        3 => p["bearing"] = float(&x),
+                        4 => p["odometer"] = float(&x),
+                        5 => p["speed"] = float(&x),
+                        _ => {}
+                    }
+                }
+                o["position"] = p;
+            }
+            3 => o["current_stop_sequence"] = json!(int(&v)),
+            4 => o["current_status"] = json!(match int(&v) { 0 => "INCOMING_AT", 1 => "STOPPED_AT", 2 => "IN_TRANSIT_TO", _ => "UNKNOWN" }),
+            5 => o["timestamp"] = json!(int(&v)),
+            7 => o["stop_id"] = text(&v),
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn translated(b: &[u8]) -> Result<Value, String> {
+    let mut list = vec![];
+    for (n, v) in fields(b)? {
+        if n == 1 {
+            let mut t = json!({});
+            for (k, x) in fields(msg(&v))? {
+                match k {
+                    1 => t["text"] = text(&x),
+                    2 => t["language"] = text(&x),
+                    _ => {}
+                }
+            }
+            list.push(t);
+        }
+    }
+    Ok(Value::Array(list))
+}
+
+fn alert(b: &[u8]) -> Result<Value, String> {
+    let mut o = json!({ "active": [], "informed": [] });
+    for (n, v) in fields(b)? {
+        match n {
+            1 => {
+                let mut t = json!({});
+                for (k, x) in fields(msg(&v))? {
+                    match k {
+                        1 => t["start"] = json!(int(&x)),
+                        2 => t["end"] = json!(int(&x)),
+                        _ => {}
+                    }
+                }
+                o["active"].as_array_mut().unwrap().push(t);
+            }
+            5 => {
+                let mut s = json!({});
+                for (k, x) in fields(msg(&v))? {
+                    match k {
+                        1 => s["agency_id"] = text(&x),
+                        2 => s["route_id"] = text(&x),
+                        3 => s["route_type"] = json!(int(&x)),
+                        4 => s["trip"] = trip_descriptor(msg(&x))?,
+                        5 => s["stop_id"] = text(&x),
+                        _ => {}
+                    }
+                }
+                o["informed"].as_array_mut().unwrap().push(s);
+            }
+            6 => o["cause"] = json!(match int(&v) { 1 => "UNKNOWN_CAUSE", 2 => "OTHER_CAUSE", 3 => "TECHNICAL_PROBLEM", 4 => "STRIKE", 5 => "DEMONSTRATION", 6 => "ACCIDENT", 7 => "HOLIDAY", 8 => "WEATHER", 9 => "MAINTENANCE", 10 => "CONSTRUCTION", 11 => "POLICE_ACTIVITY", 12 => "MEDICAL_EMERGENCY", _ => "UNKNOWN_CAUSE" }),
+            7 => o["effect"] = json!(match int(&v) { 1 => "NO_SERVICE", 2 => "REDUCED_SERVICE", 3 => "SIGNIFICANT_DELAYS", 4 => "DETOUR", 5 => "ADDITIONAL_SERVICE", 6 => "MODIFIED_SERVICE", 7 => "OTHER_EFFECT", 9 => "STOP_MOVED", 10 => "NO_EFFECT", 11 => "ACCESSIBILITY_ISSUE", _ => "UNKNOWN_EFFECT" }),
+            8 => o["url"] = translated(msg(&v))?,
+            10 => o["header"] = translated(msg(&v))?,
+            11 => o["description"] = translated(msg(&v))?,
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+fn decode_feed(b: &[u8]) -> Result<Value, String> {
+    let mut header = json!({});
+    let mut entities = vec![];
+    for (n, v) in fields(b)? {
+        match n {
+            1 => for (k, x) in fields(msg(&v))? {
+                match k {
+                    1 => header["version"] = text(&x),
+                    2 => header["incrementality"] = json!(if int(&x) == 1 { "DIFFERENTIAL" } else { "FULL_DATASET" }),
+                    3 => header["timestamp"] = json!(int(&x)),
+                    _ => {}
+                }
+            },
+            2 => {
+                let mut e = json!({});
+                for (k, x) in fields(msg(&v))? {
+                    match k {
+                        1 => e["id"] = text(&x),
+                        2 => e["is_deleted"] = json!(int(&x) != 0),
+                        3 => e["trip_update"] = trip_update(msg(&x))?,
+                        4 => e["vehicle"] = vehicle(msg(&x))?,
+                        5 => e["alert"] = alert(msg(&x))?,
+                        _ => {}
+                    }
+                }
+                entities.push(e);
+            }
+            _ => {}
+        }
+    }
+    if header["version"].is_null() {
+        return Err("this is no GTFS-Realtime feed: its header has no version".into());
+    }
+    Ok(json!({ "header": header, "entities": entities }))
+}
+
+/// Decodes a GTFS-Realtime file: `{ header: { version, incrementality, timestamp }, entities: [{ id, trip_update, vehicle, alert }] }`, by the numbers of gtfs-realtime.proto, enums as their names. Extensions are skipped.
+pub fn gtfs_realtime_file(path: &str) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    decode_feed(&b).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// Fetches and decodes a GTFS-Realtime feed. `headers` is for an API key, most agencies wanting one; give it from env, never in code. A failure says the status. Feeds are refused over 64 MB.
+pub fn gtfs_realtime_fetch(url: &str, headers: std::collections::HashMap<String, String>) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).build();
+    let mut r = agent.get(url).set("Accept", "application/x-protobuf");
+    for (k, v) in &headers {
+        r = r.set(k, v);
+    }
+    let a = match r.call() {
+        Ok(a) => a,
+        Err(ureq::Error::Status(s, a)) => return Err(format!("{} answered {}: {}", url, s, a.into_string().unwrap_or_default().chars().take(200).collect::<String>())),
+        Err(e) => return Err(format!("{}: {}", url, e)),
+    };
+    let mut b = vec![];
+    a.into_reader().take(MAX_FEED + 1).read_to_end(&mut b).map_err(|e| e.to_string())?;
+    if b.len() as u64 > MAX_FEED {
+        return Err(format!("{} is over 64 MB", url));
+    }
+    decode_feed(&b).map_err(|e| format!("{}: {}", url, e))
+}
+
+/// Lays a decoded realtime feed over `gtfs_departures`' rows: each gets `delay_s`, `expected` and `status` (scheduled, on time, delayed, early, cancelled, or skipped for a stop passed over). A delay at an earlier stop carries on, as the specification says, until a later update changes it.
+pub fn gtfs_apply_realtime(departures: Vec<serde_json::Value>, realtime: serde_json::Value) -> Vec<Value> {
+    let updates: HashMap<String, &Value> = realtime["entities"].as_array().into_iter().flatten().filter_map(|e| Some((e["trip_update"]["trip"]["trip_id"].as_str()?.to_string(), &e["trip_update"]))).collect();
+    departures.into_iter().map(|mut d| {
+        let id = d["trip_id"].as_str().unwrap_or("").to_string();
+        let seq = d["stop_sequence"].as_i64().unwrap_or(0);
+        let Some(u) = updates.get(&id) else {
+            d["status"] = json!("scheduled");
+            d["delay_s"] = Value::Null;
+            d["expected"] = d["time"].clone();
+            return d;
+        };
+        if u["trip"]["schedule_relationship"] == "CANCELED" {
+            d["status"] = json!("cancelled");
+            d["delay_s"] = Value::Null;
+            d["expected"] = Value::Null;
+            return d;
+        }
+        let mut delay = u["delay"].as_i64();
+        let mut skipped = false;
+        for s in u["stop_time_updates"].as_array().into_iter().flatten() {
+            let at = s["stop_sequence"].as_i64().unwrap_or(i64::MAX);
+            if at > seq {
+                break;
+            }
+            skipped = at == seq && s["schedule_relationship"] == "SKIPPED";
+            if let Some(x) = s["departure"]["delay"].as_i64().or(s["arrival"]["delay"].as_i64()) {
+                delay = Some(x);
+            }
+        }
+        let shown = clock(d["time"].as_str().unwrap_or("")).unwrap_or(0) + delay.unwrap_or(0);
+        d["delay_s"] = json!(delay);
+        d["expected"] = json!(clock_text(shown.rem_euclid(86400)));
+        d["status"] = json!(if skipped { "skipped" } else { match delay { None => "scheduled", Some(x) if x.abs() < 60 => "on time", Some(x) if x > 0 => "delayed", _ => "early" } });
+        d
+    }).collect()
+}

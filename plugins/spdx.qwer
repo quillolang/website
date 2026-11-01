@@ -1,0 +1,167 @@
+//! SPDX licence expressions parsed and evaluated, ids checked against the SPDX list, an expression tested against an allowlist, and the licences read from Cargo and npm manifests and lockfiles.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! spdx = "=0.13.4"
+//! toml = "0.8"
+
+use serde_json::{json, Value};
+use spdx::{AdditionItem, Expression, LicenseId, LicenseItem, LicenseReq, Licensee, ParseMode};
+
+fn license_json(id: LicenseId) -> Value {
+    json!({
+        "id": id.name, "name": id.full_name, "osi_approved": id.is_osi_approved(), "fsf_libre": id.is_fsf_free_libre(), "copyleft": id.is_copyleft(),
+        "deprecated": id.is_deprecated(), "gnu": id.is_gnu(),
+    })
+}
+
+fn req_json(r: &LicenseReq) -> Value {
+    let mut v = match &r.license {
+        LicenseItem::Spdx { id, or_later } => {
+            let mut x = license_json(*id);
+            x["or_later"] = json!(or_later);
+            x
+        }
+        LicenseItem::Other(o) => json!({ "id": o.to_string(), "name": null, "custom": true }),
+    };
+    v["exception"] = match &r.addition {
+        Some(AdditionItem::Spdx(e)) => json!(e.name),
+        Some(AdditionItem::Other(o)) => json!(o.to_string()),
+        None => Value::Null,
+    };
+    v
+}
+
+fn problem(e: &spdx::error::ParseError) -> Value {
+    json!({ "message": e.reason.to_string(), "at": e.span.start + 1, "text": e.original.get(e.span.clone()).unwrap_or("") })
+}
+
+/// Reads an expression: `{ ok, expression, licenses, error }`. `expression` is the canonical form, each of `licenses` with `id`, `name`, `osi_approved`, `fsf_libre`, `copyleft`, `deprecated`, `or_later`, `exception`. A mistake gives `ok: false` and `error` with its `message`, column `at` and the `text`. `lax` also takes what old manifests write: `MIT/Apache-2.0`, `Apache 2.0`, `GPL-2.0+`.
+pub fn spdx_parse(expression: &str, lax: bool) -> Value {
+    let mode = if lax { ParseMode::LAX } else { ParseMode::STRICT };
+    match Expression::parse_mode(expression, mode) {
+        Err(e) => json!({ "ok": false, "expression": null, "licenses": [], "error": problem(&e) }),
+        Ok(x) => {
+            let licenses: Vec<Value> = x.requirements().map(|r| req_json(&r.req)).collect();
+            let canonical = Expression::canonicalize(expression).ok().flatten().unwrap_or_else(|| x.to_string());
+            json!({ "ok": true, "expression": canonical, "licenses": licenses, "error": null })
+        }
+    }
+}
+
+/// One id looked up in the SPDX list: `{ known, id, name, osi_approved, fsf_libre, copyleft, deprecated, near }`. An unknown id gets the nearest by loose name in `near`: `Apache 2` near `Apache-2.0`.
+pub fn spdx_license(id: &str) -> Value {
+    match spdx::license_id(id) {
+        Some(l) => { let mut v = license_json(l); v["known"] = json!(true); v["near"] = Value::Null; v }
+        None => json!({ "known": false, "id": id, "near": spdx::imprecise_license_id(id).map(|x| x.0.name) }),
+    }
+}
+
+/// Whether an expression is met by what `allowed` lists: `{ allowed, failed, choose, list_version }`. Each allowed item is an id, an id with `+`, or `GPL-2.0-only WITH Classpath-exception-2.0`. `failed` holds the requirements nothing met, `choose` the smallest set of licences to take it under: for `MIT OR GPL-3.0-only` with both allowed, one. A bad item in the list is an error.
+pub fn spdx_allowed(expression: &str, allowed: Vec<String>, lax: bool) -> Result<Value, String> {
+    let mode = if lax { ParseMode::LAX } else { ParseMode::STRICT };
+    let x = Expression::parse_mode(expression, mode).map_err(|e| format!("`{}` at column {}: {}", expression, e.span.start + 1, e.reason))?;
+    let list = allowed.iter().map(|a| Licensee::parse(a).map_err(|e| format!("allowlist: `{}`: {}", a, e.reason))).collect::<Result<Vec<_>, _>>()?;
+    let result = x.evaluate_with_failures(|r| list.iter().any(|l| l.satisfies(r)));
+    let (ok, failed): (bool, Vec<String>) = match result {
+        Ok(()) => (true, vec![]),
+        Err(f) => (false, f.iter().map(|r| r.req.to_string()).collect()),
+    };
+    let choose: Vec<String> = if ok { x.minimized_requirements(list.iter()).map(|v| v.iter().map(|r| r.to_string()).collect()).unwrap_or_default() } else { vec![] };
+    Ok(json!({ "allowed": ok, "failed": failed, "choose": choose, "list_version": spdx::identifiers::VERSION }))
+}
+
+fn from_cargo(text: &str) -> Result<Value, String> {
+    let t: toml::Value = text.parse().map_err(|e| format!("not TOML: {}", e))?;
+    let p = t.get("package");
+    let w = t.get("workspace").and_then(|x| x.get("package"));
+    let field = |k: &str| -> (Option<String>, bool) {
+        match p.and_then(|p| p.get(k)) {
+            Some(toml::Value::String(s)) => (Some(s.clone()), false),
+            Some(toml::Value::Table(tb)) if tb.get("workspace").and_then(|x| x.as_bool()) == Some(true) => (w.and_then(|x| x.get(k)).and_then(|x| x.as_str()).map(str::to_string), true),
+            None => (w.and_then(|x| x.get(k)).and_then(|x| x.as_str()).map(str::to_string), false),
+            _ => (None, false),
+        }
+    };
+    let name = p.and_then(|x| x.get("name")).and_then(|x| x.as_str());
+    let version = match p.and_then(|x| x.get("version")) {
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        _ => w.and_then(|x| x.get("version")).and_then(|x| x.as_str()).map(str::to_string),
+    };
+    let (license, inherited) = field("license");
+    let (file, _) = field("license-file");
+    Ok(json!({ "kind": "cargo", "name": name, "version": version, "license": license, "license_file": file, "inherited": inherited }))
+}
+
+fn from_npm(text: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {}", e))?;
+    let (license, file) = npm_license(&v);
+    Ok(json!({ "kind": "npm", "name": v["name"], "version": v["version"], "license": license, "license_file": file, "inherited": false }))
+}
+
+/// npm's three shapes: text, `{ type, url }`, and the old `licenses` list, which means any of them.
+fn npm_license(v: &Value) -> (Option<String>, Option<String>) {
+    let one = |x: &Value| x.as_str().or(x["type"].as_str()).map(str::to_string);
+    let text = match (one(&v["license"]), v["licenses"].as_array()) {
+        (Some(l), _) => Some(l),
+        (None, Some(a)) if !a.is_empty() => Some(a.iter().filter_map(one).collect::<Vec<_>>().join(" OR ")),
+        _ => None,
+    };
+    match text {
+        Some(t) if t.to_uppercase().starts_with("SEE LICENSE IN ") => (None, Some(t[15..].trim().to_string())),
+        Some(t) => (Some(t), None),
+        None => (None, None),
+    }
+}
+
+/// A manifest's licence from its text: `kind` is cargo or npm. `{ kind, name, version, license, license_file, inherited, check }`, `check` being `spdx_parse` of it in lax mode; a package with only a licence file has `license` null.
+pub fn spdx_manifest_text(kind: &str, text: &str) -> Result<Value, String> {
+    let mut v = match kind {
+        "cargo" => from_cargo(text)?,
+        "npm" => from_npm(text)?,
+        o => return Err(format!("kind `{}` should be cargo or npm", o)),
+    };
+    v["check"] = match v["license"].as_str() {
+        Some("UNLICENSED") => json!({ "ok": false, "expression": null, "licenses": [], "error": { "message": "UNLICENSED: npm's word for no licence granted", "at": 1, "text": "UNLICENSED" } }),
+        Some(l) => spdx_parse(l, true),
+        None => Value::Null,
+    };
+    Ok(v)
+}
+
+/// The same from a file, `Cargo.toml` or `package.json` by its name.
+pub fn spdx_manifest(path: &str) -> Result<Value, String> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let kind = if base.ends_with(".toml") { "cargo" } else if base.ends_with(".json") { "npm" } else { return Err(format!("{}: a manifest is Cargo.toml or package.json", path)) };
+    spdx_manifest_text(kind, &std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?)
+}
+
+/// Each dependency in an npm `package-lock.json` (version 2 or 3) against an allowlist: `{ packages, allowed, refused, unknown }`, `refused` with `{ name, version, license, failed }`, `unknown` those with no usable licence, as a build would stop on. `exceptions` names packages already looked at.
+pub fn spdx_audit_npm(lockfile_text: &str, allowed: Vec<String>, exceptions: Vec<String>) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(lockfile_text).map_err(|e| format!("not JSON: {}", e))?;
+    let packages = v["packages"].as_object().ok_or("no `packages`: this reads lockfiles of version 2 and up")?;
+    let (mut good, mut refused, mut unknown) = (0, vec![], vec![]);
+    for (path, p) in packages.iter().filter(|(k, _)| !k.is_empty()) {
+        let name = path.rsplit("node_modules/").next().unwrap_or(path);
+        if exceptions.iter().any(|x| x == name) {
+            good += 1;
+            continue;
+        }
+        let row = |license: Value| json!({ "name": name, "version": p["version"], "license": license });
+        match npm_license(p).0 {
+            None => unknown.push(row(Value::Null)),
+            Some(l) => match spdx_allowed(&l, allowed.clone(), true) {
+                Err(_) => unknown.push(row(json!(l))),
+                Ok(r) if r["allowed"] == true => good += 1,
+                Ok(r) => { let mut x = row(json!(l)); x["failed"] = r["failed"].clone(); refused.push(x); }
+            },
+        }
+    }
+    Ok(json!({ "packages": packages.len() - 1, "allowed": good, "refused": refused, "unknown": unknown }))
+}
+
+/// The SPDX licence list this was built with, and how many ids it has.
+pub fn spdx_list_info() -> Value {
+    json!({ "version": spdx::identifiers::VERSION, "licenses": spdx::identifiers::LICENSES.len(), "exceptions": spdx::identifiers::EXCEPTIONS.len() })
+}

@@ -1,0 +1,539 @@
+//! Amazon SNS without an SDK: messages published with attributes, batches sent ten at a time with failed ones named, topics and subscriptions managed, and incoming HTTP messages checked as AWS says to (the certificate's address, its RSA signature over the canonical fields, versions 1 and 2), with SubscriptionConfirmation handled, signed with Signature Version 4.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! sha1 = { version = "0.10", features = ["oid"] }
+//! hex = "0.4"
+//! base64 = "0.22"
+//! rsa = "0.9"
+//! x509-parser = "0.16"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::signature::Verifier;
+use rsa::RsaPublicKey;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+// ---- AWS: credentials from the environment, Signature Version 4, one signed HTTP call ----
+
+struct Aws {
+    region: String,
+    key: String,
+    secret: String,
+    token: Option<String>,
+    base: String,
+    host: String,
+    service: String,
+    timeout: Duration,
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+fn opt_text(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The account to call: keys from the environment only, the region from `region` or AWS_REGION, the address from `url_var` when set.
+fn account(o: &Value, service: &str, url_var: &str, host_prefix: &str) -> Result<Aws, String> {
+    let key = var("AWS_ACCESS_KEY_ID").ok_or("no AWS key: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")?;
+    let secret = var("AWS_SECRET_ACCESS_KEY").ok_or("no AWS secret: set AWS_SECRET_ACCESS_KEY")?;
+    let region = opt_text(o, "region").or_else(|| var("AWS_REGION")).or_else(|| var("AWS_DEFAULT_REGION")).ok_or("no region: set AWS_REGION, or give the option region")?;
+    let base = var(url_var).unwrap_or_else(|| {
+        let suffix = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        format!("https://{}.{}.{}", host_prefix, region, suffix)
+    });
+    let base = base.trim_end_matches('/').to_string();
+    let host = base.split("://").nth(1).unwrap_or(&base).split('/').next().unwrap_or("").to_string();
+    let ms = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(15_000).clamp(100, 900_000);
+    Ok(Aws { region, key, secret, token: var("AWS_SESSION_TOKEN"), base, host, service: service.to_string(), timeout: Duration::from_millis(ms) })
+}
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+/// RFC 3986 encoding: only A-Z a-z 0-9 - _ . ~ kept (and `/` when asked).
+fn enc(s: &str, keep_slash: bool) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn amz_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// The headers that sign a request. `path` is as sent (already encoded once); all services here but S3 sign it encoded a second time.
+fn sign(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Vec<(String, String)> {
+    let stamp = amz_now();
+    let date = &stamp[..8];
+    let mut heads: Vec<(String, String)> = vec![("host".into(), a.host.clone()), ("x-amz-date".into(), stamp.clone())];
+    if let Some(t) = &a.token {
+        heads.push(("x-amz-security-token".into(), t.clone()));
+    }
+    for (k, v) in extra {
+        heads.push((k.to_lowercase(), v.trim().to_string()));
+    }
+    heads.sort();
+    let names = heads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canon_heads: String = heads.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect();
+    let mut pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    pairs.sort();
+    let canon = format!("{}\n{}\n{}\n{}\n{}\n{}", method, enc(path, true), pairs.join("&"), canon_heads, names, sha_hex(body));
+    let scope = format!("{}/{}/{}/aws4_request", date, a.region, a.service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canon.as_bytes()));
+    let k = hmac(format!("AWS4{}", a.secret).as_bytes(), date);
+    let k = hmac(&k, &a.region);
+    let k = hmac(&k, &a.service);
+    let k = hmac(&k, "aws4_request");
+    let sig = hex::encode(hmac(&k, &to_sign));
+    let mut out = extra.to_vec();
+    out.push(("X-Amz-Date".into(), stamp.clone()));
+    if let Some(t) = &a.token {
+        out.push(("X-Amz-Security-Token".into(), t.clone()));
+    }
+    out.push(("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", a.key, scope, names, sig)));
+    out
+}
+
+/// One signed call. Any status comes back as a Reply; only a network failure is an error.
+fn send(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Result<Reply, String> {
+    let url = if query.is_empty() { format!("{}{}", a.base, path) } else { format!("{}{}?{}", a.base, path, query) };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(a.timeout).redirects(0).build();
+    let mut r = agent.request(method, &url);
+    for (k, v) in sign(a, method, path, query, extra, body) {
+        r = r.set(&k, &v);
+    }
+    let res = if body.is_empty() && method != "POST" && method != "PUT" { r.call() } else { r.send_bytes(body) };
+    let resp = match res {
+        Ok(x) => x,
+        Err(ureq::Error::Status(_, x)) => x,
+        Err(e) => return Err(format!("cannot reach AWS at {}: {}", a.base, e)),
+    };
+    let status = resp.status();
+    let headers = resp.headers_names().iter().map(|n| (n.clone(), resp.header(n).unwrap_or("").to_string())).collect();
+    let mut body = vec![];
+    resp.into_reader().take(64 << 20).read_to_end(&mut body).map_err(|e| format!("cut off reading AWS's answer: {}", e))?;
+    Ok(Reply { status, headers, body })
+}
+
+// ---- SNS's Query protocol: a form in, XML out ----
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&#xD;", "\r").replace("&#xA;", "\n").replace("&amp;", "&")
+}
+
+fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{}>", name);
+    let a = xml.find(&open)? + open.len();
+    let b = xml[a..].find(&format!("</{}>", name))? + a;
+    Some(&xml[a..b])
+}
+
+/// Each `<member>` of a list.
+fn members(xml: &str) -> Vec<&str> {
+    let mut out = vec![];
+    let mut rest = xml;
+    while let Some(a) = rest.find("<member>") {
+        let Some(b) = rest[a..].find("</member>") else { break };
+        out.push(&rest[a + 8..a + b]);
+        rest = &rest[a + b + 9..];
+    }
+    out
+}
+
+fn text_of(xml: &str, name: &str) -> Value {
+    tag(xml, name).map_or(Value::Null, |t| json!(unescape(t)))
+}
+
+fn call(action: &str, params: Vec<(String, String)>, o: &Value) -> Result<String, String> {
+    let a = account(o, "sns", "SNS_API_URL", "sns")?;
+    let mut form = format!("Action={}&Version=2010-03-31", action);
+    for (k, v) in &params {
+        form.push_str(&format!("&{}={}", enc(k, false), enc(v, false)));
+    }
+    let heads = vec![("Content-Type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string())];
+    let mut n = 0u32;
+    loop {
+        n += 1;
+        let r = send(&a, "POST", "/", "", &heads, form.as_bytes())?;
+        let text = r.text();
+        if r.status == 200 {
+            return Ok(text);
+        }
+        let code = tag(&text, "Code").unwrap_or("").to_string();
+        if (r.status >= 500 || code == "Throttled" || code == "Throttling") && n < 6 {
+            std::thread::sleep(Duration::from_millis(100 << n));
+            continue;
+        }
+        let msg = tag(&text, "Message").map(unescape).unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(format!("SNS {}: {}: {}", action, if code.is_empty() { r.status.to_string() } else { code }, msg));
+    }
+}
+
+/// Message attributes in the Query form: strings, numbers, lists (String.Array), and `{ type, value }` for the rest.
+fn attrs(prefix: &str, a: &Value, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    for (i, (k, v)) in a.as_object().into_iter().flatten().enumerate() {
+        let p = format!("{}.entry.{}", prefix, i + 1);
+        let (kind, text) = match v {
+            Value::String(s) => ("String".to_string(), s.clone()),
+            Value::Number(n) => ("Number".to_string(), n.to_string()),
+            Value::Bool(b) => ("String".to_string(), b.to_string()),
+            Value::Array(_) => ("String.Array".to_string(), v.to_string()),
+            Value::Object(m) if m.contains_key("type") => (m["type"].as_str().unwrap_or("String").to_string(), m["value"].as_str().map(str::to_string).unwrap_or_else(|| m["value"].to_string())),
+            _ => return Err(format!("attribute {} cannot be sent: use a string, number, boolean or list", k)),
+        };
+        out.push((format!("{}.Name", p), k.clone()));
+        out.push((format!("{}.Value.DataType", p), kind));
+        out.push((format!("{}.Value.StringValue", p), text));
+    }
+    Ok(())
+}
+
+fn message_fields(prefix: &str, body: &Value, o: &Value, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    let text = match body {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if text.is_empty() {
+        return Err("SNS refuses an empty message".into());
+    }
+    if text.len() > 256 * 1024 {
+        return Err(format!("the message is {} bytes, over SNS's 256 KB", text.len()));
+    }
+    out.push((format!("{}Message", prefix), text));
+    if o.get("per_protocol") == Some(&Value::Bool(true)) {
+        out.push((format!("{}MessageStructure", prefix), "json".to_string()));
+    }
+    for (k, f) in [("subject", "Subject"), ("group_id", "MessageGroupId"), ("dedup_id", "MessageDeduplicationId")] {
+        if let Some(v) = opt_text(o, k) {
+            if k == "subject" && (v.len() > 100 || v.contains('\n')) {
+                return Err("an SNS subject is under 100 characters, on one line".into());
+            }
+            out.push((format!("{}{}", prefix, f), v));
+        }
+    }
+    if let Some(a) = o.get("attributes") {
+        attrs(&format!("{}MessageAttributes", prefix), a, out)?;
+    }
+    Ok(())
+}
+
+/// Publishes to a topic (or the option target_arn, or the option phone): `message` is text, or anything turned into JSON. Options: subject, attributes, group_id and dedup_id on FIFO topics, per_protocol (true: `message` is a map from protocol to text). Gives { message_id, sequence }.
+pub fn sns_publish(topic: &str, message: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut p = vec![];
+    match (opt_text(&options, "target_arn"), opt_text(&options, "phone")) {
+        (Some(t), _) => p.push(("TargetArn".to_string(), t)),
+        (_, Some(n)) => p.push(("PhoneNumber".to_string(), n)),
+        _ => p.push(("TopicArn".to_string(), topic.to_string())),
+    }
+    message_fields("", &message, &options, &mut p)?;
+    let x = call("Publish", p, &options)?;
+    Ok(json!({ "message_id": text_of(&x, "MessageId"), "sequence": text_of(&x, "SequenceNumber") }))
+}
+
+/// Publishes any number of messages, ten to a request: each entry is { message, subject, attributes, group_id, dedup_id }. What failed on SNS's side is sent again once. Gives { sent: [{ id, message_id }], failed: [{ id, code, message, sender_fault }], requests }.
+pub fn sns_publish_batch(topic: &str, entries: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = entries.as_array().ok_or("entries is a list")?;
+    let mut queue: Vec<(String, Value)> = list.iter().enumerate().map(|(i, e)| (e.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("m{}", i)), e.clone())).collect();
+    let mut seen = std::collections::HashSet::new();
+    for (id, _) in &queue {
+        if !seen.insert(id.clone()) {
+            return Err(format!("two entries have the id {}", id));
+        }
+    }
+    let (mut sent, mut failed, mut requests) = (vec![], vec![], 0);
+    let mut tried_again: HashMap<String, bool> = HashMap::new();
+    while !queue.is_empty() {
+        let rest = queue.split_off(queue.len().min(10));
+        let batch = std::mem::replace(&mut queue, rest);
+        let mut p = vec![("TopicArn".to_string(), topic.to_string())];
+        for (i, (id, e)) in batch.iter().enumerate() {
+            let prefix = format!("PublishBatchRequestEntries.member.{}.", i + 1);
+            p.push((format!("{}Id", prefix), id.clone()));
+            message_fields(&prefix, e.get("message").unwrap_or(&Value::Null), e, &mut p)?;
+        }
+        let x = call("PublishBatch", p, &options)?;
+        requests += 1;
+        for m in tag(&x, "Successful").map(members).unwrap_or_default() {
+            sent.push(json!({ "id": text_of(m, "Id"), "message_id": text_of(m, "MessageId") }));
+        }
+        for m in tag(&x, "Failed").map(members).unwrap_or_default() {
+            let id = tag(m, "Id").unwrap_or("").to_string();
+            let sender = tag(m, "SenderFault") == Some("true");
+            if !sender && tried_again.insert(id.clone(), true).is_none() {
+                if let Some(e) = batch.iter().find(|(i, _)| *i == id) {
+                    queue.push(e.clone());
+                    continue;
+                }
+            }
+            failed.push(json!({ "id": id, "code": text_of(m, "Code"), "message": text_of(m, "Message"), "sender_fault": sender }));
+        }
+    }
+    Ok(json!({ "sent": sent, "failed": failed, "requests": requests }))
+}
+
+/// Makes a topic, or gives the one with that name. Gives its ARN. A name ending in .fifo is a FIFO topic.
+pub fn sns_create_topic(name: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut p = vec![("Name".to_string(), name.to_string())];
+    if name.ends_with(".fifo") {
+        p.push(("Attributes.entry.1.key".to_string(), "FifoTopic".to_string()));
+        p.push(("Attributes.entry.1.value".to_string(), "true".to_string()));
+    }
+    let x = call("CreateTopic", p, &options)?;
+    tag(&x, "TopicArn").map(unescape).ok_or("no TopicArn in the answer".to_string())
+}
+
+/// Every topic's ARN, following NextToken.
+pub fn sns_topics(options: serde_json::Value) -> Result<Vec<String>, String> {
+    let mut out = vec![];
+    let mut next: Option<String> = None;
+    loop {
+        let x = call("ListTopics", next.iter().map(|t| ("NextToken".to_string(), t.clone())).collect(), &options)?;
+        for m in tag(&x, "Topics").map(members).unwrap_or_default() {
+            out.push(tag(m, "TopicArn").map(unescape).unwrap_or_default());
+        }
+        next = tag(&x, "NextToken").map(unescape);
+        if next.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+/// Subscribes `endpoint` by `protocol` (https, email, sqs, lambda, sms...). Options: attributes, a map like { FilterPolicy: "...", RawMessageDelivery: "true" }. Gives the subscription's ARN, or "pending confirmation" until the endpoint confirms.
+pub fn sns_subscribe(topic: &str, protocol: &str, endpoint: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut p = vec![("TopicArn".to_string(), topic.to_string()), ("Protocol".to_string(), protocol.to_string()), ("Endpoint".to_string(), endpoint.to_string())];
+    for (i, (k, v)) in options.get("attributes").and_then(|a| a.as_object()).into_iter().flatten().enumerate() {
+        p.push((format!("Attributes.entry.{}.key", i + 1), k.clone()));
+        p.push((format!("Attributes.entry.{}.value", i + 1), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+    }
+    let x = call("Subscribe", p, &options)?;
+    tag(&x, "SubscriptionArn").map(unescape).ok_or("no SubscriptionArn in the answer".to_string())
+}
+
+/// Ends a subscription.
+pub fn sns_unsubscribe(subscription: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("Unsubscribe", vec![("SubscriptionArn".to_string(), subscription.to_string())], &options)?;
+    Ok(true)
+}
+
+/// A topic's subscriptions, all pages: { arn, protocol, endpoint, owner }.
+pub fn sns_subscriptions(topic: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut next: Option<String> = None;
+    loop {
+        let mut p = vec![("TopicArn".to_string(), topic.to_string())];
+        if let Some(t) = &next {
+            p.push(("NextToken".to_string(), t.clone()));
+        }
+        let x = call("ListSubscriptionsByTopic", p, &options)?;
+        for m in tag(&x, "Subscriptions").map(members).unwrap_or_default() {
+            out.push(json!({ "arn": text_of(m, "SubscriptionArn"), "protocol": text_of(m, "Protocol"), "endpoint": text_of(m, "Endpoint"), "owner": text_of(m, "Owner") }));
+        }
+        next = tag(&x, "NextToken").map(unescape);
+        if next.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+// ---- Messages SNS sends to you ----
+
+/// The certificate's address decides everything, so it must be SNS's own: https on sns.<region>.amazonaws.com(.cn) with a .pem path. SNS_CERT_HOSTS, comma-separated, adds hosts for a test server.
+fn cert_url_ok(url: &str) -> Result<(), String> {
+    let (scheme, rest) = url.split_once("://").ok_or("SigningCertURL is not a URL")?;
+    let host = rest.split('/').next().unwrap_or("");
+    if rest.split('/').next_back().is_none_or(|f| !f.split('?').next().unwrap_or("").ends_with(".pem")) {
+        return Err(format!("SigningCertURL {} is not a .pem file", url));
+    }
+    if host.contains('@') {
+        return Err(format!("SigningCertURL {} carries a user name", url));
+    }
+    let extra = var("SNS_CERT_HOSTS").unwrap_or_default();
+    if extra.split(',').any(|h| !h.is_empty() && h.trim() == host) {
+        return Ok(());
+    }
+    let name = host.to_ascii_lowercase();
+    let inner = name.strip_suffix(".amazonaws.com").or(name.strip_suffix(".amazonaws.com.cn")).unwrap_or("");
+    let parts: Vec<&str> = inner.split('.').collect();
+    if scheme != "https" || parts.len() != 2 || parts[0] != "sns" || !parts[1].chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("SigningCertURL {} is not on SNS's own host: refused", url));
+    }
+    Ok(())
+}
+
+static CERTS: Mutex<Option<HashMap<String, Vec<u8>>>> = Mutex::new(None);
+
+/// The DER of the signing certificate, kept by URL: SNS uses one for a long time.
+fn cert_at(url: &str) -> Result<Vec<u8>, String> {
+    if let Some(c) = CERTS.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(url).cloned())) {
+        return Ok(c);
+    }
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).redirects(0).build();
+    let text = agent.get(url).call().map_err(|e| format!("cannot fetch the signing certificate: {}", e))?.into_string().map_err(|e| e.to_string())?;
+    let (_, p) = x509_parser::pem::parse_x509_pem(text.as_bytes()).map_err(|_| "the signing certificate is not PEM".to_string())?;
+    let c = p.contents.clone();
+    if let Ok(mut g) = CERTS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(url.to_string(), c.clone());
+    }
+    Ok(c)
+}
+
+/// The text SNS signs: named fields in a fixed order, each `Name\nvalue\n`.
+fn string_to_sign(m: &Map<String, Value>) -> Result<String, String> {
+    let kind = m.get("Type").and_then(|t| t.as_str()).unwrap_or("");
+    let fields: &[&str] = match kind {
+        "Notification" => &["Message", "MessageId", "Subject", "Timestamp", "TopicArn", "Type"],
+        "SubscriptionConfirmation" | "UnsubscribeConfirmation" => &["Message", "MessageId", "SubscribeURL", "Timestamp", "Token", "TopicArn", "Type"],
+        other => return Err(format!("`{}` is not a type of SNS message", other)),
+    };
+    let mut out = String::new();
+    for f in fields {
+        match m.get(*f).and_then(|v| v.as_str()) {
+            Some(v) => out.push_str(&format!("{}\n{}\n", f, v)),
+            None if *f == "Subject" => {}
+            None => return Err(format!("the message has no {}", f)),
+        }
+    }
+    Ok(out)
+}
+
+fn parse_time(t: &str) -> Option<i64> {
+    let d: Vec<i64> = t.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
+    if d.len() < 6 {
+        return None;
+    }
+    let (y, m) = if d[1] > 2 { (d[0], d[1]) } else { (d[0] - 1, d[1] + 12) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + d[2] - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400 + d[3] * 3600 + d[4] * 60 + d[5])
+}
+
+/// Checks a message SNS posted to your endpoint: the body as text. The certificate must come from SNS's own host and be in date, the signature (version 1 SHA-1, version 2 SHA-256) must match the canonical fields, and the message must be under an hour old (option max_age_s). Option `topics` limits it to a list of topic ARNs. Gives { type, message_id, topic, subject, message, json, timestamp, attributes, subscribe_url, token }; anything else is an error value saying what failed.
+pub fn sns_verify(body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|_| "the body is not JSON".to_string())?;
+    let m = v.as_object().ok_or("the body is not an SNS message")?;
+    let signed = string_to_sign(m)?;
+    let version = m.get("SignatureVersion").and_then(|s| s.as_str()).ok_or("the message has no SignatureVersion")?;
+    let url = m.get("SigningCertURL").or(m.get("SigningCertUrl")).and_then(|s| s.as_str()).ok_or("the message has no SigningCertURL")?;
+    let sig = m.get("Signature").and_then(|s| s.as_str()).ok_or("the message has no Signature")?;
+    let sig = B64.decode(sig).map_err(|_| "the Signature is not base64".to_string())?;
+    if version != "1" && version != "2" {
+        return Err(format!("SignatureVersion {} is not one SNS uses", version));
+    }
+    cert_url_ok(url)?;
+    let der = cert_at(url)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|_| "the signing certificate cannot be read".to_string())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if now < cert.validity().not_before.timestamp() || now > cert.validity().not_after.timestamp() {
+        return Err("the signing certificate is out of date".into());
+    }
+    let key = RsaPublicKey::from_public_key_der(cert.public_key().raw).map_err(|_| "the signing certificate's key is not RSA".to_string())?;
+    let sig = Signature::try_from(sig.as_slice()).map_err(|_| "the Signature has the wrong form".to_string())?;
+    let good = if version == "1" {
+        VerifyingKey::<sha1::Sha1>::new(key).verify(signed.as_bytes(), &sig).is_ok()
+    } else {
+        VerifyingKey::<Sha256>::new(key).verify(signed.as_bytes(), &sig).is_ok()
+    };
+    if !good {
+        return Err("the signature does not match: this message did not come from SNS, or was changed".into());
+    }
+    let stamp = m.get("Timestamp").and_then(|t| t.as_str()).unwrap_or("");
+    let age = parse_time(stamp).map(|t| now - t).ok_or(format!("the Timestamp `{}` cannot be read", stamp))?;
+    let most = options.get("max_age_s").and_then(|a| a.as_i64()).unwrap_or(3600);
+    if age > most {
+        return Err(format!("the message is {} s old, over {} s: a replay?", age, most));
+    }
+    let topic = m.get("TopicArn").and_then(|t| t.as_str()).unwrap_or("");
+    if let Some(list) = options.get("topics").and_then(|t| t.as_array()) {
+        if !list.iter().any(|t| t == topic) {
+            return Err(format!("topic {} is not one this endpoint takes", topic));
+        }
+    }
+    let text = m.get("Message").cloned().unwrap_or(Value::Null);
+    let parsed = text.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok()).unwrap_or(Value::Null);
+    let attributes: Map<String, Value> = m.get("MessageAttributes").and_then(|a| a.as_object()).into_iter().flatten().map(|(k, a)| (k.clone(), a["Value"].clone())).collect();
+    Ok(json!({ "type": m["Type"], "message_id": m["MessageId"], "topic": topic, "subject": m.get("Subject"), "message": text, "json": parsed, "timestamp": stamp, "attributes": attributes, "subscribe_url": m.get("SubscribeURL"), "token": m.get("Token") }))
+}
+
+/// Confirms a verified SubscriptionConfirmation: pass what `sns_verify` gave. Visits its SubscribeURL, after checking the host is SNS's. Gives the subscription's ARN.
+pub fn sns_confirm(verified: serde_json::Value) -> Result<String, String> {
+    if verified["type"] != "SubscriptionConfirmation" {
+        return Err(format!("this is not a SubscriptionConfirmation but {}", verified["type"]));
+    }
+    let url = verified["subscribe_url"].as_str().ok_or("no SubscribeURL")?;
+    let host = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+    let extra = var("SNS_CERT_HOSTS").unwrap_or_default();
+    let ours = extra.split(',').any(|h| !h.is_empty() && h.trim() == host) || (url.starts_with("https://sns.") && (host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")));
+    if !ours {
+        return Err(format!("SubscribeURL {} is not on SNS's own host: refused", url));
+    }
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).redirects(0).build();
+    let r = agent.get(url).call().map_err(|e| format!("confirming failed: {}", e))?;
+    let x = r.into_string().map_err(|e| e.to_string())?;
+    tag(&x, "SubscriptionArn").map(unescape).ok_or("the confirmation's answer has no SubscriptionArn".to_string())
+}
+
+/// Everything an endpoint does with a POST from SNS: verifies it, confirms a subscription by itself, and gives { type, ... } as `sns_verify` does, with `subscription` when one was confirmed.
+pub fn sns_handle(body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut v = sns_verify(body, options)?;
+    if v["type"] == "SubscriptionConfirmation" {
+        v["subscription"] = json!(sns_confirm(v.clone())?);
+    }
+    Ok(v)
+}

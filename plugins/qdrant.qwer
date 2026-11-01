@@ -1,0 +1,255 @@
+//! Qdrant's REST API: collections made, points written in batches and waited on, vector search with payload filters written the short way, scrolling through everything by its offset, payloads changed, points counted and deleted by id or filter, and errors read from Qdrant's status.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// QDRANT_API_URL is the server (http://localhost:6333 when not set), QDRANT_API_KEY the key, sent
+// as `api-key`, on a server or on Qdrant Cloud.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("QDRANT_API_URL").unwrap_or_else(|| "http://localhost:6333".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn raw(method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let url = format!("{}{}", base(), path);
+    for attempt in 0..4 {
+        let mut req = agent.request(method, &url);
+        if let Some(k) = env("QDRANT_API_KEY") {
+            req = req.set("api-key", &k);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        let (status, text) = match res {
+            Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+            Err(ureq::Error::Status(429, r)) if attempt < 3 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+                std::thread::sleep(Duration::from_secs(wait.min(10)));
+                continue;
+            }
+            Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+            Err(e) => return Err(format!("cannot reach Qdrant at {}: {}", base(), e)),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap_or(json!({ "status": { "error": text } }));
+        return Ok((status, v));
+    }
+    Err("Qdrant stayed busy (429) through four tries".into())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let (status, v) = raw(method, path, body)?;
+    if status >= 300 {
+        return Err(format!("Qdrant answered {}: {}", status, v["status"]["error"].as_str().or(v["status"].as_str()).unwrap_or(&v.to_string())));
+    }
+    Ok(v["result"].clone())
+}
+
+/// A point's id is a whole number or a UUID, and Qdrant takes nothing else.
+fn check_id(id: &Value) -> Result<(), String> {
+    match id {
+        Value::Number(n) if n.as_u64().is_some() => Ok(()),
+        Value::String(s) if is_uuid(s) => Ok(()),
+        o => Err(format!("{} is not a point id: Qdrant takes a whole number or a UUID", o)),
+    }
+}
+
+fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() == 36 && [8, 13, 18, 23].iter().all(|&i| b[i] == b'-') && s.replace('-', "").len() == 32 && s.replace('-', "").bytes().all(|c| c.is_ascii_hexdigit())) || (b.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Writes a condition for one payload field the short way.
+fn condition(key: &str, v: &Value) -> Result<Value, String> {
+    match v {
+        Value::Array(a) => Ok(json!({ "key": key, "match": { "any": a } })),
+        Value::Object(m) => {
+            if m.keys().all(|k| ["gt", "gte", "lt", "lte"].contains(&k.as_str())) {
+                return Ok(json!({ "key": key, "range": v }));
+            }
+            Ok(json!({ "key": key, "match": v }))
+        }
+        Value::Null => Ok(json!({ "is_null": { "key": key } })),
+        o => Ok(json!({ "key": key, "match": { "value": o } })),
+    }
+}
+
+/// A filter as Qdrant's API wants it, from a map of field to value: a value matches that value, a list any of them, `{ gte, lt }` a range, null a field that is null. A map with `must`, `should` or `must_not` takes such maps in each, and one that holds Qdrant's own condition lists is left as it is.
+pub fn qdrant_filter(short: serde_json::Value) -> Result<Value, String> {
+    let m = match &short {
+        Value::Null => return Ok(Value::Null),
+        Value::Object(m) => m,
+        _ => return Err("a filter is a map of field to value".into()),
+    };
+    let clauses = ["must", "should", "must_not"];
+    if m.keys().any(|k| clauses.contains(&k.as_str())) {
+        let mut out = json!({});
+        for (k, v) in m {
+            if !clauses.contains(&k.as_str()) {
+                return Err(format!("{} beside must, should and must_not: put it inside one of them", k));
+            }
+            out[k.as_str()] = match v {
+                Value::Array(_) => v.clone(),
+                Value::Object(f) => Value::Array(f.iter().map(|(n, x)| condition(n, x)).collect::<Result<_, _>>()?),
+                _ => return Err(format!("{} takes a map of field to value", k)),
+            };
+        }
+        return Ok(out);
+    }
+    Ok(json!({ "must": m.iter().map(|(n, x)| condition(n, x)).collect::<Result<Vec<_>, _>>()? }))
+}
+
+/// Makes a collection of `size`-long vectors; `distance` is "Cosine", "Dot", "Euclid" or "Manhattan". `options` go in the body too (`on_disk_payload`, `hnsw_config`, ...). True when made, false when it exists.
+pub fn qdrant_create_collection(name: &str, size: i64, distance: &str, options: serde_json::Value) -> Result<bool, String> {
+    if !["Cosine", "Dot", "Euclid", "Manhattan"].contains(&distance) {
+        return Err(format!("{:?} is not a distance: Cosine, Dot, Euclid or Manhattan", distance));
+    }
+    let mut b = if options.is_object() { options } else { json!({}) };
+    b["vectors"] = json!({ "size": size, "distance": distance });
+    let (status, v) = raw("PUT", &format!("/collections/{}", enc(name)), Some(&b))?;
+    if status == 409 {
+        return Ok(false);
+    }
+    if status >= 300 {
+        return Err(format!("Qdrant answered {}: {}", status, v["status"]["error"].as_str().unwrap_or("")));
+    }
+    Ok(true)
+}
+
+/// A collection's `{ status, points_count, config, ... }`, or null when there is none.
+pub fn qdrant_collection(name: &str) -> Result<Value, String> {
+    let (status, v) = raw("GET", &format!("/collections/{}", enc(name)), None)?;
+    if status == 404 {
+        return Ok(Value::Null);
+    }
+    if status >= 300 {
+        return Err(format!("Qdrant answered {}: {}", status, v["status"]["error"].as_str().unwrap_or("")));
+    }
+    Ok(v["result"].clone())
+}
+
+/// Deletes a collection.
+pub fn qdrant_delete_collection(name: &str) -> Result<bool, String> {
+    Ok(call("DELETE", &format!("/collections/{}", enc(name)), None)?.as_bool().unwrap_or(false))
+}
+
+/// Indexes a payload field for fast filters; `schema` is "keyword", "integer", "float", "bool", "geo" or "text".
+pub fn qdrant_index_field(collection: &str, field: &str, schema: &str) -> Result<Value, String> {
+    call("PUT", &format!("/collections/{}/index?wait=true", enc(collection)), Some(&json!({ "field_name": field, "field_schema": schema })))
+}
+
+/// Writes points, each `{ id, vector, payload }`, 500 to a request, and waits until they can be read. Gives how many.
+pub fn qdrant_upsert(collection: &str, points: Vec<serde_json::Value>) -> Result<i64, String> {
+    for p in &points {
+        check_id(&p["id"])?;
+        if !p["vector"].is_array() && !p["vector"].is_object() {
+            return Err(format!("point {} has no vector", p["id"]));
+        }
+    }
+    for chunk in points.chunks(500) {
+        call("PUT", &format!("/collections/{}/points?wait=true", enc(collection)), Some(&json!({ "points": chunk })))?;
+    }
+    Ok(points.len() as i64)
+}
+
+/// The nearest points to `vector`. `options`: `limit` (10), `filter` (as for `qdrant_filter`), `score_threshold`, `offset`, `with_vector`, `with_payload` (true), `using` (a named vector). Gives a list of `{ id, score, payload }`, best first.
+pub fn qdrant_search(collection: &str, vector: serde_json::Value, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    if !vector.is_array() {
+        return Err("the query vector is a list of numbers".into());
+    }
+    let mut b = json!({ "query": vector, "limit": options["limit"].as_i64().unwrap_or(10), "with_payload": options.get("with_payload").cloned().unwrap_or(json!(true)) });
+    if !options["filter"].is_null() {
+        b["filter"] = qdrant_filter(options["filter"].clone())?;
+    }
+    for k in ["score_threshold", "offset", "with_vector", "using", "params"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    let r = call("POST", &format!("/collections/{}/points/query", enc(collection)), Some(&b))?;
+    Ok(r["points"].as_array().cloned().unwrap_or_default().into_iter().map(|mut p| {
+        if let Some(m) = p.as_object_mut() {
+            m.remove("version");
+        }
+        p
+    }).collect())
+}
+
+/// Points by id (a list of whole numbers or UUIDs): `{ id, payload }`, vectors too if `with_vector`. Ids that do not exist are left out.
+pub fn qdrant_get(collection: &str, ids: serde_json::Value, with_vector: bool) -> Result<Value, String> {
+    for i in ids.as_array().ok_or("ids are a list")? {
+        check_id(i)?;
+    }
+    call("POST", &format!("/collections/{}/points", enc(collection)), Some(&json!({ "ids": ids, "with_payload": true, "with_vector": with_vector })))
+}
+
+/// One page of points in id order, `filter` as for `qdrant_filter` or null, `limit` of them, from `offset` (null at first, then the `next` of the page before). Gives `{ points, next }`, `next` null at the end.
+pub fn qdrant_scroll(collection: &str, filter: serde_json::Value, limit: i64, offset: serde_json::Value) -> Result<Value, String> {
+    let mut b = json!({ "limit": limit, "with_payload": true, "with_vector": false });
+    if !filter.is_null() {
+        b["filter"] = qdrant_filter(filter)?;
+    }
+    if !offset.is_null() {
+        b["offset"] = offset;
+    }
+    let r = call("POST", &format!("/collections/{}/points/scroll", enc(collection)), Some(&b))?;
+    Ok(json!({ "points": r["points"], "next": r["next_page_offset"] }))
+}
+
+/// Every point matching `filter`, up to `max`, read page by page: `{ points, complete }`.
+pub fn qdrant_scroll_all(collection: &str, filter: serde_json::Value, max: i64) -> Result<Value, String> {
+    let (mut out, mut offset): (Vec<Value>, Value) = (vec![], Value::Null);
+    loop {
+        let p = qdrant_scroll(collection, filter.clone(), 256.min(max.max(1)), offset)?;
+        out.extend(p["points"].as_array().cloned().unwrap_or_default());
+        offset = p["next"].clone();
+        if offset.is_null() || out.len() as i64 >= max {
+            let complete = offset.is_null();
+            out.truncate(max.max(0) as usize);
+            return Ok(json!({ "points": out, "complete": complete }));
+        }
+    }
+}
+
+/// How many points match `filter` (null for all), counted exactly.
+pub fn qdrant_count(collection: &str, filter: serde_json::Value) -> Result<i64, String> {
+    let mut b = json!({ "exact": true });
+    if !filter.is_null() {
+        b["filter"] = qdrant_filter(filter)?;
+    }
+    Ok(call("POST", &format!("/collections/{}/points/count", enc(collection)), Some(&b))?["count"].as_i64().unwrap_or(0))
+}
+
+/// Adds payload fields to points, chosen by a list of ids or by a filter map.
+pub fn qdrant_set_payload(collection: &str, payload: serde_json::Value, ids_or_filter: serde_json::Value) -> Result<Value, String> {
+    let mut b = json!({ "payload": payload });
+    match ids_or_filter {
+        Value::Array(a) => b["points"] = Value::Array(a),
+        f => b["filter"] = qdrant_filter(f)?,
+    }
+    call("POST", &format!("/collections/{}/points/payload?wait=true", enc(collection)), Some(&b))
+}
+
+/// Deletes points, chosen by a list of ids or by a filter map, and waits.
+pub fn qdrant_delete(collection: &str, ids_or_filter: serde_json::Value) -> Result<Value, String> {
+    let b = match ids_or_filter {
+        Value::Array(a) => json!({ "points": a }),
+        Value::Null => return Err("name the points: a list of ids, or a filter (null would mean all of them)".into()),
+        f => json!({ "filter": qdrant_filter(f)? }),
+    };
+    call("POST", &format!("/collections/{}/points/delete?wait=true", enc(collection)), Some(&b))
+}

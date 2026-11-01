@@ -1,0 +1,392 @@
+//! OpenStreetMap PBF extracts read in pure Rust: the file's header, nodes, ways and relations filtered by tags and a bounding box, dense nodes included, ways given their coordinates, tags counted, and matches as GeoJSON.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! osmpbf = "0.3"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use osmpbf::{BlobDecode, BlobReader, Element, RelMemberType};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+
+const KNOWN: [&str; 4] = ["OsmSchema-V0.6", "DenseNodes", "HistoricalInformation", "Sort.Type_then_ID"];
+const MAX_COORDS: usize = 20_000_000;
+
+struct Filter {
+    rules: Vec<(String, Option<Vec<String>>)>,
+    not: Vec<(String, Option<Vec<String>>)>,
+    bbox: Option<[f64; 4]>,
+    limit: usize,
+    meta: bool,
+}
+
+fn rules_of(v: &Value) -> Result<Vec<(String, Option<Vec<String>>)>, String> {
+    let mut out = vec![];
+    match v {
+        Value::Null => {}
+        Value::String(s) => match s.split_once('=') {
+            Some((k, val)) => out.push((k.to_string(), Some(val.split('|').map(String::from).collect()))),
+            None => out.push((s.clone(), None)),
+        },
+        Value::Object(m) => {
+            for (k, x) in m {
+                out.push((k.clone(), match x {
+                    Value::Bool(true) => None,
+                    Value::String(s) => Some(vec![s.clone()]),
+                    Value::Array(a) => Some(a.iter().filter_map(|y| y.as_str().map(String::from)).collect()),
+                    o => return Err(format!("the rule for `{}` is `{}`: true, a value, or a list of values", k, o)),
+                }));
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                out.extend(rules_of(x)?);
+            }
+        }
+        o => return Err(format!("`{}` is no tag rule: use \"amenity=cafe\" or {{ amenity: \"cafe\" }}", o)),
+    }
+    Ok(out)
+}
+
+// A filter is text like "amenity=cafe|pub", or { tags, not, bbox, limit, meta }.
+fn filter_of(v: &Value) -> Result<Filter, String> {
+    let is_opts = v.as_object().map(|m| m.keys().all(|k| ["tags", "not", "bbox", "limit", "meta"].contains(&k.as_str()))).unwrap_or(false);
+    let (tags, not) = if is_opts { (v.get("tags").cloned().unwrap_or(Value::Null), v.get("not").cloned().unwrap_or(Value::Null)) } else { (v.clone(), Value::Null) };
+    let bbox = match v.get("bbox").filter(|_| is_opts) {
+        None | Some(Value::Null) => None,
+        Some(b) => {
+            let a: Vec<f64> = b.as_array().ok_or("bbox is [west, south, east, north]")?.iter().filter_map(|x| x.as_f64()).collect();
+            if a.len() != 4 || a[0] > a[2] || a[1] > a[3] {
+                return Err("bbox is [west, south, east, north], in that order".into());
+            }
+            Some([a[0], a[1], a[2], a[3]])
+        }
+    };
+    let limit = v.get("limit").filter(|_| is_opts).and_then(|x| x.as_i64()).unwrap_or(10_000);
+    if !(1..=2_000_000).contains(&limit) {
+        return Err(format!("limit is 1 to 2000000, not {}", limit));
+    }
+    Ok(Filter { rules: rules_of(&tags)?, not: rules_of(&not)?, bbox, limit: limit as usize, meta: v.get("meta").filter(|_| is_opts).and_then(|x| x.as_bool()).unwrap_or(false) })
+}
+
+fn hit(rule: &(String, Option<Vec<String>>), tags: &[(&str, &str)]) -> bool {
+    tags.iter().any(|(k, v)| *k == rule.0 && rule.1.as_ref().map(|a| a.iter().any(|x| x == v)).unwrap_or(true))
+}
+
+impl Filter {
+    fn tags_match(&self, tags: &[(&str, &str)]) -> bool {
+        self.rules.iter().all(|r| hit(r, tags)) && !self.not.iter().any(|r| hit(r, tags))
+    }
+    fn inside(&self, lat: f64, lon: f64) -> bool {
+        self.bbox.map(|b| lon >= b[0] && lat >= b[1] && lon <= b[2] && lat <= b[3]).unwrap_or(true)
+    }
+}
+
+fn tag_map(t: &[(&str, &str)]) -> Value {
+    Value::Object(t.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<_, _>>())
+}
+
+fn round(x: f64) -> f64 {
+    (x * 1e7).round() / 1e7
+}
+
+fn open(path: &str) -> Result<BlobReader<std::io::BufReader<std::fs::File>>, String> {
+    if !std::path::Path::new(path).is_file() {
+        return Err(format!("{}: no such file", path));
+    }
+    BlobReader::from_path(path).map_err(|e| format!("cannot read {}: {}", path, e))
+}
+
+// Each element in turn; `f` returns false to stop early. Features the file demands and this reader
+// lacks stop it, as the format says they must.
+fn each(path: &str, f: &mut dyn FnMut(Element) -> bool) -> Result<(), String> {
+    for blob in open(path)? {
+        let blob = blob.map_err(|e| format!("{} is damaged or not a PBF: {}", path, e))?;
+        match blob.decode().map_err(|e| format!("{} is damaged: {}", path, e))? {
+            BlobDecode::OsmHeader(h) => {
+                if let Some(bad) = h.required_features().iter().find(|x| !KNOWN.contains(&x.as_str()) && x.as_str() != "LocationsOnWays") {
+                    return Err(format!("{} requires `{}`, which this reader does not know", path, bad));
+                }
+            }
+            BlobDecode::OsmData(b) => {
+                for g in b.groups() {
+                    for n in g.dense_nodes() {
+                        if !f(Element::DenseNode(n)) {
+                            return Ok(());
+                        }
+                    }
+                    for n in g.nodes() {
+                        if !f(Element::Node(n)) {
+                            return Ok(());
+                        }
+                    }
+                    for w in g.ways() {
+                        if !f(Element::Way(w)) {
+                            return Ok(());
+                        }
+                    }
+                    for r in g.relations() {
+                        if !f(Element::Relation(r)) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            BlobDecode::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A file's header and how much is in it: { required_features, optional_features, writing_program, source, bbox, replication, nodes, ways, relations, tagged_nodes }. It reads every block; `bbox` is [west, south, east, north].
+pub fn osm_info(path: &str) -> Result<Value, String> {
+    let mut o = Map::new();
+    for blob in open(path)? {
+        let blob = blob.map_err(|e| format!("{} is damaged or not a PBF: {}", path, e))?;
+        if let BlobDecode::OsmHeader(h) = blob.decode().map_err(|e| format!("{} is damaged: {}", path, e))? {
+            o.insert("required_features".into(), json!(h.required_features()));
+            o.insert("optional_features".into(), json!(h.optional_features()));
+            o.insert("writing_program".into(), json!(h.writing_program()));
+            o.insert("source".into(), json!(h.source()));
+            o.insert("bbox".into(), h.bbox().map(|b| json!([round(b.left), round(b.bottom), round(b.right), round(b.top)])).unwrap_or(Value::Null));
+            o.insert("replication".into(), json!({ "timestamp": h.osmosis_replication_timestamp(), "sequence": h.osmosis_replication_sequence_number(), "base_url": h.osmosis_replication_base_url() }));
+            break;
+        }
+    }
+    let (mut nodes, mut ways, mut relations, mut tagged) = (0u64, 0u64, 0u64, 0u64);
+    each(path, &mut |e| {
+        match e {
+            Element::Node(n) => {
+                nodes += 1;
+                tagged += u64::from(n.tags().next().is_some());
+            }
+            Element::DenseNode(n) => {
+                nodes += 1;
+                tagged += u64::from(n.tags().next().is_some());
+            }
+            Element::Way(_) => ways += 1,
+            Element::Relation(_) => relations += 1,
+        }
+        true
+    })?;
+    o.insert("nodes".into(), json!(nodes));
+    o.insert("tagged_nodes".into(), json!(tagged));
+    o.insert("ways".into(), json!(ways));
+    o.insert("relations".into(), json!(relations));
+    Ok(Value::Object(o))
+}
+
+/// Nodes matching a filter: [{ id, lat, lon, tags }]. `filter` is text like `"amenity=cafe|pub"` or `"shop"`, or { tags: { amenity: ["cafe", "pub"], name: true }, not, bbox, limit (default 10000), meta }. Nodes without tags are passed over unless a filter names none and there is a bbox. `meta` adds version and timestamp.
+pub fn osm_nodes(path: &str, filter: serde_json::Value) -> Result<Value, String> {
+    let fl = filter_of(&filter)?;
+    let mut out = vec![];
+    let keep_bare = fl.rules.is_empty() && fl.bbox.is_some();
+    let mut push = |id: i64, lat: f64, lon: f64, tags: Vec<(&str, &str)>, meta: Value| -> bool {
+        if (tags.is_empty() && !keep_bare) || !fl.inside(lat, lon) || !fl.tags_match(&tags) {
+            return true;
+        }
+        let mut n = json!({ "id": id, "lat": round(lat), "lon": round(lon), "tags": tag_map(&tags) });
+        if fl.meta {
+            n["meta"] = meta;
+        }
+        out.push(n);
+        out.len() < fl.limit
+    };
+    each(path, &mut |e| match e {
+        Element::Node(n) => {
+            let i = n.info();
+            let meta = json!({ "version": i.version(), "timestamp_ms": i.milli_timestamp(), "changeset": i.changeset(), "user": i.user().and_then(|u| u.ok()) });
+            push(n.id(), n.lat(), n.lon(), n.tags().collect(), meta)
+        }
+        Element::DenseNode(n) => {
+            let meta = n.info().map(|i| json!({ "version": i.version(), "timestamp_ms": i.milli_timestamp(), "changeset": i.changeset(), "user": i.user().ok() })).unwrap_or(Value::Null);
+            push(n.id(), n.lat(), n.lon(), n.tags().collect(), meta)
+        }
+        Element::Way(_) | Element::Relation(_) => false, // Files sort nodes first, so the rest can wait.
+    })?;
+    Ok(json!(out))
+}
+
+struct WayRow {
+    id: i64,
+    refs: Vec<i64>,
+    tags: Value,
+}
+
+// Nodes inside the box, for a way filter that has one.
+fn nodes_in(path: &str, f: &Filter) -> Result<Option<HashSet<i64>>, String> {
+    if f.bbox.is_none() {
+        return Ok(None);
+    }
+    let mut s = HashSet::new();
+    each(path, &mut |e| {
+        match e {
+            Element::Node(n) if f.inside(n.lat(), n.lon()) => {
+                s.insert(n.id());
+            }
+            Element::DenseNode(n) if f.inside(n.lat(), n.lon()) => {
+                s.insert(n.id());
+            }
+            Element::Way(_) | Element::Relation(_) => return false,
+            _ => {}
+        }
+        s.len() < MAX_COORDS
+    })?;
+    Ok(Some(s))
+}
+
+fn collect_ways(path: &str, f: &Filter) -> Result<Vec<WayRow>, String> {
+    let inside = nodes_in(path, f)?;
+    let mut out = vec![];
+    each(path, &mut |e| match e {
+        Element::Way(w) => {
+            let t: Vec<(&str, &str)> = w.tags().collect();
+            if f.tags_match(&t) {
+                let refs: Vec<i64> = w.refs().collect();
+                if inside.as_ref().map(|s| refs.iter().any(|r| s.contains(r))).unwrap_or(true) {
+                    out.push(WayRow { id: w.id(), refs, tags: tag_map(&t) });
+                    return out.len() < f.limit;
+                }
+            }
+            true
+        }
+        Element::Relation(_) => false,
+        _ => true,
+    })?;
+    Ok(out)
+}
+
+fn coords(path: &str, ways: &[WayRow]) -> Result<HashMap<i64, (f64, f64)>, String> {
+    let want: HashSet<i64> = ways.iter().flat_map(|w| w.refs.iter().copied()).collect();
+    if want.len() > MAX_COORDS {
+        return Err(format!("{} nodes to look up is too many: narrow the filter", want.len()));
+    }
+    let mut got = HashMap::with_capacity(want.len());
+    each(path, &mut |e| {
+        match e {
+            Element::Node(n) if want.contains(&n.id()) => {
+                got.insert(n.id(), (n.lat(), n.lon()));
+            }
+            Element::DenseNode(n) if want.contains(&n.id()) => {
+                got.insert(n.id(), (n.lat(), n.lon()));
+            }
+            Element::Way(_) | Element::Relation(_) => return false,
+            _ => {}
+        }
+        got.len() < want.len()
+    })?;
+    Ok(got)
+}
+
+fn metres(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let r = 6_371_008.8;
+    let (p1, p2) = (a.0.to_radians(), b.0.to_radians());
+    let (dp, dl) = (p2 - p1, (b.1 - a.1).to_radians());
+    let h = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
+}
+
+/// Ways matching a filter: [{ id, tags, nodes, closed }], and with `geometry` true also { coordinates: [[lat, lon]], length_m, missing }. An extract can cut a way, so `missing` counts node refs not in the file. Finding coordinates reads the file a second time.
+pub fn osm_ways(path: &str, filter: serde_json::Value, geometry: bool) -> Result<Value, String> {
+    let f = filter_of(&filter)?;
+    let ways = collect_ways(path, &f)?;
+    let got = if geometry { coords(path, &ways)? } else { HashMap::new() };
+    Ok(json!(ways.iter().map(|w| {
+        let mut o = json!({ "id": w.id, "tags": w.tags, "nodes": w.refs, "closed": w.refs.len() > 2 && w.refs.first() == w.refs.last() });
+        if geometry {
+            let pts: Vec<(f64, f64)> = w.refs.iter().filter_map(|r| got.get(r).copied()).collect();
+            o["coordinates"] = json!(pts.iter().map(|p| [round(p.0), round(p.1)]).collect::<Vec<_>>());
+            o["length_m"] = json!((pts.windows(2).map(|x| metres(x[0], x[1])).sum::<f64>() * 10.0).round() / 10.0);
+            o["missing"] = json!(w.refs.len() - pts.len());
+        }
+        o
+    }).collect::<Vec<_>>()))
+}
+
+/// Relations matching a filter: [{ id, tags, members: [{ type, id, role }] }], for routes, boundaries and multipolygons.
+pub fn osm_relations(path: &str, filter: serde_json::Value) -> Result<Value, String> {
+    let f = filter_of(&filter)?;
+    let mut out = vec![];
+    let mut bad = None;
+    each(path, &mut |e| {
+        if let Element::Relation(r) = e {
+            let t: Vec<(&str, &str)> = r.tags().collect();
+            if f.tags_match(&t) {
+                let mut ms = vec![];
+                for m in r.members() {
+                    let kind = match m.member_type {
+                        RelMemberType::Node => "node",
+                        RelMemberType::Way => "way",
+                        RelMemberType::Relation => "relation",
+                    };
+                    match m.role() {
+                        Ok(role) => ms.push(json!({ "type": kind, "id": m.member_id, "role": role })),
+                        Err(x) => {
+                            bad = Some(x.to_string());
+                            return false;
+                        }
+                    }
+                }
+                out.push(json!({ "id": r.id(), "tags": tag_map(&t), "members": ms }));
+                return out.len() < f.limit;
+            }
+        }
+        true
+    })?;
+    match bad {
+        Some(e) => Err(format!("{} has a broken string table: {}", path, e)),
+        None => Ok(json!(out)),
+    }
+}
+
+/// How often each key appears, or each value of a key given: [{ tag, count }], commonest first, `limit` at most. `key` "" counts keys across nodes, ways and relations.
+pub fn osm_tag_counts(path: &str, key: &str, limit: i64) -> Result<Value, String> {
+    let mut c: HashMap<String, u64> = HashMap::new();
+    let mut add = |tags: Vec<(&str, &str)>| {
+        for (k, v) in tags {
+            if key.is_empty() {
+                *c.entry(k.to_string()).or_insert(0) += 1;
+            } else if k == key {
+                *c.entry(v.to_string()).or_insert(0) += 1;
+            }
+        }
+    };
+    each(path, &mut |e| {
+        match e {
+            Element::Node(n) => add(n.tags().collect()),
+            Element::DenseNode(n) => add(n.tags().collect()),
+            Element::Way(w) => add(w.tags().collect()),
+            Element::Relation(r) => add(r.tags().collect()),
+        }
+        true
+    })?;
+    let mut rows: Vec<(String, u64)> = c.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.truncate(limit.max(0) as usize);
+    Ok(json!(rows.iter().map(|(k, n)| json!({ "tag": k, "count": n })).collect::<Vec<_>>()))
+}
+
+/// What matches a filter as a GeoJSON FeatureCollection, ready for a map: nodes as points, ways as lines, closed ways as polygons unless tagged `highway` or `barrier`. Coordinates are [lon, lat]; each feature's id is `node/1` or `way/2`. Ways an extract cut short are left out, with their number in `skipped`.
+pub fn osm_geojson(path: &str, filter: serde_json::Value) -> Result<Value, String> {
+    let f = filter_of(&filter)?;
+    let mut features = vec![];
+    let nodes = osm_nodes(path, filter.clone())?;
+    for n in nodes.as_array().into_iter().flatten() {
+        features.push(json!({ "type": "Feature", "id": format!("node/{}", n["id"]), "properties": n["tags"], "geometry": { "type": "Point", "coordinates": [n["lon"], n["lat"]] } }));
+    }
+    let ways = collect_ways(path, &f)?;
+    let got = coords(path, &ways)?;
+    let mut skipped = 0;
+    for w in &ways {
+        let pts: Vec<[f64; 2]> = w.refs.iter().filter_map(|r| got.get(r)).map(|p| [round(p.1), round(p.0)]).collect();
+        if pts.len() != w.refs.len() || pts.len() < 2 {
+            skipped += 1;
+            continue;
+        }
+        let closed = pts.len() > 3 && pts.first() == pts.last();
+        let area = closed && w.tags.get("highway").is_none() && w.tags.get("barrier").is_none();
+        let geometry = if area { json!({ "type": "Polygon", "coordinates": [pts] }) } else { json!({ "type": "LineString", "coordinates": pts }) };
+        features.push(json!({ "type": "Feature", "id": format!("way/{}", w.id), "properties": w.tags, "geometry": geometry }));
+    }
+    Ok(json!({ "type": "FeatureCollection", "features": features, "skipped": skipped }))
+}

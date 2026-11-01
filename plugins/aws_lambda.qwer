@@ -1,0 +1,347 @@
+//! AWS Lambda without an SDK: functions invoked and waited for, or queued to run later, payloads and function errors read from their header, the log tail decoded and its REPORT line turned into numbers, throttling retried as Lambda asks, functions listed and described, all signed with Signature Version 4.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+// ---- AWS: credentials from the environment, Signature Version 4, one signed HTTP call ----
+
+struct Aws {
+    region: String,
+    key: String,
+    secret: String,
+    token: Option<String>,
+    base: String,
+    host: String,
+    service: String,
+    timeout: Duration,
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+fn opt_text(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The account to call: keys from the environment only, the region from `region` or AWS_REGION, the address from `url_var` when set.
+fn account(o: &Value, service: &str, url_var: &str, host_prefix: &str) -> Result<Aws, String> {
+    let key = var("AWS_ACCESS_KEY_ID").ok_or("no AWS key: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")?;
+    let secret = var("AWS_SECRET_ACCESS_KEY").ok_or("no AWS secret: set AWS_SECRET_ACCESS_KEY")?;
+    let region = opt_text(o, "region").or_else(|| var("AWS_REGION")).or_else(|| var("AWS_DEFAULT_REGION")).ok_or("no region: set AWS_REGION, or give the option region")?;
+    let base = var(url_var).unwrap_or_else(|| {
+        let suffix = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        format!("https://{}.{}.{}", host_prefix, region, suffix)
+    });
+    let base = base.trim_end_matches('/').to_string();
+    let host = base.split("://").nth(1).unwrap_or(&base).split('/').next().unwrap_or("").to_string();
+    let ms = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(15_000).clamp(100, 900_000);
+    Ok(Aws { region, key, secret, token: var("AWS_SESSION_TOKEN"), base, host, service: service.to_string(), timeout: Duration::from_millis(ms) })
+}
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+/// RFC 3986 encoding: only A-Z a-z 0-9 - _ . ~ kept (and `/` when asked).
+fn enc(s: &str, keep_slash: bool) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn amz_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// The headers that sign a request. `path` is as sent (already encoded once); all services here but S3 sign it encoded a second time.
+fn sign(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Vec<(String, String)> {
+    let stamp = amz_now();
+    let date = &stamp[..8];
+    let mut heads: Vec<(String, String)> = vec![("host".into(), a.host.clone()), ("x-amz-date".into(), stamp.clone())];
+    if let Some(t) = &a.token {
+        heads.push(("x-amz-security-token".into(), t.clone()));
+    }
+    for (k, v) in extra {
+        heads.push((k.to_lowercase(), v.trim().to_string()));
+    }
+    heads.sort();
+    let names = heads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canon_heads: String = heads.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect();
+    let mut pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    pairs.sort();
+    let canon = format!("{}\n{}\n{}\n{}\n{}\n{}", method, enc(path, true), pairs.join("&"), canon_heads, names, sha_hex(body));
+    let scope = format!("{}/{}/{}/aws4_request", date, a.region, a.service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canon.as_bytes()));
+    let k = hmac(format!("AWS4{}", a.secret).as_bytes(), date);
+    let k = hmac(&k, &a.region);
+    let k = hmac(&k, &a.service);
+    let k = hmac(&k, "aws4_request");
+    let sig = hex::encode(hmac(&k, &to_sign));
+    let mut out = extra.to_vec();
+    out.push(("X-Amz-Date".into(), stamp.clone()));
+    if let Some(t) = &a.token {
+        out.push(("X-Amz-Security-Token".into(), t.clone()));
+    }
+    out.push(("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", a.key, scope, names, sig)));
+    out
+}
+
+/// One signed call. Any status comes back as a Reply; only a network failure is an error.
+fn send(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Result<Reply, String> {
+    let url = if query.is_empty() { format!("{}{}", a.base, path) } else { format!("{}{}?{}", a.base, path, query) };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(a.timeout).redirects(0).build();
+    let mut r = agent.request(method, &url);
+    for (k, v) in sign(a, method, path, query, extra, body) {
+        r = r.set(&k, &v);
+    }
+    let res = if body.is_empty() && method != "POST" && method != "PUT" { r.call() } else { r.send_bytes(body) };
+    let resp = match res {
+        Ok(x) => x,
+        Err(ureq::Error::Status(_, x)) => x,
+        Err(e) => return Err(format!("cannot reach AWS at {}: {}", a.base, e)),
+    };
+    let status = resp.status();
+    let headers = resp.headers_names().iter().map(|n| (n.clone(), resp.header(n).unwrap_or("").to_string())).collect();
+    let mut body = vec![];
+    resp.into_reader().take(64 << 20).read_to_end(&mut body).map_err(|e| format!("cut off reading AWS's answer: {}", e))?;
+    Ok(Reply { status, headers, body })
+}
+
+fn lambda(method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8], o: &Value) -> Result<Reply, String> {
+    let a = account(o, "lambda", "LAMBDA_API_URL", "lambda")?;
+    let mut n = 0;
+    loop {
+        n += 1;
+        let r = send(&a, method, path, query, extra, body)?;
+        // Lambda says how long to wait in Retry-After (seconds), on 429 and on its own 5xx.
+        let again = r.status == 429 || r.status == 503 || r.status == 502;
+        if again && n < 4 && r.header("x-amz-function-error").is_none() {
+            let secs = r.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok()).unwrap_or(0.2 * n as f64).clamp(0.0, 30.0);
+            std::thread::sleep(Duration::from_millis((secs * 1000.0) as u64));
+            continue;
+        }
+        return Ok(r);
+    }
+}
+
+/// The error Lambda itself gave: its kind from x-amzn-ErrorType, its text from the body.
+fn refused(r: &Reply, what: &str) -> String {
+    let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+    let kind = r.header("x-amzn-errortype").map(|k| k.split(':').next().unwrap_or(k).to_string()).or(v["Type"].as_str().map(str::to_string)).or(v["__type"].as_str().map(str::to_string)).unwrap_or_default();
+    let msg = v["Message"].as_str().or(v["message"].as_str()).map(str::to_string).unwrap_or_else(|| r.text().chars().take(200).collect());
+    if kind.is_empty() { format!("Lambda {} {}: {}", what, r.status, msg) } else { format!("Lambda {}: {}: {}", what, kind, msg) }
+}
+
+fn fn_path(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("no function name".into());
+    }
+    Ok(format!("/2015-03-31/functions/{}", enc(name, false)))
+}
+
+fn payload_bytes(p: &Value) -> Vec<u8> {
+    if p.is_null() { b"{}".to_vec() } else { p.to_string().into_bytes() }
+}
+
+fn read_payload(b: &[u8]) -> Value {
+    if b.is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_slice(b).unwrap_or_else(|_| json!(String::from_utf8_lossy(b)))
+}
+
+fn invoke(name: &str, payload: &Value, kind: &str, o: &Value) -> Result<Reply, String> {
+    let mut heads = vec![("Content-Type".to_string(), "application/json".to_string()), ("X-Amz-Invocation-Type".to_string(), kind.to_string())];
+    if o.get("log") == Some(&Value::Bool(true)) && kind == "RequestResponse" {
+        heads.push(("X-Amz-Log-Type".into(), "Tail".into()));
+    }
+    if let Some(c) = o.get("client_context").filter(|c| !c.is_null()) {
+        let text = B64.encode(c.to_string());
+        if text.len() > 3583 {
+            return Err("client_context is over Lambda's 3,583 bytes of base64".into());
+        }
+        heads.push(("X-Amz-Client-Context".into(), text));
+    }
+    let query = opt_text(o, "qualifier").map(|q| format!("Qualifier={}", enc(&q, false))).unwrap_or_default();
+    lambda("POST", &format!("{}/invocations", fn_path(name)?), &query, &heads, &payload_bytes(payload), o)
+}
+
+fn decode_logs(r: &Reply) -> Value {
+    match r.header("x-amz-log-result").and_then(|h| B64.decode(h.trim()).ok()) {
+        Some(b) => json!(String::from_utf8_lossy(&b)),
+        None => Value::Null,
+    }
+}
+
+/// Runs a function and waits. Options: qualifier (a version or alias), log (true for the last 4 KB of its log), client_context. Gives { status, ok, payload, error, logs, version }: when the function failed, `ok` is false and `error` is { kind ("Unhandled" or "Handled"), type, message, trace }. Only a call Lambda refused is an error value.
+pub fn lambda_invoke(name: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = invoke(name, &payload, "RequestResponse", &options)?;
+    if r.status >= 300 {
+        return Err(refused(&r, name));
+    }
+    let out = read_payload(&r.body);
+    let failed = r.header("x-amz-function-error").map(str::to_string);
+    let error = match &failed {
+        Some(kind) => json!({ "kind": kind, "type": out["errorType"], "message": out["errorMessage"], "trace": out["stackTrace"] }),
+        None => Value::Null,
+    };
+    Ok(json!({ "status": r.status, "ok": failed.is_none(), "payload": if failed.is_some() { Value::Null } else { out }, "error": error, "logs": decode_logs(&r), "version": r.header("x-amz-executed-version") }))
+}
+
+/// Runs a function and gives what it returned; a function that failed is an error value with its type and message, for `?`.
+pub fn lambda_call(name: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = lambda_invoke(name, payload, options)?;
+    if r["ok"] == true {
+        return Ok(r["payload"].clone());
+    }
+    Err(format!("{}: {}: {}", name, r["error"]["type"].as_str().unwrap_or("error"), r["error"]["message"].as_str().unwrap_or("the function failed")))
+}
+
+/// Queues a run and comes back at once, Lambda retrying it twice on failure by itself. Gives the request id.
+pub fn lambda_invoke_async(name: &str, payload: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let r = invoke(name, &payload, "Event", &options)?;
+    if r.status != 202 {
+        return Err(refused(&r, name));
+    }
+    Ok(r.header("x-amzn-requestid").unwrap_or("").to_string())
+}
+
+/// Asks whether a call would be allowed, without running the function: true, or an error value saying why not.
+pub fn lambda_dry_run(name: &str, options: serde_json::Value) -> Result<bool, String> {
+    let r = invoke(name, &Value::Null, "DryRun", &options)?;
+    if r.status != 204 {
+        return Err(refused(&r, name));
+    }
+    Ok(true)
+}
+
+/// Reads a log's `REPORT RequestId: ...` line into { request_id, duration_ms, billed_ms, memory_mb, max_memory_mb, init_ms }, or null if it has none.
+pub fn lambda_log_report(logs: &str) -> Option<serde_json::Value> {
+    let line = logs.lines().find(|l| l.starts_with("REPORT "))?;
+    let mut out = json!({ "request_id": null, "duration_ms": null, "billed_ms": null, "memory_mb": null, "max_memory_mb": null, "init_ms": null });
+    for part in line["REPORT ".len()..].split('\t') {
+        let Some((k, v)) = part.split_once(':') else { continue };
+        let v = v.trim();
+        let number = v.split_whitespace().next().and_then(|n| n.parse::<f64>().ok());
+        let slot = match k.trim() {
+            "RequestId" => {
+                out["request_id"] = json!(v);
+                continue;
+            }
+            "Duration" => "duration_ms",
+            "Billed Duration" => "billed_ms",
+            "Memory Size" => "memory_mb",
+            "Max Memory Used" => "max_memory_mb",
+            "Init Duration" => "init_ms",
+            _ => continue,
+        };
+        out[slot] = json!(number);
+    }
+    Some(out)
+}
+
+/// A function's configuration (state, runtime, memory, last update) and the link to its code.
+pub fn lambda_get(name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = opt_text(&options, "qualifier").map(|q| format!("Qualifier={}", enc(&q, false))).unwrap_or_default();
+    let r = lambda("GET", &fn_path(name)?, &q, &[], &[], &options)?;
+    if r.status != 200 {
+        return Err(refused(&r, name));
+    }
+    serde_json::from_slice(&r.body).map_err(|e| e.to_string())
+}
+
+/// Waits until a function just made or changed can be run (State Active, LastUpdateStatus Successful). Option wait_ms (60 s). Gives its configuration; a failed one is an error value with Lambda's reason.
+pub fn lambda_wait_ready(name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let limit = Duration::from_millis(options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(60_000));
+    let start = Instant::now();
+    loop {
+        let c = lambda_get(name, options.clone())?["Configuration"].clone();
+        let (state, update) = (c["State"].as_str().unwrap_or("Active"), c["LastUpdateStatus"].as_str().unwrap_or("Successful"));
+        if state == "Failed" || update == "Failed" {
+            return Err(format!("{}: {} ({})", name, c["StateReason"].as_str().or(c["LastUpdateStatusReason"].as_str()).unwrap_or("failed"), c["StateReasonCode"].as_str().or(c["LastUpdateStatusReasonCode"].as_str()).unwrap_or("?")));
+        }
+        if state == "Active" && update == "Successful" {
+            return Ok(c);
+        }
+        if start.elapsed() > limit {
+            return Err(format!("{}: still {} after {} ms", name, state, limit.as_millis()));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Every function in the region, following NextMarker: their configurations.
+pub fn lambda_list(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut marker: Option<String> = None;
+    loop {
+        let mut q = format!("MaxItems={}", options.get("page_size").and_then(|v| v.as_u64()).unwrap_or(50));
+        if let Some(m) = &marker {
+            q = format!("Marker={}&{}", enc(m, false), q);
+        }
+        let r = lambda("GET", "/2015-03-31/functions/", &q, &[], &[], &options)?;
+        if r.status != 200 {
+            return Err(refused(&r, "list"));
+        }
+        let v: Value = serde_json::from_slice(&r.body).map_err(|e| e.to_string())?;
+        out.extend(v["Functions"].as_array().cloned().unwrap_or_default());
+        marker = v["NextMarker"].as_str().filter(|m| !m.is_empty()).map(str::to_string);
+        if marker.is_none() {
+            return Ok(out);
+        }
+    }
+}

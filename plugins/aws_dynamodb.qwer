@@ -1,0 +1,614 @@
+//! Amazon DynamoDB without an SDK: items got, put, updated and deleted with plain maps turned into attribute values and back (numbers kept exact, sets, binary), queries and scans paged, batch writes and reads with what DynamoDB left unprocessed sent again, throttling retried, and each answer's CRC32 checked, all signed with Signature Version 4.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+// ---- AWS: credentials from the environment, Signature Version 4, one signed HTTP call ----
+
+struct Aws {
+    region: String,
+    key: String,
+    secret: String,
+    token: Option<String>,
+    base: String,
+    host: String,
+    service: String,
+    timeout: Duration,
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+fn opt_text(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The account to call: keys from the environment only, the region from `region` or AWS_REGION, the address from `url_var` when set.
+fn account(o: &Value, service: &str, url_var: &str, host_prefix: &str) -> Result<Aws, String> {
+    let key = var("AWS_ACCESS_KEY_ID").ok_or("no AWS key: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")?;
+    let secret = var("AWS_SECRET_ACCESS_KEY").ok_or("no AWS secret: set AWS_SECRET_ACCESS_KEY")?;
+    let region = opt_text(o, "region").or_else(|| var("AWS_REGION")).or_else(|| var("AWS_DEFAULT_REGION")).ok_or("no region: set AWS_REGION, or give the option region")?;
+    let base = var(url_var).unwrap_or_else(|| {
+        let suffix = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        format!("https://{}.{}.{}", host_prefix, region, suffix)
+    });
+    let base = base.trim_end_matches('/').to_string();
+    let host = base.split("://").nth(1).unwrap_or(&base).split('/').next().unwrap_or("").to_string();
+    let ms = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(15_000).clamp(100, 900_000);
+    Ok(Aws { region, key, secret, token: var("AWS_SESSION_TOKEN"), base, host, service: service.to_string(), timeout: Duration::from_millis(ms) })
+}
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+/// RFC 3986 encoding: only A-Z a-z 0-9 - _ . ~ kept (and `/` when asked).
+fn enc(s: &str, keep_slash: bool) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn amz_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// The headers that sign a request. `path` is as sent (already encoded once); all services here but S3 sign it encoded a second time.
+fn sign(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Vec<(String, String)> {
+    let stamp = amz_now();
+    let date = &stamp[..8];
+    let mut heads: Vec<(String, String)> = vec![("host".into(), a.host.clone()), ("x-amz-date".into(), stamp.clone())];
+    if let Some(t) = &a.token {
+        heads.push(("x-amz-security-token".into(), t.clone()));
+    }
+    for (k, v) in extra {
+        heads.push((k.to_lowercase(), v.trim().to_string()));
+    }
+    heads.sort();
+    let names = heads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canon_heads: String = heads.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect();
+    let mut pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    pairs.sort();
+    let canon = format!("{}\n{}\n{}\n{}\n{}\n{}", method, enc(path, true), pairs.join("&"), canon_heads, names, sha_hex(body));
+    let scope = format!("{}/{}/{}/aws4_request", date, a.region, a.service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canon.as_bytes()));
+    let k = hmac(format!("AWS4{}", a.secret).as_bytes(), date);
+    let k = hmac(&k, &a.region);
+    let k = hmac(&k, &a.service);
+    let k = hmac(&k, "aws4_request");
+    let sig = hex::encode(hmac(&k, &to_sign));
+    let mut out = extra.to_vec();
+    out.push(("X-Amz-Date".into(), stamp.clone()));
+    if let Some(t) = &a.token {
+        out.push(("X-Amz-Security-Token".into(), t.clone()));
+    }
+    out.push(("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", a.key, scope, names, sig)));
+    out
+}
+
+/// One signed call. Any status comes back as a Reply; only a network failure is an error.
+fn send(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Result<Reply, String> {
+    let url = if query.is_empty() { format!("{}{}", a.base, path) } else { format!("{}{}?{}", a.base, path, query) };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(a.timeout).redirects(0).build();
+    let mut r = agent.request(method, &url);
+    for (k, v) in sign(a, method, path, query, extra, body) {
+        r = r.set(&k, &v);
+    }
+    let res = if body.is_empty() && method != "POST" && method != "PUT" { r.call() } else { r.send_bytes(body) };
+    let resp = match res {
+        Ok(x) => x,
+        Err(ureq::Error::Status(_, x)) => x,
+        Err(e) => return Err(format!("cannot reach AWS at {}: {}", a.base, e)),
+    };
+    let status = resp.status();
+    let headers = resp.headers_names().iter().map(|n| (n.clone(), resp.header(n).unwrap_or("").to_string())).collect();
+    let mut body = vec![];
+    resp.into_reader().take(64 << 20).read_to_end(&mut body).map_err(|e| format!("cut off reading AWS's answer: {}", e))?;
+    Ok(Reply { status, headers, body })
+}
+
+// ---- DynamoDB's call, with its retries ----
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        }
+    }
+    !c
+}
+
+fn wait(n: u32) {
+    std::thread::sleep(Duration::from_millis(50u64 << n.min(6)));
+}
+
+/// One DynamoDB operation: throttling and 5xx are tried again with growing waits, as is an answer whose CRC32 does not match, which the network garbled.
+fn call(op: &str, body: &Value, o: &Value) -> Result<Value, String> {
+    let a = account(o, "dynamodb", "DYNAMODB_API_URL", "dynamodb")?;
+    let text = body.to_string();
+    let heads = vec![("Content-Type".to_string(), "application/x-amz-json-1.0".to_string()), ("X-Amz-Target".to_string(), format!("DynamoDB_20120810.{}", op))];
+    let tries = o.get("max_tries").and_then(|v| v.as_u64()).unwrap_or(8).clamp(1, 20) as u32;
+    let mut n = 0;
+    loop {
+        n += 1;
+        let r = send(&a, "POST", "/", "", &heads, text.as_bytes())?;
+        if r.status == 200 {
+            if let Some(want) = r.header("x-amz-crc32").and_then(|c| c.trim().parse::<u32>().ok()) {
+                if crc32(&r.body) != want {
+                    if n < tries {
+                        wait(n);
+                        continue;
+                    }
+                    return Err(format!("DynamoDB {}: the answer's CRC32 did not match, {} times", op, n));
+                }
+            }
+            return serde_json::from_slice(&r.body).map_err(|e| format!("DynamoDB {}: not JSON: {}", op, e));
+        }
+        let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+        let kind = v["__type"].as_str().and_then(|t| t.rsplit('#').next()).unwrap_or("").to_string();
+        let again = r.status >= 500 || r.status == 429 || matches!(kind.as_str(), "ThrottlingException" | "ProvisionedThroughputExceededException" | "RequestLimitExceeded" | "TransactionInProgressException");
+        if again && n < tries {
+            wait(n);
+            continue;
+        }
+        let msg = v["message"].as_str().or(v["Message"].as_str()).map(str::to_string).unwrap_or_else(|| r.text().chars().take(200).collect());
+        return Err(if kind.is_empty() { format!("DynamoDB {} {}: {}", op, r.status, msg) } else { format!("DynamoDB {}: {}: {}", op, kind, msg) });
+    }
+}
+
+// ---- Attribute values ----
+
+fn set_of(list: &Value) -> Result<Value, String> {
+    let a = list.as_array().ok_or("$set takes a list")?;
+    if a.is_empty() {
+        return Err("DynamoDB has no empty sets: leave the attribute out".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for x in a {
+        if !seen.insert(x.to_string()) {
+            return Err(format!("a set holds {} twice, which DynamoDB refuses", x));
+        }
+    }
+    if a.iter().all(|x| x.is_string()) {
+        Ok(json!({ "SS": a }))
+    } else if a.iter().all(|x| x.is_number()) {
+        Ok(json!({ "NS": a.iter().map(|x| x.to_string()).collect::<Vec<_>>() }))
+    } else if a.iter().all(|x| x.get("$binary").is_some()) {
+        Ok(json!({ "BS": a.iter().map(|x| x["$binary"].clone()).collect::<Vec<_>>() }))
+    } else {
+        Err("a set is all strings, all numbers, or all { $binary }".into())
+    }
+}
+
+fn to_av(v: &Value) -> Result<Value, String> {
+    Ok(match v {
+        Value::Null => json!({ "NULL": true }),
+        Value::Bool(b) => json!({ "BOOL": b }),
+        Value::Number(n) => json!({ "N": n.to_string() }),
+        Value::String(s) => json!({ "S": s }),
+        Value::Array(a) => json!({ "L": a.iter().map(to_av).collect::<Result<Vec<_>, _>>()? }),
+        Value::Object(m) => {
+            if m.len() == 1 {
+                if let Some(x) = m.get("$set") {
+                    return set_of(x);
+                }
+                if let Some(x) = m.get("$number") {
+                    return Ok(json!({ "N": x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()) }));
+                }
+                if let Some(x) = m.get("$binary") {
+                    let t = x.as_str().ok_or("$binary takes base64 text")?;
+                    B64.decode(t).map_err(|_| "$binary is not base64".to_string())?;
+                    return Ok(json!({ "B": t }));
+                }
+            }
+            let mut out = Map::new();
+            for (k, x) in m {
+                out.insert(k.clone(), to_av(x)?);
+            }
+            json!({ "M": out })
+        }
+    })
+}
+
+/// A number as it can be kept: an int, a float that says the same digits, or `{ $number: text }` for DynamoDB's 38 digits, which neither holds.
+fn number_of(t: &str) -> Value {
+    if let Ok(i) = t.parse::<i64>() {
+        return json!(i);
+    }
+    let digits = t.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    if !t.contains(|c| c == 'e' || c == 'E') && digits.trim_start_matches('0').len() <= 15 {
+        if let Ok(f) = t.parse::<f64>() {
+            return json!(f);
+        }
+    }
+    json!({ "$number": t })
+}
+
+fn from_av(v: &Value) -> Result<Value, String> {
+    let m = v.as_object().filter(|m| m.len() == 1).ok_or(format!("{} is not an attribute value", v))?;
+    let (kind, x) = m.iter().next().unwrap();
+    Ok(match kind.as_str() {
+        "S" | "BOOL" => x.clone(),
+        "NULL" => Value::Null,
+        "N" => number_of(x.as_str().unwrap_or("0")),
+        "B" => json!({ "$binary": x }),
+        "SS" => json!({ "$set": x }),
+        "NS" => json!({ "$set": x.as_array().map(|l| l.iter().map(|n| number_of(n.as_str().unwrap_or("0"))).collect::<Vec<_>>()) }),
+        "BS" => json!({ "$set": x.as_array().map(|l| l.iter().map(|b| json!({ "$binary": b })).collect::<Vec<_>>()) }),
+        "L" => Value::Array(x.as_array().ok_or("L is not a list")?.iter().map(from_av).collect::<Result<_, _>>()?),
+        "M" => {
+            let mut out = Map::new();
+            for (k, y) in x.as_object().ok_or("M is not a map")? {
+                out.insert(k.clone(), from_av(y)?);
+            }
+            Value::Object(out)
+        }
+        other => return Err(format!("unknown attribute type {}", other)),
+    })
+}
+
+fn to_item(m: &Value) -> Result<Value, String> {
+    let o = m.as_object().ok_or("an item or key is a map")?;
+    let mut out = Map::new();
+    for (k, v) in o {
+        out.insert(k.clone(), to_av(v)?);
+    }
+    Ok(Value::Object(out))
+}
+
+fn from_item(m: &Value) -> Result<Value, String> {
+    let o = m.as_object().ok_or("an item is a map")?;
+    let mut out = Map::new();
+    for (k, v) in o {
+        out.insert(k.clone(), from_av(v)?);
+    }
+    Ok(Value::Object(out))
+}
+
+/// Maps a program's item to DynamoDB's attribute values: `{ id: 7 }` is `{ id: { N: "7" } }`. `{ $set: [...] }` makes a set, `{ $binary: base64 }` a binary, `{ $number: text }` a number past what a float holds.
+pub fn dynamodb_marshal(item: serde_json::Value) -> Result<serde_json::Value, String> {
+    to_item(&item)
+}
+
+/// Attribute values back to a plain map, the other way round from `dynamodb_marshal`.
+pub fn dynamodb_unmarshal(item: serde_json::Value) -> Result<serde_json::Value, String> {
+    from_item(&item)
+}
+
+// ---- Items ----
+
+/// The options every expression shares: `names`, `values` (plain values, with or without the colon), and `condition`.
+fn expressions(req: &mut Map<String, Value>, o: &Value) -> Result<(), String> {
+    if let Some(c) = opt_text(o, "condition") {
+        req.insert("ConditionExpression".into(), json!(c));
+    }
+    if let Some(p) = opt_text(o, "projection") {
+        req.insert("ProjectionExpression".into(), json!(p));
+    }
+    if let Some(f) = opt_text(o, "filter") {
+        req.insert("FilterExpression".into(), json!(f));
+    }
+    if let Some(n) = o.get("names").filter(|n| n.is_object()) {
+        add_names(req, n);
+    }
+    if let Some(v) = o.get("values").filter(|v| v.is_object()) {
+        add_values(req, v)?;
+    }
+    Ok(())
+}
+
+fn add_names(req: &mut Map<String, Value>, n: &Value) {
+    let slot = req.entry("ExpressionAttributeNames").or_insert(json!({})).as_object_mut().unwrap();
+    for (k, v) in n.as_object().into_iter().flatten() {
+        slot.insert(if k.starts_with('#') { k.clone() } else { format!("#{}", k) }, v.clone());
+    }
+}
+
+fn add_values(req: &mut Map<String, Value>, v: &Value) -> Result<(), String> {
+    let slot = req.entry("ExpressionAttributeValues").or_insert(json!({})).as_object_mut().unwrap();
+    for (k, x) in v.as_object().into_iter().flatten() {
+        slot.insert(if k.starts_with(':') { k.clone() } else { format!(":{}", k) }, to_av(x)?);
+    }
+    Ok(())
+}
+
+/// One item by its key, or null. Options: consistent, projection, names.
+pub fn dynamodb_get(table: &str, key: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut req = Map::new();
+    req.insert("TableName".into(), json!(table));
+    req.insert("Key".into(), to_item(&key)?);
+    if options.get("consistent") == Some(&Value::Bool(true)) {
+        req.insert("ConsistentRead".into(), json!(true));
+    }
+    expressions(&mut req, &options)?;
+    let r = call("GetItem", &Value::Object(req), &options)?;
+    match r.get("Item") {
+        Some(i) => from_item(i),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Puts an item, replacing one with its key. Options: `if_absent` (the partition key's name: fail if it exists), condition, names, values, return_old. Gives the old item when asked, else null; a failed condition is an error saying ConditionalCheckFailedException.
+pub fn dynamodb_put(table: &str, item: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut req = Map::new();
+    req.insert("TableName".into(), json!(table));
+    req.insert("Item".into(), to_item(&item)?);
+    if let Some(k) = opt_text(&options, "if_absent") {
+        req.insert("ConditionExpression".into(), json!("attribute_not_exists(#if_absent)"));
+        add_names(&mut req, &json!({ "#if_absent": k }));
+    }
+    expressions(&mut req, &options)?;
+    if options.get("return_old") == Some(&Value::Bool(true)) {
+        req.insert("ReturnValues".into(), json!("ALL_OLD"));
+    }
+    let r = call("PutItem", &Value::Object(req), &options)?;
+    match r.get("Attributes") {
+        Some(i) => from_item(i),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Changes an item from a map of what to change: a value is SET, null is REMOVE, `{ $add: n }` is ADD, `{ $delete: { $set: [...] } }` takes from a set; a name like `address.city` is a path. Builds the placeholders, so no name clashes with a reserved word. Options: condition, names, values, returning (ALL_NEW by default). Gives the attributes.
+pub fn dynamodb_update(table: &str, key: serde_json::Value, changes: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let m = changes.as_object().filter(|m| !m.is_empty()).ok_or("changes is a map with something in it")?;
+    let (mut set, mut remove, mut add, mut del) = (vec![], vec![], vec![], vec![]);
+    let mut names = Map::new();
+    let mut values = Map::new();
+    let mut i = 0;
+    for (field, v) in m {
+        let parts: Vec<String> = field.split('.').enumerate().map(|(n, p)| {
+            let ph = format!("#u{}_{}", i, n);
+            names.insert(ph.clone(), json!(p));
+            ph
+        }).collect();
+        let path = parts.join(".");
+        let ph = format!(":u{}", i);
+        i += 1;
+        match v {
+            Value::Null => remove.push(path),
+            Value::Object(o) if o.len() == 1 && o.contains_key("$add") => {
+                add.push(format!("{} {}", path, ph));
+                values.insert(ph, o["$add"].clone());
+            }
+            Value::Object(o) if o.len() == 1 && o.contains_key("$delete") => {
+                del.push(format!("{} {}", path, ph));
+                values.insert(ph, o["$delete"].clone());
+            }
+            _ => {
+                set.push(format!("{} = {}", path, ph));
+                values.insert(ph, v.clone());
+            }
+        }
+    }
+    let mut parts = vec![];
+    for (word, list) in [("SET", &set), ("REMOVE", &remove), ("ADD", &add), ("DELETE", &del)] {
+        if !list.is_empty() {
+            parts.push(format!("{} {}", word, list.join(", ")));
+        }
+    }
+    let mut req = Map::new();
+    req.insert("TableName".into(), json!(table));
+    req.insert("Key".into(), to_item(&key)?);
+    req.insert("UpdateExpression".into(), json!(parts.join(" ")));
+    req.insert("ReturnValues".into(), json!(opt_text(&options, "returning").unwrap_or("ALL_NEW".into())));
+    add_names(&mut req, &Value::Object(names));
+    if !values.is_empty() {
+        add_values(&mut req, &Value::Object(values))?;
+    }
+    expressions(&mut req, &options)?;
+    let r = call("UpdateItem", &Value::Object(req), &options)?;
+    match r.get("Attributes") {
+        Some(i) => from_item(i),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Deletes an item. Options: condition, names, values. Gives the item that was there, or null.
+pub fn dynamodb_delete(table: &str, key: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut req = Map::new();
+    req.insert("TableName".into(), json!(table));
+    req.insert("Key".into(), to_item(&key)?);
+    req.insert("ReturnValues".into(), json!("ALL_OLD"));
+    expressions(&mut req, &options)?;
+    let r = call("DeleteItem", &Value::Object(req), &options)?;
+    match r.get("Attributes") {
+        Some(i) => from_item(i),
+        None => Ok(Value::Null),
+    }
+}
+
+// ---- Queries ----
+
+fn page_of(op: &str, table: &str, condition: &str, values: &Value, o: &Value, start: Option<&Value>) -> Result<Value, String> {
+    let mut req = Map::new();
+    req.insert("TableName".into(), json!(table));
+    if !condition.is_empty() {
+        req.insert("KeyConditionExpression".into(), json!(condition));
+    }
+    if values.is_object() {
+        add_values(&mut req, values)?;
+    }
+    expressions(&mut req, o)?;
+    if let Some(i) = opt_text(o, "index") {
+        req.insert("IndexName".into(), json!(i));
+    }
+    if let Some(l) = o.get("limit").and_then(|l| l.as_i64()) {
+        req.insert("Limit".into(), json!(l));
+    }
+    if o.get("forward") == Some(&Value::Bool(false)) {
+        req.insert("ScanIndexForward".into(), json!(false));
+    }
+    if o.get("consistent") == Some(&Value::Bool(true)) {
+        req.insert("ConsistentRead".into(), json!(true));
+    }
+    if let Some(s) = start.filter(|s| !s.is_null()) {
+        req.insert("ExclusiveStartKey".into(), to_item(s)?);
+    }
+    let r = call(op, &Value::Object(req), o)?;
+    let items = r["Items"].as_array().map(|l| l.iter().map(from_item).collect::<Result<Vec<_>, _>>()).transpose()?.unwrap_or_default();
+    let next = match r.get("LastEvaluatedKey") {
+        Some(k) => from_item(k)?,
+        None => Value::Null,
+    };
+    Ok(json!({ "items": items, "count": r["Count"], "scanned": r["ScannedCount"], "next": next }))
+}
+
+fn every_page(op: &str, table: &str, condition: &str, values: &Value, o: &Value) -> Result<Value, String> {
+    let most = o.get("max_items").and_then(|m| m.as_u64()).unwrap_or(u64::MAX) as usize;
+    let (mut items, mut pages, mut scanned) = (vec![], 0, 0);
+    let mut start = o.get("start").cloned().unwrap_or(Value::Null);
+    loop {
+        let p = page_of(op, table, condition, values, o, Some(&start))?;
+        pages += 1;
+        scanned += p["scanned"].as_i64().unwrap_or(0);
+        items.extend(p["items"].as_array().cloned().unwrap_or_default());
+        start = p["next"].clone();
+        if start.is_null() || items.len() >= most {
+            items.truncate(most);
+            return Ok(json!({ "items": items, "pages": pages, "scanned": scanned, "next": start }));
+        }
+    }
+}
+
+/// One page of a query: `condition` is a KeyConditionExpression, `values` its `:x`es as plain values. Options: index, names, filter, projection, limit, forward (false for newest first), consistent, start (the `next` of the last page). Gives { items, count, scanned, next }; `next` null means the end.
+pub fn dynamodb_query(table: &str, condition: &str, values: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    page_of("Query", table, condition, &values, &options, options.get("start"))
+}
+
+/// Every page of a query (`limit` is then the page size), up to the option max_items. Gives { items, pages, scanned, next }.
+pub fn dynamodb_query_all(table: &str, condition: &str, values: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    every_page("Query", table, condition, &values, &options)
+}
+
+/// Every page of a table's scan. Options as for a query, with `filter` and its `values`; `max_items` stops early.
+pub fn dynamodb_scan_all(table: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    every_page("Scan", table, "", &Value::Null, &options)
+}
+
+// ---- Batches ----
+
+/// Writes any number of items: `writes` is { put: [items], delete: [keys] }, sent 25 at a time, and what DynamoDB answers with as UnprocessedItems is sent again with growing waits. Gives { written, requests, resent }, or an error saying how many never went. Option max_rounds (10).
+pub fn dynamodb_batch_write(table: &str, writes: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut queue = vec![];
+    for i in writes.get("put").and_then(|p| p.as_array()).into_iter().flatten() {
+        queue.push(json!({ "PutRequest": { "Item": to_item(i)? } }));
+    }
+    for k in writes.get("delete").and_then(|p| p.as_array()).into_iter().flatten() {
+        queue.push(json!({ "DeleteRequest": { "Key": to_item(k)? } }));
+    }
+    let total = queue.len();
+    let rounds = options.get("max_rounds").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+    let (mut requests, mut resent, mut idle) = (0, 0, 0);
+    while !queue.is_empty() {
+        let rest = queue.split_off(queue.len().min(25));
+        let sent = std::mem::replace(&mut queue, rest);
+        let n = sent.len();
+        let r = call("BatchWriteItem", &json!({ "RequestItems": { table: sent } }), &options)?;
+        requests += 1;
+        let left = r["UnprocessedItems"][table].as_array().cloned().unwrap_or_default();
+        if !left.is_empty() {
+            idle = if left.len() == n { idle + 1 } else { 0 };
+            if idle >= rounds {
+                return Err(format!("DynamoDB left {} of {} writes unprocessed after {} tries: raise the table's capacity", left.len() + queue.len(), total, rounds));
+            }
+            resent += left.len();
+            wait(idle);
+            queue.extend(left);
+        }
+    }
+    Ok(json!({ "written": total, "requests": requests, "resent": resent }))
+}
+
+/// Reads any number of keys, 100 at a time, asking again for UnprocessedKeys. Options: consistent, projection, names. The order is DynamoDB's own, not that of `keys`.
+pub fn dynamodb_batch_get(table: &str, keys: serde_json::Value, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let list = keys.as_array().ok_or("keys is a list of keys")?;
+    let mut queue = list.iter().map(to_item).collect::<Result<Vec<_>, _>>()?;
+    let mut extra = Map::new();
+    if options.get("consistent") == Some(&Value::Bool(true)) {
+        extra.insert("ConsistentRead".into(), json!(true));
+    }
+    expressions(&mut extra, &options)?;
+    let mut out = vec![];
+    let mut idle = 0;
+    while !queue.is_empty() {
+        let rest = queue.split_off(queue.len().min(100));
+        let ask = std::mem::replace(&mut queue, rest);
+        let mut one = extra.clone();
+        one.insert("Keys".into(), json!(ask));
+        let r = call("BatchGetItem", &json!({ "RequestItems": { table: one } }), &options)?;
+        for i in r["Responses"][table].as_array().into_iter().flatten() {
+            out.push(from_item(i)?);
+        }
+        let left = r["UnprocessedKeys"][table]["Keys"].as_array().cloned().unwrap_or_default();
+        if !left.is_empty() {
+            idle += 1;
+            if idle > 10 {
+                return Err(format!("DynamoDB left {} keys unread", left.len() + queue.len()));
+            }
+            wait(idle);
+            queue.extend(left);
+        }
+    }
+    Ok(out)
+}
+
+/// Any other operation, like `DescribeTable` or `TransactWriteItems`: `body` as DynamoDB's JSON, the answer as it comes, retried like the rest.
+pub fn dynamodb_call(operation: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(operation, &body, &options)
+}

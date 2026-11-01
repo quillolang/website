@@ -1,0 +1,757 @@
+//! SIP (RFC 3261): messages parsed and built with compact headers, folded lines, Via lists and name-addrs read, OPTIONS pings and requests over UDP with retransmission and over TCP with Content-Length framing, digest authentication answered with MD5 or SHA-256, REGISTER, responses made for what you receive, and SDP read and written.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! md-5 = "0.10"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use md5::Md5;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+const COMPACT: [(&str, &str); 15] = [
+    ("i", "call-id"), ("m", "contact"), ("e", "content-encoding"), ("l", "content-length"), ("c", "content-type"), ("f", "from"), ("s", "subject"),
+    ("k", "supported"), ("t", "to"), ("v", "via"), ("o", "event"), ("r", "refer-to"), ("b", "referred-by"), ("u", "allow-events"), ("a", "accept-contact"),
+];
+const MAX_MESSAGE: usize = 1 << 20;
+
+fn rand_hex(n: usize) -> Result<String, String> {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(hex::encode(b))
+}
+
+fn full_name(h: &str) -> String {
+    let l = h.trim().to_lowercase();
+    COMPACT.iter().find(|c| c.0 == l).map_or(l.clone(), |c| c.1.to_string())
+}
+
+// Commas inside quotes and <> do not split a header.
+fn split_commas(v: &str) -> Vec<String> {
+    let (mut out, mut cur, mut q, mut a) = (vec![], String::new(), false, 0);
+    let mut esc = false;
+    for c in v.chars() {
+        if esc {
+            esc = false;
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '\\' if q => esc = true,
+            '"' => q = !q,
+            '<' if !q => a += 1,
+            '>' if !q => a -= 1,
+            ',' if !q && a == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+const MULTI: [&str; 9] = ["via", "route", "record-route", "contact", "allow", "supported", "require", "accept", "proxy-require"];
+
+fn parse_params(v: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    for p in v.split(';') {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.split_once('=') {
+            Some((k, x)) => m.insert(k.trim().to_lowercase(), json!(x.trim().trim_matches('"'))),
+            None => m.insert(p.to_lowercase(), json!(true)),
+        };
+    }
+    m
+}
+
+/// Reads a SIP URI: `{ scheme, user, password, host, port, params, headers }`. IPv6 hosts in brackets are understood.
+pub fn sip_uri(uri: &str) -> Result<Value, String> {
+    let t = uri.trim().trim_start_matches('<').trim_end_matches('>');
+    let (scheme, rest) = t.split_once(':').ok_or(format!("`{}` is not a SIP URI", uri))?;
+    let scheme = scheme.to_lowercase();
+    if scheme != "sip" && scheme != "sips" && scheme != "tel" {
+        return Err(format!("`{}` is not a SIP URI", uri));
+    }
+    if scheme == "tel" {
+        return Ok(json!({ "scheme": "tel", "user": rest.split(';').next(), "host": Value::Null }));
+    }
+    let (body, headers) = rest.split_once('?').map_or((rest, ""), |x| x);
+    let (who, params) = match body.find(';') {
+        Some(i) if !body[..i].contains('[') || body[..i].contains(']') => (&body[..i], &body[i + 1..]),
+        _ => (body, ""),
+    };
+    let (user, host) = who.rsplit_once('@').map_or((None, who), |(u, h)| (Some(u), h));
+    let (name, password) = user.map_or((None, None), |u| u.split_once(':').map_or((Some(u), None), |(a, b)| (Some(a), Some(b))));
+    let (h, port) = if let Some(end) = host.strip_prefix('[').and_then(|x| x.find(']')) {
+        let inner = &host[1..=end];
+        let p = host[end + 2..].strip_prefix(':').and_then(|x| x.parse::<u64>().ok());
+        (inner, p)
+    } else {
+        match host.rsplit_once(':') {
+            Some((a, b)) => (a, Some(b.parse::<u64>().map_err(|_| format!("`{}` has a bad port", uri))?)),
+            None => (host, None),
+        }
+    };
+    if h.is_empty() {
+        return Err(format!("`{}` has no host", uri));
+    }
+    let mut hs = Map::new();
+    for p in headers.split('&').filter(|x| !x.is_empty()) {
+        if let Some((k, v)) = p.split_once('=') {
+            hs.insert(k.to_string(), json!(v));
+        }
+    }
+    Ok(json!({ "scheme": scheme, "user": name, "password": password, "host": h, "port": port, "params": parse_params(params), "headers": hs }))
+}
+
+// A quoted display name, its `\"` and `\\` undone. Only the outer quotes are its own.
+fn unquote(t: &str) -> String {
+    let inner = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
+    let mut out = String::new();
+    let mut c = inner.chars();
+    while let Some(x) = c.next() {
+        out.push(if x == '\\' { c.next().unwrap_or(x) } else { x });
+    }
+    out
+}
+
+/// Reads a From, To or Contact value: `"Alice" <sip:alice@example.com>;tag=9fx` into `{ name, uri, params, tag }`.
+pub fn sip_address(value: &str) -> Result<Value, String> {
+    let t = value.trim();
+    if t == "*" {
+        return Ok(json!({ "uri": "*" }));
+    }
+    let (name, uri, rest) = if let Some(open) = t.rfind('<') {
+        let close = t[open..].find('>').ok_or(format!("`{}` has no closing `>`", value))? + open;
+        (unquote(t[..open].trim()), t[open + 1..close].to_string(), t[close + 1..].to_string())
+    } else {
+        // Without <>, parameters belong to the header, not the URI.
+        let (u, r) = t.split_once(';').unwrap_or((t, ""));
+        (String::new(), u.trim().to_string(), r.to_string())
+    };
+    let params = parse_params(&rest);
+    Ok(json!({ "name": if name.is_empty() { Value::Null } else { json!(name) }, "uri": uri, "tag": params.get("tag"), "params": params }))
+}
+
+fn via_of(v: &str) -> Value {
+    let t = v.trim();
+    let (head, params) = t.split_once(';').unwrap_or((t, ""));
+    let mut words = head.split_whitespace();
+    let proto = words.next().unwrap_or("");
+    let by = words.next().unwrap_or("");
+    let p = parse_params(params);
+    json!({ "protocol": proto.rsplit('/').next(), "sent_by": by, "branch": p.get("branch"), "received": p.get("received"), "rport": p.get("rport"), "params": p })
+}
+
+fn parse(text: &str) -> Result<Value, String> {
+    let (head, body) = match text.find("\r\n\r\n") {
+        Some(i) => (&text[..i], &text[i + 4..]),
+        None => match text.find("\n\n") {
+            Some(i) => (&text[..i], &text[i + 2..]),
+            None => (text, ""),
+        },
+    };
+    // Keep-alive CRLFs may come first.
+    let head = head.trim_start_matches(['\r', '\n']);
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+    let first = lines.next().unwrap_or("");
+    let mut m = Map::new();
+    if let Some(r) = first.strip_prefix("SIP/2.0 ") {
+        let (code, reason) = r.split_once(' ').unwrap_or((r, ""));
+        m.insert("kind".into(), json!("response"));
+        m.insert("status".into(), json!(code.parse::<u64>().ok().filter(|c| (100..700).contains(c)).ok_or(format!("`{}` is not a SIP status", code))?));
+        m.insert("reason".into(), json!(reason));
+    } else {
+        let p: Vec<&str> = first.split_whitespace().collect();
+        if p.len() != 3 || p[2] != "SIP/2.0" {
+            return Err(format!("`{}` is not a SIP start line", first.chars().take(60).collect::<String>()));
+        }
+        m.insert("kind".into(), json!("request"));
+        m.insert("method".into(), json!(p[0]));
+        m.insert("uri".into(), json!(p[1]));
+    }
+    let mut pairs: Vec<(String, String)> = vec![];
+    for l in lines {
+        if l.starts_with(' ') || l.starts_with('\t') {
+            if let Some(last) = pairs.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(l.trim());
+            }
+            continue;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            pairs.push((full_name(k), v.trim().to_string()));
+        }
+    }
+    let mut headers = Map::new();
+    for (k, v) in &pairs {
+        let parts = if MULTI.contains(&k.as_str()) { split_commas(v) } else { vec![v.clone()] };
+        let e = headers.entry(k.clone()).or_insert(json!([]));
+        if let Some(a) = e.as_array_mut() {
+            a.extend(parts.into_iter().map(Value::String));
+        }
+    }
+    let one = |k: &str| headers.get(k).and_then(|v| v.get(0)).and_then(|v| v.as_str()).map(String::from);
+    if let Some(v) = headers.get("via").and_then(|v| v.as_array()) {
+        m.insert("via".into(), json!(v.iter().filter_map(|x| x.as_str()).map(via_of).collect::<Vec<_>>()));
+    }
+    for (k, name) in [("from", "from"), ("to", "to")] {
+        if let Some(v) = one(k) {
+            m.insert(name.into(), sip_address(&v)?);
+        }
+    }
+    if let Some(c) = headers.get("contact").and_then(|v| v.as_array()) {
+        m.insert("contact".into(), json!(c.iter().filter_map(|x| x.as_str().and_then(|s| sip_address(s).ok())).collect::<Vec<_>>()));
+    }
+    if let Some(v) = one("call-id") {
+        m.insert("call_id".into(), json!(v));
+    }
+    if let Some(v) = one("cseq") {
+        let (n, method) = v.split_once(' ').ok_or(format!("`{}` is not a CSeq", v))?;
+        m.insert("cseq".into(), json!({ "number": n.parse::<u64>().map_err(|_| format!("`{}` is not a CSeq", v))?, "method": method.trim() }));
+    }
+    let n = one("content-length").and_then(|v| v.parse::<usize>().ok());
+    let b = match n {
+        Some(l) => {
+            let bytes = body.as_bytes();
+            if l > bytes.len() {
+                return Err(format!("Content-Length says {} bytes; {} came", l, bytes.len()));
+            }
+            String::from_utf8_lossy(&bytes[..l]).to_string()
+        }
+        None => body.to_string(),
+    };
+    if one("content-type").map_or(false, |c| c.to_lowercase().starts_with("application/sdp")) && !b.is_empty() {
+        m.insert("sdp".into(), sip_sdp_parse(&b)?);
+    }
+    m.insert("headers".into(), Value::Object(headers));
+    m.insert("body".into(), json!(b));
+    Ok(Value::Object(m))
+}
+
+/// Reads a SIP message: `kind`, `method` and `uri` or `status` and `reason`, `via`, `from`, `to`, `contact`, `call_id`, `cseq`, `headers` (lower-case, long names, each a list), `body`, and `sdp` when it is SDP. Compact names, folded lines and comma lists are all understood.
+pub fn sip_parse(message: &str) -> Result<Value, String> {
+    parse(message)
+}
+
+/// Builds a request's text: `{ method, uri, headers: { "Max-Forwards": 70 }, body }`, with Content-Length written for you. A header's value may be a list; line breaks in it are refused.
+pub fn sip_build(request: serde_json::Value) -> Result<String, String> {
+    let method = request.get("method").and_then(|v| v.as_str()).ok_or("a request needs `method`")?;
+    let uri = request.get("uri").and_then(|v| v.as_str()).ok_or("a request needs `uri`")?;
+    if !method.bytes().all(|c| c.is_ascii_alphabetic()) {
+        return Err(format!("`{}` is not a SIP method", method));
+    }
+    sip_uri(uri)?;
+    let mut t = format!("{} {} SIP/2.0\r\n", method, uri);
+    write_headers(&mut t, request.get("headers"), request.get("body").and_then(|v| v.as_str()).unwrap_or(""))?;
+    Ok(t)
+}
+
+fn write_headers(t: &mut String, headers: Option<&Value>, body: &str) -> Result<(), String> {
+    for (k, v) in headers.and_then(|h| h.as_object()).into_iter().flatten() {
+        if k.is_empty() || !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+            return Err(format!("`{}` is not a header name", k));
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let list = match v {
+            Value::Array(a) => a.clone(),
+            x => vec![x.clone()],
+        };
+        for x in list {
+            let s = match x {
+                Value::String(s) => s,
+                y => y.to_string(),
+            };
+            if s.contains(['\r', '\n']) {
+                return Err(format!("the `{}` header cannot hold a line break", k));
+            }
+            t.push_str(&format!("{}: {}\r\n", k, s));
+        }
+    }
+    t.push_str(&format!("Content-Length: {}\r\n\r\n{}", body.len(), body));
+    Ok(())
+}
+
+/// Builds the answer to a request you received: its Via list, From, To (with a tag added), Call-ID and CSeq copied, as RFC 3261 8.2.6 says. `options`: `headers`, `body`, `tag`.
+pub fn sip_response(request: &str, status: i64, reason: &str, options: serde_json::Value) -> Result<String, String> {
+    if !(100..700).contains(&status) {
+        return Err(format!("{} is not a SIP status", status));
+    }
+    if reason.contains(['\r', '\n']) {
+        return Err("a reason cannot hold a line break".into());
+    }
+    let q = parse(request)?;
+    if q["kind"] != "request" {
+        return Err("that is not a request".into());
+    }
+    let h = &q["headers"];
+    let mut t = format!("SIP/2.0 {} {}\r\n", status, reason);
+    for k in ["via", "record-route"] {
+        for v in h.get(k).and_then(|x| x.as_array()).into_iter().flatten() {
+            t.push_str(&format!("{}: {}\r\n", if k == "via" { "Via" } else { "Record-Route" }, v.as_str().unwrap_or("")));
+        }
+    }
+    let one = |k: &str| h.get(k).and_then(|v| v.get(0)).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    t.push_str(&format!("From: {}\r\n", one("from")));
+    let to = one("to");
+    let has_tag = q["to"]["tag"].is_string();
+    if has_tag || status == 100 {
+        t.push_str(&format!("To: {}\r\n", to));
+    } else {
+        let tag = match options.get("tag").and_then(|v| v.as_str()) {
+            Some(x) => x.to_string(),
+            None => rand_hex(5)?,
+        };
+        t.push_str(&format!("To: {};tag={}\r\n", to, tag));
+    }
+    t.push_str(&format!("Call-ID: {}\r\nCSeq: {}\r\n", one("call-id"), one("cseq")));
+    write_headers(&mut t, options.get("headers"), options.get("body").and_then(|v| v.as_str()).unwrap_or(""))?;
+    Ok(t)
+}
+
+fn params_of_challenge(c: &str) -> Map<String, Value> {
+    let t = c.trim();
+    let rest = t.strip_prefix("Digest").or(t.strip_prefix("digest")).unwrap_or(t);
+    let mut m = Map::new();
+    for p in split_commas(rest) {
+        if let Some((k, v)) = p.split_once('=') {
+            m.insert(k.trim().to_lowercase(), json!(v.trim().trim_matches('"')));
+        }
+    }
+    m
+}
+
+fn h(alg: &str, s: &str) -> String {
+    if alg.starts_with("SHA-256") {
+        hex::encode(Sha256::digest(s.as_bytes()))
+    } else {
+        hex::encode(Md5::digest(s.as_bytes()))
+    }
+}
+
+/// Answers a digest challenge (the value of WWW-Authenticate or Proxy-Authenticate): `credentials` has `method`, `uri`, `username`, `password`, and may set `cnonce` and `nc`. Answers the Authorization header's value, with `response`, MD5 or SHA-256, `qop=auth` where offered. RFC 2617's own example comes out right.
+pub fn sip_digest(challenge: &str, credentials: serde_json::Value) -> Result<String, String> {
+    let c = params_of_challenge(challenge);
+    let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let need = |k: &str| credentials.get(k).and_then(|v| v.as_str()).ok_or(format!("the credentials need `{}`", k));
+    let (method, uri, user, pass) = (need("method")?, need("uri")?, need("username")?, need("password")?);
+    let (realm, nonce) = (get("realm"), get("nonce"));
+    if nonce.is_empty() {
+        return Err("the challenge has no nonce".into());
+    }
+    let alg = if get("algorithm").is_empty() { "MD5".to_string() } else { get("algorithm").to_uppercase() };
+    if !["MD5", "MD5-SESS", "SHA-256", "SHA-256-SESS"].contains(&alg.as_str()) {
+        return Err(format!("digest algorithm `{}` is not one this answers", alg));
+    }
+    let qops: Vec<String> = get("qop").split(',').map(|x| x.trim().to_lowercase()).collect();
+    let qop = qops.iter().any(|x| x == "auth");
+    if !get("qop").is_empty() && !qop {
+        return Err(format!("the server offers only qop={}", get("qop")));
+    }
+    let cnonce = match credentials.get("cnonce").and_then(|v| v.as_str()) {
+        Some(x) => x.to_string(),
+        None => rand_hex(8)?,
+    };
+    let nc = credentials.get("nc").and_then(|v| v.as_u64()).unwrap_or(1);
+    let nc = format!("{:08x}", nc);
+    let mut ha1 = h(&alg, &format!("{}:{}:{}", user, realm, pass));
+    if alg.ends_with("-SESS") {
+        ha1 = h(&alg, &format!("{}:{}:{}", ha1, nonce, cnonce));
+    }
+    let ha2 = h(&alg, &format!("{}:{}", method, uri));
+    let resp = if qop { h(&alg, &format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2)) } else { h(&alg, &format!("{}:{}:{}", ha1, nonce, ha2)) };
+    let mut out = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm={}", user, realm, nonce, uri, resp, get("algorithm").is_empty().then(|| "MD5".to_string()).unwrap_or(get("algorithm")));
+    if qop {
+        out.push_str(&format!(", qop=auth, nc={}, cnonce=\"{}\"", nc, cnonce));
+    }
+    if !get("opaque").is_empty() {
+        out.push_str(&format!(", opaque=\"{}\"", get("opaque")));
+    }
+    Ok(out)
+}
+
+enum Link {
+    Udp(UdpSocket, SocketAddr),
+    Tcp(TcpStream, Vec<u8>),
+}
+
+fn target_of(t: &str) -> Result<(String, u16, String, bool), String> {
+    // "host", "host:port", or a SIP URI; `;transport=tcp` picks TCP.
+    let (host, port, tcp) = if t.starts_with("sip:") || t.starts_with("sips:") {
+        let u = sip_uri(t)?;
+        let tcp = u["params"]["transport"].as_str().map_or(false, |x| x.eq_ignore_ascii_case("tcp"));
+        (u["host"].as_str().unwrap_or("").to_string(), u["port"].as_u64().unwrap_or(5060) as u16, tcp)
+    } else {
+        match t.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().map_err(|_| format!("`{}` has a bad port", t))?, false),
+            _ => (t.to_string(), 5060, false),
+        }
+    };
+    Ok((host.clone(), port, format!("{}:{}", host, port), tcp))
+}
+
+fn open(target: &str, o: &Value) -> Result<(Link, String), String> {
+    let (host, port, name, tcp_uri) = target_of(target)?;
+    let tcp = match o.get("transport").and_then(|v| v.as_str()) {
+        Some("tcp") | Some("TCP") => true,
+        Some("udp") | Some("UDP") => false,
+        Some(x) => return Err(format!("`{}` is not a transport: udp or tcp", x)),
+        None => tcp_uri,
+    };
+    let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{}: {}", name, e))?.next().ok_or(format!("{}: no address", name))?;
+    let timeout = Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000));
+    if tcp {
+        let s = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("cannot reach {} over TCP: {}", name, e))?;
+        s.set_nodelay(true).ok();
+        let local = s.local_addr().map_err(|e| e.to_string())?.to_string();
+        Ok((Link::Tcp(s, vec![]), local))
+    } else {
+        let s = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        s.connect(addr).map_err(|e| format!("{}: {}", name, e))?;
+        let local = s.local_addr().map_err(|e| e.to_string())?.to_string();
+        Ok((Link::Udp(s, addr), local))
+    }
+}
+
+// One whole message off a TCP stream: head to the blank line, then Content-Length bytes.
+fn tcp_message(s: &mut TcpStream, buf: &mut Vec<u8>, end: Instant) -> Result<Option<String>, String> {
+    let mut t = [0u8; 4096];
+    loop {
+        while buf.starts_with(b"\r\n") {
+            buf.drain(..2);
+        }
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+            let mut len = None;
+            for l in head.lines() {
+                if let Some((k, v)) = l.split_once(':') {
+                    if full_name(k) == "content-length" {
+                        len = v.trim().parse::<usize>().ok();
+                    }
+                }
+            }
+            // Over TCP, Content-Length is mandatory.
+            let n = len.ok_or("a SIP message over TCP without Content-Length")?;
+            if i + 4 + n > MAX_MESSAGE {
+                return Err("a SIP message over 1 MiB".into());
+            }
+            if buf.len() >= i + 4 + n {
+                let m: Vec<u8> = buf.drain(..i + 4 + n).collect();
+                return Ok(Some(String::from_utf8_lossy(&m).to_string()));
+            }
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        match s.read(&mut t) {
+            Ok(0) => return Err("the server closed the connection".into()),
+            Ok(n) => buf.extend(&t[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+// A transaction: sent, retransmitted over UDP (T1, doubling to T2), to a final response.
+fn transact(link: &mut Link, text: &str, branch: &str, o: &Value) -> Result<(Value, u64, u32, Vec<u64>), String> {
+    let t1 = o.get("t1_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+    let total = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000);
+    let start = Instant::now();
+    let end = start + Duration::from_millis(total);
+    let mut interval = Duration::from_millis(t1);
+    let mut sends = 1;
+    let mut provisional = vec![];
+    let ok = |m: &Value| m["via"][0]["branch"].as_str() == Some(branch);
+    match link {
+        Link::Udp(s, _) => {
+            s.send(text.as_bytes()).map_err(|e| format!("cannot send: {}", e))?;
+            let mut next = Instant::now() + interval;
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let now = Instant::now();
+                if now >= end {
+                    return Err(format!("no final answer in {} ms, after {} sends", total, sends));
+                }
+                if now >= next {
+                    s.send(text.as_bytes()).map_err(|e| e.to_string())?;
+                    sends += 1;
+                    interval = (interval * 2).min(Duration::from_millis(4000));
+                    next = now + interval;
+                }
+                s.set_read_timeout(Some(next.min(end).saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).map_err(|e| e.to_string())?;
+                match s.recv(&mut buf) {
+                    Ok(n) => {
+                        let m = parse(&String::from_utf8_lossy(&buf[..n]))?;
+                        if m["kind"] != "response" || !ok(&m) {
+                            continue;
+                        }
+                        let code = m["status"].as_u64().unwrap_or(0);
+                        if code < 200 {
+                            provisional.push(code);
+                            // After a 1xx, retransmit at T2 (RFC 3261 17.1.2.2).
+                            interval = Duration::from_millis(4000);
+                            next = Instant::now() + interval;
+                            continue;
+                        }
+                        return Ok((m, start.elapsed().as_millis() as u64, sends, provisional));
+                    }
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err("connection refused: nothing listens there".into()),
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        Link::Tcp(s, buf) => {
+            s.set_write_timeout(Some(Duration::from_millis(total))).ok();
+            s.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            loop {
+                let t = tcp_message(s, buf, end)?.ok_or(format!("no final answer in {} ms", total))?;
+                let m = parse(&t)?;
+                if m["kind"] != "response" || !ok(&m) {
+                    continue;
+                }
+                let code = m["status"].as_u64().unwrap_or(0);
+                if code < 200 {
+                    provisional.push(code);
+                    continue;
+                }
+                return Ok((m, start.elapsed().as_millis() as u64, sends, provisional));
+            }
+        }
+    }
+}
+
+struct Call {
+    id: String,
+    tag: String,
+    cseq: u64,
+}
+
+fn message(method: &str, uri: &str, from: &str, to: &str, call: &Call, local: &str, tcp: bool, branch: &str, o: &Value, auth: Option<(&str, &str)>) -> Result<String, String> {
+    let body = o.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let mut t = format!("{} {} SIP/2.0\r\n", method, uri);
+    t.push_str(&format!("Via: SIP/2.0/{} {};branch={};rport\r\n", if tcp { "TCP" } else { "UDP" }, local, branch));
+    t.push_str("Max-Forwards: 70\r\n");
+    t.push_str(&format!("From: <{}>;tag={}\r\nTo: <{}>\r\nCall-ID: {}\r\nCSeq: {} {}\r\n", from, call.tag, to, call.id, call.cseq, method));
+    t.push_str(&format!("Contact: <sip:quillo@{}>\r\n", local));
+    t.push_str(&format!("User-Agent: {}\r\n", o.get("user_agent").and_then(|v| v.as_str()).unwrap_or("quillo-sip/1.0")));
+    if method == "REGISTER" {
+        t.push_str(&format!("Expires: {}\r\n", o.get("expires").and_then(|v| v.as_u64()).unwrap_or(3600)));
+    }
+    if method == "OPTIONS" {
+        t.push_str("Accept: application/sdp\r\n");
+    }
+    if let Some((k, v)) = auth {
+        t.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    write_headers(&mut t, o.get("headers"), body)?;
+    Ok(t)
+}
+
+fn summary(m: &Value, rtt: u64, sends: u32, provisional: Vec<u64>) -> Value {
+    let h = &m["headers"];
+    let one = |k: &str| h.get(k).and_then(|v| v.get(0)).cloned().unwrap_or(Value::Null);
+    let mut o = json!({
+        "status": m["status"], "reason": m["reason"], "ok": m["status"].as_u64().map_or(false, |c| (200..300).contains(&c)),
+        "rtt_ms": rtt, "sends": sends, "provisional": provisional,
+        "server": one("server"), "allow": h.get("allow").cloned().unwrap_or(json!([])),
+    });
+    if let Some(s) = m.get("sdp") {
+        o["sdp"] = s.clone();
+    }
+    if !m["body"].as_str().unwrap_or("").is_empty() {
+        o["body"] = m["body"].clone();
+    }
+    if let Some(c) = m.get("contact") {
+        o["contact"] = c.clone();
+    }
+    o
+}
+
+/// Sends a request and waits for its final answer, retransmitting over UDP, answering a 401 or 407 once when `username` and `password` are given. `target` is "host", "host:port" or a SIP URI. Options: `transport` (udp, tcp), `uri`, `from`, `to`, `username`, `password`, `headers`, `body`, `timeout_ms`, `t1_ms`, `user_agent`. Answers `{ status, reason, ok, rtt_ms, sends, provisional, server, allow }`.
+pub fn sip_request(target: &str, method: &str, options: serde_json::Value) -> Result<Value, String> {
+    if method.is_empty() || !method.bytes().all(|c| c.is_ascii_uppercase()) {
+        return Err(format!("`{}` is not a SIP method", method));
+    }
+    let (host, port, name, _) = target_of(target)?;
+    let (mut link, local) = open(target, &options)?;
+    let tcp = matches!(link, Link::Tcp(..));
+    let domain = if port == 5060 { host.clone() } else { name };
+    let uri = options.get("uri").and_then(|v| v.as_str()).map(String::from).unwrap_or(format!("sip:{}{}", domain, if tcp { ";transport=tcp" } else { "" }));
+    sip_uri(&uri)?;
+    let user = options.get("username").and_then(|v| v.as_str());
+    let from = options.get("from").and_then(|v| v.as_str()).map(String::from).unwrap_or(format!("sip:{}@{}", user.unwrap_or("quillo"), domain));
+    let to = options.get("to").and_then(|v| v.as_str()).map(String::from).unwrap_or(if method == "REGISTER" { from.clone() } else { uri.clone() });
+    let mut call = Call { id: format!("{}@{}", rand_hex(10)?, host), tag: rand_hex(5)?, cseq: 1 };
+    let mut branch = format!("z9hG4bK{}", rand_hex(8)?);
+    let text = message(method, &uri, &from, &to, &call, &local, tcp, &branch, &options, None)?;
+    let (m, rtt, sends, prov) = transact(&mut link, &text, &branch, &options)?;
+    let code = m["status"].as_u64().unwrap_or(0);
+    if code == 401 || code == 407 {
+        let (Some(u), Some(p)) = (user, options.get("password").and_then(|v| v.as_str())) else { return Ok(summary(&m, rtt, sends, prov)) };
+        let want = if code == 401 { "www-authenticate" } else { "proxy-authenticate" };
+        let challenge = m["headers"].get(want).and_then(|v| v.get(0)).and_then(|v| v.as_str()).ok_or(format!("a {} without {}", code, want))?;
+        let answer = sip_digest(challenge, json!({ "method": method, "uri": uri, "username": u, "password": p }))?;
+        call.cseq += 1;
+        branch = format!("z9hG4bK{}", rand_hex(8)?);
+        let name = if code == 401 { "Authorization" } else { "Proxy-Authorization" };
+        let text = message(method, &uri, &from, &to, &call, &local, tcp, &branch, &options, Some((name, &answer)))?;
+        let (m2, rtt2, sends2, prov2) = transact(&mut link, &text, &branch, &options)?;
+        let mut s = summary(&m2, rtt2, sends2, prov2);
+        s["authenticated"] = json!(true);
+        return Ok(s);
+    }
+    Ok(summary(&m, rtt, sends, prov))
+}
+
+/// An OPTIONS ping: is this SIP server or phone alive, and what does it support? Any answer means alive, a 404 or a 401 too.
+pub fn sip_options(target: &str, options: serde_json::Value) -> Result<Value, String> {
+    sip_request(target, "OPTIONS", options)
+}
+
+/// Registers an address of record with a registrar: `username` and `password` in `options`, with `expires`. Answers what `sip_request` does, with the bindings in `contact`.
+pub fn sip_register(target: &str, options: serde_json::Value) -> Result<Value, String> {
+    sip_request(target, "REGISTER", options)
+}
+
+/// Reads SDP (RFC 8866): `{ version, origin, name, connection, time, attributes, media: [{ type, port, protocol, formats, codecs, direction, connection, attributes }] }`. Each codec has its payload type, name, clock rate, and fmtp.
+pub fn sip_sdp_parse(text: &str) -> Result<Value, String> {
+    let mut s = json!({ "attributes": {}, "media": [] });
+    let mut media: Vec<Value> = vec![];
+    let mut seen_v = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = line.split_once('=').filter(|x| x.0.len() == 1).ok_or(format!("`{}` is not an SDP line", line))?;
+        match k {
+            "v" => {
+                seen_v = true;
+                s["version"] = json!(v.parse::<u64>().map_err(|_| "bad v= line")?);
+            }
+            "o" => {
+                let p: Vec<&str> = v.split_whitespace().collect();
+                if p.len() != 6 {
+                    return Err(format!("`{}` is not an o= line", line));
+                }
+                s["origin"] = json!({ "username": p[0], "session_id": p[1], "version": p[2], "address": p[5] });
+            }
+            "s" => s["name"] = json!(v),
+            "t" => s["time"] = json!(v.split_whitespace().filter_map(|x| x.parse::<u64>().ok()).collect::<Vec<_>>()),
+            "c" => {
+                let a = v.split_whitespace().nth(2).unwrap_or("").to_string();
+                match media.last_mut() {
+                    Some(m) => m["connection"] = json!(a),
+                    None => s["connection"] = json!(a),
+                }
+            }
+            "m" => {
+                let p: Vec<&str> = v.split_whitespace().collect();
+                if p.len() < 4 {
+                    return Err(format!("`{}` is not an m= line", line));
+                }
+                let (port, count) = p[1].split_once('/').map_or((p[1], None), |(a, b)| (a, b.parse::<u64>().ok()));
+                let formats: Vec<&str> = p[3..].to_vec();
+                let codecs: Vec<Value> = formats.iter().map(|f| {
+                    // RFC 3551's static payload types, for offers with no rtpmap.
+                    let known = match *f {
+                        "0" => Some(("PCMU", 8000)),
+                        "3" => Some(("GSM", 8000)),
+                        "8" => Some(("PCMA", 8000)),
+                        "9" => Some(("G722", 8000)),
+                        "18" => Some(("G729", 8000)),
+                        _ => None,
+                    };
+                    json!({ "payload": f.parse::<u64>().ok(), "name": known.map(|k| k.0), "rate": known.map(|k| k.1) })
+                }).collect();
+                media.push(json!({ "type": p[0], "port": port.parse::<u64>().map_err(|_| format!("`{}` has a bad port", line))?, "ports": count, "protocol": p[2], "formats": formats, "codecs": codecs, "direction": "sendrecv", "attributes": {} }));
+            }
+            "a" => {
+                let (name, val) = v.split_once(':').map_or((v, None), |(a, b)| (a, Some(b)));
+                if let Some(m) = media.last_mut() {
+                    match name {
+                        "sendrecv" | "sendonly" | "recvonly" | "inactive" => m["direction"] = json!(name),
+                        "rtpmap" => {
+                            if let Some((pt, enc)) = val.and_then(|x| x.split_once(' ')) {
+                                let mut e = enc.split('/');
+                                let (n, r, ch) = (e.next(), e.next().and_then(|x| x.parse::<u64>().ok()), e.next().and_then(|x| x.parse::<u64>().ok()));
+                                let pt = pt.parse::<u64>().ok();
+                                if let Some(c) = m["codecs"].as_array_mut().and_then(|l| l.iter_mut().find(|c| c["payload"].as_u64() == pt)) {
+                                    c["name"] = json!(n);
+                                    c["rate"] = json!(r);
+                                    if ch.is_some() {
+                                        c["channels"] = json!(ch);
+                                    }
+                                }
+                            }
+                        }
+                        "fmtp" => {
+                            if let Some((pt, f)) = val.and_then(|x| x.split_once(' ')) {
+                                let pt = pt.parse::<u64>().ok();
+                                if let Some(c) = m["codecs"].as_array_mut().and_then(|l| l.iter_mut().find(|c| c["payload"].as_u64() == pt)) {
+                                    c["fmtp"] = json!(f);
+                                }
+                            }
+                        }
+                        _ => m["attributes"][name] = val.map_or(json!(true), |x| json!(x)),
+                    }
+                } else {
+                    s["attributes"][name] = val.map_or(json!(true), |x| json!(x));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !seen_v {
+        return Err("SDP must start with v=".into());
+    }
+    s["media"] = json!(media);
+    Ok(s)
+}
+
+/// Writes a simple SDP offer: `{ address, session_id, name, media: [{ type, port, codecs: [{ payload, name, rate, fmtp }], direction }] }`.
+pub fn sip_sdp_build(offer: serde_json::Value) -> Result<String, String> {
+    let addr = offer.get("address").and_then(|v| v.as_str()).ok_or("an offer needs `address`")?;
+    let family = if addr.contains(':') { "IP6" } else { "IP4" };
+    let id = offer.get("session_id").and_then(|v| v.as_u64()).unwrap_or(1);
+    let mut t = format!("v=0\r\no=- {} {} IN {} {}\r\ns={}\r\nc=IN {} {}\r\nt=0 0\r\n", id, id, family, addr, offer.get("name").and_then(|v| v.as_str()).unwrap_or("-"), family, addr);
+    for m in offer.get("media").and_then(|v| v.as_array()).ok_or("an offer needs `media`")? {
+        let ty = m.get("type").and_then(|v| v.as_str()).ok_or("media needs `type`")?;
+        let port = m.get("port").and_then(|v| v.as_u64()).ok_or("media needs `port`")?;
+        let codecs = m.get("codecs").and_then(|v| v.as_array()).ok_or("media needs `codecs`")?;
+        let pts: Vec<String> = codecs.iter().map(|c| c["payload"].to_string()).collect();
+        t.push_str(&format!("m={} {} RTP/AVP {}\r\n", ty, port, pts.join(" ")));
+        for c in codecs {
+            if let (Some(n), Some(r)) = (c["name"].as_str(), c["rate"].as_u64()) {
+                t.push_str(&format!("a=rtpmap:{} {}/{}\r\n", c["payload"], n, r));
+            }
+            if let Some(f) = c["fmtp"].as_str() {
+                t.push_str(&format!("a=fmtp:{} {}\r\n", c["payload"], f));
+            }
+        }
+        if let Some(d) = m.get("direction").and_then(|v| v.as_str()) {
+            t.push_str(&format!("a={}\r\n", d));
+        }
+    }
+    Ok(t)
+}

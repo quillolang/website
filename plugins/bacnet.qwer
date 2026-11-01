@@ -1,0 +1,773 @@
+//! BACnet/IP for building automation: Who-Is and I-Am to find devices, ReadProperty, ReadPropertyMultiple and WriteProperty with priorities, values encoded and read by their application tags, arrays walked item by item where a device cannot segment, and Error, Reject and Abort answers turned into errors by name.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+
+const BACNET_PORT: u16 = 47808;
+const CONFIRMED_READ: u8 = 12;
+const CONFIRMED_READ_MULTIPLE: u8 = 14;
+const CONFIRMED_WRITE: u8 = 15;
+
+const OBJECT_TYPES: [(&str, u32); 24] = [
+    ("analog-input", 0), ("analog-output", 1), ("analog-value", 2), ("binary-input", 3), ("binary-output", 4), ("binary-value", 5),
+    ("calendar", 6), ("command", 7), ("device", 8), ("event-enrollment", 9), ("file", 10), ("group", 11), ("loop", 12),
+    ("multi-state-input", 13), ("multi-state-output", 14), ("notification-class", 15), ("program", 16), ("schedule", 17),
+    ("averager", 18), ("multi-state-value", 19), ("trend-log", 20), ("life-safety-point", 21), ("life-safety-zone", 22), ("accumulator", 23),
+];
+
+const PROPERTIES: [(&str, u32); 37] = [
+    ("all", 8), ("application-software-version", 12), ("description", 28), ("device-address-binding", 30), ("event-state", 36),
+    ("firmware-revision", 44), ("high-limit", 45), ("location", 58), ("low-limit", 59), ("max-apdu-length-accepted", 62),
+    ("max-pres-value", 65), ("min-pres-value", 69), ("model-name", 70), ("number-of-apdu-retries", 73), ("number-of-states", 74),
+    ("object-identifier", 75), ("object-list", 76), ("object-name", 77), ("object-type", 79), ("out-of-service", 81), ("polarity", 84),
+    ("present-value", 85), ("priority-array", 87), ("protocol-object-types-supported", 96), ("protocol-services-supported", 97),
+    ("protocol-version", 98), ("reliability", 103), ("relinquish-default", 104), ("resolution", 106), ("segmentation-supported", 107),
+    ("state-text", 110), ("status-flags", 111), ("system-status", 112), ("units", 117), ("vendor-identifier", 120), ("vendor-name", 121),
+    ("protocol-revision", 139),
+];
+
+const ERROR_CLASSES: [&str; 8] = ["device", "object", "property", "resources", "security", "services", "vt", "communication"];
+const REJECTS: [&str; 10] = ["other", "buffer-overflow", "inconsistent-parameters", "invalid-parameter-data-type", "invalid-tag", "missing-required-parameter", "parameter-out-of-range", "too-many-arguments", "undefined-enumeration", "unrecognized-service"];
+const ABORTS: [&str; 5] = ["other", "buffer-overflow", "invalid-apdu-in-this-state", "preempted-by-higher-priority-task", "segmentation-not-supported"];
+const SEGMENTATION: [&str; 4] = ["both", "transmit", "receive", "none"];
+
+fn error_code(c: u64) -> String {
+    match c {
+        0 => "other".into(), 2 => "configuration-in-progress".into(), 3 => "device-busy".into(), 9 => "invalid-data-type".into(),
+        25 => "operational-problem".into(), 27 => "read-access-denied".into(), 31 => "unknown-object".into(), 32 => "unknown-property".into(),
+        37 => "value-out-of-range".into(), 40 => "write-access-denied".into(), 41 => "character-set-not-supported".into(), 42 => "invalid-array-index".into(),
+        n => format!("error {}", n),
+    }
+}
+
+fn units_name(u: u64) -> Option<&'static str> {
+    Some(match u {
+        19 => "kilowatt-hours", 47 => "watts", 48 => "kilowatts", 62 => "degrees-celsius", 63 => "degrees-kelvin", 64 => "degrees-fahrenheit",
+        95 => "no-units", 98 => "percent", _ => return None,
+    })
+}
+
+fn object_of(s: &str) -> Result<(u32, u32), String> {
+    let (t, i) = s.rsplit_once(|c| c == ':' || c == ',').ok_or(format!("`{}` is not an object: write \"analog-input:3\"", s))?;
+    let ty = match OBJECT_TYPES.iter().find(|x| x.0 == t) {
+        Some(x) => x.1,
+        None => t.parse::<u32>().ok().filter(|n| *n < 1024).ok_or(format!("`{}` is not an object type", t))?,
+    };
+    let inst: u32 = i.trim().parse().ok().filter(|n| *n <= 4194303).ok_or(format!("`{}` is not an instance: 0 to 4194303", i))?;
+    Ok((ty, inst))
+}
+
+fn object_name(raw: u32) -> String {
+    let (t, i) = (raw >> 22, raw & 0x3fffff);
+    match OBJECT_TYPES.iter().find(|x| x.1 == t) {
+        Some(x) => format!("{}:{}", x.0, i),
+        None => format!("{}:{}", t, i),
+    }
+}
+
+fn property_of(p: &Value) -> Result<u32, String> {
+    match p {
+        Value::Number(n) => n.as_u64().map(|x| x as u32).ok_or("a property number is not negative".into()),
+        Value::String(s) => PROPERTIES.iter().find(|x| x.0 == s).map(|x| x.1).or(s.parse().ok()).ok_or(format!("`{}` is not a property this knows: give its number", s)),
+        _ => Err("give a property as a name or a number".into()),
+    }
+}
+
+fn property_name(n: u64) -> Value {
+    match PROPERTIES.iter().find(|x| x.1 as u64 == n) {
+        Some(x) => json!(x.0),
+        None => json!(n),
+    }
+}
+
+// Tags.
+
+#[derive(Debug)]
+struct Tag {
+    number: u32,
+    context: bool,
+    open: bool,
+    close: bool,
+    lvt: u32, // the length, or a boolean's value
+}
+
+fn read_tag(b: &[u8], i: &mut usize) -> Result<Tag, String> {
+    let t = *b.get(*i).ok_or("a tag runs past the end")?;
+    *i += 1;
+    let mut number = (t >> 4) as u32;
+    if number == 15 {
+        number = *b.get(*i).ok_or("a tag runs past the end")? as u32;
+        *i += 1;
+    }
+    let context = t & 8 != 0;
+    let l = t & 7;
+    if context && l == 6 {
+        return Ok(Tag { number, context, open: true, close: false, lvt: 0 });
+    }
+    if context && l == 7 {
+        return Ok(Tag { number, context, open: false, close: true, lvt: 0 });
+    }
+    let mut lvt = l as u32;
+    if l == 5 {
+        let x = *b.get(*i).ok_or("a tag's length runs past the end")?;
+        *i += 1;
+        lvt = match x {
+            254 => {
+                let v = b.get(*i..*i + 2).ok_or("a tag's length runs past the end")?;
+                *i += 2;
+                u16::from_be_bytes([v[0], v[1]]) as u32
+            }
+            255 => {
+                let v = b.get(*i..*i + 4).ok_or("a tag's length runs past the end")?;
+                *i += 4;
+                u32::from_be_bytes([v[0], v[1], v[2], v[3]])
+            }
+            n => n as u32,
+        };
+    }
+    Ok(Tag { number, context, open: false, close: false, lvt })
+}
+
+fn put_tag(out: &mut Vec<u8>, number: u8, context: bool, len: usize) {
+    let class = if context { 8 } else { 0 };
+    let head = |l: u8| if number < 15 { vec![number << 4 | class | l] } else { vec![0xf0 | class | l, number] };
+    if len < 5 {
+        out.extend(head(len as u8));
+    } else {
+        out.extend(head(5));
+        if len < 254 {
+            out.push(len as u8);
+        } else if len < 65536 {
+            out.push(254);
+            out.extend((len as u16).to_be_bytes());
+        } else {
+            out.push(255);
+            out.extend((len as u32).to_be_bytes());
+        }
+    }
+}
+
+fn uint_bytes(v: u64) -> Vec<u8> {
+    let b = v.to_be_bytes();
+    let n = b.iter().position(|x| *x != 0).unwrap_or(7);
+    b[n..].to_vec()
+}
+
+fn int_bytes(v: i64) -> Vec<u8> {
+    let b = v.to_be_bytes();
+    let mut n = 0;
+    while n < 7 && ((b[n] == 0 && b[n + 1] & 0x80 == 0) || (b[n] == 0xff && b[n + 1] & 0x80 != 0)) {
+        n += 1;
+    }
+    b[n..].to_vec()
+}
+
+fn context_uint(out: &mut Vec<u8>, number: u8, v: u64) {
+    let b = uint_bytes(v);
+    put_tag(out, number, true, b.len());
+    out.extend(b);
+}
+
+fn context_object(out: &mut Vec<u8>, number: u8, o: (u32, u32)) {
+    put_tag(out, number, true, 4);
+    out.extend((o.0 << 22 | o.1).to_be_bytes());
+}
+
+fn app_value(out: &mut Vec<u8>, ty: &str, v: &Value) -> Result<(), String> {
+    let bad = || format!("{} cannot be written as {}", v, ty);
+    match ty {
+        "null" => out.push(0x00),
+        "boolean" => out.push(0x10 | v.as_bool().ok_or_else(bad)? as u8),
+        "unsigned" => {
+            let b = uint_bytes(v.as_u64().ok_or_else(bad)?);
+            put_tag(out, 2, false, b.len());
+            out.extend(b);
+        }
+        "signed" => {
+            let b = int_bytes(v.as_i64().ok_or_else(bad)?);
+            put_tag(out, 3, false, b.len());
+            out.extend(b);
+        }
+        "real" => {
+            put_tag(out, 4, false, 4);
+            out.extend((v.as_f64().ok_or_else(bad)? as f32).to_be_bytes());
+        }
+        "double" => {
+            put_tag(out, 5, false, 8);
+            out.extend(v.as_f64().ok_or_else(bad)?.to_be_bytes());
+        }
+        "octet-string" => {
+            let b = hex::decode(v.as_str().ok_or_else(bad)?).map_err(|_| bad())?;
+            put_tag(out, 6, false, b.len());
+            out.extend(b);
+        }
+        "character-string" => {
+            let s = v.as_str().ok_or_else(bad)?.as_bytes();
+            put_tag(out, 7, false, s.len() + 1);
+            out.push(0); // UTF-8
+            out.extend(s);
+        }
+        "bit-string" => {
+            let list = v.as_array().ok_or_else(bad)?;
+            let mut bytes = vec![0u8; (list.len() + 7) / 8];
+            for (i, x) in list.iter().enumerate() {
+                if x.as_bool().ok_or_else(bad)? {
+                    bytes[i / 8] |= 0x80 >> (i % 8);
+                }
+            }
+            put_tag(out, 8, false, bytes.len() + 1);
+            out.push(((8 - list.len() % 8) % 8) as u8);
+            out.extend(bytes);
+        }
+        "enumerated" => {
+            let b = uint_bytes(v.as_u64().ok_or_else(bad)?);
+            put_tag(out, 9, false, b.len());
+            out.extend(b);
+        }
+        "date" => {
+            let s = v.as_str().ok_or_else(bad)?;
+            let n: Vec<u32> = s.split('-').filter_map(|x| x.parse().ok()).collect();
+            if n.len() != 3 || !(1900..=2154).contains(&n[0]) {
+                return Err(bad());
+            }
+            let (y, m, d) = (n[0] as i32, n[1] as i32, n[2] as i32);
+            let k = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4][(m - 1).clamp(0, 11) as usize];
+            let yy = if m < 3 { y - 1 } else { y };
+            let w = (yy + yy / 4 - yy / 100 + yy / 400 + k + d).rem_euclid(7);
+            put_tag(out, 10, false, 4);
+            out.extend([(y - 1900) as u8, m as u8, d as u8, if w == 0 { 7 } else { w as u8 }]);
+        }
+        "time" => {
+            let s = v.as_str().ok_or_else(bad)?;
+            let n: Vec<u8> = s.split(|c| c == ':' || c == '.').filter_map(|x| x.parse().ok()).collect();
+            if n.len() < 3 {
+                return Err(bad());
+            }
+            put_tag(out, 11, false, 4);
+            out.extend([n[0], n[1], n[2], *n.get(3).unwrap_or(&0)]);
+        }
+        "object-id" => {
+            let (t, i) = object_of(v.as_str().ok_or_else(bad)?)?;
+            put_tag(out, 12, false, 4);
+            out.extend((t << 22 | i).to_be_bytes());
+        }
+        t => return Err(format!("`{}` is not a BACnet type: null, boolean, unsigned, signed, real, double, octet-string, character-string, bit-string, enumerated, date, time or object-id", t)),
+    }
+    Ok(())
+}
+
+fn guess_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "real",
+        Value::Array(_) => "bit-string",
+        _ => "character-string",
+    }
+}
+
+fn be_uint(b: &[u8]) -> u64 {
+    b.iter().fold(0u64, |a, x| (a << 8) | *x as u64)
+}
+
+fn be_int(b: &[u8]) -> i64 {
+    let v = b.iter().fold(if b.first().map_or(false, |x| x & 0x80 != 0) { -1i64 } else { 0 }, |a, x| (a << 8) | *x as i64);
+    v
+}
+
+fn char_string(d: &[u8]) -> Result<String, String> {
+    let (enc, s) = d.split_first().ok_or("an empty character string")?;
+    Ok(match enc {
+        0 => String::from_utf8_lossy(s).to_string(),
+        4 => {
+            let u: Vec<u16> = s.chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            String::from_utf16_lossy(&u)
+        }
+        5 => s.iter().map(|c| *c as char).collect(),
+        x => return Err(format!("character set {} is not one this reads", x)),
+    })
+}
+
+fn date_text(d: &[u8]) -> String {
+    let p = |x: u8, w: usize, base: u32| if x == 255 { "*".repeat(w) } else { format!("{:0w$}", base + x as u32, w = w) };
+    format!("{}-{}-{}", p(d[0], 4, 1900), p(d[1], 2, 0), p(d[2], 2, 0))
+}
+
+fn time_text(d: &[u8]) -> String {
+    let p = |x: u8| if x == 255 { "**".to_string() } else { format!("{:02}", x) };
+    format!("{}:{}:{}.{}", p(d[0]), p(d[1]), p(d[2]), p(d[3]))
+}
+
+// One application-tagged value: its type's name and value.
+fn app_read(t: &Tag, d: &[u8]) -> Result<(&'static str, Value), String> {
+    let want = |n: usize| -> Result<(), String> {
+        if d.len() != n {
+            Err(format!("a value of {} bytes where {} are expected", d.len(), n))
+        } else {
+            Ok(())
+        }
+    };
+    Ok(match t.number {
+        0 => ("null", Value::Null),
+        2 => ("unsigned", json!(be_uint(d))),
+        3 => ("signed", json!(be_int(d))),
+        4 => {
+            want(4)?;
+            let x = f32::from_be_bytes([d[0], d[1], d[2], d[3]]) as f64;
+            ("real", json!((x * 1e6).round() / 1e6))
+        }
+        5 => {
+            want(8)?;
+            ("double", json!(f64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])))
+        }
+        6 => ("octet-string", json!(hex::encode(d))),
+        7 => ("character-string", json!(char_string(d)?)),
+        8 => {
+            let (unused, bits) = d.split_first().ok_or("an empty bit string")?;
+            let n = bits.len() * 8 - (*unused as usize).min(bits.len() * 8);
+            ("bit-string", json!((0..n).map(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0).collect::<Vec<bool>>()))
+        }
+        9 => ("enumerated", json!(be_uint(d))),
+        10 => {
+            want(4)?;
+            ("date", json!(date_text(d)))
+        }
+        11 => {
+            want(4)?;
+            ("time", json!(time_text(d)))
+        }
+        12 => {
+            want(4)?;
+            ("object-id", json!(object_name(be_uint(d) as u32)))
+        }
+        n => return Err(format!("application tag {} is reserved", n)),
+    })
+}
+
+// Values up to a closing tag of this number (or the end): each `{ type, value }`.
+fn read_values(b: &[u8], i: &mut usize, closing: Option<u32>) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    while *i < b.len() {
+        let at = *i;
+        let t = read_tag(b, i)?;
+        if t.close {
+            if Some(t.number) == closing {
+                return Ok(out);
+            }
+            return Err(format!("closing tag {} out of place at byte {}", t.number, at));
+        }
+        if t.open {
+            let inner = read_values(b, i, Some(t.number))?;
+            out.push(json!({ "type": "constructed", "tag": t.number, "value": inner }));
+            continue;
+        }
+        if !t.context && t.number == 1 {
+            out.push(json!({ "type": "boolean", "value": t.lvt != 0 }));
+            continue;
+        }
+        let d = b.get(*i..*i + t.lvt as usize).ok_or(format!("the value at byte {} runs past the end", at))?;
+        *i += t.lvt as usize;
+        if t.context {
+            out.push(json!({ "type": "context", "tag": t.number, "value": hex::encode(d) }));
+        } else {
+            let (ty, v) = app_read(&t, d)?;
+            out.push(json!({ "type": ty, "value": v }));
+        }
+    }
+    match closing {
+        Some(n) => Err(format!("no closing tag {}", n)),
+        None => Ok(out),
+    }
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.replace(' ', "")).map_err(|_| "not hex".to_string()),
+        _ => Err("give bytes as hex or a list of numbers".into()),
+    }
+}
+
+/// Encodes one value with its application tag, as hex: `bacnet_encode("real", 21.5)` is "4441ac0000". Types: null, boolean, unsigned, signed, real, double, octet-string, character-string, bit-string, enumerated, date, time, object-id.
+pub fn bacnet_encode(kind: &str, value: serde_json::Value) -> Result<String, String> {
+    let mut out = vec![];
+    app_value(&mut out, kind, &value)?;
+    Ok(hex::encode(out))
+}
+
+/// Reads application-tagged values (hex or bytes) into a list of `{ type, value }`.
+pub fn bacnet_decode(data: serde_json::Value) -> Result<Vec<Value>, String> {
+    let b = bytes_of(&data)?;
+    let mut i = 0;
+    read_values(&b, &mut i, None)
+}
+
+// BVLC, NPDU.
+
+fn bvlc(function: u8, npdu: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x81, function];
+    p.extend(((npdu.len() + 4) as u16).to_be_bytes());
+    p.extend(npdu);
+    p
+}
+
+// The APDU in a packet, and the routed source if any.
+fn apdu_of(p: &[u8]) -> Result<(&[u8], Option<Value>), String> {
+    if p.len() < 6 || p[0] != 0x81 {
+        return Err("not BACnet/IP".into());
+    }
+    let total = (p[2] as usize) << 8 | p[3] as usize;
+    if total != p.len() {
+        return Err(format!("the BVLC says {} bytes, the packet has {}", total, p.len()));
+    }
+    let n = match p[1] {
+        0x0a | 0x0b => 4,
+        0x04 => 10, // forwarded: the origin's address comes first
+        f => return Err(format!("BVLC function 0x{:02x} carries no message", f)),
+    };
+    let np = p.get(n..).ok_or("a BVLC cut off")?;
+    if np.len() < 2 || np[0] != 1 {
+        return Err("NPDU version is not 1".into());
+    }
+    let ctl = np[1];
+    if ctl & 0x80 != 0 {
+        return Err("a network layer message".into());
+    }
+    let mut i = 2;
+    if ctl & 0x20 != 0 {
+        let l = *np.get(i + 2).ok_or("an NPDU cut off")? as usize;
+        i += 3 + l;
+    }
+    let mut source = None;
+    if ctl & 0x08 != 0 {
+        let net = ((*np.get(i).ok_or("an NPDU cut off")? as u16) << 8) | *np.get(i + 1).ok_or("an NPDU cut off")? as u16;
+        let l = *np.get(i + 2).ok_or("an NPDU cut off")? as usize;
+        let a = np.get(i + 3..i + 3 + l).ok_or("an NPDU cut off")?;
+        source = Some(json!({ "network": net, "address": hex::encode(a) }));
+        i += 3 + l;
+    }
+    if ctl & 0x20 != 0 {
+        i += 1; // hop count
+    }
+    Ok((np.get(i..).ok_or("an NPDU cut off")?, source))
+}
+
+fn iam(a: &[u8]) -> Result<Value, String> {
+    let list = {
+        let mut i = 2;
+        read_values(a, &mut i, None)?
+    };
+    if list.len() < 4 {
+        return Err("an I-Am is cut off".into());
+    }
+    let device = list[0]["value"].as_str().unwrap_or("").to_string();
+    Ok(json!({
+        "device": device.rsplit(':').next().and_then(|x| x.parse::<u64>().ok()),
+        "object": device,
+        "max_apdu": list[1]["value"],
+        "segmentation": SEGMENTATION.get(list[2]["value"].as_u64().unwrap_or(9) as usize).cloned().unwrap_or("unknown"),
+        "vendor": list[3]["value"],
+    }))
+}
+
+fn target_of(t: &str) -> Result<SocketAddr, String> {
+    let s = if t.contains(':') { t.to_string() } else { format!("{}:{}", t, BACNET_PORT) };
+    s.to_socket_addrs().map_err(|e| format!("{}: {}", s, e))?.find(|a| a.is_ipv4()).ok_or(format!("{}: no IPv4 address", s))
+}
+
+fn socket(o: &Value) -> Result<UdpSocket, String> {
+    let port = o.get("local_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let s = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| format!("cannot bind UDP port {}: {}", port, e))?;
+    s.set_broadcast(true).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+/// Finds devices: sends Who-Is (to `options.to`, the broadcast address 255.255.255.255:47808 unless given) and gathers I-Am answers for `wait_ms` (2000). `low` and `high` narrow it to a range of device instances. Answers `{ device, address, max_apdu, segmentation, vendor }`, with `routed` for a device behind a router.
+pub fn bacnet_who_is(options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let to = options.get("to").and_then(|v| v.as_str()).unwrap_or("255.255.255.255");
+    let addr = target_of(to)?;
+    let sock = socket(&options)?;
+    let mut apdu = vec![0x10, 0x08];
+    if let (Some(l), Some(h)) = (options.get("low").and_then(|v| v.as_u64()), options.get("high").and_then(|v| v.as_u64())) {
+        context_uint(&mut apdu, 0, l);
+        context_uint(&mut apdu, 1, h);
+    }
+    // Global broadcast: DNET 0xFFFF, no DADR, hop count 255.
+    let mut npdu = vec![1, 0x20, 0xff, 0xff, 0, 0xff];
+    npdu.extend(apdu);
+    sock.send_to(&bvlc(0x0b, &npdu), addr).map_err(|e| format!("cannot send to {}: {}", addr, e))?;
+    let end = Instant::now() + Duration::from_millis(options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(2000));
+    let mut out: Vec<Value> = vec![];
+    let mut buf = [0u8; 1500];
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(out);
+        }
+        sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(out),
+            Err(e) => return Err(e.to_string()),
+        };
+        if let Ok((a, source)) = apdu_of(&buf[..n]) {
+            if a.len() > 2 && a[0] == 0x10 && a[1] == 0 {
+                let mut m = iam(a)?;
+                m["address"] = json!(from.to_string());
+                if let Some(s) = source {
+                    m["routed"] = s;
+                }
+                if !out.iter().any(|x| x["device"] == m["device"]) {
+                    out.push(m);
+                }
+            }
+        }
+    }
+}
+
+static INVOKE: AtomicU8 = AtomicU8::new(1);
+
+// A confirmed service: repeated on silence, answered by a Simple or Complex ACK.
+fn confirmed(target: &str, service: u8, body: &[u8], o: &Value) -> Result<Vec<u8>, String> {
+    let addr = target_of(target)?;
+    let sock = socket(o)?;
+    let id = INVOKE.fetch_add(1, Ordering::Relaxed);
+    // PDU type 0, no segmentation, a response up to 1476 bytes in one piece.
+    let mut apdu = vec![0x00, 0x05, id, service];
+    apdu.extend(body);
+    let mut npdu = vec![1, 0x04];
+    npdu.extend(apdu);
+    let p = bvlc(0x0a, &npdu);
+    let timeout = Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000));
+    let retries = o.get("retries").and_then(|v| v.as_u64()).unwrap_or(2);
+    let mut buf = [0u8; 1500];
+    for _ in 0..=retries {
+        sock.send_to(&p, addr).map_err(|e| format!("cannot send to {}: {}", addr, e))?;
+        let end = Instant::now() + timeout;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            let n = match sock.recv_from(&mut buf) {
+                Ok((n, _)) => n,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+                Err(e) => return Err(e.to_string()),
+            };
+            let Ok((a, _)) = apdu_of(&buf[..n]) else { continue };
+            if a.len() < 3 || a[0] >> 4 == 1 {
+                continue;
+            }
+            if a[1] != id {
+                continue;
+            }
+            return match a[0] >> 4 {
+                2 => Ok(vec![]),
+                3 => {
+                    if a[0] & 8 != 0 {
+                        return Err("the device sent a segmented answer: read array items one at a time with bacnet_read_list".into());
+                    }
+                    Ok(a[3..].to_vec())
+                }
+                5 => {
+                    let mut i = 3;
+                    let v = read_values(a, &mut i, None)?;
+                    // Some services wrap the pair in an opening tag.
+                    let flat: Vec<&Value> = v.iter().flat_map(|x| x["value"].as_array().map(|l| l.iter().collect()).unwrap_or(vec![x])).collect();
+                    let class = flat.first().and_then(|x| x["value"].as_u64()).unwrap_or(0);
+                    let code = flat.get(1).and_then(|x| x["value"].as_u64()).unwrap_or(0);
+                    Err(format!("BACnet error: {}: {}", ERROR_CLASSES.get(class as usize).cloned().unwrap_or("unknown class"), error_code(code)))
+                }
+                6 => Err(format!("BACnet reject: {}", REJECTS.get(a[2] as usize).cloned().unwrap_or("unknown"))),
+                7 => Err(format!("BACnet abort: {}", ABORTS.get(a[2] as usize).cloned().unwrap_or("unknown"))),
+                t => Err(format!("an unexpected PDU type {}", t)),
+            };
+        }
+    }
+    Err(format!("no answer from {} after {} tries", addr, retries + 1))
+}
+
+fn present(values: Vec<Value>, property: u64) -> Value {
+    let mut m = json!({});
+    if property == 117 {
+        if let Some(n) = values.first().and_then(|v| v["value"].as_u64()).and_then(units_name) {
+            m["name"] = json!(n);
+        }
+    }
+    if values.len() == 1 {
+        m["value"] = values[0]["value"].clone();
+        m["type"] = values[0]["type"].clone();
+    } else {
+        m["value"] = json!(values.iter().map(|v| v["value"].clone()).collect::<Vec<_>>());
+        m["types"] = json!(values.iter().map(|v| v["type"].clone()).collect::<Vec<_>>());
+    }
+    m
+}
+
+fn read_ack(a: &[u8]) -> Result<Vec<Value>, String> {
+    let mut i = 0;
+    loop {
+        let t = read_tag(a, &mut i)?;
+        if t.open && t.number == 3 {
+            return read_values(a, &mut i, Some(3));
+        }
+        if t.open || t.close {
+            return Err("a ReadProperty answer without its value".into());
+        }
+        i += t.lvt as usize;
+    }
+}
+
+/// Reads a property with ReadProperty: `bacnet_read("192.168.1.20", "analog-input:1", "present-value", {})`. Answers `{ value, type }`, a list for a list. Options: `array_index`, `timeout_ms`, `retries`.
+pub fn bacnet_read(target: &str, object: &str, property: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let o = object_of(object)?;
+    let p = property_of(&property)?;
+    let mut b = vec![];
+    context_object(&mut b, 0, o);
+    context_uint(&mut b, 1, p as u64);
+    if let Some(i) = options.get("array_index").and_then(|v| v.as_u64()) {
+        context_uint(&mut b, 2, i);
+    }
+    let a = confirmed(target, CONFIRMED_READ, &b, &options)?;
+    Ok(present(read_ack(&a)?, p as u64))
+}
+
+/// Reads a whole array whatever its size: all at once, or, where the device aborts because the answer would need segmenting, index 0 for the length and then each item. Answers the items.
+pub fn bacnet_read_list(target: &str, object: &str, property: serde_json::Value, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let at = |i: u64| -> Result<Value, String> {
+        let mut o = if options.is_object() { options.clone() } else { json!({}) };
+        o["array_index"] = json!(i);
+        Ok(bacnet_read(target, object, property.clone(), o)?["value"].clone())
+    };
+    match bacnet_read(target, object, property.clone(), options.clone()) {
+        Ok(v) => Ok(match &v["value"] {
+            Value::Array(a) if v.get("types").is_some() => a.clone(),
+            x => vec![x.clone()],
+        }),
+        Err(e) if e.contains("segment") || e.contains("buffer-overflow") => {
+            let n = at(0)?.as_u64().ok_or("the array's length at index 0 is not a number")?;
+            (1..=n).map(at).collect()
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads several properties of several objects at once (ReadPropertyMultiple): `requests` is `[{ object: "analog-input:1", properties: ["present-value", "units"] }]`. Answers one map per object; a property the device refuses holds `{ error }` instead of its value.
+pub fn bacnet_read_multiple(target: &str, requests: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let mut b = vec![];
+    for r in &requests {
+        context_object(&mut b, 0, object_of(r.get("object").and_then(|v| v.as_str()).ok_or("a request needs `object`")?)?);
+        b.push(0x1e);
+        for p in r.get("properties").and_then(|v| v.as_array()).ok_or("a request needs `properties`")? {
+            context_uint(&mut b, 0, property_of(p)? as u64);
+        }
+        b.push(0x1f);
+    }
+    let a = confirmed(target, CONFIRMED_READ_MULTIPLE, &b, &options)?;
+    let mut out = vec![];
+    let mut i = 0;
+    while i < a.len() {
+        let t = read_tag(&a, &mut i)?;
+        if t.number != 0 || t.lvt != 4 {
+            return Err("a ReadPropertyMultiple answer without an object".into());
+        }
+        let name = object_name(be_uint(&a[i..i + 4]) as u32);
+        i += 4;
+        let open = read_tag(&a, &mut i)?;
+        if !open.open {
+            return Err("a ReadPropertyMultiple answer without its results".into());
+        }
+        let mut m = json!({ "object": name });
+        let mut prop = Value::Null;
+        let mut raw = 0;
+        loop {
+            let t = read_tag(&a, &mut i)?;
+            if t.close && t.number == 1 {
+                break;
+            }
+            if t.context && !t.open && t.number == 2 {
+                raw = be_uint(a.get(i..i + t.lvt as usize).ok_or("cut off")?);
+                prop = property_name(raw);
+                i += t.lvt as usize;
+            } else if t.context && !t.open && t.number == 3 {
+                i += t.lvt as usize; // the array index
+            } else if t.open && t.number == 4 {
+                let v = read_values(&a, &mut i, Some(4))?;
+                m[prop.as_str().map(String::from).unwrap_or(raw.to_string())] = present(v, raw)["value"].clone();
+            } else if t.open && t.number == 5 {
+                let v = read_values(&a, &mut i, Some(5))?;
+                let class = v.first().and_then(|x| x["value"].as_u64()).unwrap_or(0);
+                let code = v.get(1).and_then(|x| x["value"].as_u64()).unwrap_or(0);
+                m[prop.as_str().map(String::from).unwrap_or(raw.to_string())] = json!({ "error": format!("{}: {}", ERROR_CLASSES.get(class as usize).cloned().unwrap_or("unknown"), error_code(code)) });
+            } else {
+                return Err("a ReadPropertyMultiple answer out of order".into());
+            }
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// Writes a property with WriteProperty. `options`: `type` (real for a number unless given: a binary output wants `enumerated`, a counter `unsigned`), `priority` (1 to 16; give `null` as the value at a priority to let go of it), `array_index`, `timeout_ms`.
+pub fn bacnet_write(target: &str, object: &str, property: serde_json::Value, value: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    let o = object_of(object)?;
+    let p = property_of(&property)?;
+    let mut b = vec![];
+    context_object(&mut b, 0, o);
+    context_uint(&mut b, 1, p as u64);
+    if let Some(i) = options.get("array_index").and_then(|v| v.as_u64()) {
+        context_uint(&mut b, 2, i);
+    }
+    b.push(0x3e);
+    let ty = options.get("type").and_then(|v| v.as_str()).unwrap_or(guess_type(&value));
+    app_value(&mut b, ty, &value)?;
+    b.push(0x3f);
+    if let Some(pr) = options.get("priority").and_then(|v| v.as_u64()) {
+        if !(1..=16).contains(&pr) {
+            return Err("a priority is 1 to 16".into());
+        }
+        context_uint(&mut b, 4, pr);
+    }
+    confirmed(target, CONFIRMED_WRITE, &b, &options)?;
+    Ok(true)
+}
+
+/// Reads a whole BACnet/IP packet (hex or `p.bytes`): what kind of message it is, its invoke id and service, and an I-Am's fields. For a device of your own on `udp.listen`.
+pub fn bacnet_parse(packet: serde_json::Value) -> Result<Value, String> {
+    let p = bytes_of(&packet)?;
+    let (a, source) = apdu_of(&p)?;
+    let first = *a.first().ok_or("no APDU")?;
+    let mut m = match first >> 4 {
+        0 => json!({ "kind": "confirmed-request", "invoke": a.get(2), "service": a.get(3) }),
+        1 => {
+            let svc = *a.get(1).ok_or("cut off")?;
+            let name = match svc { 0 => "i-am", 1 => "i-have", 8 => "who-is", 7 => "who-has", 2 => "unconfirmed-cov", 6 => "time-sync", n => return Ok(json!({ "kind": "unconfirmed-request", "service": n })) };
+            let mut m = json!({ "kind": "unconfirmed-request", "service": name });
+            if svc == 0 {
+                m = iam(a)?;
+                m["kind"] = json!("unconfirmed-request");
+                m["service"] = json!("i-am");
+            }
+            m
+        }
+        2 => json!({ "kind": "simple-ack", "invoke": a.get(1), "service": a.get(2) }),
+        3 => json!({ "kind": "complex-ack", "invoke": a.get(1), "service": a.get(2), "segmented": first & 8 != 0 }),
+        5 => json!({ "kind": "error", "invoke": a.get(1), "service": a.get(2) }),
+        6 => json!({ "kind": "reject", "invoke": a.get(1), "reason": REJECTS.get(*a.get(2).unwrap_or(&0) as usize) }),
+        7 => json!({ "kind": "abort", "invoke": a.get(1), "reason": ABORTS.get(*a.get(2).unwrap_or(&0) as usize) }),
+        t => json!({ "kind": format!("pdu {}", t) }),
+    };
+    if let Some(s) = source {
+        m["routed"] = s;
+    }
+    Ok(m)
+}

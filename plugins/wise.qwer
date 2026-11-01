@@ -1,0 +1,247 @@
+//! Wise's Platform API without an SDK: profiles, quotes with their payment options, recipients, transfers made safe to retry with a UUID of your own, funding from a balance, and the one-time token Wise answers with on a protected call, signed by your private key and the call sent again.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// WISE_API_TOKEN is the token; WISE_API_URL the API (https://api.wise.com when not set;
+// https://api.sandbox.transferwise.tech for the sandbox). WISE_PRIVATE_KEY holds the RSA private key
+// in PEM, or WISE_PRIVATE_KEY_FILE its file: its public half is uploaded to Wise, and only calls
+// under strong customer authentication need it.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("WISE_API_URL").unwrap_or_else(|| "https://api.wise.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn private_key() -> Result<String, String> {
+    match (setting("WISE_PRIVATE_KEY"), setting("WISE_PRIVATE_KEY_FILE")) {
+        (Some(k), _) => Ok(k),
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e)),
+        _ => Err("Wise wants this call signed: set WISE_PRIVATE_KEY or WISE_PRIVATE_KEY_FILE to the key whose public half you uploaded".into()),
+    }
+}
+
+/// Signs a one-time token as Wise wants: SHA-256 with RSA by your private key, in base64. The calls here do it themselves; this is for a call of your own.
+pub fn wise_sign(one_time_token: &str) -> Result<String, String> {
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key()?.as_bytes()).map_err(|e| format!("the private key: {}", e))?;
+    let sig = jsonwebtoken::crypto::sign(one_time_token.as_bytes(), &key, jsonwebtoken::Algorithm::RS256).map_err(|e| e.to_string())?;
+    let raw = URL_SAFE_NO_PAD.decode(sig).map_err(|e| e.to_string())?;
+    Ok(STANDARD.encode(raw))
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if let Some(list) = v["errors"].as_array().filter(|l| !l.is_empty()) {
+        let parts: Vec<String> = list
+            .iter()
+            .map(|e| {
+                let mut t = format!("{}: {}", e["code"].as_str().unwrap_or("error"), e["message"].as_str().unwrap_or(""));
+                if let Some(p) = e["path"].as_str() {
+                    t.push_str(&format!(" (at {})", p));
+                }
+                t
+            })
+            .collect();
+        return format!("Wise {}: {}", status, parts.join("; "));
+    }
+    let what = v["error_description"].as_str().or(v["message"].as_str()).or(v["error"].as_str()).map(str::to_string).unwrap_or_else(|| text.trim().chars().take(300).collect());
+    format!("Wise {}: {}", status, what)
+}
+
+fn fetch(method: &str, path: &str, body: Option<&Value>, content_type: &str) -> Result<Value, String> {
+    let token = setting("WISE_API_TOKEN").ok_or("WISE_API_TOKEN is not set")?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut ott: Option<(String, String)> = None;
+    let mut limited = 0u32;
+    loop {
+        let mut req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        if let Some((t, s)) = &ott {
+            req = req.set("X-2FA-Approval", t).set("X-Signature", s);
+        }
+        let res = match body {
+            Some(b) => req.set("Content-Type", content_type).send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Wise's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            // Strong customer authentication: a 403 with a token to sign, and the same call again.
+            Err(ureq::Error::Status(403, r)) if r.header("x-2fa-approval-result").map_or(false, |h| h.eq_ignore_ascii_case("REJECTED")) && r.header("x-2fa-approval").is_some() => {
+                if ott.is_some() {
+                    return Err("Wise refused the signature on this call: is the public key of WISE_PRIVATE_KEY uploaded to this profile?".into());
+                }
+                let t = r.header("x-2fa-approval").unwrap_or("").to_string();
+                let s = wise_sign(&t)?;
+                ott = Some((t, s));
+            }
+            Err(ureq::Error::Status(429 | 502 | 503 | 504, r)) if method == "GET" && limited < 3 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(400u64 << limited, |s| s * 1000);
+                limited += 1;
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Wise at {}: {}", api(), e)),
+        }
+    }
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    fetch(method, path, body, "application/json")
+}
+
+/// Any other call: `method`, `path` like "/v4/profiles/1/balances?types=STANDARD", `body` or null. A signature is added when Wise asks for one.
+pub fn wise_call(method: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) })
+}
+
+/// The profiles this token can act for: each with `id` and `type`.
+pub fn wise_profiles() -> Result<serde_json::Value, String> {
+    call("GET", "/v2/profiles", None)
+}
+
+/// The id of the "personal" or "business" profile. Every other call needs one.
+pub fn wise_profile_id(kind: &str) -> Result<i64, String> {
+    let all = wise_profiles()?;
+    let found = all.as_array().into_iter().flatten().find(|p| p["type"].as_str().map_or(false, |t| t.eq_ignore_ascii_case(kind)));
+    found.and_then(|p| p["id"].as_i64()).ok_or(format!("this token has no {} profile", kind))
+}
+
+/// A quote: `side` says what `amount` is, "source" (what leaves) or "target" (what arrives); `params` adds `targetAccount`, `payOut`, `preferredPayIn`. Gives Wise's quote with `best`, its first usable option (`payIn`, `fee`, `sourceAmount`, `targetAmount`).
+pub fn wise_quote(profile_id: i64, source: &str, target: &str, amount: f64, side: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if amount <= 0.0 {
+        return Err("a quote's amount must be more than 0".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["sourceCurrency"] = json!(source.to_uppercase());
+    b["targetCurrency"] = json!(target.to_uppercase());
+    match side {
+        "source" => b["sourceAmount"] = json!(amount),
+        "target" => b["targetAmount"] = json!(amount),
+        o => return Err(format!("`{}` is not a side: \"source\" or \"target\"", o)),
+    }
+    let mut q = call("POST", &format!("/v3/profiles/{}/quotes", profile_id), Some(&b))?;
+    let best = q["paymentOptions"].as_array().and_then(|l| l.iter().find(|o| o["disabled"] != json!(true)).cloned()).unwrap_or(Value::Null);
+    q["best"] = best;
+    Ok(q)
+}
+
+/// Ties a quote to a recipient, which can change its price: do this before making the transfer.
+pub fn wise_quote_for_recipient(profile_id: i64, quote_id: &str, recipient_id: i64) -> Result<serde_json::Value, String> {
+    fetch("PATCH", &format!("/v3/profiles/{}/quotes/{}", profile_id, enc(quote_id)), Some(&json!({ "targetAccount": recipient_id })), "application/merge-patch+json")
+}
+
+/// Makes a recipient: `kind` is Wise's account type ("iban", "sort_code", "aba"...), `details` the fields it needs. A wrong field is an error naming its path.
+pub fn wise_recipient_create(profile_id: i64, currency: &str, kind: &str, holder: &str, details: serde_json::Value) -> Result<serde_json::Value, String> {
+    if holder.trim().split_whitespace().count() < 2 {
+        return Err("Wise wants the account holder's full name".into());
+    }
+    call("POST", "/v1/accounts", Some(&json!({ "profile": profile_id, "currency": currency.to_uppercase(), "type": kind, "accountHolderName": holder, "details": details })))
+}
+
+/// The profile's recipients in a currency ("" for all).
+pub fn wise_recipients(profile_id: i64, currency: &str) -> Result<serde_json::Value, String> {
+    let mut p = format!("/v1/accounts?profile={}", profile_id);
+    if !currency.is_empty() {
+        p.push_str(&format!("&currency={}", enc(&currency.to_uppercase())));
+    }
+    call("GET", &p, None)
+}
+
+/// Deletes a recipient.
+pub fn wise_recipient_delete(id: i64) -> Result<bool, String> {
+    call("DELETE", &format!("/v1/accounts/{}", id), None)?;
+    Ok(true)
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A new UUID for a transfer's `customer_transaction_id`. Keep it with your payout: sent again, it finds the first transfer instead of making another.
+pub fn wise_new_transaction_id() -> String {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let d = Sha256::digest(format!("{}:{}:{}:{:?}", t, n, std::process::id(), std::collections::hash_map::RandomState::new()));
+    let mut b: Vec<u8> = d[..16].to_vec();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+/// Makes a transfer from a quote, unfunded: `customer_transaction_id` is a UUID of yours (wise_new_transaction_id), `details` Wise's map (`reference`, `transferPurpose`, `sourceOfFunds`). Gives the transfer, `incoming_payment_waiting` until wise_fund.
+pub fn wise_transfer(recipient_id: i64, quote_id: &str, customer_transaction_id: &str, details: serde_json::Value) -> Result<serde_json::Value, String> {
+    let u = customer_transaction_id.as_bytes();
+    let shape = u.len() == 36 && [8, 13, 18, 23].iter().all(|i| u[*i] == b'-') && u.iter().enumerate().all(|(i, c)| [8, 13, 18, 23].contains(&i) || c.is_ascii_hexdigit());
+    if !shape {
+        return Err(format!("`{}` is not a UUID: see wise_new_transaction_id", customer_transaction_id));
+    }
+    call("POST", "/v1/transfers", Some(&json!({ "targetAccount": recipient_id, "quoteUuid": quote_id, "customerTransactionId": customer_transaction_id, "details": if details.is_object() { details } else { json!({}) } })))
+}
+
+/// One transfer by id.
+pub fn wise_transfer_get(id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/v1/transfers/{}", id), None)
+}
+
+/// Pays for a transfer from the profile's balance, signing when Wise asks. Gives { type, status }; a `REJECTED` funding is an error naming Wise's code.
+pub fn wise_fund(profile_id: i64, transfer_id: i64) -> Result<serde_json::Value, String> {
+    let r = call("POST", &format!("/v3/profiles/{}/transfers/{}/payments", profile_id, transfer_id), Some(&json!({ "type": "BALANCE" })))?;
+    if r["status"] == "REJECTED" {
+        return Err(format!("Wise did not fund transfer {}: {}", transfer_id, r["errorCode"].as_str().unwrap_or("no reason given")));
+    }
+    Ok(r)
+}
+
+/// Cancels a transfer not yet sent.
+pub fn wise_transfer_cancel(id: i64) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/v1/transfers/{}/cancel", id), None)
+}
+
+/// The profile's transfers through every page: `filter` adds `status`, `createdDateStart`, `createdDateEnd`, `sourceCurrency`, `targetCurrency`; `max_items` caps them (0: all).
+pub fn wise_transfers(profile_id: i64, filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let mut q = format!("profile={}", profile_id);
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            q.push_str(&format!("&{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+        }
+    }
+    let mut out: Vec<Value> = vec![];
+    loop {
+        let page = call("GET", &format!("/v1/transfers?{}&limit=100&offset={}", q, out.len()), None)?;
+        let items = page.as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < 100 {
+            return Ok(out);
+        }
+    }
+}
+
+/// The profile's balances.
+pub fn wise_balances(profile_id: i64) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/v4/profiles/{}/balances?types=STANDARD", profile_id), None)
+}

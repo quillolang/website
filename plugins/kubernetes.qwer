@@ -1,0 +1,452 @@
+//! The Kubernetes API from a kubeconfig (a token, a client certificate, its own CA) or a pod's in-cluster token: pods and deployments read with their readiness worked out, every page of a list followed by continue tokens, label selectors written as maps, scaling, rollout restarts, logs, deletes, and Status errors turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_yaml = "0.9"
+//! rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+//! rustls-pemfile = "2"
+//! webpki-roots = "0.26"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// KUBECONFIG names the kubeconfig (its first file, if it lists several), and KUBERNETES_CONTEXT the
+// context, else its current-context. In a pod, with no KUBECONFIG, the service account's token and
+// CA are read from KUBERNETES_SA_DIR (/var/run/secrets/kubernetes.io/serviceaccount), and the
+// address from KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT. Failing those, ~/.kube/config.
+// A kubeconfig user that signs in by running a program (`exec`) cannot be used: a plugin runs none.
+
+struct Cluster {
+    server: String,
+    context: String,
+    namespace: String,
+    auth: &'static str,
+    token: Option<String>,
+    token_file: Option<String>,
+    agent: ureq::Agent,
+}
+
+static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
+static CURRENT: Mutex<Option<(String, Arc<Cluster>)>> = Mutex::new(None);
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn b64(s: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD.decode(s.trim()).map_err(|e| format!("kubeconfig base64: {}", e))
+}
+
+fn pem_or_file(data: Option<&str>, file: Option<&str>, what: &str, dir: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+    if let Some(d) = data {
+        return b64(d).map(Some);
+    }
+    if let Some(f) = file {
+        let p = if std::path::Path::new(f).is_absolute() { std::path::PathBuf::from(f) } else { dir.join(f) };
+        return std::fs::read(&p).map(Some).map_err(|e| format!("the {} at {}: {}", what, p.display(), e));
+    }
+    Ok(None)
+}
+
+fn make_agent(ca: Option<&[u8]>, client: Option<(&[u8], &[u8])>) -> Result<ureq::Agent, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca {
+        Some(pem) => {
+            for c in rustls_pemfile::certs(&mut &*pem) {
+                roots.add(c.map_err(|e| format!("the cluster's CA: {}", e))?).map_err(|e| format!("the cluster's CA: {}", e))?;
+            }
+            if roots.is_empty() {
+                return Err("the cluster's CA holds no certificate".into());
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().map_err(|e| e.to_string())?.with_root_certificates(roots);
+    let config = match client {
+        Some((cert, key)) => {
+            let chain = rustls_pemfile::certs(&mut &*cert).collect::<Result<Vec<_>, _>>().map_err(|e| format!("the client certificate: {}", e))?;
+            let key = rustls_pemfile::private_key(&mut &*key).map_err(|e| format!("the client key: {}", e))?.ok_or("the client key holds no key")?;
+            builder.with_client_auth_cert(chain, key).map_err(|e| format!("the client certificate: {}", e))?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    Ok(ureq::AgentBuilder::new().tls_config(Arc::new(config)).timeout(Duration::from_secs(60)).build())
+}
+
+fn in_cluster(name: &str) -> Result<Cluster, String> {
+    let dir = env("KUBERNETES_SA_DIR").unwrap_or_else(|| "/var/run/secrets/kubernetes.io/serviceaccount".into());
+    let host = env("KUBERNETES_SERVICE_HOST").ok_or("KUBERNETES_SERVICE_HOST is not set: this is not a pod")?;
+    let port = env("KUBERNETES_SERVICE_PORT").unwrap_or_else(|| "443".into());
+    let ca = std::fs::read(format!("{}/ca.crt", dir)).map_err(|e| format!("{}/ca.crt: {}", dir, e))?;
+    let namespace = std::fs::read_to_string(format!("{}/namespace", dir)).map_or("default".to_string(), |n| n.trim().to_string());
+    let shown = if host.contains(':') { format!("[{}]", host) } else { host };
+    Ok(Cluster { server: format!("https://{}:{}", shown, port), context: name.to_string(), namespace, auth: "service account", token: None, token_file: Some(format!("{}/token", dir)), agent: make_agent(Some(&ca), None)? })
+}
+
+fn named<'a>(list: &'a Value, name: &str, what: &str) -> Result<&'a Value, String> {
+    list.as_array().into_iter().flatten().find(|e| e["name"] == name).ok_or(format!("the kubeconfig has no {} {:?}", what, name))
+}
+
+fn from_kubeconfig(path: &str, wanted: Option<String>) -> Result<Cluster, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    let cfg: Value = serde_yaml::from_str(&text).map_err(|e| format!("{} is not a kubeconfig: {}", path, e))?;
+    let name = wanted.or(cfg["current-context"].as_str().filter(|s| !s.is_empty()).map(str::to_string)).ok_or("the kubeconfig names no current-context")?;
+    let ctx = &named(&cfg["contexts"], &name, "context")?["context"];
+    let cluster = &named(&cfg["clusters"], ctx["cluster"].as_str().unwrap_or(""), "cluster")?["cluster"];
+    let user = &named(&cfg["users"], ctx["user"].as_str().unwrap_or(""), "user")?["user"];
+    let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    if !user["exec"].is_null() {
+        return Err(format!("the user of {} signs in by running {} (exec), and a plugin runs no programs: give it a token", name, user["exec"]["command"]));
+    }
+    if !user["auth-provider"].is_null() {
+        return Err(format!("the user of {} uses an auth-provider, which this plugin does not speak: give it a token", name));
+    }
+    if cluster["insecure-skip-tls-verify"] == true {
+        return Err("the kubeconfig says insecure-skip-tls-verify, which this plugin will not do: give it certificate-authority-data".into());
+    }
+    let server = cluster["server"].as_str().ok_or("the cluster has no server")?.trim_end_matches('/').to_string();
+    let ca = pem_or_file(cluster["certificate-authority-data"].as_str(), cluster["certificate-authority"].as_str(), "CA", &dir)?;
+    let cert = pem_or_file(user["client-certificate-data"].as_str(), user["client-certificate"].as_str(), "client certificate", &dir)?;
+    let key = pem_or_file(user["client-key-data"].as_str(), user["client-key"].as_str(), "client key", &dir)?;
+    let client = match (&cert, &key) {
+        (Some(c), Some(k)) => Some((c.as_slice(), k.as_slice())),
+        _ => None,
+    };
+    let token = user["token"].as_str().map(str::to_string);
+    let token_file = user["tokenFile"].as_str().map(str::to_string);
+    let auth = if token.is_some() || token_file.is_some() { "token" } else if client.is_some() { "client certificate" } else { "none" };
+    Ok(Cluster { server, context: name, namespace: ctx["namespace"].as_str().unwrap_or("default").to_string(), auth, token, token_file, agent: make_agent(ca.as_deref(), client)? })
+}
+
+fn cluster() -> Result<Arc<Cluster>, String> {
+    let chosen = CHOSEN.lock().unwrap_or_else(|e| e.into_inner()).clone().or(env("KUBERNETES_CONTEXT"));
+    let key = chosen.clone().unwrap_or_default();
+    if let Some((k, c)) = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key {
+            return Ok(c.clone());
+        }
+    }
+    let c = if chosen.as_deref() == Some("in-cluster") {
+        in_cluster("in-cluster")?
+    } else if let Some(path) = env("KUBECONFIG") {
+        from_kubeconfig(path.split(':').next().unwrap_or(""), chosen)?
+    } else if env("KUBERNETES_SERVICE_HOST").is_some() && chosen.is_none() {
+        in_cluster("in-cluster")?
+    } else {
+        let home = env("HOME").ok_or("no KUBECONFIG, and no HOME to find ~/.kube/config")?;
+        from_kubeconfig(&format!("{}/.kube/config", home), chosen)?
+    };
+    let c = Arc::new(c);
+    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, c.clone()));
+    Ok(c)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn refused(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    match v["message"].as_str() {
+        Some(m) => format!("Kubernetes answered {} {}: {}", status, v["reason"].as_str().unwrap_or(""), m),
+        None => format!("Kubernetes answered {}: {}", status, text.chars().take(200).collect::<String>()),
+    }
+}
+
+/// One request; the answer's status and text. A projected token file is read each time, as it is replaced as it ages.
+fn send(method: &str, path: &str, kind: Option<&str>, body: Option<String>) -> Result<(u16, String), String> {
+    let c = cluster()?;
+    let mut req = c.agent.request(method, &format!("{}{}", c.server, path)).set("Accept", "application/json, */*");
+    let tok = match &c.token_file {
+        Some(f) => Some(std::fs::read_to_string(f).map_err(|e| format!("{}: {}", f, e))?.trim().to_string()),
+        None => c.token.clone(),
+    };
+    if let Some(t) = tok {
+        req = req.set("Authorization", &format!("Bearer {}", t));
+    }
+    let res = match (kind, body) {
+        (Some(k), Some(b)) => req.set("Content-Type", k).send_string(&b),
+        _ => req.call(),
+    };
+    match res {
+        Ok(r) => Ok((r.status(), r.into_string().map_err(|e| e.to_string())?)),
+        Err(ureq::Error::Status(c, r)) => Ok((c, r.into_string().unwrap_or_default())),
+        Err(e) => Err(format!("cannot reach the cluster at {}: {}", c.server, e)),
+    }
+}
+
+fn call(method: &str, path: &str, kind: Option<&str>, body: Option<String>) -> Result<Value, String> {
+    let (s, t) = send(method, path, kind, body)?;
+    if s >= 300 {
+        return Err(refused(s, &t));
+    }
+    serde_json::from_str(&t).map_err(|_| format!("the cluster's answer is not JSON: {}", t.chars().take(200).collect::<String>()))
+}
+
+fn namespace_of(ns: &str) -> Result<String, String> {
+    if ns.is_empty() {
+        return Ok(cluster()?.namespace.clone());
+    }
+    Ok(ns.to_string())
+}
+
+/// A kind's API group and whether it lives in a namespace.
+fn base_of(kind: &str) -> Result<(&'static str, bool), String> {
+    Ok(match kind {
+        "pods" | "services" | "configmaps" | "secrets" | "events" | "persistentvolumeclaims" | "serviceaccounts" | "endpoints" => ("/api/v1", true),
+        "nodes" | "namespaces" | "persistentvolumes" => ("/api/v1", false),
+        "deployments" | "replicasets" | "statefulsets" | "daemonsets" => ("/apis/apps/v1", true),
+        "jobs" | "cronjobs" => ("/apis/batch/v1", true),
+        "ingresses" => ("/apis/networking.k8s.io/v1", true),
+        o => return Err(format!("{:?} is not a kind this plugin knows; use k8s_request with its path", o)),
+    })
+}
+
+fn collection(kind: &str, ns: &str) -> Result<String, String> {
+    let (base, namespaced) = base_of(kind)?;
+    if namespaced && ns != "*" {
+        return Ok(format!("{}/namespaces/{}/{}", base, enc(&namespace_of(ns)?), kind));
+    }
+    Ok(format!("{}/{}", base, kind))
+}
+
+fn check_label_value(v: &str) -> Result<(), String> {
+    if v.len() > 63 || !v.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+        return Err(format!("{:?} is not a label value: up to 63 letters, digits, - _ and .", v));
+    }
+    Ok(())
+}
+
+/// A label selector from a map: a text is `key=value`, a list `key in (a,b)`, `{ not: "x" }` is `key!=x`, `{ not: ["a"] }` is `key notin (a)`, true means the label exists, false that it does not. Values are checked, as a selector is built from text. A text is given back as it is.
+pub fn k8s_selector(labels: serde_json::Value) -> Result<String, String> {
+    let m = match &labels {
+        Value::Null => return Ok(String::new()),
+        Value::String(s) => return Ok(s.clone()),
+        Value::Object(m) => m,
+        _ => return Err("a selector is a map of label to value, or a text".into()),
+    };
+    let list = |a: &Vec<Value>| -> Result<String, String> {
+        let mut t = vec![];
+        for v in a {
+            let s = v.as_str().map_or(v.to_string(), str::to_string);
+            check_label_value(&s)?;
+            t.push(s);
+        }
+        Ok(t.join(","))
+    };
+    let mut out = vec![];
+    for (k, v) in m {
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+            return Err(format!("{:?} is not a label key", k));
+        }
+        out.push(match v {
+            Value::Bool(true) => k.clone(),
+            Value::Bool(false) => format!("!{}", k),
+            Value::Array(a) => format!("{} in ({})", k, list(a)?),
+            Value::Object(o) => match o.get("not") {
+                Some(Value::Array(a)) => format!("{} notin ({})", k, list(a)?),
+                Some(x) => {
+                    let s = x.as_str().map_or(x.to_string(), str::to_string);
+                    check_label_value(&s)?;
+                    format!("{}!={}", k, s)
+                }
+                None => return Err(format!("the selector for {} is a text, a list, a bool, or {{ not: ... }}", k)),
+            },
+            x => {
+                let s = x.as_str().map_or(x.to_string(), str::to_string);
+                check_label_value(&s)?;
+                format!("{}={}", k, s)
+            }
+        });
+    }
+    Ok(out.join(","))
+}
+
+/// Which cluster this is talking to: `{ context, server, namespace, auth }`.
+pub fn k8s_context() -> Result<Value, String> {
+    let c = cluster()?;
+    Ok(json!({ "context": c.context, "server": c.server, "namespace": c.namespace, "auth": c.auth }))
+}
+
+/// Uses another kubeconfig context from now on, for the whole program, or "in-cluster" for the pod's own account. Gives what `k8s_context` gives.
+pub fn k8s_use_context(name: &str) -> Result<Value, String> {
+    let before = CHOSEN.lock().unwrap_or_else(|e| e.into_inner()).replace(name.to_string());
+    if name.is_empty() {
+        *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    let r = k8s_context();
+    if r.is_err() {
+        *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = before;
+    }
+    r
+}
+
+fn list_query(options: &Value, limit: i64, token: Option<&str>) -> Result<String, String> {
+    let mut q = vec![format!("limit={}", limit)];
+    let sel = k8s_selector(options.get("selector").cloned().unwrap_or(Value::Null))?;
+    if !sel.is_empty() {
+        q.push(format!("labelSelector={}", enc(&sel)));
+    }
+    if let Some(f) = options["fields"].as_str() {
+        q.push(format!("fieldSelector={}", enc(f)));
+    }
+    if let Some(t) = token {
+        q.push(format!("continue={}", enc(t)));
+    }
+    Ok(q.join("&"))
+}
+
+/// Every object of a kind (`pods`, `services`, `configmaps`, `events`, `nodes`, `namespaces`, `deployments`, `replicasets`, `statefulsets`, `daemonsets`, `jobs`, `cronjobs`, `ingresses`) in a namespace ("" the context's, "*" all), following continue tokens. `options`: `selector` (see `k8s_selector`), `fields` (a field selector), `page` (500), `max` (10000). Gives `{ items, complete, pages }`. A list that takes so long its token expires is an error, as the rest would no longer match.
+pub fn k8s_list(kind: &str, namespace: &str, options: serde_json::Value) -> Result<Value, String> {
+    let path = collection(kind, namespace)?;
+    let page = options["page"].as_i64().unwrap_or(500).clamp(1, 5000);
+    let max = options["max"].as_i64().unwrap_or(10_000);
+    let (mut items, mut token, mut pages): (Vec<Value>, Option<String>, i64) = (vec![], None, 0);
+    loop {
+        let q = list_query(&options, page, token.as_deref())?;
+        let (s, t) = send("GET", &format!("{}?{}", path, q), None, None)?;
+        if s == 410 {
+            return Err(format!("the list went stale after {} pages (410): {}; list again from the start", pages, refused(s, &t)));
+        }
+        if s >= 300 {
+            return Err(refused(s, &t));
+        }
+        let r: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        pages += 1;
+        items.extend(r["items"].as_array().cloned().unwrap_or_default());
+        let next = r["metadata"]["continue"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        if items.len() as i64 >= max {
+            let complete = next.is_none() && items.len() as i64 <= max;
+            items.truncate(max.max(0) as usize);
+            return Ok(json!({ "items": items, "complete": complete, "pages": pages }));
+        }
+        match next {
+            Some(n) => token = Some(n),
+            None => return Ok(json!({ "items": items, "complete": true, "pages": pages })),
+        }
+    }
+}
+
+/// An object by kind and name, in full, or null when there is none.
+pub fn k8s_get(kind: &str, namespace: &str, name: &str) -> Result<Value, String> {
+    let (s, t) = send("GET", &format!("{}/{}", collection(kind, namespace)?, enc(name)), None, None)?;
+    if s == 404 {
+        return Ok(Value::Null);
+    }
+    if s >= 300 {
+        return Err(refused(s, &t));
+    }
+    serde_json::from_str(&t).map_err(|e| e.to_string())
+}
+
+/// What `kubectl get pods` shows, from a pod: its state (`Running`, `CrashLoopBackOff`, `Terminating`...), ready count and restarts.
+fn pod_row(p: &Value) -> Value {
+    let statuses = p["status"]["containerStatuses"].as_array().cloned().unwrap_or_default();
+    let total = p["spec"]["containers"].as_array().map_or(statuses.len(), |c| c.len());
+    let ready = statuses.iter().filter(|c| c["ready"] == true).count();
+    let restarts: i64 = statuses.iter().map(|c| c["restartCount"].as_i64().unwrap_or(0)).sum();
+    let waiting = statuses.iter().find_map(|c| c["state"]["waiting"]["reason"].as_str().or(c["state"]["terminated"]["reason"].as_str()));
+    let state = if !p["metadata"]["deletionTimestamp"].is_null() { "Terminating" } else { waiting.or(p["status"]["phase"].as_str()).unwrap_or("Unknown") };
+    json!({ "name": p["metadata"]["name"], "namespace": p["metadata"]["namespace"], "state": state, "ready": format!("{}/{}", ready, total), "all_ready": total > 0 && ready == total, "restarts": restarts, "node": p["spec"]["nodeName"], "ip": p["status"]["podIP"], "labels": p["metadata"]["labels"], "containers": p["spec"]["containers"].as_array().map(|c| c.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()) })
+}
+
+/// Pods as `kubectl get pods` shows them: each `{ name, namespace, state, ready, all_ready, restarts, node, ip, labels, containers }`. `options` as for `k8s_list`.
+pub fn k8s_pods(namespace: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    Ok(k8s_list("pods", namespace, options)?["items"].as_array().into_iter().flatten().map(pod_row).collect())
+}
+
+/// One pod in that form, or null.
+pub fn k8s_pod(namespace: &str, name: &str) -> Result<Value, String> {
+    let p = k8s_get("pods", namespace, name)?;
+    Ok(if p.is_null() { Value::Null } else { pod_row(&p) })
+}
+
+fn deployment_row(d: &Value) -> Value {
+    let want = d["spec"]["replicas"].as_i64().unwrap_or(1);
+    let s = &d["status"];
+    let n = |k: &str| s[k].as_i64().unwrap_or(0);
+    // Done means the controller has seen this generation and every replica is new and available.
+    let done = s["observedGeneration"].as_i64().unwrap_or(0) >= d["metadata"]["generation"].as_i64().unwrap_or(0) && n("updatedReplicas") == want && n("availableReplicas") == want && n("replicas") == want;
+    let images: Vec<Value> = d["spec"]["template"]["spec"]["containers"].as_array().into_iter().flatten().map(|c| c["image"].clone()).collect();
+    json!({ "name": d["metadata"]["name"], "namespace": d["metadata"]["namespace"], "replicas": want, "ready": n("readyReplicas"), "updated": n("updatedReplicas"), "available": n("availableReplicas"), "done": done, "images": images })
+}
+
+/// Deployments: each `{ name, namespace, replicas, ready, updated, available, done, images }`, `done` true when a rollout has finished. `options` as for `k8s_list`.
+pub fn k8s_deployments(namespace: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    Ok(k8s_list("deployments", namespace, options)?["items"].as_array().into_iter().flatten().map(deployment_row).collect())
+}
+
+/// One deployment in that form, or null.
+pub fn k8s_deployment(namespace: &str, name: &str) -> Result<Value, String> {
+    let d = k8s_get("deployments", namespace, name)?;
+    Ok(if d.is_null() { Value::Null } else { deployment_row(&d) })
+}
+
+/// Sets a deployment's replicas through its scale subresource, which needs less permission than editing it. Gives `{ replicas, was }`.
+pub fn k8s_scale(namespace: &str, name: &str, replicas: i64) -> Result<Value, String> {
+    if replicas < 0 {
+        return Err("replicas cannot be negative".into());
+    }
+    let path = format!("{}/{}/scale", collection("deployments", namespace)?, enc(name));
+    let was = call("GET", &path, None, None)?;
+    let r = call("PATCH", &path, Some("application/merge-patch+json"), Some(json!({ "spec": { "replicas": replicas } }).to_string()))?;
+    Ok(json!({ "replicas": r["spec"]["replicas"], "was": was["spec"]["replicas"] }))
+}
+
+/// Restarts a deployment's pods one by one, as `kubectl rollout restart` does: by a changed annotation on its template. `at` is the time written there; it must differ from the last one. Gives `true`.
+pub fn k8s_rollout_restart(namespace: &str, name: &str, at: &str) -> Result<bool, String> {
+    let stamp = if at.is_empty() { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string() } else { at.to_string() };
+    let b = json!({ "spec": { "template": { "metadata": { "annotations": { "kubectl.kubernetes.io/restartedAt": stamp } } } } });
+    call("PATCH", &format!("{}/{}", collection("deployments", namespace)?, enc(name)), Some("application/strategic-merge-patch+json"), Some(b.to_string()))?;
+    Ok(true)
+}
+
+/// A pod's logs as text. `options`: `container` (needed when it has several), `tail` (lines), `since_seconds`, `previous` (the container before its last restart), `timestamps`.
+pub fn k8s_logs(namespace: &str, pod: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut q = vec![];
+    if let Some(c) = options["container"].as_str() {
+        q.push(format!("container={}", enc(c)));
+    }
+    if let Some(n) = options["tail"].as_i64() {
+        q.push(format!("tailLines={}", n));
+    }
+    if let Some(n) = options["since_seconds"].as_i64() {
+        q.push(format!("sinceSeconds={}", n));
+    }
+    for k in ["previous", "timestamps"] {
+        if options[k] == true {
+            q.push(format!("{}=true", k));
+        }
+    }
+    let (s, t) = send("GET", &format!("{}/{}/log?{}", collection("pods", namespace)?, enc(pod), q.join("&")), None, None)?;
+    if s >= 300 {
+        return Err(refused(s, &t));
+    }
+    Ok(t)
+}
+
+/// Deletes an object by kind and name; false when there was none. A pod under a deployment is replaced.
+pub fn k8s_delete(kind: &str, namespace: &str, name: &str) -> Result<bool, String> {
+    let (s, t) = send("DELETE", &format!("{}/{}", collection(kind, namespace)?, enc(name)), None, None)?;
+    match s {
+        404 => Ok(false),
+        x if x < 300 => Ok(true),
+        _ => Err(refused(s, &t)),
+    }
+}
+
+/// Any call: a `path` like "/apis/batch/v1/namespaces/shop/jobs", `body` a map or null. A PATCH goes as a JSON merge patch. Gives the answer's JSON.
+pub fn k8s_request(method: &str, path: &str, body: serde_json::Value) -> Result<Value, String> {
+    let m = method.to_uppercase();
+    let kind = if m == "PATCH" { "application/merge-patch+json" } else { "application/json" };
+    if body.is_null() {
+        return call(&m, path, None, None);
+    }
+    call(&m, path, Some(kind), Some(body.to_string()))
+}

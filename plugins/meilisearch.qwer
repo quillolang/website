@@ -1,0 +1,219 @@
+//! Meilisearch's API: indexes, documents and settings written through tasks that are waited on, with a failed task turned into its error, searches with filters and facets, keys listed, and tenant tokens signed so that each customer's browser searches only its own documents.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+// MEILISEARCH_API_URL is the server (http://localhost:7700 when not set), MEILISEARCH_API_KEY the
+// key sent with each request. MEILISEARCH_SEARCH_KEY signs tenant tokens and, with its uid, gives
+// them their authority (MEILISEARCH_API_KEY when not set).
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("MEILISEARCH_API_URL").unwrap_or_else(|| "http://localhost:7700".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn valid_uid(uid: &str) -> Result<(), String> {
+    if uid.is_empty() || uid.len() > 400 || !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("{:?} is not an index uid: letters, digits, - and _", uid));
+    }
+    Ok(())
+}
+
+fn call_with(token: Option<String>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let mut req = agent.request(method, &format!("{}{}", base(), path));
+    if let Some(k) = token.or_else(|| env("MEILISEARCH_API_KEY")) {
+        req = req.set("Authorization", &format!("Bearer {}", k));
+    }
+    let res = match body {
+        Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+        None => req.call(),
+    };
+    match res {
+        Ok(r) => {
+            let t = r.into_string().map_err(|e| e.to_string())?;
+            if t.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            serde_json::from_str(&t).map_err(|_| format!("Meilisearch's answer is not JSON: {}", t.chars().take(200).collect::<String>()))
+        }
+        Err(ureq::Error::Status(c, r)) => {
+            let t = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            match (v["code"].as_str(), v["message"].as_str()) {
+                (Some(code), Some(m)) => Err(format!("Meilisearch refused this ({}): {}", code, m)),
+                _ => Err(format!("Meilisearch answered {}: {}", c, t.chars().take(300).collect::<String>())),
+            }
+        }
+        Err(e) => Err(format!("cannot reach Meilisearch at {}: {}", base(), e)),
+    }
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    call_with(None, method, path, body)
+}
+
+fn task_id(t: &Value) -> Result<i64, String> {
+    t["taskUid"].as_i64().or(t["uid"].as_i64()).ok_or(format!("the answer names no task: {}", t))
+}
+
+/// The task's state: `{ uid, status, type, indexUid, details, error, duration, ... }`.
+pub fn meili_task(uid: i64) -> Result<Value, String> {
+    call("GET", &format!("/tasks/{}", uid), None)
+}
+
+/// Waits until a task is done, asking more slowly as time goes on, up to `timeout_ms`. Gives the task when it succeeded; when it failed or was canceled, an error with Meilisearch's own code and message.
+pub fn meili_wait(uid: i64, timeout_ms: i64) -> Result<Value, String> {
+    let start = Instant::now();
+    let mut pause = 25u64;
+    loop {
+        let t = meili_task(uid)?;
+        match t["status"].as_str().unwrap_or("") {
+            "succeeded" => return Ok(t),
+            "failed" => return Err(format!("task {} failed ({}): {}", uid, t["error"]["code"].as_str().unwrap_or("unknown"), t["error"]["message"].as_str().unwrap_or(""))),
+            "canceled" => return Err(format!("task {} was canceled", uid)),
+            _ => {}
+        }
+        if start.elapsed().as_millis() as i64 > timeout_ms {
+            return Err(format!("task {} is still {} after {} ms", uid, t["status"].as_str().unwrap_or("?"), timeout_ms));
+        }
+        std::thread::sleep(Duration::from_millis(pause));
+        pause = (pause * 2).min(1000);
+    }
+}
+
+fn finished(t: Value, wait_ms: i64) -> Result<Value, String> {
+    let id = task_id(&t)?;
+    if wait_ms <= 0 {
+        return Ok(t);
+    }
+    meili_wait(id, wait_ms)
+}
+
+/// Makes an index with `primary_key` ("" lets Meilisearch guess from the first documents) and waits for it. An index that exists is not an error: gives false for it, true when made.
+pub fn meili_create_index(uid: &str, primary_key: &str) -> Result<bool, String> {
+    valid_uid(uid)?;
+    let mut b = json!({ "uid": uid });
+    if !primary_key.is_empty() {
+        b["primaryKey"] = json!(primary_key);
+    }
+    let t = call("POST", "/indexes", Some(&b))?;
+    match meili_wait(task_id(&t)?, 30_000) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("index_already_exists") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Deletes an index and waits; true when it was there.
+pub fn meili_delete_index(uid: &str) -> Result<bool, String> {
+    valid_uid(uid)?;
+    let t = call("DELETE", &format!("/indexes/{}", uid), None)?;
+    match meili_wait(task_id(&t)?, 30_000) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("index_not_found") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Changes an index's settings (`searchableAttributes`, `filterableAttributes`, `sortableAttributes`, `rankingRules`, `synonyms`...) and waits for the task. Re-indexing can take a while: `wait_ms` is how long to wait, 0 not to.
+pub fn meili_settings(uid: &str, settings: serde_json::Value, wait_ms: i64) -> Result<Value, String> {
+    valid_uid(uid)?;
+    finished(call("PATCH", &format!("/indexes/{}/settings", uid), Some(&settings))?, wait_ms)
+}
+
+/// Adds or replaces documents (a list of maps) and waits up to `wait_ms` (0 gives the queued task at once). A document with a bad id, or a batch that cannot be indexed, fails here with Meilisearch's reason, although the request itself was accepted.
+pub fn meili_add_documents(uid: &str, documents: Vec<serde_json::Value>, primary_key: &str, wait_ms: i64) -> Result<Value, String> {
+    valid_uid(uid)?;
+    let q = if primary_key.is_empty() { String::new() } else { format!("?primaryKey={}", enc(primary_key)) };
+    finished(call("POST", &format!("/indexes/{}/documents{}", uid, q), Some(&Value::Array(documents)))?, wait_ms)
+}
+
+/// Changes only the fields given in each document (each needs its primary key), waiting as `meili_add_documents` does.
+pub fn meili_update_documents(uid: &str, documents: Vec<serde_json::Value>, wait_ms: i64) -> Result<Value, String> {
+    valid_uid(uid)?;
+    finished(call("PUT", &format!("/indexes/{}/documents", uid), Some(&Value::Array(documents)))?, wait_ms)
+}
+
+/// A document by id, or null when there is none.
+pub fn meili_document(uid: &str, id: &str) -> Result<Value, String> {
+    valid_uid(uid)?;
+    match call("GET", &format!("/indexes/{}/documents/{}", uid, enc(id)), None) {
+        Err(e) if e.contains("document_not_found") => Ok(Value::Null),
+        o => o,
+    }
+}
+
+/// Removes documents by a list of ids, or by a `filter` text (the attributes must be filterable), and waits up to `wait_ms`.
+pub fn meili_delete_documents(uid: &str, ids_or_filter: serde_json::Value, wait_ms: i64) -> Result<Value, String> {
+    valid_uid(uid)?;
+    let t = match &ids_or_filter {
+        Value::Array(_) => call("POST", &format!("/indexes/{}/documents/delete-batch", uid), Some(&ids_or_filter))?,
+        Value::String(f) => call("POST", &format!("/indexes/{}/documents/delete", uid), Some(&json!({ "filter": f })))?,
+        _ => return Err("give a list of ids, or a filter text".into()),
+    };
+    finished(t, wait_ms)
+}
+
+/// A search: `options` as Meilisearch documents them (`filter`, `sort`, `facets`, `limit`, `offset`, `attributesToHighlight`...). Gives `{ hits, estimatedTotalHits, facetDistribution, processingTimeMs, query, ... }`.
+pub fn meili_search(uid: &str, query: &str, options: serde_json::Value) -> Result<Value, String> {
+    valid_uid(uid)?;
+    let mut b = if options.is_object() { options } else { json!({}) };
+    b["q"] = json!(query);
+    call("POST", &format!("/indexes/{}/search", uid), Some(&b))
+}
+
+/// The same search as a browser with a tenant token would make it: what that tenant sees.
+pub fn meili_search_as(token: &str, uid: &str, query: &str, options: serde_json::Value) -> Result<Value, String> {
+    valid_uid(uid)?;
+    let mut b = if options.is_object() { options } else { json!({}) };
+    b["q"] = json!(query);
+    call_with(Some(token.to_string()), "POST", &format!("/indexes/{}/search", uid), Some(&b))
+}
+
+/// The API keys, each `{ uid, key, name, actions, indexes, expiresAt }`.
+pub fn meili_keys() -> Result<Value, String> {
+    Ok(call("GET", "/keys?limit=100", None)?["results"].clone())
+}
+
+/// A tenant token: a JWT for the browser that lets it search only what `search_rules` allows, `{ "orders": { "filter": "tenant = 7" } }`, or `{ "*": {...} }`. `api_key_uid` is the uid of the key in MEILISEARCH_SEARCH_KEY (see `meili_keys`); that key signs it. `expires_at` is a Unix time, 0 for no expiry. No request is made.
+pub fn meili_tenant_token(api_key_uid: &str, search_rules: serde_json::Value, expires_at: i64) -> Result<String, String> {
+    let hex: Vec<char> = api_key_uid.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.iter().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{:?} is not a key's uid: that is the UUID in the key's `uid`, not the key", api_key_uid));
+    }
+    if !(search_rules.is_object() || search_rules.is_array()) {
+        return Err("searchRules are a map of index to its rules, or a list of index names".into());
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if expires_at != 0 && expires_at <= now {
+        return Err("the token's expiry is in the past".into());
+    }
+    let key = env("MEILISEARCH_SEARCH_KEY").or_else(|| env("MEILISEARCH_API_KEY")).ok_or("set MEILISEARCH_SEARCH_KEY, the search key that signs tenant tokens")?;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut claims = json!({ "searchRules": search_rules, "apiKeyUid": api_key_uid });
+    if expires_at != 0 {
+        claims["exp"] = json!(expires_at);
+    }
+    let signing = format!("{}.{}", b64.encode(json!({ "alg": "HS256", "typ": "JWT" }).to_string()), b64.encode(claims.to_string()));
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key");
+    m.update(signing.as_bytes());
+    Ok(format!("{}.{}", signing, b64.encode(m.finalize().into_bytes())))
+}

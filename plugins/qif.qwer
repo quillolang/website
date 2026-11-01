@@ -1,0 +1,591 @@
+//! Quicken QIF read and written: account types, split transactions, dates in their several forms, amounts with thousands separators, investments, categories and lists, with splits that do not add up named.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+const BANK_TYPES: [&str; 5] = ["Bank", "Cash", "CCard", "Oth A", "Oth L"];
+
+fn money_text(c: i128) -> String {
+    format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
+}
+
+fn with_commas(c: i128) -> String {
+    let whole = (c.abs() / 100).to_string();
+    let mut o = String::new();
+    for (i, ch) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            o.push(',');
+        }
+        o.push(ch);
+    }
+    format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, o, c.abs() % 100)
+}
+
+/// `1,234.56`, `1.234,56`, `1 234,56`, `-$12`, `(5.00)`: the amount as plain digits. `decimal` is `.` or `,`, or empty to tell from the text. Refuses what is not an amount.
+fn clean_amount(t: &str, decimal: &str) -> Result<String, String> {
+    let bad = || format!("`{}` is not an amount", t);
+    let mut s: String = t.trim().chars().filter(|c| !"$€£¥ \u{a0}'".contains(*c)).collect();
+    let mut neg = false;
+    if s.starts_with('(') && s.ends_with(')') {
+        neg = true;
+        s = s[1..s.len() - 1].to_string();
+    }
+    if let Some(r) = s.strip_prefix('-') {
+        neg = !neg;
+        s = r.to_string();
+    } else if let Some(r) = s.strip_prefix('+') {
+        s = r.to_string();
+    } else if let Some(r) = s.strip_suffix('-') {
+        neg = !neg;
+        s = r.to_string();
+    }
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
+        return Err(bad());
+    }
+    let (dots, commas) = (s.matches('.').count(), s.matches(',').count());
+    let point = match decimal {
+        "." => Some('.'),
+        "," => Some(','),
+        _ => {
+            if dots > 0 && commas > 0 {
+                // The last one used is the decimal point.
+                Some(if s.rfind('.') > s.rfind(',') { '.' } else { ',' })
+            } else if commas == 1 {
+                // `1,234` is a thousand, `12,50` is not.
+                let after = s.len() - s.rfind(',').unwrap_or(0) - 1;
+                if after == 3 { None } else { Some(',') }
+            } else if dots == 1 {
+                Some('.')
+            } else {
+                None
+            }
+        }
+    };
+    let (mut whole, frac) = match point.and_then(|p| s.rfind(p).map(|i| (i, p))) {
+        Some((i, _)) => (s[..i].to_string(), s[i + 1..].to_string()),
+        None => (s.clone(), String::new()),
+    };
+    if frac.contains(['.', ',']) {
+        return Err(bad());
+    }
+    // Separators must fall every three digits.
+    if whole.contains(['.', ',']) {
+        let groups: Vec<&str> = whole.split(['.', ',']).collect();
+        if groups[0].is_empty() || groups[0].len() > 3 || groups[1..].iter().any(|g| g.len() != 3) {
+            return Err(bad());
+        }
+        whole = groups.concat();
+    }
+    if whole.is_empty() {
+        whole.push('0');
+    }
+    let w = whole.trim_start_matches('0');
+    let body = format!("{}{}", if w.is_empty() { "0" } else { w }, if frac.is_empty() { String::new() } else { format!(".{}", frac) });
+    Ok(if neg { format!("-{}", body) } else { body })
+}
+
+/// Plain digits to cents, when they fit two places.
+fn cents(t: &str) -> Option<i128> {
+    let (neg, b) = t.strip_prefix('-').map_or((false, t), |x| (true, x));
+    let (w, f) = b.split_once('.').unwrap_or((b, ""));
+    if f.trim_end_matches('0').len() > 2 {
+        return None;
+    }
+    let f2 = format!("{:0<2}", &f[..f.len().min(2)]);
+    let c = w.parse::<i128>().ok()? * 100 + f2.parse::<i128>().ok()?;
+    Some(if neg { -c } else { c })
+}
+
+fn days_in(y: i64, m: i64) -> i64 {
+    match m {
+        2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The three numbers of a date, and whether a `'` stood before the year.
+fn date_parts(t: &str) -> Option<(Vec<i64>, bool)> {
+    let cleaned: String = t.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    let apostrophe = cleaned.contains('\'');
+    let parts: Vec<&str> = cleaned.split(['/', '-', '.', '\'']).collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    Some((parts.iter().map(|p| p.parse().unwrap_or(0)).collect(), apostrophe))
+}
+
+fn iso_date(t: &str, order: &str) -> Result<String, String> {
+    let bad = || format!("`{}` is not a date", t);
+    let (p, apos) = date_parts(t).ok_or_else(bad)?;
+    let (y, m, d) = if p[0] > 31 {
+        (p[0], p[1], p[2])
+    } else if order == "dmy" {
+        (p[2], p[1], p[0])
+    } else if order == "ymd" {
+        (p[0], p[1], p[2])
+    } else {
+        (p[2], p[0], p[1])
+    };
+    // In Quicken's own files `'05` is 2005 and `/95` is 1995. Others write `/05`: the pivot catches them.
+    let y = if y >= 100 { y } else if apos { 2000 + y } else if y < 70 { 2000 + y } else { 1900 + y };
+    if !(1..=12).contains(&m) || d < 1 || d > days_in(y, m) {
+        return Err(bad());
+    }
+    Ok(format!("{:04}-{:02}-{:02}", y, m, d))
+}
+
+/// Month first or day first, from the dates in a file: a first part over 12 can only be a day.
+fn guess_order(text: &str) -> &'static str {
+    let (mut mdy, mut dmy) = (false, false);
+    for l in text.lines() {
+        if let Some(r) = l.strip_prefix('D') {
+            if let Some((p, _)) = date_parts(r) {
+                if p[0] > 31 {
+                    return "ymd";
+                }
+                if p[0] > 12 {
+                    dmy = true;
+                }
+                if p[1] > 12 {
+                    mdy = true;
+                }
+            }
+        }
+    }
+    if dmy && !mdy { "dmy" } else { "mdy" }
+}
+
+fn cleared(c: &str) -> Value {
+    match c.trim() {
+        "" => Value::Null,
+        "*" | "c" | "C" => json!("cleared"),
+        "X" | "x" | "R" | "r" => json!("reconciled"),
+        o => json!(o),
+    }
+}
+
+/// `Cat:Sub/Class`, or `[Account]/Class`, taken apart.
+fn category(s: &str) -> (Value, Value, Value) {
+    let (c, class) = match s.rsplit_once('/') {
+        Some((a, b)) => (a, Some(b.to_string())),
+        None => (s, None),
+    };
+    match c.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        Some(t) => (Value::Null, json!(t), json!(class)),
+        None => (json!(if c.is_empty() { None } else { Some(c) }), Value::Null, json!(class)),
+    }
+}
+
+struct Opts {
+    order: String,
+    decimal: String,
+}
+
+fn amount_fields(m: &mut Map<String, Value>, key: &str, raw: &str, o: &Opts, n: usize) -> Result<(), String> {
+    let v = clean_amount(raw, &o.decimal).map_err(|e| format!("line {}: {}", n, e))?;
+    // Shares and share prices are not money to the cent.
+    if key != "quantity" && key != "price" {
+        if let Some(c) = cents(&v) {
+            m.insert(format!("{}_cents", key), json!(c as i64));
+        }
+    }
+    m.insert(key.to_string(), json!(v));
+    Ok(())
+}
+
+fn close_bank(m: &mut Map<String, Value>, addr: Vec<String>, splits: Vec<Value>, problems: &mut Vec<String>, n: usize) {
+    if !addr.is_empty() {
+        m.insert("address".into(), json!(addr));
+    }
+    if !splits.is_empty() {
+        let sum: Option<i128> = splits.iter().map(|s| s["amount_cents"].as_i64().map(|x| x as i128)).sum();
+        let total = m.get("amount_cents").and_then(Value::as_i64).map(|x| x as i128);
+        if let (Some(a), Some(b)) = (sum, total) {
+            if a != b {
+                problems.push(format!("line {}: the splits add up to {} and the transaction says {}", n, money_text(a), money_text(b)));
+            }
+        }
+        m.insert("splits".into(), json!(splits));
+    }
+}
+
+fn parse(text: &str, options: &Value) -> Result<Value, String> {
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    let order = options.get("dates").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| guess_order(&text).to_string());
+    if !["mdy", "dmy", "ymd"].contains(&order.as_str()) {
+        return Err(format!("`{}` is not a date order: mdy, dmy or ymd", order));
+    }
+    let o = Opts { order, decimal: options.get("decimal").and_then(Value::as_str).unwrap_or("").to_string() };
+    let (mut accounts, mut categories, mut classes, mut securities, mut memorized): (Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>) = (vec![], vec![], vec![], vec![], vec![]);
+    let mut groups: Vec<Value> = vec![];
+    let mut problems: Vec<String> = vec![];
+    let mut section = String::new();
+    let mut account: Option<Value> = None;
+    let mut in_account_list = false;
+    let mut auto = false;
+    let mut cur: Map<String, Value> = Map::new();
+    let mut addr: Vec<String> = vec![];
+    let mut splits: Vec<Value> = vec![];
+    let mut seen = false;
+    let mut count = 0;
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let l = raw.trim_end();
+        if l.trim().is_empty() {
+            continue;
+        }
+        if let Some(h) = l.strip_prefix('!') {
+            if seen {
+                return Err(format!("line {}: a header inside a record: a ^ is missing", n));
+            }
+            let h = h.trim();
+            if h.eq_ignore_ascii_case("Option:AutoSwitch") {
+                auto = true;
+                in_account_list = true;
+            } else if h.eq_ignore_ascii_case("Clear:AutoSwitch") {
+                auto = false;
+                in_account_list = false;
+            } else if h.eq_ignore_ascii_case("Account") {
+                in_account_list = true;
+                section = "Account".to_string();
+            } else if let Some(t) = h.strip_prefix("Type:") {
+                section = t.trim().to_string();
+                in_account_list = false;
+                let known = BANK_TYPES.contains(&section.as_str()) || ["Invst", "Cat", "Class", "Memorized", "Tag", "Security", "Budget", "Prices"].contains(&section.as_str());
+                if !known {
+                    return Err(format!("line {}: !Type:{} is not a QIF type", n, section));
+                }
+                if BANK_TYPES.contains(&section.as_str()) || section == "Invst" {
+                    groups.push(json!({ "type": section, "account": account.as_ref().and_then(|a| a.get("name")), "transactions": [] }));
+                }
+            } else {
+                problems.push(format!("line {}: `!{}` is not known, and what follows was skipped", n, h));
+                section = "?".to_string();
+            }
+            continue;
+        }
+        if section.is_empty() {
+            return Err(format!("line {}: a QIF file starts with a !Type or !Account header", n));
+        }
+        let code = l.chars().next().unwrap_or(' ');
+        let rest: String = l.chars().skip(1).collect();
+        let rest = rest.as_str();
+        if code == '^' {
+            if seen {
+                count += 1;
+                let mut m = std::mem::take(&mut cur);
+                let sp = std::mem::take(&mut splits);
+                let ad = std::mem::take(&mut addr);
+                if section == "Account" || in_account_list {
+                    if !auto || section == "Account" {
+                        account = Some(json!({ "name": m.get("name"), "type": m.get("type") }));
+                    }
+                    if (auto || section == "Account") && !accounts.iter().any(|a| a.get("name") == m.get("name")) {
+                        accounts.push(Value::Object(m));
+                    }
+                } else if BANK_TYPES.contains(&section.as_str()) || section == "Invst" {
+                    close_bank(&mut m, ad, sp, &mut problems, n);
+                    if !m.contains_key("date") {
+                        problems.push(format!("line {}: a transaction has no date", n));
+                    }
+                    if let Some(g) = groups.last_mut() {
+                        g["transactions"].as_array_mut().unwrap().push(Value::Object(m));
+                    }
+                } else if section == "Cat" {
+                    categories.push(Value::Object(m));
+                } else if section == "Class" || section == "Tag" {
+                    classes.push(Value::Object(m));
+                } else if section == "Security" {
+                    securities.push(Value::Object(m));
+                } else if section == "Memorized" {
+                    close_bank(&mut m, ad, sp, &mut problems, n);
+                    memorized.push(Value::Object(m));
+                }
+                seen = false;
+            }
+            continue;
+        }
+        if section == "?" || section == "Budget" || section == "Prices" {
+            continue;
+        }
+        seen = true;
+        if section == "Account" || in_account_list {
+            match code {
+                'N' => { cur.insert("name".into(), json!(rest.trim())); }
+                'T' => { cur.insert("type".into(), json!(rest.trim())); }
+                'D' => { cur.insert("description".into(), json!(rest.trim())); }
+                'L' => amount_fields(&mut cur, "credit_limit", rest, &o, n)?,
+                '$' => amount_fields(&mut cur, "balance", rest, &o, n)?,
+                '/' => { cur.insert("balance_date".into(), json!(iso_date(rest, &o.order).map_err(|e| format!("line {}: {}", n, e))?)); }
+                _ => {}
+            }
+            continue;
+        }
+        match section.as_str() {
+            "Cat" => match code {
+                'N' => { cur.insert("name".into(), json!(rest.trim())); }
+                'D' => { cur.insert("description".into(), json!(rest.trim())); }
+                'T' => { cur.insert("tax_related".into(), json!(true)); }
+                'I' => { cur.insert("kind".into(), json!("income")); }
+                'E' => { cur.insert("kind".into(), json!("expense")); }
+                'R' => { cur.insert("tax_schedule".into(), json!(rest.trim())); }
+                'B' => {
+                    let v = clean_amount(rest, &o.decimal).map_err(|e| format!("line {}: {}", n, e))?;
+                    cur.entry("budget").or_insert(json!([])).as_array_mut().unwrap().push(json!(v));
+                }
+                _ => {}
+            },
+            "Class" | "Tag" => match code {
+                'N' => { cur.insert("name".into(), json!(rest.trim())); }
+                'D' => { cur.insert("description".into(), json!(rest.trim())); }
+                _ => {}
+            },
+            "Security" => match code {
+                'N' => { cur.insert("name".into(), json!(rest.trim())); }
+                'S' => { cur.insert("symbol".into(), json!(rest.trim())); }
+                'T' => { cur.insert("type".into(), json!(rest.trim())); }
+                'G' => { cur.insert("goal".into(), json!(rest.trim())); }
+                _ => {}
+            },
+            _ => {
+                let invest = section == "Invst";
+                match code {
+                    'D' => { cur.insert("date".into(), json!(iso_date(rest, &o.order).map_err(|e| format!("line {}: {}", n, e))?)); }
+                    'T' | 'U' if !cur.contains_key("amount") || code == 'T' => amount_fields(&mut cur, "amount", rest, &o, n)?,
+                    'U' => {}
+                    'C' => { cur.insert("cleared".into(), cleared(rest)); }
+                    'N' if invest => { cur.insert("action".into(), json!(rest.trim())); }
+                    'N' => { cur.insert("number".into(), json!(rest.trim())); }
+                    'P' => { cur.insert("payee".into(), json!(rest.trim())); }
+                    'M' => { cur.insert("memo".into(), json!(rest.trim())); }
+                    'A' => addr.push(rest.trim().to_string()),
+                    'L' => {
+                        let (c, t, k) = category(rest.trim());
+                        cur.insert("category".into(), c);
+                        cur.insert("transfer".into(), t);
+                        cur.insert("class".into(), k);
+                    }
+                    'F' => { cur.insert("reimbursable".into(), json!(true)); }
+                    'S' => {
+                        let (c, t, k) = category(rest.trim());
+                        splits.push(json!({ "category": c, "transfer": t, "class": k }));
+                    }
+                    'E' => {
+                        let s = splits.last_mut().ok_or(format!("line {}: E before any S", n))?;
+                        s["memo"] = json!(rest.trim());
+                    }
+                    '$' if invest => amount_fields(&mut cur, "transferred", rest, &o, n)?,
+                    '$' => {
+                        let v = clean_amount(rest, &o.decimal).map_err(|e| format!("line {}: {}", n, e))?;
+                        let s = splits.last_mut().ok_or(format!("line {}: $ before any S", n))?;
+                        s["amount"] = json!(v);
+                        if let Some(c) = cents(&v) {
+                            s["amount_cents"] = json!(c as i64);
+                        }
+                    }
+                    '%' => {
+                        let s = splits.last_mut().ok_or(format!("line {}: % before any S", n))?;
+                        s["percent"] = json!(rest.trim());
+                    }
+                    'Y' if invest => { cur.insert("security".into(), json!(rest.trim())); }
+                    'I' if invest => amount_fields(&mut cur, "price", rest, &o, n)?,
+                    'Q' if invest => amount_fields(&mut cur, "quantity", rest, &o, n)?,
+                    'O' if invest => amount_fields(&mut cur, "commission", rest, &o, n)?,
+                    'K' if section == "Memorized" => {
+                        let kind = match rest.trim() { "C" => "check", "D" => "deposit", "P" => "payment", "I" => "investment", "E" => "electronic", o => o };
+                        cur.insert("kind".into(), json!(kind));
+                    }
+                    _ if section == "Memorized" => {}
+                    o => problems.push(format!("line {}: `{}` is not a field here", n, o)),
+                }
+            }
+        }
+    }
+    if seen {
+        problems.push("the last record has no ^: it was left out".to_string());
+    }
+    Ok(json!({ "accounts": accounts, "groups": groups, "categories": categories, "classes": classes, "securities": securities, "memorized": memorized, "records": count, "dates": o.order, "problems": problems }))
+}
+
+/// Reads QIF: `{ groups: [{ type, account, transactions }], accounts, categories, classes, securities, memorized, problems }`. Dates come as `YYYY-MM-DD`, and amounts as plain text and exact `amount_cents`. `options.dates` is `mdy`, `dmy` or `ymd`, else told from the file; `options.decimal` is `.` or `,`.
+pub fn qif_parse(text: &str, options: serde_json::Value) -> Result<Value, String> {
+    parse(text, &options)
+}
+
+/// Reads a QIF file from a path, as `qif_parse` does. Bytes that are not UTF-8 are read as Latin-1, as old Quicken wrote.
+pub fn qif_read_file(path: &str, options: serde_json::Value) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let t = String::from_utf8(b).unwrap_or_else(|e| e.as_bytes().iter().map(|x| *x as char).collect());
+    parse(&t, &options)
+}
+
+/// An amount in any of the ways people write one: `{ text, cents }`.
+pub fn qif_amount(text: &str, decimal: &str) -> Result<Value, String> {
+    let v = clean_amount(text, decimal)?;
+    Ok(json!({ "text": v, "cents": cents(&v).map(|c| c as i64) }))
+}
+
+/// A date in any of QIF's forms as `YYYY-MM-DD`. `order` is `mdy`, `dmy` or `ymd`.
+pub fn qif_date(text: &str, order: &str) -> Result<String, String> {
+    iso_date(text, order)
+}
+
+/// One row for each split or plain transaction, for a spreadsheet: `{ date, payee, category, transfer, amount, memo, number, account, split }`.
+pub fn qif_rows(text: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let d = parse(text, &options)?;
+    let mut out = vec![];
+    for g in d["groups"].as_array().into_iter().flatten() {
+        for t in g["transactions"].as_array().into_iter().flatten() {
+            let row = |cat: &Value, xfer: &Value, amount: &Value, cents: &Value, memo: &Value, split: bool| json!({
+                "account": g["account"], "type": g["type"], "date": t.get("date"), "number": t.get("number"), "payee": t.get("payee"),
+                "category": cat, "transfer": xfer, "amount": amount, "amount_cents": cents, "memo": memo, "split": split,
+            });
+            let nul = Value::Null;
+            match t.get("splits").and_then(Value::as_array) {
+                Some(s) => for x in s {
+                    out.push(row(&x["category"], &x["transfer"], &x["amount"], &x["amount_cents"], x.get("memo").unwrap_or(&nul), true));
+                },
+                None => out.push(row(t.get("category").unwrap_or(&nul), t.get("transfer").unwrap_or(&nul), t.get("amount").unwrap_or(&nul), t.get("amount_cents").unwrap_or(&nul), t.get("memo").unwrap_or(&nul), false)),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sums in exact cents: the whole file's total, what it comes to from `opening_cents`, and totals by account, category and payee.
+pub fn qif_totals(text: &str, options: serde_json::Value) -> Result<Value, String> {
+    let rows = qif_rows(text, options.clone())?;
+    let mut cats: BTreeMap<String, i128> = BTreeMap::new();
+    let mut payees: BTreeMap<String, i128> = BTreeMap::new();
+    let mut accounts: BTreeMap<String, i128> = BTreeMap::new();
+    let mut total: i128 = 0;
+    for r in &rows {
+        let c = r["amount_cents"].as_i64().unwrap_or(0) as i128;
+        total += c;
+        *accounts.entry(r["account"].as_str().unwrap_or("(none)").to_string()).or_default() += c;
+        let key = r["category"].as_str().map(str::to_string).or(r["transfer"].as_str().map(|t| format!("[{}]", t))).unwrap_or("(none)".to_string());
+        *cats.entry(key).or_default() += c;
+        *payees.entry(r["payee"].as_str().unwrap_or("(none)").to_string()).or_default() += c;
+    }
+    let show = |m: BTreeMap<String, i128>| -> Map<String, Value> { m.into_iter().map(|(k, v)| (k, json!(money_text(v)))).collect() };
+    let opening = options.get("opening_cents").and_then(Value::as_i64).unwrap_or(0) as i128;
+    Ok(json!({ "rows": rows.len(), "total": money_text(total), "closing": money_text(opening + total), "closing_with_commas": with_commas(opening + total), "accounts": show(accounts), "categories": show(cats), "payees": show(payees) }))
+}
+
+fn date_out(t: &str, order: &str) -> Result<String, String> {
+    let d = iso_date(t, "ymd").or_else(|_| iso_date(t, order))?;
+    let (y, m, day) = (&d[..4], d[5..7].trim_start_matches('0'), d[8..10].trim_start_matches('0'));
+    Ok(if order == "dmy" { format!("{}/{}/{}", day, m, y) } else { format!("{}/{}/{}", m, day, y) })
+}
+
+fn line(k: char, v: &str, o: &mut String) -> Result<(), String> {
+    if v.contains(['\n', '\r']) {
+        return Err(format!("`{}` has a line break in it", v));
+    }
+    o.push(k);
+    o.push_str(v);
+    o.push('\n');
+    Ok(())
+}
+
+fn amount_out(v: &Value) -> Result<String, String> {
+    let t = match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        o => return Err(format!("{} is not an amount", o)),
+    };
+    clean_amount(&t, "")
+}
+
+fn cat_out(c: &Value) -> Option<String> {
+    let base = match (c.get("transfer").and_then(Value::as_str), c.get("category").and_then(Value::as_str)) {
+        (Some(t), _) => format!("[{}]", t),
+        (None, Some(k)) => k.to_string(),
+        _ => String::new(),
+    };
+    let class = c.get("class").and_then(Value::as_str);
+    match (base.is_empty(), class) {
+        (true, None) => None,
+        (_, Some(k)) => Some(format!("{}/{}", base, k)),
+        _ => Some(base),
+    }
+}
+
+/// Writes transactions of one account: `kind` is `Bank`, `Cash`, `CCard`, `Oth A`, `Oth L` or `Invst`; each one as `qif_parse` gives it, or `{ date, amount, payee, memo, category, number, splits }`. `options.dates` is `mdy` or `dmy`; `options.account` writes an `!Account` block first. Splits that do not add up are refused.
+pub fn qif_write(kind: &str, transactions: Vec<serde_json::Value>, options: serde_json::Value) -> Result<String, String> {
+    if !BANK_TYPES.contains(&kind) && kind != "Invst" {
+        return Err(format!("`{}` is not a QIF account type", kind));
+    }
+    let order = options.get("dates").and_then(Value::as_str).unwrap_or("mdy");
+    let mut o = String::new();
+    if let Some(a) = options.get("account") {
+        o.push_str("!Account\n");
+        line('N', a.get("name").and_then(Value::as_str).ok_or("an account needs a `name`")?, &mut o)?;
+        line('T', a.get("type").and_then(Value::as_str).unwrap_or(kind), &mut o)?;
+        if let Some(d) = a.get("description").and_then(Value::as_str) {
+            line('D', d, &mut o)?;
+        }
+        o.push_str("^\n");
+    }
+    o.push_str(&format!("!Type:{}\n", kind));
+    for (i, t) in transactions.iter().enumerate() {
+        let date = t.get("date").and_then(Value::as_str).ok_or(format!("transaction {} needs a `date`", i))?;
+        let amount = t.get("amount").ok_or(format!("transaction {} needs an `amount`", i))?;
+        let a = amount_out(amount).map_err(|e| format!("transaction {}: {}", i, e))?;
+        line('D', &date_out(date, order).map_err(|e| format!("transaction {}: {}", i, e))?, &mut o)?;
+        line('T', &a, &mut o)?;
+        if kind != "Invst" {
+            line('U', &a, &mut o)?;
+        }
+        if let Some(c) = t.get("cleared").and_then(Value::as_str) {
+            line('C', if c == "cleared" { "*" } else if c == "reconciled" { "X" } else { c }, &mut o)?;
+        }
+        let num_key = if kind == "Invst" { "action" } else { "number" };
+        if let Some(n) = t.get(num_key).and_then(Value::as_str) {
+            line('N', n, &mut o)?;
+        }
+        for (k, f) in [("security", 'Y'), ("price", 'I'), ("quantity", 'Q'), ("commission", 'O')] {
+            if let Some(v) = t.get(k) {
+                if !v.is_null() {
+                    line(f, &v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()), &mut o)?;
+                }
+            }
+        }
+        if let Some(p) = t.get("payee").and_then(Value::as_str) {
+            line('P', p, &mut o)?;
+        }
+        if let Some(m) = t.get("memo").and_then(Value::as_str) {
+            line('M', m, &mut o)?;
+        }
+        for a in t.get("address").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            line('A', a, &mut o)?;
+        }
+        if let Some(c) = cat_out(t) {
+            line('L', &c, &mut o)?;
+        }
+        if let Some(sp) = t.get("splits").and_then(Value::as_array) {
+            let mut sum: Option<i128> = Some(0);
+            for s in sp {
+                line('S', &cat_out(s).unwrap_or_default(), &mut o)?;
+                if let Some(m) = s.get("memo").and_then(Value::as_str) {
+                    line('E', m, &mut o)?;
+                }
+                let v = amount_out(s.get("amount").ok_or(format!("transaction {}: a split needs an `amount`", i))?)?;
+                sum = sum.and_then(|x| cents(&v).map(|c| x + c));
+                line('$', &v, &mut o)?;
+            }
+            if let (Some(x), Some(y)) = (sum, cents(&a)) {
+                if x != y {
+                    return Err(format!("transaction {}: the splits add up to {} and the amount is {}", i, money_text(x), money_text(y)));
+                }
+            }
+        }
+        o.push_str("^\n");
+    }
+    Ok(o)
+}

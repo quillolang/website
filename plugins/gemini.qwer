@@ -1,0 +1,321 @@
+//! Google's Gemini API: generateContent with system instructions, function calls and safety blocks read, streams collected, embedContent and batches of it, token counts, and 429s retried by the delay the error names.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader};
+use std::time::Duration;
+
+struct Conf {
+    key: String,
+    base: String,
+    retries: u32,
+    timeout: Duration,
+}
+
+fn txt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn conf(o: &Value) -> Result<Conf, String> {
+    Ok(Conf {
+        key: txt(o, "api_key").or_else(|| env("GEMINI_API_KEY")).or_else(|| env("GOOGLE_API_KEY")).ok_or("no API key: set GEMINI_API_KEY, or give the option api_key")?,
+        base: txt(o, "base_url").or_else(|| env("GEMINI_API_URL")).unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()).trim_end_matches('/').to_string(),
+        retries: o.get("retries").and_then(|v| v.as_i64()).unwrap_or(2).clamp(0, 8) as u32,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(300_000).clamp(100, 3_600_000) as u64),
+    })
+}
+
+fn model_of(o: &Value) -> Result<String, String> {
+    let m = txt(o, "model").or_else(|| env("GEMINI_MODEL")).ok_or("no model: set GEMINI_MODEL (like gemini-2.5-flash), or give the option model")?;
+    Ok(m.trim_start_matches("models/").to_string())
+}
+
+fn embed_model(o: &Value) -> String {
+    txt(o, "model").or_else(|| env("GEMINI_EMBEDDING_MODEL")).unwrap_or_else(|| "gemini-embedding-001".into()).trim_start_matches("models/").to_string()
+}
+
+fn error_text(status: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let st = v.pointer("/error/status").and_then(|x| x.as_str()).unwrap_or("ERROR");
+    let msg = v.pointer("/error/message").and_then(|x| x.as_str()).map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let hint = match (status, st) {
+        (400, "FAILED_PRECONDITION") => " (the free tier is not available from this country: enable billing)",
+        (404, _) => " (check the model name)",
+        (403, _) => " (check GEMINI_API_KEY)",
+        _ => "",
+    };
+    format!("Gemini answered {} {}: {}{}", status, st, msg, hint)
+}
+
+// A 429 names its wait in a RetryInfo detail: `"retryDelay": "27s"`.
+fn retry_delay(body: &str) -> Option<f64> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    v.pointer("/error/details")?.as_array()?.iter().find_map(|d| d.get("retryDelay")?.as_str()?.trim_end_matches('s').parse::<f64>().ok())
+}
+
+fn send(c: &Conf, method: &str, path: &str, body: Option<&Value>) -> Result<ureq::Response, String> {
+    let text = body.map(|b| b.to_string());
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(30)).timeout_read(c.timeout).build();
+    let mut attempt = 0;
+    loop {
+        // The key goes in a header, so it stays out of URLs and logs.
+        let r = agent.request(method, &format!("{}{}", c.base, path)).set("x-goog-api-key", &c.key).set("User-Agent", "quillo-gemini/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        let backoff = (0.5 * 2f64.powi(attempt as i32)).min(8.0);
+        match res {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, resp)) => {
+                let after = resp.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                let wait = retry_delay(&t).or(after).unwrap_or(backoff);
+                if !(code == 429 || code >= 500) || attempt >= c.retries || wait > 60.0 {
+                    return Err(error_text(code, &t));
+                }
+                std::thread::sleep(Duration::from_secs_f64(wait));
+            }
+            Err(e) => {
+                if attempt >= c.retries {
+                    return Err(format!("cannot reach Gemini at {}: {}", c.base, e));
+                }
+                std::thread::sleep(Duration::from_secs_f64(backoff));
+            }
+        }
+        attempt += 1;
+    }
+}
+
+fn json_of(resp: ureq::Response) -> Result<Value, String> {
+    let t = resp.into_string().map_err(|e| format!("reading the answer: {}", e))?;
+    serde_json::from_str(&t).map_err(|_| format!("Gemini's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+}
+
+// `contents` may be one text; `system` becomes systemInstruction.
+fn body_of(params: &Value) -> Result<Map<String, Value>, String> {
+    let mut p = match params {
+        Value::Object(m) => m.clone(),
+        Value::String(s) => {
+            let mut m = Map::new();
+            m.insert("contents".into(), json!(s));
+            m
+        }
+        _ => return Err("params must be a map like { contents, system, tools, generationConfig } or the text of one question".into()),
+    };
+    match p.get("contents") {
+        Some(Value::String(s)) => {
+            let c = json!([{ "role": "user", "parts": [{ "text": s }] }]);
+            p.insert("contents".into(), c);
+        }
+        Some(Value::Array(l)) if !l.is_empty() => {}
+        _ => return Err("`contents` must hold at least one turn, or be a text".into()),
+    }
+    if let Some(s) = p.remove("system") {
+        let parts = match s {
+            Value::String(t) => json!({ "parts": [{ "text": t }] }),
+            other => other,
+        };
+        p.insert("systemInstruction".into(), parts);
+    }
+    Ok(p)
+}
+
+fn shape(r: Value) -> Value {
+    let cand = r.pointer("/candidates/0").cloned().unwrap_or(json!({}));
+    let parts = cand.pointer("/content/parts").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    // Thought summaries are parts too, marked `thought`; they are not the answer.
+    let text: String = parts.iter().filter(|p| p["thought"] != true).filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("");
+    let calls: Vec<Value> = parts.iter().filter_map(|p| p.get("functionCall")).map(|f| json!({ "id": f.get("id").cloned().unwrap_or(Value::Null), "name": f["name"], "args": f["args"] })).collect();
+    let blocked = r.pointer("/promptFeedback/blockReason").cloned().unwrap_or(Value::Null);
+    let finish = cand.get("finishReason").cloned().unwrap_or(Value::Null);
+    json!({
+        "text": text,
+        "function_calls": calls,
+        "finish_reason": finish,
+        "blocked": blocked,
+        "truncated": finish == "MAX_TOKENS",
+        "usage": r.get("usageMetadata").cloned().unwrap_or(json!({})),
+        "model_version": r.get("modelVersion").cloned().unwrap_or(Value::Null),
+        "safety": cand.get("safetyRatings").cloned().unwrap_or(json!([])),
+        "content": cand.get("content").cloned().unwrap_or(json!({ "role": "model", "parts": [] })),
+    })
+}
+
+/// generateContent: `params` as documented (`contents`, `tools`, `toolConfig`, `generationConfig`, `safetySettings`) with `system` for the system instruction, or one question as text. Options: model (else GEMINI_MODEL), api_key (else GEMINI_API_KEY), base_url (else GEMINI_API_URL), retries (2), timeout_ms. Gives { text, function_calls, finish_reason, blocked, truncated, usage, model_version, safety, content }.
+pub fn gemini_generate(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let m = model_of(&options)?;
+    let p = body_of(&params)?;
+    Ok(shape(json_of(send(&c, "POST", &format!("/models/{}:generateContent", m), Some(&Value::Object(p)))?)?))
+}
+
+/// One question with a `system` instruction (or "") and the text of the answer; a blocked prompt, a stop for safety or a cut-off answer is an error.
+pub fn gemini_ask(question: &str, system: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut p = json!({ "contents": question });
+    if !system.is_empty() {
+        p["system"] = json!(system);
+    }
+    let r = gemini_generate(p, options)?;
+    if let Some(b) = r["blocked"].as_str() {
+        return Err(format!("Gemini blocked the prompt: {}", b));
+    }
+    match r["finish_reason"].as_str().unwrap_or("STOP") {
+        "STOP" => Ok(r["text"].as_str().unwrap_or("").to_string()),
+        "MAX_TOKENS" => Err("the answer stopped at maxOutputTokens: raise it".into()),
+        other => Err(format!("Gemini stopped the answer: {}", other)),
+    }
+}
+
+/// generateContent as a stream (streamGenerateContent, alt=sse), collected: each event is a partial answer, and the text and function calls of all of them are joined.
+pub fn gemini_stream(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let m = model_of(&options)?;
+    let p = body_of(&params)?;
+    let resp = send(&c, "POST", &format!("/models/{}:streamGenerateContent?alt=sse", m), Some(&Value::Object(p)))?;
+    let mut parts: Vec<Value> = vec![];
+    let mut last = json!({});
+    let mut lines = BufReader::new(resp.into_reader());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).map_err(|e| format!("the stream broke: {}", e))? == 0 {
+            break;
+        }
+        let Some(d) = line.trim_end().strip_prefix("data:") else { continue };
+        let ev: Value = serde_json::from_str(d.trim()).map_err(|e| format!("a stream event is not JSON: {}", e))?;
+        if let Some(e) = ev.get("error") {
+            return Err(format!("the stream failed: {}", e.get("message").and_then(|m| m.as_str()).unwrap_or("no message")));
+        }
+        for part in ev.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()).into_iter().flatten() {
+            // Text pieces of one kind are joined, so `content` goes back as one part.
+            match (parts.last_mut(), part["text"].as_str()) {
+                (Some(prev), Some(t)) if prev["text"].is_string() && prev["thought"] == part["thought"] => {
+                    let joined = format!("{}{}", prev["text"].as_str().unwrap_or(""), t);
+                    prev["text"] = json!(joined);
+                }
+                _ => parts.push(part.clone()),
+            }
+        }
+        last = ev;
+    }
+    if last.get("candidates").is_none() && last.get("promptFeedback").is_none() {
+        return Err("the stream ended with no answer".into());
+    }
+    if last.pointer("/candidates/0").is_some() {
+        last["candidates"][0]["content"] = json!({ "role": "model", "parts": parts });
+    }
+    Ok(shape(last))
+}
+
+/// A function the model may call: its name, what it does, and a JSON Schema of its arguments. Put a list of them in `gemini_tools`.
+pub fn gemini_function(name: &str, description: &str, parameters: serde_json::Value) -> serde_json::Value {
+    json!({ "name": name, "description": description, "parameters": parameters })
+}
+
+/// `tools` for a request from gemini_function values.
+pub fn gemini_tools(functions: Vec<serde_json::Value>) -> serde_json::Value {
+    json!([{ "functionDeclarations": functions }])
+}
+
+/// The part answering one function call: `id` the call's id or "", its `name`, and the result (a map; anything else is wrapped in { result }).
+pub fn gemini_function_response(id: &str, name: &str, response: serde_json::Value) -> serde_json::Value {
+    let body = if response.is_object() { response } else { json!({ "result": response }) };
+    let mut f = json!({ "name": name, "response": body });
+    if !id.is_empty() {
+        f["id"] = json!(id);
+    }
+    json!({ "functionResponse": f })
+}
+
+/// The contents for the next turn: `contents`, the `response`'s content unchanged (thought signatures must go back as they came), then the function responses in one user turn. Refuses when a call has no answer.
+pub fn gemini_continue(contents: Vec<serde_json::Value>, response: serde_json::Value, results: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = contents;
+    out.push(response.get("content").cloned().ok_or("the response has no content: pass what gemini_generate gave")?);
+    for call in response["function_calls"].as_array().into_iter().flatten() {
+        if !results.iter().any(|r| r.pointer("/functionResponse/name") == Some(&call["name"])) {
+            return Err(format!("the call to {} has no response", call["name"].as_str().unwrap_or("?")));
+        }
+    }
+    out.push(json!({ "role": "user", "parts": results }));
+    Ok(out)
+}
+
+fn embed_body(model: &str, text: &str, o: &Value) -> Value {
+    let mut b = json!({ "model": format!("models/{}", model), "content": { "parts": [{ "text": text }] } });
+    if let Some(t) = txt(o, "task_type") { b["taskType"] = json!(t); }
+    if let Some(t) = txt(o, "title") { b["title"] = json!(t); }
+    if let Some(d) = o.get("dimensions").and_then(|v| v.as_i64()) { b["outputDimensionality"] = json!(d); }
+    b
+}
+
+/// embedContent: one text's vector. Options: model (else GEMINI_EMBEDDING_MODEL, else gemini-embedding-001), task_type (RETRIEVAL_DOCUMENT, RETRIEVAL_QUERY...), title, dimensions.
+pub fn gemini_embed(text: &str, options: serde_json::Value) -> Result<Vec<f64>, String> {
+    let c = conf(&options)?;
+    let m = embed_model(&options);
+    let r = json_of(send(&c, "POST", &format!("/models/{}:embedContent", m), Some(&embed_body(&m, text, &options)))?)?;
+    vector(&r["embedding"])
+}
+
+fn vector(e: &Value) -> Result<Vec<f64>, String> {
+    e["values"].as_array().map(|l| l.iter().filter_map(|x| x.as_f64()).collect()).ok_or(format!("no embedding in the answer: {}", e))
+}
+
+/// batchEmbedContents: the vectors of many texts in one go, split into requests of 100 as the API wants; in the order given.
+pub fn gemini_embed_batch(texts: Vec<String>, options: serde_json::Value) -> Result<Vec<Vec<f64>>, String> {
+    if texts.is_empty() {
+        return Err("no texts to embed".into());
+    }
+    let c = conf(&options)?;
+    let m = embed_model(&options);
+    let mut out = vec![];
+    for chunk in texts.chunks(100) {
+        let reqs: Vec<Value> = chunk.iter().map(|t| embed_body(&m, t, &options)).collect();
+        let r = json_of(send(&c, "POST", &format!("/models/{}:batchEmbedContents", m), Some(&json!({ "requests": reqs })))?)?;
+        for e in r["embeddings"].as_array().ok_or("no embeddings in the answer")? {
+            out.push(vector(e)?);
+        }
+    }
+    Ok(out)
+}
+
+/// countTokens for the same `params` as gemini_generate: gives the total.
+pub fn gemini_count_tokens(params: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    let c = conf(&options)?;
+    let m = model_of(&options)?;
+    let mut p = body_of(&params)?;
+    // A request with a system instruction or tools has to go in as a whole generateContentRequest.
+    let body = if p.len() > 1 {
+        p.insert("model".into(), json!(format!("models/{}", m)));
+        json!({ "generateContentRequest": p })
+    } else {
+        Value::Object(p)
+    };
+    let r = json_of(send(&c, "POST", &format!("/models/{}:countTokens", m), Some(&body))?)?;
+    r["totalTokens"].as_i64().ok_or(format!("the answer has no totalTokens: {}", r))
+}
+
+/// The models this key can use, every page followed: { name, displayName, inputTokenLimit, outputTokenLimit, supportedGenerationMethods }.
+pub fn gemini_models(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let c = conf(&options)?;
+    let mut out = vec![];
+    let mut token = String::new();
+    for _ in 0..100 {
+        let path = if token.is_empty() { "/models?pageSize=100".to_string() } else { format!("/models?pageSize=100&pageToken={}", token) };
+        let r = json_of(send(&c, "GET", &path, None)?)?;
+        out.extend(r["models"].as_array().cloned().unwrap_or_default());
+        match r["nextPageToken"].as_str() {
+            Some(t) if !t.is_empty() => token = t.to_string(),
+            _ => break,
+        }
+    }
+    Ok(out)
+}

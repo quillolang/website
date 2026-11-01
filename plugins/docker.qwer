@@ -1,0 +1,340 @@
+//! The Docker Engine API over its Unix socket, with no client library: containers listed with filters, inspected, started, stopped, restarted and removed, logs with the multiplexed stream decoded into stdout and stderr, stats, images listed and pulled, and error bodies turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
+// DOCKER_HOST is the socket: unix:///var/run/docker.sock when not set (Docker Desktop's is at
+// ~/.docker/run/docker.sock), or a plain path. DOCKER_API_VERSION is the version to ask for, like
+// 1.43: when it is not set the path has none, and the daemon uses its newest. Reaching this socket
+// is as good as root on that machine: never let a visitor choose what is sent here unchecked.
+
+const MAX_ANSWER: usize = 256 * 1024 * 1024;
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn socket() -> Result<String, String> {
+    let host = env("DOCKER_HOST").unwrap_or_else(|| "unix:///var/run/docker.sock".into());
+    if let Some(p) = host.strip_prefix("unix://") {
+        return Ok(p.to_string());
+    }
+    if host.contains("://") {
+        return Err(format!("{}: this plugin speaks to a Unix socket: write unix:///path/to/docker.sock", host));
+    }
+    Ok(host)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn path_of(p: &str) -> String {
+    match env("DOCKER_API_VERSION") {
+        Some(v) => format!("/v{}{}", v.trim_start_matches('v'), p),
+        None => p.to_string(),
+    }
+}
+
+struct Answer {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Answer {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|x| x.1.as_str())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+    fn failure(&self) -> String {
+        let v = self.json();
+        let m = v["message"].as_str().map(str::to_string).unwrap_or_else(|| self.text().trim().chars().take(300).collect());
+        format!("Docker answered {}: {}", self.status, m)
+    }
+}
+
+/// An HTTP/1.1 exchange on the socket, written by hand: ureq has no way onto a Unix socket, and one request needs only this.
+fn request(method: &str, path: &str, body: Option<&Value>, timeout: Duration) -> Result<Answer, String> {
+    let sock = socket()?;
+    let mut s = UnixStream::connect(&sock).map_err(|e| format!("cannot reach Docker at {}: {} (is the daemon running, and may this user use its socket?)", sock, e))?;
+    s.set_read_timeout(Some(timeout)).ok();
+    s.set_write_timeout(Some(timeout)).ok();
+    let text = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut head = format!("{} {} HTTP/1.1\r\nHost: docker\r\nUser-Agent: quillo-docker/1.0\r\nConnection: close\r\n", method, path_of(path));
+    if body.is_some() {
+        head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", text.len()));
+    } else if method == "POST" {
+        head.push_str("Content-Length: 0\r\n");
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    read_answer(BufReader::new(s))
+}
+
+fn read_answer(mut r: BufReader<UnixStream>) -> Result<Answer, String> {
+    let mut line = String::new();
+    r.read_line(&mut line).map_err(|e| format!("Docker gave no answer: {}", e))?;
+    let status: u16 = line.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or(format!("that is not an HTTP answer: {:?}", line.trim()))?;
+    let mut headers = vec![];
+    loop {
+        line.clear();
+        r.read_line(&mut line).map_err(|e| e.to_string())?;
+        let l = line.trim_end();
+        if l.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    let mut a = Answer { status, headers, body: vec![] };
+    if a.header("Transfer-Encoding").map_or(false, |t| t.eq_ignore_ascii_case("chunked")) {
+        loop {
+            line.clear();
+            r.read_line(&mut line).map_err(|e| e.to_string())?;
+            let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16).map_err(|_| format!("a bad chunk size: {:?}", line.trim()))?;
+            if size == 0 {
+                break;
+            }
+            if a.body.len() + size > MAX_ANSWER {
+                return Err("the answer is over 256 MB".into());
+            }
+            let at = a.body.len();
+            a.body.resize(at + size, 0);
+            r.read_exact(&mut a.body[at..]).map_err(|e| format!("the answer broke off: {}", e))?;
+            line.clear();
+            r.read_line(&mut line).map_err(|e| e.to_string())?;
+        }
+    } else if let Some(n) = a.header("Content-Length").and_then(|n| n.parse::<usize>().ok()) {
+        a.body.resize(n, 0);
+        r.read_exact(&mut a.body).map_err(|e| format!("the answer broke off: {}", e))?;
+    } else {
+        r.take(MAX_ANSWER as u64).read_to_end(&mut a.body).map_err(|e| e.to_string())?;
+    }
+    Ok(a)
+}
+
+fn get(path: &str) -> Result<Value, String> {
+    let a = request("GET", path, None, Duration::from_secs(30))?;
+    if a.status >= 300 {
+        return Err(a.failure());
+    }
+    Ok(a.json())
+}
+
+fn check_name(id: &str) -> Result<String, String> {
+    if id.is_empty() {
+        return Err("no container or image named".into());
+    }
+    Ok(enc(id))
+}
+
+/// `?filters=` is a map of name to a list of values, in JSON.
+fn filters_text(f: &Value) -> Result<Option<String>, String> {
+    let m = match f {
+        Value::Null => return Ok(None),
+        Value::Object(m) if m.is_empty() => return Ok(None),
+        Value::Object(m) => m,
+        _ => return Err("filters are a map, like { status: \"running\", label: [\"app=web\"] }".into()),
+    };
+    let mut o = serde_json::Map::new();
+    for (k, v) in m {
+        o.insert(k.clone(), match v {
+            Value::Array(_) => v.clone(),
+            other => json!([other.as_str().map_or(other.to_string(), str::to_string)]),
+        });
+    }
+    Ok(Some(enc(&Value::Object(o).to_string())))
+}
+
+fn short(c: &Value) -> Value {
+    let name = c["Names"][0].as_str().unwrap_or("").trim_start_matches('/');
+    let id = c["Id"].as_str().unwrap_or("");
+    json!({ "id": &id[..id.len().min(12)], "full_id": id, "name": name, "image": c["Image"], "state": c["State"], "status": c["Status"], "created": c["Created"], "labels": c["Labels"], "ports": c["Ports"] })
+}
+
+/// The daemon's `{ version, api_version, os, arch }`.
+pub fn docker_version() -> Result<Value, String> {
+    let v = get("/version")?;
+    Ok(json!({ "version": v["Version"], "api_version": v["ApiVersion"], "os": v["Os"], "arch": v["Arch"] }))
+}
+
+/// Containers: `all` includes stopped ones, `filters` as Docker takes them, `{ status: "running", label: ["app=web"], name: "api" }`, a single value being fine. Each is `{ id, full_id, name, image, state, status, created, labels, ports }`.
+pub fn docker_containers(all: bool, filters: serde_json::Value) -> Result<Vec<Value>, String> {
+    let mut p = format!("/containers/json?all={}", all);
+    if let Some(f) = filters_text(&filters)? {
+        p.push_str(&format!("&filters={}", f));
+    }
+    Ok(get(&p)?.as_array().into_iter().flatten().map(short).collect())
+}
+
+/// One container in full as Docker describes it (`Id`, `Name`, `State`, `Config`, `NetworkSettings`...), or null when there is none.
+pub fn docker_inspect(id: &str) -> Result<Value, String> {
+    let a = request("GET", &format!("/containers/{}/json", check_name(id)?), None, Duration::from_secs(30))?;
+    if a.status == 404 {
+        return Ok(Value::Null);
+    }
+    if a.status >= 300 {
+        return Err(a.failure());
+    }
+    Ok(a.json())
+}
+
+fn act(path: &str, verb: &str, id: &str, wait: Duration) -> Result<bool, String> {
+    let a = request("POST", path, None, wait)?;
+    match a.status {
+        204 => Ok(true),
+        304 => Ok(false),
+        404 => Err(format!("no container {}", id)),
+        _ => Err(format!("cannot {} {}: {}", verb, id, a.failure())),
+    }
+}
+
+/// Starts a container. True when it started, false when it was running already.
+pub fn docker_start(id: &str) -> Result<bool, String> {
+    act(&format!("/containers/{}/start", check_name(id)?), "start", id, Duration::from_secs(60))
+}
+
+/// Stops a container, killing it `timeout_seconds` after asking (-1 for its own setting). True when it stopped, false when it was stopped already.
+pub fn docker_stop(id: &str, timeout_seconds: i64) -> Result<bool, String> {
+    let q = if timeout_seconds >= 0 { format!("?t={}", timeout_seconds) } else { String::new() };
+    act(&format!("/containers/{}/stop{}", check_name(id)?, q), "stop", id, Duration::from_secs((timeout_seconds.max(30) + 15) as u64))
+}
+
+/// Restarts a container.
+pub fn docker_restart(id: &str, timeout_seconds: i64) -> Result<bool, String> {
+    let q = if timeout_seconds >= 0 { format!("?t={}", timeout_seconds) } else { String::new() };
+    act(&format!("/containers/{}/restart{}", check_name(id)?, q), "restart", id, Duration::from_secs((timeout_seconds.max(30) + 15) as u64))
+}
+
+/// Removes a container; `force` takes a running one too, `volumes` its anonymous volumes. False when there was none.
+pub fn docker_remove(id: &str, force: bool, volumes: bool) -> Result<bool, String> {
+    let a = request("DELETE", &format!("/containers/{}?force={}&v={}", check_name(id)?, force, volumes), None, Duration::from_secs(60))?;
+    match a.status {
+        204 => Ok(true),
+        404 => Ok(false),
+        _ => Err(a.failure()),
+    }
+}
+
+/// Splits Docker's multiplexed stream: frames of [kind, 0, 0, 0, length as four big-endian bytes], then that many bytes, kind 0 stdin, 1 stdout, 2 stderr. Gives the two texts and the frames in order.
+fn demux(b: &[u8]) -> Result<Value, String> {
+    let (mut stdout, mut stderr, mut lines): (Vec<u8>, Vec<u8>, Vec<Value>) = (vec![], vec![], vec![]);
+    let mut i = 0;
+    while i < b.len() {
+        if i + 8 > b.len() {
+            return Err(format!("the log stream broke off inside a frame header, {} bytes from the end", b.len() - i));
+        }
+        let kind = b[i];
+        if kind > 2 || b[i + 1] != 0 || b[i + 2] != 0 || b[i + 3] != 0 {
+            return Err(format!("the log stream is not multiplexed at byte {}: is this a TTY container?", i));
+        }
+        let n = u32::from_be_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
+        i += 8;
+        if i + n > b.len() {
+            return Err("the log stream broke off inside a frame".into());
+        }
+        let part = &b[i..i + n];
+        i += n;
+        match kind {
+            2 => stderr.extend_from_slice(part),
+            _ => stdout.extend_from_slice(part),
+        }
+        lines.push(json!({ "stream": if kind == 2 { "stderr" } else { "stdout" }, "text": String::from_utf8_lossy(part) }));
+    }
+    Ok(json!({ "stdout": String::from_utf8_lossy(&stdout), "stderr": String::from_utf8_lossy(&stderr), "frames": lines }))
+}
+
+/// A container's logs: `options` `tail` (a number of lines), `since` (a Unix time), `timestamps`, `stderr` and `stdout` (both true by default). Gives `{ stdout, stderr, frames: [{ stream, text }] }`, the frames in the order they came. A container with a TTY has one stream, which comes back as stdout.
+pub fn docker_logs(id: &str, options: serde_json::Value) -> Result<Value, String> {
+    let info = docker_inspect(id)?;
+    if info.is_null() {
+        return Err(format!("no container {}", id));
+    }
+    let on = |k: &str| options.get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut p = format!("/containers/{}/logs?stdout={}&stderr={}&timestamps={}", check_name(id)?, on("stdout"), on("stderr"), options["timestamps"] == true);
+    for k in ["tail", "since"] {
+        match &options[k] {
+            Value::Null => {}
+            Value::String(s) => p.push_str(&format!("&{}={}", k, enc(s))),
+            o => p.push_str(&format!("&{}={}", k, o)),
+        }
+    }
+    let a = request("GET", &p, None, Duration::from_secs(60))?;
+    if a.status >= 300 {
+        return Err(a.failure());
+    }
+    if info["Config"]["Tty"] == true {
+        return Ok(json!({ "stdout": a.text(), "stderr": "", "frames": [{ "stream": "stdout", "text": a.text() }] }));
+    }
+    demux(&a.body)
+}
+
+/// One reading of a container's use: `{ cpu_percent, memory_bytes, memory_limit, memory_percent, pids }`, worked out as `docker stats` does it.
+pub fn docker_stats(id: &str) -> Result<Value, String> {
+    let a = request("GET", &format!("/containers/{}/stats?stream=false", check_name(id)?), None, Duration::from_secs(30))?;
+    if a.status >= 300 {
+        return Err(a.failure());
+    }
+    let s = a.json();
+    let n = |v: &Value| v.as_f64().unwrap_or(0.0);
+    let cpu = n(&s["cpu_stats"]["cpu_usage"]["total_usage"]) - n(&s["precpu_stats"]["cpu_usage"]["total_usage"]);
+    let sys = n(&s["cpu_stats"]["system_cpu_usage"]) - n(&s["precpu_stats"]["system_cpu_usage"]);
+    let cpus = s["cpu_stats"]["online_cpus"].as_f64().unwrap_or(1.0);
+    let cache = s["memory_stats"]["stats"]["inactive_file"].as_f64().unwrap_or(0.0);
+    let used = n(&s["memory_stats"]["usage"]) - cache;
+    let limit = n(&s["memory_stats"]["limit"]);
+    Ok(json!({ "cpu_percent": if sys > 0.0 { cpu / sys * cpus * 100.0 } else { 0.0 }, "memory_bytes": used, "memory_limit": limit, "memory_percent": if limit > 0.0 { used / limit * 100.0 } else { 0.0 }, "pids": s["pids_stats"]["current"] }))
+}
+
+/// Images: each `{ id, tags, digests, size, created }`. `filters` as for containers, `{ reference: "nginx:*", dangling: "true" }`.
+pub fn docker_images(filters: serde_json::Value) -> Result<Vec<Value>, String> {
+    let mut p = "/images/json".to_string();
+    if let Some(f) = filters_text(&filters)? {
+        p.push_str(&format!("?filters={}", f));
+    }
+    Ok(get(&p)?.as_array().into_iter().flatten().map(|i| json!({ "id": i["Id"], "tags": i["RepoTags"], "digests": i["RepoDigests"], "size": i["Size"], "created": i["Created"] })).collect())
+}
+
+/// Pulls an image, `tag` "" meaning latest, waiting until it is done. The answer is a stream of JSON lines, a 200 whatever happens, so an error in it is looked for. Gives the last status line.
+pub fn docker_pull(image: &str, tag: &str) -> Result<String, String> {
+    let t = if tag.is_empty() { "latest" } else { tag };
+    let a = request("POST", &format!("/images/create?fromImage={}&tag={}", enc(image), enc(t)), None, Duration::from_secs(900))?;
+    if a.status >= 300 {
+        return Err(a.failure());
+    }
+    let mut last = String::new();
+    for l in a.text().lines() {
+        let v: Value = serde_json::from_str(l).unwrap_or(Value::Null);
+        if let Some(e) = v["error"].as_str().or(v["errorDetail"]["message"].as_str()) {
+            return Err(format!("the pull of {}:{} failed: {}", image, t, e));
+        }
+        if let Some(s) = v["status"].as_str() {
+            last = s.to_string();
+        }
+    }
+    Ok(last)
+}
+
+/// Removes an image; false when there was none. An image in use is an error unless `force`.
+pub fn docker_remove_image(image: &str, force: bool) -> Result<bool, String> {
+    let a = request("DELETE", &format!("/images/{}?force={}", check_name(image)?, force), None, Duration::from_secs(60))?;
+    match a.status {
+        200 => Ok(true),
+        404 => Ok(false),
+        _ => Err(a.failure()),
+    }
+}

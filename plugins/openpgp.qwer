@@ -1,0 +1,225 @@
+//! OpenPGP through the pure-Rust `pgp` crate: keys made and read, messages encrypted, decrypted, signed and verified, detached signatures, and armor.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! pgp = { version = "=0.21.0", default-features = false }
+//! rand = "0.8"
+
+use pgp::composed::{ArmorOptions, CleartextSignedMessage, Deserializable, DetachedSignature, EncryptionCaps, KeyType, Message, MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey, SignedSecretKey, SubkeyParamsBuilder};
+use pgp::crypto::ecc_curve::ECCCurve;
+use pgp::crypto::hash::HashAlgorithm;
+use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::types::{KeyDetails, KeyVersion, Password};
+use rand::thread_rng;
+use serde_json::{json, Value};
+
+fn e<T: std::fmt::Display>(what: &str) -> impl Fn(T) -> String + '_ {
+    move |x| format!("{}: {}", what, x)
+}
+
+fn read_public(key: &str) -> Result<SignedPublicKey, String> {
+    let (k, _) = SignedPublicKey::from_string(key).map_err(e("not an OpenPGP public key"))?;
+    k.verify_bindings().map_err(e("the key's own signatures do not hold"))?;
+    Ok(k)
+}
+
+fn read_secret(key: &str) -> Result<SignedSecretKey, String> {
+    let (k, _) = SignedSecretKey::from_string(key).map_err(e("not an OpenPGP private key"))?;
+    k.verify_bindings().map_err(e("the key's own signatures do not hold"))?;
+    Ok(k)
+}
+
+fn hex(x: impl std::fmt::UpperHex) -> String {
+    format!("{:X}", x)
+}
+
+fn algorithm(k: &impl KeyDetails) -> String {
+    format!("{:?}", k.algorithm())
+}
+
+fn sub_info(k: &impl KeyDetails) -> Value {
+    json!({
+        "fingerprint": hex(k.fingerprint()), "algorithm": algorithm(k), "created": k.created_at().as_secs(),
+        "can_encrypt": k.algorithm().can_encrypt(), "can_sign": k.algorithm().can_sign(),
+    })
+}
+
+/// Makes a key for `user_id` ("Ada <ada@example.com>"): Ed25519 to sign and Curve25519 to decrypt, which every current OpenPGP program reads. `passphrase` empty leaves the private key unprotected. Gives `{ public, private, fingerprint, key_id }`, armored; keep `private` with care.
+pub fn openpgp_generate(user_id: &str, passphrase: &str) -> Result<Value, String> {
+    if user_id.trim().is_empty() {
+        return Err("a key needs a user id".into());
+    }
+    let pass = (!passphrase.is_empty()).then(|| passphrase.to_string());
+    let mut sub = SubkeyParamsBuilder::default();
+    sub.key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy)).can_sign(false).can_encrypt(EncryptionCaps::All).can_authenticate(false).passphrase(pass.clone());
+    let mut p = SecretKeyParamsBuilder::default();
+    p.key_type(KeyType::Ed25519Legacy).can_certify(true).can_sign(true).can_encrypt(EncryptionCaps::None).primary_user_id(user_id.into()).passphrase(pass).subkeys(vec![sub.build().map_err(e("the subkey"))?]);
+    let k = p.build().map_err(e("the key"))?.generate(thread_rng()).map_err(e("making the key"))?;
+    let public = SignedPublicKey::from(k.clone());
+    Ok(json!({
+        "public": public.to_armored_string(ArmorOptions::default()).map_err(e("armor"))?,
+        "private": k.to_armored_string(ArmorOptions::default()).map_err(e("armor"))?,
+        "fingerprint": hex(k.fingerprint()),
+        "key_id": k.legacy_key_id().to_string().to_uppercase(),
+    }))
+}
+
+/// What a key is, public or private: `{ private, fingerprint, key_id, version, algorithm, created, users, subkeys }`, the key's own signatures checked. `created` is seconds since 1970.
+pub fn openpgp_key_info(key: &str) -> Result<Value, String> {
+    let private = key.contains("PRIVATE KEY BLOCK");
+    let public = if private { SignedPublicKey::from(read_secret(key)?) } else { read_public(key)? };
+    let users: Vec<String> = public.details.users.iter().filter_map(|u| u.id.as_str().map(str::to_string)).collect();
+    let subkeys: Vec<Value> = public.public_subkeys.iter().map(|s| sub_info(&s.key)).collect();
+    let version = match public.version() { KeyVersion::V4 => 4, KeyVersion::V6 => 6, _ => 0 };
+    Ok(json!({
+        "private": private, "fingerprint": hex(public.fingerprint()), "key_id": public.legacy_key_id().to_string().to_uppercase(), "version": version,
+        "algorithm": algorithm(&public), "created": public.created_at().as_secs(), "users": users, "subkeys": subkeys,
+    }))
+}
+
+/// The public half of a private key, armored, to hand out.
+pub fn openpgp_public_of(private_key: &str) -> Result<String, String> {
+    SignedPublicKey::from(read_secret(private_key)?).to_armored_string(ArmorOptions::default()).map_err(e("armor"))
+}
+
+/// Encrypts text to one or more public keys, the first of each that can decrypt: an armored message, in SEIPD v1 (AES-256) for v4 keys, which GnuPG reads, and in v2 for v6 keys.
+pub fn openpgp_encrypt(message: &str, public_keys: Vec<String>) -> Result<String, String> {
+    if public_keys.is_empty() {
+        return Err("no public keys".into());
+    }
+    let keys: Vec<SignedPublicKey> = public_keys.iter().map(|k| read_public(k)).collect::<Result<_, _>>()?;
+    let targets = keys.iter().map(|k| k.public_subkeys.iter().find(|s| s.key.algorithm().can_encrypt()).ok_or(format!("key {} has no encryption subkey", hex(k.fingerprint())))).collect::<Result<Vec<_>, _>>()?;
+    let mut rng = thread_rng();
+    if targets.iter().all(|t| t.key.version() == KeyVersion::V6) {
+        let mut b = MessageBuilder::from_bytes("", message.as_bytes().to_vec()).seipd_v2(&mut rng, SymmetricKeyAlgorithm::AES256, pgp::crypto::aead::AeadAlgorithm::Ocb, pgp::crypto::aead::ChunkSize::default());
+        for t in &targets {
+            b.encrypt_to_key(&mut rng, &t.key).map_err(e("encrypting"))?;
+        }
+        return b.to_armored_string(&mut rng, ArmorOptions::default()).map_err(e("encrypting"));
+    }
+    let mut b = MessageBuilder::from_bytes("", message.as_bytes().to_vec()).seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    for t in &targets {
+        b.encrypt_to_key(&mut rng, &t.key).map_err(e("encrypting"))?;
+    }
+    b.to_armored_string(&mut rng, ArmorOptions::default()).map_err(e("encrypting"))
+}
+
+/// Encrypts and signs: the message opens only with the receiver's key, and proves who sent it. `passphrase` is the signer's.
+pub fn openpgp_encrypt_signed(message: &str, public_key: &str, private_key: &str, passphrase: &str) -> Result<String, String> {
+    let key = read_public(public_key)?;
+    let signer = read_secret(private_key)?;
+    let target = key.public_subkeys.iter().find(|s| s.key.algorithm().can_encrypt()).ok_or("the key has no encryption subkey")?;
+    let mut rng = thread_rng();
+    let mut b = MessageBuilder::from_bytes("", message.as_bytes().to_vec()).seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    b.sign(&signer.primary_key, Password::from(passphrase), HashAlgorithm::Sha256);
+    b.encrypt_to_key(&mut rng, &target.key).map_err(e("encrypting"))?;
+    b.to_armored_string(&mut rng, ArmorOptions::default()).map_err(e("encrypting"))
+}
+
+/// Encrypts text with a password alone, for a receiver with no key: an armored message any OpenPGP program opens with the password.
+pub fn openpgp_encrypt_password(message: &str, password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        return Err("the password is empty".into());
+    }
+    let mut rng = thread_rng();
+    let mut b = MessageBuilder::from_bytes("", message.as_bytes().to_vec()).seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    b.encrypt_with_password(pgp::types::StringToKey::new_default(&mut rng), &Password::from(password)).map_err(e("encrypting"))?;
+    b.to_armored_string(&mut rng, ArmorOptions::default()).map_err(e("encrypting"))
+}
+
+fn opened(mut m: Message<'_>) -> Result<Message<'_>, String> {
+    if m.is_compressed() {
+        m = m.decompress().map_err(e("decompressing"))?;
+    }
+    Ok(m)
+}
+
+fn text_of(m: &mut Message<'_>) -> Result<String, String> {
+    let data = m.as_data_vec().map_err(e("reading the message"))?;
+    String::from_utf8(data).map_err(|_| "the message is not text".to_string())
+}
+
+/// Opens a message with a private key: its text. The wrong key or passphrase, or a message changed on the way, is an error, as the integrity check is part of decrypting.
+pub fn openpgp_decrypt(armored: &str, private_key: &str, passphrase: &str) -> Result<String, String> {
+    let key = read_secret(private_key)?;
+    let (m, _) = Message::from_string(armored).map_err(e("not an OpenPGP message"))?;
+    let m = m.decrypt(&Password::from(passphrase), &key).map_err(e("cannot decrypt"))?;
+    let mut m = opened(m)?;
+    text_of(&mut m)
+}
+
+/// Opens a message made with a password.
+pub fn openpgp_decrypt_password(armored: &str, password: &str) -> Result<String, String> {
+    let (m, _) = Message::from_string(armored).map_err(e("not an OpenPGP message"))?;
+    let m = m.decrypt_with_password(&Password::from(password)).map_err(e("cannot decrypt"))?;
+    let mut m = opened(m)?;
+    text_of(&mut m)
+}
+
+/// Opens a signed and encrypted message, and checks the signature against the sender's public key: `{ text, signer }`. A message from someone else is an error, the text kept from the caller.
+pub fn openpgp_decrypt_verify(armored: &str, private_key: &str, passphrase: &str, sender_public_key: &str) -> Result<Value, String> {
+    let key = read_secret(private_key)?;
+    let sender = read_public(sender_public_key)?;
+    let (m, _) = Message::from_string(armored).map_err(e("not an OpenPGP message"))?;
+    let m = m.decrypt(&Password::from(passphrase), &key).map_err(e("cannot decrypt"))?;
+    let mut m = opened(m)?;
+    let text = text_of(&mut m)?;
+    if !m.is_signed() {
+        return Err("the message is not signed".into());
+    }
+    if m.verify(&sender.primary_key).is_err() && !sender.public_subkeys.iter().any(|s| m.verify(&s.key).is_ok()) {
+        return Err("the signature is not the sender's".into());
+    }
+    Ok(json!({ "text": text, "signer": hex(sender.fingerprint()) }))
+}
+
+/// A cleartext signed message: readable as it stands, signature below it.
+pub fn openpgp_sign(message: &str, private_key: &str, passphrase: &str) -> Result<String, String> {
+    let key = read_secret(private_key)?;
+    let m = CleartextSignedMessage::sign(thread_rng(), message, &key.primary_key, &Password::from(passphrase)).map_err(e("cannot sign"))?;
+    m.to_armored_string(ArmorOptions::default()).map_err(e("armor"))
+}
+
+/// Checks a cleartext signed message against a public key: `{ text, signer }`, `signer` being the fingerprint of the key or subkey that signed. A changed text or another key is an error.
+pub fn openpgp_verify(signed: &str, public_key: &str) -> Result<Value, String> {
+    let key = read_public(public_key)?;
+    let (m, _) = CleartextSignedMessage::from_string(signed).map_err(e("not a cleartext signed message"))?;
+    let signer = if m.verify(&key.primary_key).is_ok() {
+        hex(key.fingerprint())
+    } else {
+        key.public_subkeys.iter().find(|s| m.verify(&s.key).is_ok()).map(|s| hex(s.key.fingerprint())).ok_or("the signature does not match this key and text")?
+    };
+    Ok(json!({ "text": m.text(), "signer": signer }))
+}
+
+/// A detached signature over text or a file's bytes, armored: the data stays as it is.
+pub fn openpgp_sign_detached(data: &str, private_key: &str, passphrase: &str) -> Result<String, String> {
+    let key = read_secret(private_key)?;
+    let s = DetachedSignature::sign_binary_data(thread_rng(), &key.primary_key, &Password::from(passphrase), HashAlgorithm::Sha256, data.as_bytes()).map_err(e("cannot sign"))?;
+    s.to_armored_string(ArmorOptions::default()).map_err(e("armor"))
+}
+
+/// Checks a detached signature: the signer's fingerprint, or an error.
+pub fn openpgp_verify_detached(data: &str, signature: &str, public_key: &str) -> Result<String, String> {
+    let key = read_public(public_key)?;
+    let (s, _) = DetachedSignature::from_string(signature).map_err(e("not a detached signature"))?;
+    if s.verify(&key.primary_key, data.as_bytes()).is_ok() {
+        return Ok(hex(key.fingerprint()));
+    }
+    key.public_subkeys.iter().find(|x| s.verify(&x.key, data.as_bytes()).is_ok()).map(|x| hex(x.key.fingerprint())).ok_or("the signature does not match this key and data".into())
+}
+
+/// What an armored block is: `{ type, headers }`, for telling what someone has sent. A bad armor checksum or a broken packet is an error.
+pub fn openpgp_inspect(armored: &str) -> Result<Value, String> {
+    let (m, h) = pgp::composed::Any::from_string(armored).map_err(e("not OpenPGP armor"))?;
+    let kind = match &m {
+        pgp::composed::Any::Cleartext(_) => "cleartext signed message",
+        pgp::composed::Any::PublicKey(_) => "public key",
+        pgp::composed::Any::SecretKey(_) => "private key",
+        pgp::composed::Any::Message(_) => "message",
+        pgp::composed::Any::Signature(_) => "signature",
+    };
+    let headers: serde_json::Map<String, Value> = h.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+    Ok(json!({ "type": kind, "headers": headers }))
+}

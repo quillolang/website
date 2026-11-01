@@ -1,0 +1,547 @@
+//! Passkeys: WebAuthn registration and sign-in checked by hand in pure Rust, with challenges, clientDataJSON, authenticator data and its flags, attestation (none and packed), COSE keys for ES256, EdDSA and RS256, and signature counters.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! base64 = "0.22"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+//! ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+//! rsa = { version = "0.9", default-features = false, features = ["std"] }
+//! getrandom = "0.2"
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+const ES256: i64 = -7;
+const EDDSA: i64 = -8;
+const RS256: i64 = -257;
+
+const UP: u8 = 0x01;
+const UV: u8 = 0x04;
+const BE: u8 = 0x08;
+const BS: u8 = 0x10;
+const AT: u8 = 0x40;
+const ED: u8 = 0x80;
+
+fn b64(x: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(x)
+}
+
+/// Base64url as WebAuthn writes it; padding or the other alphabet is forgiven, as some libraries send them.
+fn unb64(what: &str, x: &str) -> Result<Vec<u8>, String> {
+    let t: String = x.trim_end_matches('=').chars().map(|c| match c { '+' => '-', '/' => '_', o => o }).collect();
+    URL_SAFE_NO_PAD.decode(t).map_err(|_| format!("{} is not base64url", what))
+}
+
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(b)
+}
+
+fn sha256(x: &[u8]) -> Vec<u8> {
+    Sha256::digest(x).to_vec()
+}
+
+/// CBOR, as much as WebAuthn uses.
+#[derive(Debug, Clone, PartialEq)]
+enum Cbor {
+    Int(i128),
+    Bytes(Vec<u8>),
+    Text(String),
+    Array(Vec<Cbor>),
+    Map(Vec<(Cbor, Cbor)>),
+    Bool(bool),
+    Null,
+}
+
+impl Cbor {
+    fn get(&self, key: &Cbor) -> Option<&Cbor> {
+        if let Cbor::Map(m) = self { m.iter().find(|(k, _)| k == key).map(|(_, v)| v) } else { None }
+    }
+    fn text(&self, key: &str) -> Option<&Cbor> {
+        self.get(&Cbor::Text(key.into()))
+    }
+    fn int(&self, key: i128) -> Option<&Cbor> {
+        self.get(&Cbor::Int(key))
+    }
+    fn bytes(&self) -> Option<&[u8]> {
+        if let Cbor::Bytes(b) = self { Some(b) } else { None }
+    }
+    fn number(&self) -> Option<i128> {
+        if let Cbor::Int(i) = self { Some(*i) } else { None }
+    }
+}
+
+fn take<'a>(d: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8], String> {
+    let end = p.checked_add(n).filter(|e| *e <= d.len()).ok_or("the CBOR ends early")?;
+    let s = &d[*p..end];
+    *p = end;
+    Ok(s)
+}
+
+fn head(d: &[u8], p: &mut usize) -> Result<(u8, u64), String> {
+    let b = take(d, p, 1)?[0];
+    let (major, info) = (b >> 5, b & 0x1f);
+    let arg = match info {
+        0..=23 => info as u64,
+        24 => take(d, p, 1)?[0] as u64,
+        25 => u16::from_be_bytes(take(d, p, 2)?.try_into().unwrap()) as u64,
+        26 => u32::from_be_bytes(take(d, p, 4)?.try_into().unwrap()) as u64,
+        27 => u64::from_be_bytes(take(d, p, 8)?.try_into().unwrap()),
+        _ => return Err(format!("CBOR additional information {} is not used by WebAuthn", info)),
+    };
+    Ok((major, arg))
+}
+
+/// One CBOR item from position `p`, which moves past it. WebAuthn's CBOR is definite-length and shallow.
+fn cbor(d: &[u8], p: &mut usize, depth: usize) -> Result<Cbor, String> {
+    if depth > 16 {
+        return Err("the CBOR is nested too deep".into());
+    }
+    let (major, arg) = head(d, p)?;
+    Ok(match major {
+        0 => Cbor::Int(arg as i128),
+        1 => Cbor::Int(-1 - arg as i128),
+        2 => Cbor::Bytes(take(d, p, arg as usize)?.to_vec()),
+        3 => Cbor::Text(String::from_utf8(take(d, p, arg as usize)?.to_vec()).map_err(|_| "CBOR text is not UTF-8")?),
+        4 => {
+            if arg as usize > d.len() { return Err("the CBOR ends early".into()); }
+            Cbor::Array((0..arg).map(|_| cbor(d, p, depth + 1)).collect::<Result<_, _>>()?)
+        }
+        5 => {
+            if arg as usize > d.len() { return Err("the CBOR ends early".into()); }
+            Cbor::Map((0..arg).map(|_| Ok((cbor(d, p, depth + 1)?, cbor(d, p, depth + 1)?))).collect::<Result<_, String>>()?)
+        }
+        6 => return cbor(d, p, depth + 1),
+        7 => match arg {
+            20 => Cbor::Bool(false),
+            21 => Cbor::Bool(true),
+            22 | 23 => Cbor::Null,
+            o => return Err(format!("CBOR simple value {} is not used by WebAuthn", o)),
+        },
+        _ => unreachable!(),
+    })
+}
+
+/// The COSE key's algorithm, checked to be whole: curve, coordinates, sizes.
+fn key_alg(key: &Cbor) -> Result<i64, String> {
+    let kty = key.int(1).and_then(Cbor::number).ok_or("the COSE key has no kty")?;
+    let alg = key.int(3).and_then(Cbor::number).ok_or("the COSE key has no alg")? as i64;
+    let part = |label: i128, n: usize, name: &str| -> Result<(), String> {
+        match key.int(label).and_then(Cbor::bytes) {
+            Some(b) if b.len() == n => Ok(()),
+            _ => Err(format!("the COSE key's {} should be {} bytes", name, n)),
+        }
+    };
+    match (kty, alg) {
+        (2, ES256) => {
+            if key.int(-1).and_then(Cbor::number) != Some(1) { return Err("an ES256 key must be on curve P-256 (crv 1)".into()); }
+            part(-2, 32, "x")?;
+            part(-3, 32, "y")?;
+        }
+        (1, EDDSA) => {
+            if key.int(-1).and_then(Cbor::number) != Some(6) { return Err("an EdDSA key must be Ed25519 (crv 6)".into()); }
+            part(-2, 32, "x")?;
+        }
+        (3, RS256) => {
+            let n = key.int(-1).and_then(Cbor::bytes).ok_or("the RSA key has no n")?;
+            if n.len() < 256 { return Err(format!("the RSA key has {} bits; at least 2048", n.len() * 8)); }
+            key.int(-2).and_then(Cbor::bytes).ok_or("the RSA key has no e")?;
+        }
+        _ => return Err(format!("COSE key type {} with algorithm {} is not supported: ES256 (-7), EdDSA (-8) and RS256 (-257) are", kty, alg)),
+    }
+    Ok(alg)
+}
+
+fn alg_name(a: i64) -> &'static str {
+    match a { ES256 => "ES256", EDDSA => "EdDSA", RS256 => "RS256", _ => "?" }
+}
+
+fn verify_es256(public: &[u8], msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    use p256::ecdsa::signature::Verifier;
+    let k = p256::ecdsa::VerifyingKey::from_sec1_bytes(public).map_err(|_| "the public key is not on P-256")?;
+    let Ok(s) = p256::ecdsa::Signature::from_der(sig) else { return Ok(false) };
+    Ok(k.verify(msg, &s).is_ok())
+}
+
+/// Checks a signature with a COSE key.
+fn verify(key: &Cbor, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    match key_alg(key)? {
+        ES256 => {
+            let mut point = vec![4u8];
+            point.extend_from_slice(key.int(-2).and_then(Cbor::bytes).unwrap());
+            point.extend_from_slice(key.int(-3).and_then(Cbor::bytes).unwrap());
+            verify_es256(&point, msg, sig)
+        }
+        EDDSA => {
+            let x: [u8; 32] = key.int(-2).and_then(Cbor::bytes).unwrap().try_into().unwrap();
+            let k = ed25519_dalek::VerifyingKey::from_bytes(&x).map_err(|_| "the public key is not an Ed25519 point")?;
+            let Ok(s) = <[u8; 64]>::try_from(sig) else { return Ok(false) };
+            Ok(k.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&s)).is_ok())
+        }
+        RS256 => {
+            let n = rsa::BigUint::from_bytes_be(key.int(-1).and_then(Cbor::bytes).unwrap());
+            let e = rsa::BigUint::from_bytes_be(key.int(-2).and_then(Cbor::bytes).unwrap());
+            let k = rsa::RsaPublicKey::new(n, e).map_err(|e| e.to_string())?;
+            Ok(k.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(msg), sig).is_ok())
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The next DER element at `p`: (tag, content, position after it).
+fn der(d: &[u8], p: usize) -> Result<(u8, &[u8], usize), String> {
+    let short = || "the certificate ends early".to_string();
+    let tag = *d.get(p).ok_or_else(short)?;
+    let first = *d.get(p + 1).ok_or_else(short)? as usize;
+    let (len, at) = if first < 0x80 {
+        (first, p + 2)
+    } else {
+        let n = first & 0x7f;
+        if n == 0 || n > 4 {
+            return Err("a certificate length is not one this reads".into());
+        }
+        let bytes = d.get(p + 2..p + 2 + n).ok_or_else(short)?;
+        (bytes.iter().fold(0usize, |a, b| a << 8 | *b as usize), p + 2 + n)
+    };
+    let end = at.checked_add(len).filter(|e| *e <= d.len()).ok_or_else(short)?;
+    Ok((tag, &d[at..end], end))
+}
+
+/// The uncompressed P-256 public key of an X.509 certificate. Only the walk to it: trust in the certificate is the caller's.
+fn cert_p256_key(cert: &[u8]) -> Result<Vec<u8>, String> {
+    let (_, whole, _) = der(cert, 0)?;
+    let (_, tbs, _) = der(whole, 0)?;
+    let mut p = 0;
+    let (tag, _, next) = der(tbs, p)?;
+    if tag == 0xa0 {
+        p = next; // the version
+    }
+    for _ in 0..5 {
+        p = der(tbs, p)?.2; // serial, signature algorithm, issuer, validity, subject
+    }
+    let (_, spki, _) = der(tbs, p)?;
+    let (_, algorithm, after) = der(spki, 0)?;
+    let (_, oid, _) = der(algorithm, 0)?;
+    if oid != [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01] {
+        return Err("the attestation certificate's key is not an EC key".into());
+    }
+    let (_, bits, _) = der(spki, after)?;
+    let key = bits.get(1..).ok_or("the attestation certificate's key is empty")?;
+    if key.len() != 65 {
+        return Err("the attestation certificate's key is not on P-256".into());
+    }
+    Ok(key.to_vec())
+}
+
+struct Auth {
+    flags: u8,
+    counter: u32,
+    aaguid: Vec<u8>,
+    credential_id: Vec<u8>,
+    key: Option<Cbor>,
+    key_bytes: Vec<u8>,
+    extensions: Value,
+}
+
+fn read_auth(d: &[u8]) -> Result<Auth, String> {
+    if d.len() < 37 {
+        return Err(format!("authenticator data is {} bytes; at least 37", d.len()));
+    }
+    let flags = d[32];
+    let counter = u32::from_be_bytes(d[33..37].try_into().unwrap());
+    let mut a = Auth { flags, counter, aaguid: vec![], credential_id: vec![], key: None, key_bytes: vec![], extensions: Value::Null };
+    let mut p = 37;
+    if flags & AT != 0 {
+        if d.len() < p + 18 {
+            return Err("authenticator data ends inside the attested credential".into());
+        }
+        a.aaguid = d[p..p + 16].to_vec();
+        let n = u16::from_be_bytes([d[p + 16], d[p + 17]]) as usize;
+        p += 18;
+        if n > 1023 {
+            return Err(format!("a credential id of {} bytes; at most 1023", n));
+        }
+        a.credential_id = d.get(p..p + n).ok_or("authenticator data ends inside the credential id")?.to_vec();
+        p += n;
+        let start = p;
+        a.key = Some(cbor(d, &mut p, 0).map_err(|e| format!("the credential's public key: {}", e))?);
+        a.key_bytes = d[start..p].to_vec();
+    }
+    if flags & ED != 0 {
+        cbor(d, &mut p, 0).map_err(|e| format!("extensions: {}", e))?;
+        a.extensions = json!(true);
+    }
+    if p != d.len() {
+        return Err(format!("{} bytes left over after the authenticator data", d.len() - p));
+    }
+    Ok(a)
+}
+
+fn origins(expected: &Value) -> Vec<String> {
+    match expected.get("origin") {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => vec![],
+    }
+}
+
+fn str_of<'a>(v: &'a Value, k: &str, what: &str) -> Result<&'a str, String> {
+    v.get(k).and_then(Value::as_str).ok_or(format!("{}: no {}", what, k))
+}
+
+/// Parses and checks the clientDataJSON; gives its raw bytes.
+fn client_data(response: &Value, kind: &str, expected: &Value) -> Result<Vec<u8>, String> {
+    let raw = unb64("clientDataJSON", str_of(&response["response"], "clientDataJSON", "response")?)?;
+    let c: Value = serde_json::from_slice(&raw).map_err(|e| format!("clientDataJSON is not JSON: {}", e))?;
+    if c["type"] != kind {
+        return Err(format!("clientDataJSON's type is {}, and should be {}", c["type"], kind));
+    }
+    let challenge = str_of(expected, "challenge", "expected")?;
+    if challenge.is_empty() {
+        return Err("expected: the challenge is empty".into());
+    }
+    if unb64("the challenge", c["challenge"].as_str().unwrap_or(""))? != unb64("the expected challenge", challenge)? {
+        return Err("the challenge does not match the one given out: an old or a stolen response".into());
+    }
+    let allowed = origins(expected);
+    if allowed.is_empty() {
+        return Err("expected: no origin".into());
+    }
+    let origin = c["origin"].as_str().unwrap_or("");
+    if !allowed.iter().any(|o| o == origin) {
+        return Err(format!("origin {} is not {}", origin, allowed.join(" or ")));
+    }
+    if c["crossOrigin"] == true && !expected["allow_cross_origin"].as_bool().unwrap_or(false) {
+        return Err("the ceremony ran in a cross-origin frame".into());
+    }
+    Ok(raw)
+}
+
+fn check_flags(a: &Auth, auth_data: &[u8], expected: &Value) -> Result<(), String> {
+    let rp = str_of(expected, "rp_id", "expected")?;
+    if auth_data[..32] != sha256(rp.as_bytes())[..] {
+        return Err(format!("the rpIdHash is not that of {}", rp));
+    }
+    if a.flags & UP == 0 {
+        return Err("the user was not present (flag UP is off)".into());
+    }
+    if expected["require_user_verification"].as_bool().unwrap_or(false) && a.flags & UV == 0 {
+        return Err("the user was not verified (flag UV is off), and this site requires it".into());
+    }
+    if a.flags & BS != 0 && a.flags & BE == 0 {
+        return Err("flag BS (backed up) is on without BE (backup eligible)".into());
+    }
+    Ok(())
+}
+
+fn aaguid_text(a: &[u8]) -> String {
+    if a.len() != 16 {
+        return String::new();
+    }
+    let h: String = a.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+fn check_id(response: &Value) -> Result<String, String> {
+    if response["type"] != "public-key" {
+        return Err(format!("the credential's type is {}, and should be public-key", response["type"]));
+    }
+    let id = str_of(response, "id", "credential")?;
+    if let Some(raw) = response["rawId"].as_str() {
+        if unb64("rawId", raw)? != unb64("id", id)? {
+            return Err("id and rawId differ".into());
+        }
+    }
+    unb64("id", id)?;
+    Ok(id.to_string())
+}
+
+/// A new random challenge, 32 bytes as base64url. Keep it in the visitor's session and use it once.
+pub fn passkeys_challenge() -> Result<String, String> {
+    Ok(b64(&random(32)?))
+}
+
+/// What `navigator.credentials.create` needs, ready for `PublicKeyCredential.parseCreationOptionsFromJSON`. `rp` is `{ id, name }`, `user` `{ id, name, display_name }` (`id` an opaque text of up to 64 bytes, never an e-mail address; made when left out). `options`: `exclude` (credential ids the user has), `attestation` (none, direct), `user_verification`, `resident_key` (preferred), `attachment`, `timeout_ms`, `challenge`.
+pub fn passkeys_register_options(rp: serde_json::Value, user: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let rp_id = str_of(&rp, "id", "rp")?;
+    let name = user.get("name").and_then(Value::as_str).filter(|x| !x.is_empty()).ok_or("user: no name")?;
+    let display = user.get("display_name").and_then(Value::as_str).unwrap_or(name);
+    let id = match user.get("id").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+        Some(x) if x.len() > 64 => return Err("user.id is over 64 bytes".into()),
+        Some(x) => b64(x.as_bytes()),
+        None => b64(&random(32)?),
+    };
+    let challenge = match options.get("challenge").and_then(Value::as_str) {
+        Some(c) => c.to_string(),
+        None => passkeys_challenge()?,
+    };
+    let g = |k: &str, d: &str| options.get(k).and_then(Value::as_str).unwrap_or(d).to_string();
+    let exclude: Vec<Value> = options["exclude"].as_array().into_iter().flatten().map(|c| json!({ "type": "public-key", "id": c.as_str().or(c["credential_id"].as_str()).unwrap_or("") })).collect();
+    let mut selection = json!({ "residentKey": g("resident_key", "preferred"), "userVerification": g("user_verification", "preferred") });
+    if selection["residentKey"] == "required" {
+        selection["requireResidentKey"] = json!(true);
+    }
+    if let Some(a) = options.get("attachment").and_then(Value::as_str) {
+        selection["authenticatorAttachment"] = json!(a);
+    }
+    Ok(json!({
+        "challenge": challenge,
+        "rp": { "id": rp_id, "name": rp.get("name").and_then(Value::as_str).unwrap_or(rp_id) },
+        "user": { "id": id, "name": name, "displayName": display },
+        "pubKeyCredParams": [{ "type": "public-key", "alg": ES256 }, { "type": "public-key", "alg": EDDSA }, { "type": "public-key", "alg": RS256 }],
+        "timeout": options.get("timeout_ms").and_then(Value::as_i64).unwrap_or(300000),
+        "attestation": g("attestation", "none"),
+        "excludeCredentials": exclude,
+        "authenticatorSelection": selection,
+    }))
+}
+
+/// Checks what `navigator.credentials.create` gave (its `toJSON()`). `expected` is `{ challenge, origin (or a list), rp_id, require_user_verification, algorithms, allow_cross_origin }`. Gives what to keep for this user: `{ credential_id, public_key, algorithm, counter, transports, aaguid, attestation, certificate, user_verified, backup_eligible, backed_up }`. Attestation `none` and `packed` are checked, self-attested or by its certificate, whose chain is yours to judge; other formats are refused, so ask for `attestation: "none"`.
+pub fn passkeys_register_verify(response: serde_json::Value, expected: serde_json::Value) -> Result<Value, String> {
+    let id = check_id(&response)?;
+    let raw_client = client_data(&response, "webauthn.create", &expected)?;
+    let object = unb64("attestationObject", str_of(&response["response"], "attestationObject", "response")?)?;
+    let mut p = 0;
+    let att = cbor(&object, &mut p, 0).map_err(|e| format!("attestationObject: {}", e))?;
+    let fmt = match att.text("fmt") { Some(Cbor::Text(t)) => t.clone(), _ => return Err("attestationObject has no fmt".into()) };
+    let auth_data = att.text("authData").and_then(Cbor::bytes).ok_or("attestationObject has no authData")?;
+    let stmt = att.text("attStmt").ok_or("attestationObject has no attStmt")?;
+    let a = read_auth(auth_data)?;
+    check_flags(&a, auth_data, &expected)?;
+    if a.flags & AT == 0 {
+        return Err("a registration must carry attested credential data (flag AT is off)".into());
+    }
+    let key = a.key.as_ref().unwrap();
+    let alg = key_alg(key)?;
+    if let Some(list) = expected["algorithms"].as_array() {
+        if !list.iter().any(|x| x.as_i64() == Some(alg)) {
+            return Err(format!("algorithm {} is not among those allowed", alg_name(alg)));
+        }
+    }
+    if a.credential_id != unb64("id", &id)? {
+        return Err("the credential id in the authenticator data is not the response's".into());
+    }
+    let mut signed = auth_data.to_vec();
+    signed.extend_from_slice(&sha256(&raw_client));
+    let (kind, certificate) = match fmt.as_str() {
+        "none" => {
+            if !matches!(stmt, Cbor::Map(m) if m.is_empty()) {
+                return Err("attestation format none has a statement, and it must be empty".into());
+            }
+            ("none", Value::Null)
+        }
+        "packed" => {
+            let st_alg = stmt.text("alg").and_then(Cbor::number).ok_or("packed attestation: no alg")? as i64;
+            let sig = stmt.text("sig").and_then(Cbor::bytes).ok_or("packed attestation: no sig")?;
+            match stmt.text("x5c") {
+                None => {
+                    if st_alg != alg {
+                        return Err(format!("packed self attestation says {} and the credential is {}", st_alg, alg));
+                    }
+                    if !verify(key, &signed, sig)? {
+                        return Err("the packed self attestation's signature is wrong".into());
+                    }
+                    ("self", Value::Null)
+                }
+                Some(Cbor::Array(chain)) => {
+                    let cert = chain.first().and_then(Cbor::bytes).ok_or("packed attestation: x5c is empty")?;
+                    if st_alg != ES256 {
+                        return Err("packed attestation by certificate: only ES256 is read".into());
+                    }
+                    if !verify_es256(&cert_p256_key(cert)?, &signed, sig)? {
+                        return Err("the packed attestation's signature is wrong".into());
+                    }
+                    ("basic", json!(STANDARD.encode(cert)))
+                }
+                Some(_) => return Err("packed attestation: x5c is not a list".into()),
+            }
+        }
+        o => return Err(format!("attestation format `{}` is not checked here: ask the browser for attestation \"none\"", o)),
+    };
+    Ok(json!({
+        "credential_id": id,
+        "public_key": b64(&a.key_bytes),
+        "algorithm": alg_name(alg),
+        "counter": a.counter,
+        "transports": response["response"]["transports"],
+        "aaguid": aaguid_text(&a.aaguid),
+        "attestation": kind,
+        "certificate": certificate,
+        "user_verified": a.flags & UV != 0,
+        "backup_eligible": a.flags & BE != 0,
+        "backed_up": a.flags & BS != 0,
+    }))
+}
+
+/// What `navigator.credentials.get` needs. `credentials` lists the user's ids (or kept credentials); an empty list lets the browser offer any passkey for this site. `options`: `user_verification`, `timeout_ms`, `challenge`.
+pub fn passkeys_signin_options(rp_id: &str, credentials: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let allow: Vec<Value> = credentials.as_array().into_iter().flatten().map(|c| {
+        let mut x = json!({ "type": "public-key", "id": c.as_str().or(c["credential_id"].as_str()).unwrap_or("") });
+        if c["transports"].is_array() {
+            x["transports"] = c["transports"].clone();
+        }
+        x
+    }).collect();
+    let challenge = match options.get("challenge").and_then(Value::as_str) {
+        Some(c) => c.to_string(),
+        None => passkeys_challenge()?,
+    };
+    Ok(json!({
+        "challenge": challenge, "rpId": rp_id, "allowCredentials": allow,
+        "userVerification": options.get("user_verification").and_then(Value::as_str).unwrap_or("preferred"),
+        "timeout": options.get("timeout_ms").and_then(Value::as_i64).unwrap_or(300000),
+    }))
+}
+
+/// Checks what `navigator.credentials.get` gave against a kept `credential` (`credential_id`, `public_key`, `counter`, as registration gave them, and `user_handle` if you hold one). `expected` as for registering. A counter that did not go up, when either side counts, is refused: the key may have been copied. Gives `{ credential_id, counter, user_verified, backed_up, user_handle }`: save the new `counter` and `backed_up`.
+pub fn passkeys_signin_verify(response: serde_json::Value, credential: serde_json::Value, expected: serde_json::Value) -> Result<Value, String> {
+    let id = check_id(&response)?;
+    if credential["credential_id"] != json!(id) {
+        return Err("this response is for another credential".into());
+    }
+    let raw_client = client_data(&response, "webauthn.get", &expected)?;
+    let r = &response["response"];
+    let auth_data = unb64("authenticatorData", str_of(r, "authenticatorData", "response")?)?;
+    let a = read_auth(&auth_data)?;
+    check_flags(&a, &auth_data, &expected)?;
+    if credential["backup_eligible"] == json!(false) && a.flags & BE != 0 || credential["backup_eligible"] == json!(true) && a.flags & BE == 0 {
+        return Err("backup eligibility changed since registration, which a credential cannot do".into());
+    }
+    let key_bytes = unb64("public_key", str_of(&credential, "public_key", "credential")?)?;
+    let mut p = 0;
+    let key = cbor(&key_bytes, &mut p, 0).map_err(|e| format!("the kept public key: {}", e))?;
+    let mut signed = auth_data.clone();
+    signed.extend_from_slice(&sha256(&raw_client));
+    let sig = unb64("signature", str_of(r, "signature", "response")?)?;
+    if !verify(&key, &signed, &sig)? {
+        return Err("the signature is wrong".into());
+    }
+    let handle = r["userHandle"].as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    if let (Some(h), Some(want)) = (&handle, credential["user_handle"].as_str()) {
+        if unb64("userHandle", h)? != unb64("user_handle", want)? {
+            return Err("the userHandle is not this credential's user".into());
+        }
+    }
+    let stored = credential["counter"].as_u64().unwrap_or(0);
+    if (a.counter != 0 || stored != 0) && a.counter as u64 <= stored {
+        return Err(format!("the signature counter went from {} to {}: this key may have been copied", stored, a.counter));
+    }
+    Ok(json!({
+        "credential_id": id, "counter": a.counter, "user_verified": a.flags & UV != 0, "backup_eligible": a.flags & BE != 0,
+        "backed_up": a.flags & BS != 0, "user_handle": handle,
+    }))
+}
+
+/// What a kept COSE public key is: `{ algorithm, kty, curve }`.
+pub fn passkeys_key_info(public_key: &str) -> Result<Value, String> {
+    let b = unb64("public_key", public_key)?;
+    let mut p = 0;
+    let k = cbor(&b, &mut p, 0).map_err(|e| format!("the public key: {}", e))?;
+    let alg = key_alg(&k)?;
+    Ok(json!({ "algorithm": alg_name(alg), "kty": match alg { ES256 => "EC2", EDDSA => "OKP", _ => "RSA" }, "curve": match alg { ES256 => json!("P-256"), EDDSA => json!("Ed25519"), _ => Value::Null } }))
+}

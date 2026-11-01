@@ -1,0 +1,321 @@
+//! Mixpanel from the server: events tracked and imported with a service account, batches cut to 2000, stable $insert_ids so a retry is not counted twice, failed records read back by position, people and group profiles in Mixpanel's own operations, and the Query API for segmentation, funnels, retention, saved reports and profiles, without JQL.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// MIXPANEL_TOKEN is the project's token, for /track and profiles. MIXPANEL_PROJECT_ID,
+// MIXPANEL_SERVICE_USER and MIXPANEL_SERVICE_SECRET are for /import and the Query API.
+// MIXPANEL_API_URL is ingestion (https://api.mixpanel.com; https://api-eu.mixpanel.com in the EU),
+// MIXPANEL_QUERY_URL queries (https://mixpanel.com/api; https://eu.mixpanel.com/api in the EU).
+
+const BATCH: usize = 2000;
+const FIVE_DAYS: i64 = 5 * 86400;
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn ingest() -> String {
+    setting("MIXPANEL_API_URL").unwrap_or_else(|| "https://api.mixpanel.com".into()).trim_end_matches('/').to_string()
+}
+
+fn query_root() -> String {
+    setting("MIXPANEL_QUERY_URL").unwrap_or_else(|| "https://mixpanel.com/api".into()).trim_end_matches('/').to_string()
+}
+
+fn token() -> Result<String, String> {
+    setting("MIXPANEL_TOKEN").ok_or("MIXPANEL_TOKEN is not set".to_string())
+}
+
+fn project() -> Result<String, String> {
+    setting("MIXPANEL_PROJECT_ID").ok_or("MIXPANEL_PROJECT_ID is not set".to_string())
+}
+
+fn account() -> Result<String, String> {
+    let u = setting("MIXPANEL_SERVICE_USER").ok_or("MIXPANEL_SERVICE_USER is not set: /import and queries need a service account")?;
+    let s = setting("MIXPANEL_SERVICE_SECRET").ok_or("MIXPANEL_SERVICE_SECRET is not set")?;
+    Ok(format!("Basic {}", STANDARD.encode(format!("{}:{}", u, s))))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+// Answers on a 4xx with a body are given back: /import's holds the failed records.
+fn send(req: ureq::Request, body: Option<&str>, name: &str) -> Result<(u16, Value), String> {
+    let kind = req.header("Content-Type").unwrap_or("application/json").to_string();
+    for attempt in 0..5u32 {
+        let r = req.clone();
+        let res = match body {
+            Some(b) => r.set("Content-Type", &kind).send_string(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(x) => {
+                let c = x.status();
+                let t = x.into_string().map_err(|e| e.to_string())?;
+                return Ok((c, serde_json::from_str(&t).unwrap_or(Value::String(t))));
+            }
+            Err(ureq::Error::Status(429 | 502 | 503, x)) if attempt < 4 => {
+                let wait = x.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(500u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(60_000)));
+            }
+            Err(ureq::Error::Status(c, x)) => {
+                let t = x.into_string().unwrap_or_default();
+                return Ok((c, serde_json::from_str(&t).unwrap_or(Value::String(t))));
+            }
+            Err(e) => return Err(format!("cannot reach Mixpanel's {}: {}", name, e)),
+        }
+    }
+    Err("Mixpanel stayed busy through five tries".into())
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build()
+}
+
+fn refuse(c: u16, v: &Value) -> String {
+    let what = v["error"].as_str().map(str::to_string).or(v.as_str().map(str::to_string)).unwrap_or_else(|| v.to_string());
+    let hint = if c == 401 { " (check the service account)" } else if c == 403 { " (the account cannot reach this project)" } else { "" };
+    format!("Mixpanel {}: {}{}", c, what, hint)
+}
+
+/// A stable $insert_id for an event, from what identifies it: Mixpanel keeps one of events with the same id, time and name, so a retry is not counted twice. At most 36 characters, of letters and digits, as it requires.
+pub fn mixpanel_insert_id(parts: Vec<serde_json::Value>) -> String {
+    let joined = parts.iter().map(|p| p.as_str().map(str::to_string).unwrap_or_else(|| p.to_string())).collect::<Vec<_>>().join("\u{1f}");
+    Sha256::digest(joined.as_bytes())[..16].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn event_of(e: &Value, need_time: bool) -> Result<Value, String> {
+    let name = e["event"].as_str().filter(|n| !n.is_empty()).ok_or("an event needs a name")?;
+    let mut p: Map<String, Value> = e["properties"].as_object().cloned().unwrap_or_default();
+    if let Some(d) = e["distinct_id"].as_str() {
+        p.insert("distinct_id".into(), json!(d));
+    }
+    if !p.contains_key("distinct_id") {
+        return Err(format!("event `{}` needs a distinct_id: \"\" is an event for no one, if you mean that", name));
+    }
+    let t = p.get("time").and_then(|t| t.as_i64()).or(e["time"].as_i64());
+    let t = match (t, need_time) {
+        (Some(t), _) => t,
+        (None, false) => now(),
+        (None, true) => return Err(format!("event `{}` needs a `time`: /import keeps history, so now is not assumed", name)),
+    };
+    p.insert("time".into(), json!(t));
+    if !p.contains_key("$insert_id") {
+        let id = e["insert_id"].as_str().map(str::to_string).unwrap_or_else(|| mixpanel_insert_id(vec![json!(name), p["distinct_id"].clone(), json!(t), Value::Object(p.clone())]));
+        p.insert("$insert_id".into(), json!(id));
+    }
+    if let Some(id) = p["$insert_id"].as_str() {
+        if id.len() > 36 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(format!("$insert_id `{}` is at most 36 of letters, digits and -", id));
+        }
+    }
+    Ok(json!({ "event": name, "properties": p }))
+}
+
+fn track_list(events: Vec<Value>) -> Result<i64, String> {
+    let tok = token()?;
+    let url = format!("{}/track?verbose=1", ingest());
+    let mut sent = 0;
+    for chunk in events.chunks(BATCH) {
+        let list: Vec<Value> = chunk.iter().map(|e| { let mut x = e.clone(); x["properties"]["token"] = json!(tok); x }).collect();
+        let (c, v) = send(agent().post(&url), Some(&Value::Array(list).to_string()), "ingestion")?;
+        if c != 200 || v["status"] != 1 {
+            return Err(refuse(c, &v));
+        }
+        sent += chunk.len() as i64;
+    }
+    Ok(sent)
+}
+
+/// Tracks an event that just happened: `properties` a map, and `options` may hold `time` (unix seconds, within the last 5 days), `insert_id`. Older events need mixpanel_import. Gives true.
+pub fn mixpanel_track(event: &str, distinct_id: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    mixpanel_track_many(vec![json!({ "event": event, "distinct_id": distinct_id, "properties": properties, "time": options["time"], "insert_id": options["insert_id"] })])?;
+    Ok(true)
+}
+
+/// Tracks many events, each { event, distinct_id, properties, time, insert_id }, 2000 at a go. Gives how many went.
+pub fn mixpanel_track_many(events: Vec<serde_json::Value>) -> Result<i64, String> {
+    let mut made = vec![];
+    for e in &events {
+        let x = event_of(e, false)?;
+        if x["properties"]["time"].as_i64().map_or(false, |t| now() - t > FIVE_DAYS) {
+            return Err(format!("`{}` is more than 5 days old: /track drops those, so use mixpanel_import", x["event"].as_str().unwrap_or("")));
+        }
+        made.push(x);
+    }
+    track_list(made)
+}
+
+/// Imports history by service account: each { event, distinct_id, time (unix seconds or ms), properties, insert_id }, 2000 at a go, with `strict` on, so a bad record is named rather than dropped. Gives { imported, failed: [{ index, field, message }] }, `index` a position in `events`.
+pub fn mixpanel_import(events: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let auth = account()?;
+    let url = format!("{}/import?strict=1&project_id={}", ingest(), enc(&project()?));
+    let made: Vec<Value> = events.iter().map(|e| event_of(e, true)).collect::<Result<_, _>>()?;
+    let mut imported = 0;
+    let mut failed = vec![];
+    for (n, chunk) in made.chunks(BATCH).enumerate() {
+        let (c, v) = send(agent().post(&url).set("Authorization", &auth), Some(&Value::Array(chunk.to_vec()).to_string()), "ingestion")?;
+        match c {
+            200 => imported += v["num_records_imported"].as_i64().unwrap_or(chunk.len() as i64),
+            400 if v["failed_records"].is_array() => {
+                imported += v["num_records_imported"].as_i64().unwrap_or(0);
+                for f in v["failed_records"].as_array().into_iter().flatten() {
+                    failed.push(json!({ "index": f["index"].as_i64().unwrap_or(0) + (n * BATCH) as i64, "field": f["field"], "message": f["message"] }));
+                }
+            }
+            _ => return Err(refuse(c, &v)),
+        }
+    }
+    Ok(json!({ "imported": imported, "failed": failed }))
+}
+
+fn people_op(op: &str) -> Result<String, String> {
+    const OPS: &[&str] = &["set", "set_once", "add", "union", "append", "remove", "unset", "delete"];
+    if !OPS.contains(&op) {
+        return Err(format!("`{}` is not a profile operation; it takes {}", op, OPS.join(", ")));
+    }
+    Ok(format!("${}", op))
+}
+
+fn engage(path: &str, updates: Vec<Value>) -> Result<bool, String> {
+    for chunk in updates.chunks(BATCH) {
+        let (c, v) = send(agent().post(&format!("{}{}?verbose=1", ingest(), path)), Some(&Value::Array(chunk.to_vec()).to_string()), "ingestion")?;
+        if c != 200 || v["status"] != 1 {
+            return Err(refuse(c, &v));
+        }
+    }
+    Ok(true)
+}
+
+/// Changes a person's profile: `op` is "set", "set_once", "add", "union", "append", "remove", "unset" or "delete"; `value` a map, a list of names for "unset", or null for "delete". `ignore_time` keeps it from counting as their last activity. Gives true.
+pub fn mixpanel_people(distinct_id: &str, op: &str, value: serde_json::Value, ignore_time: bool) -> Result<bool, String> {
+    let tok = token()?;
+    let name = people_op(op)?;
+    let v = match op {
+        "delete" => json!(""),
+        "unset" if !value.is_array() => return Err("\"unset\" takes a list of property names".into()),
+        "unset" => value,
+        _ if !value.is_object() => return Err(format!("\"{}\" takes a map of properties", op)),
+        _ => value,
+    };
+    let mut u = json!({ "$token": tok, "$distinct_id": distinct_id, name: v });
+    if ignore_time {
+        u["$ignore_time"] = json!(true);
+    }
+    engage("/engage", vec![u])
+}
+
+/// Changes many profiles, each { distinct_id, op, value }, 2000 at a go.
+pub fn mixpanel_people_many(updates: Vec<serde_json::Value>) -> Result<bool, String> {
+    let tok = token()?;
+    let mut list = vec![];
+    for u in &updates {
+        let name = people_op(u["op"].as_str().ok_or("each update needs an `op`")?)?;
+        list.push(json!({ "$token": tok, "$distinct_id": u["distinct_id"], name: u["value"] }));
+    }
+    engage("/engage", list)
+}
+
+/// Sets a group's profile, for `group_key` like "company_id" and `group_id` like "acme".
+pub fn mixpanel_group_set(group_key: &str, group_id: &str, properties: serde_json::Value) -> Result<bool, String> {
+    if !properties.is_object() {
+        return Err("a group's properties must be a map".into());
+    }
+    engage("/groups", vec![json!({ "$token": token()?, "$group_key": group_key, "$group_id": group_id, "$set": properties })])
+}
+
+fn query_get(path: &str, params: &Value, base: Vec<(&str, String)>) -> Result<Value, String> {
+    let mut q = vec![format!("project_id={}", enc(&project()?))];
+    for (k, v) in base {
+        q.push(format!("{}={}", enc(k), enc(&v)));
+    }
+    for (k, v) in params.as_object().into_iter().flatten() {
+        q.push(format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+    }
+    let (c, v) = send(agent().get(&format!("{}/query{}?{}", query_root(), path, q.join("&"))).set("Authorization", &account()?).set("Accept", "application/json"), None, "Query API")?;
+    if c != 200 {
+        return Err(refuse(c, &v));
+    }
+    Ok(v)
+}
+
+fn date_ok(d: &str) -> Result<String, String> {
+    let b = d.as_bytes();
+    if d.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return Err(format!("`{}` is not a date like 2026-11-01", d));
+    }
+    Ok(d.to_string())
+}
+
+/// Counts of an event by day: `params` adds `unit` ("hour", "day", "week", "month"), `on` to segment by, `type` ("general", "unique", "average"), `where`. Gives { series, counts: { group: { date: n } } }.
+pub fn mixpanel_segmentation(event: &str, from_date: &str, to_date: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let v = query_get("/segmentation", &params, vec![("event", event.to_string()), ("from_date", date_ok(from_date)?), ("to_date", date_ok(to_date)?)])?;
+    Ok(json!({ "series": v["data"]["series"], "counts": v["data"]["values"] }))
+}
+
+/// A saved funnel's numbers by date, as Mixpanel gives them.
+pub fn mixpanel_funnel(funnel_id: i64, from_date: &str, to_date: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    query_get("/funnels", &params, vec![("funnel_id", funnel_id.to_string()), ("from_date", date_ok(from_date)?), ("to_date", date_ok(to_date)?)])
+}
+
+/// Retention by cohort date, as Mixpanel gives it: `params` adds `born_event`, `event`, `unit`.
+pub fn mixpanel_retention(from_date: &str, to_date: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    query_get("/retention", &params, vec![("from_date", date_ok(from_date)?), ("to_date", date_ok(to_date)?)])
+}
+
+/// A saved Insights report, by its bookmark id.
+pub fn mixpanel_insights(bookmark_id: i64) -> Result<serde_json::Value, String> {
+    query_get("/insights", &Value::Null, vec![("bookmark_id", bookmark_id.to_string())])
+}
+
+/// Profiles through every page: `where_expression` like `properties["plan"] == "pro"` or "", `max_items` caps them (0: all). Each is { distinct_id, properties }.
+pub fn mixpanel_profiles(where_expression: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!("{}/query/engage?project_id={}", query_root(), enc(&project()?));
+    let auth = account()?;
+    let mut out = vec![];
+    let mut page = 0;
+    let mut session = String::new();
+    loop {
+        let mut form = vec![];
+        if !where_expression.is_empty() {
+            form.push(format!("where={}", enc(where_expression)));
+        }
+        if !session.is_empty() {
+            form.push(format!("session_id={}&page={}", enc(&session), page));
+        }
+        let r = agent().post(&url).set("Authorization", &auth).set("Content-Type", "application/x-www-form-urlencoded");
+        let (c, v) = send(r, Some(&form.join("&")), "Query API")?;
+        if c != 200 {
+            return Err(refuse(c, &v));
+        }
+        let rows = v["results"].as_array().cloned().unwrap_or_default();
+        let n = rows.len() as i64;
+        for r in rows {
+            out.push(json!({ "distinct_id": r["$distinct_id"], "properties": r["$properties"] }));
+        }
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < v["page_size"].as_i64().unwrap_or(1000) {
+            return Ok(out);
+        }
+        session = v["session_id"].as_str().unwrap_or("").to_string();
+        page += 1;
+    }
+}

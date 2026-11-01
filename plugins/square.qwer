@@ -1,0 +1,321 @@
+//! Square's API without an SDK: payments taken, completed and cancelled, refunds, customers and catalog items, every list followed through its cursors, an idempotency key on each write that a retry reuses, money in each currency's smallest unit, Square's error lists read, and webhook signatures checked over the notification URL and body.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// SQUARE_ACCESS_TOKEN is the token; SQUARE_API_URL the API (https://connect.squareup.com when not
+// set; https://connect.squareupsandbox.com for the sandbox); SQUARE_VERSION an API version date.
+
+const ZERO_DECIMAL: &[&str] = &["BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"];
+const THREE_DECIMAL: &[&str] = &["BHD", "JOD", "KWD", "OMR", "TND"];
+const VERSION: &str = "2024-10-17";
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("SQUARE_API_URL").unwrap_or_else(|| "https://connect.squareup.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+// Square gives a list: each with a category, a code, and usually a detail and a field.
+fn errors_text(status: u16, v: &Value, raw: &str) -> String {
+    let list = v["errors"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return format!("Square {}: {}", status, raw.trim().chars().take(300).collect::<String>());
+    }
+    let parts: Vec<String> = list
+        .iter()
+        .map(|e| {
+            let mut t = format!("{}: {}", e["code"].as_str().unwrap_or("ERROR"), e["detail"].as_str().unwrap_or(e["category"].as_str().unwrap_or("")));
+            if let Some(f) = e["field"].as_str() {
+                t.push_str(&format!(" (field {})", f));
+            }
+            t
+        })
+        .collect();
+    let hint = match status {
+        401 => " (check SQUARE_ACCESS_TOKEN, and that it belongs to this environment)",
+        403 => " (the token lacks the permission this call needs)",
+        _ => "",
+    };
+    format!("Square {}: {}{}", status, parts.join("; "), hint)
+}
+
+// The body keeps its idempotency key through the retries, so a write sent twice happens once.
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("SQUARE_ACCESS_TOKEN").ok_or("SQUARE_ACCESS_TOKEN is not set")?;
+    let url = format!("{}{}", api(), path);
+    let version = setting("SQUARE_VERSION").unwrap_or_else(|| VERSION.into());
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..5u32 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Square-Version", &version).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&t).map_err(|_| format!("Square's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(429 | 500 | 502 | 503 | 504, r)) if attempt < 4 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(250u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(30_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                return Err(errors_text(c, &serde_json::from_str(&t).unwrap_or(Value::Null), &t));
+            }
+            Err(e) => return Err(format!("cannot reach Square at {}: {}", api(), e)),
+        }
+    }
+    Err("Square stayed busy through five tries".into())
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A new idempotency key, a UUID in form: send the same key to make a retry of your own safe.
+pub fn square_new_key() -> String {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seed = std::collections::hash_map::RandomState::new();
+    let d = Sha256::digest(format!("{}:{}:{}:{:?}", t, n, std::process::id(), seed));
+    let mut b: Vec<u8> = d[..16].to_vec();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+fn with_key(mut v: Value, key_of: &str) -> Result<Value, String> {
+    let k = if key_of.is_empty() { v["idempotency_key"].as_str().map(str::to_string).unwrap_or_else(square_new_key) } else { key_of.to_string() };
+    if k.len() > 45 {
+        return Err(format!("an idempotency key is at most 45 characters, not {}", k.len()));
+    }
+    v["idempotency_key"] = json!(k);
+    Ok(v)
+}
+
+/// Money as Square wants it: `square_money("19.99", "USD")` is `{ amount: 1999, currency: "USD" }`, in the currency's smallest unit (yen has none, dinars three). Takes text so no float rounding creeps in; an error for more decimals than the currency has.
+pub fn square_money(amount: &str, currency: &str) -> Result<serde_json::Value, String> {
+    let c = currency.to_uppercase();
+    if c.len() != 3 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("`{}` is not a three-letter currency code", currency));
+    }
+    let places = if ZERO_DECIMAL.contains(&c.as_str()) { 0 } else if THREE_DECIMAL.contains(&c.as_str()) { 3 } else { 2 };
+    let a = amount.trim();
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > places {
+        return Err(format!("{} has {} decimals; {} has {}", amount, frac.len(), c, places));
+    }
+    let n: i64 = format!("{}{}{}", whole, frac, "0".repeat(places - frac.len())).parse().map_err(|_| format!("`{}` is too large", amount))?;
+    Ok(json!({ "amount": n, "currency": c }))
+}
+
+/// Takes a payment from `source_id` (a nonce from the Web Payments SDK, or a card on file) for `money` (from square_money). `params` adds what Square documents: `autocomplete` (false only authorizes), `location_id`, `customer_id`, `reference_id`, `note`, `idempotency_key` (one is made if not given). Gives the payment; a decline is an error naming its code.
+pub fn square_pay(source_id: &str, money: serde_json::Value, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if source_id.is_empty() {
+        return Err("a payment needs a source_id".into());
+    }
+    if !money["amount"].is_i64() || !money["currency"].is_string() {
+        return Err("money must be { amount, currency }: see square_money".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["source_id"] = json!(source_id);
+    b["amount_money"] = money;
+    let b = with_key(b, "")?;
+    Ok(call("POST", "/v2/payments", Some(&b))?["payment"].clone())
+}
+
+/// One payment by id.
+pub fn square_payment(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/v2/payments/{}", enc(id)), None)?["payment"].clone())
+}
+
+/// Completes a payment taken with `autocomplete: false`.
+pub fn square_payment_complete(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &format!("/v2/payments/{}/complete", enc(id)), Some(&json!({})))?["payment"].clone())
+}
+
+/// Cancels a payment taken with `autocomplete: false`, before it is completed.
+pub fn square_payment_cancel(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &format!("/v2/payments/{}/cancel", enc(id)), Some(&json!({})))?["payment"].clone())
+}
+
+fn query_of(filter: &Value) -> String {
+    let mut q = vec![];
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            if !v.is_null() {
+                q.push(format!("{}={}", enc(k), enc(&t)));
+            }
+        }
+    }
+    q.join("&")
+}
+
+// GET lists: `cursor` in the query, `cursor` in the answer until the last page.
+fn walk_get(path: &str, filter: &Value, field: &str, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let mut cursor: Option<String> = None;
+    let base_q = query_of(filter);
+    loop {
+        let mut q = base_q.clone();
+        if let Some(c) = &cursor {
+            if !q.is_empty() {
+                q.push('&');
+            }
+            q.push_str(&format!("cursor={}", enc(c)));
+        }
+        let url = if q.is_empty() { path.to_string() } else { format!("{}?{}", path, q) };
+        let v = call("GET", &url, None)?;
+        out.extend(v[field].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["cursor"].as_str() {
+            Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// Payments through every page: `filter` is Square's (`begin_time`, `end_time`, `location_id`, `sort_order`, `limit`); `max_items` caps them (0: all).
+pub fn square_payments(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_get("/v2/payments", &filter, "payments", max_items)
+}
+
+/// Refunds `money` of a payment; `reason` shows on the receipt and `idempotency_key` may be "" to make one. Gives the refund, usually PENDING at first.
+pub fn square_refund(payment_id: &str, money: serde_json::Value, reason: &str, idempotency_key: &str) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "payment_id": payment_id, "amount_money": money });
+    if !reason.is_empty() {
+        b["reason"] = json!(reason);
+    }
+    let b = with_key(b, idempotency_key)?;
+    Ok(call("POST", "/v2/refunds", Some(&b))?["refund"].clone())
+}
+
+/// One refund by id, to see it leave PENDING.
+pub fn square_refund_get(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/v2/refunds/{}", enc(id)), None)?["refund"].clone())
+}
+
+/// Makes a customer from Square's fields (`given_name`, `family_name`, `email_address`, `phone_number`, `reference_id`...), with `idempotency_key` when you want one kept.
+pub fn square_customer_create(fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = with_key(if fields.is_object() { fields } else { json!({}) }, "")?;
+    Ok(call("POST", "/v2/customers", Some(&b))?["customer"].clone())
+}
+
+/// One customer by id.
+pub fn square_customer(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/v2/customers/{}", enc(id)), None)?["customer"].clone())
+}
+
+/// Changes a customer's fields; give `version` to be refused when someone changed it first.
+pub fn square_customer_update(id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("PUT", &format!("/v2/customers/{}", enc(id)), Some(&fields))?["customer"].clone())
+}
+
+/// Customers through every page; `max_items` caps them (0: all).
+pub fn square_customers(max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk_get("/v2/customers", &json!({ "limit": 100 }), "customers", max_items)
+}
+
+/// Customers with exactly this email address.
+pub fn square_customer_by_email(email: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut body = json!({ "limit": 100, "query": { "filter": { "email_address": { "exact": email } } } });
+    loop {
+        let v = call("POST", "/v2/customers/search", Some(&body))?;
+        out.extend(v["customers"].as_array().cloned().unwrap_or_default());
+        match v["cursor"].as_str() {
+            Some(c) if !c.is_empty() => body["cursor"] = json!(c),
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// Puts any catalog object (`object` with a `type` and, for a new one, an `id` starting with `#`). Gives { object, id_mappings }, the ids Square gave in place of yours.
+pub fn square_catalog_upsert(object: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !object["type"].is_string() || !object["id"].is_string() {
+        return Err("a catalog object needs a `type` and an `id` (a new one's starts with #)".into());
+    }
+    let b = with_key(json!({ "object": object }), "")?;
+    let v = call("POST", "/v2/catalog/object", Some(&b))?;
+    Ok(json!({ "object": v["catalog_object"], "id_mappings": v["id_mappings"] }))
+}
+
+/// Makes an ITEM with its variations: `variations` is a list of { name, price, currency } (price as text; Square needs at least one).
+pub fn square_catalog_item(name: &str, variations: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    if variations.is_empty() {
+        return Err("an item needs at least one variation".into());
+    }
+    let mut vars = vec![];
+    for (i, x) in variations.iter().enumerate() {
+        let vn = x["name"].as_str().ok_or("each variation needs a `name`")?;
+        let price = x["price"].as_str().ok_or("each variation needs a `price`, as text")?;
+        vars.push(json!({
+            "type": "ITEM_VARIATION", "id": format!("#var{}", i),
+            "item_variation_data": { "item_id": "#item", "name": vn, "pricing_type": "FIXED_PRICING", "price_money": square_money(price, x["currency"].as_str().unwrap_or("USD"))? },
+        }));
+    }
+    square_catalog_upsert(json!({ "type": "ITEM", "id": "#item", "item_data": { "name": name, "variations": vars } }))
+}
+
+/// Catalog objects of the `types` given ("ITEM,CATEGORY", "" for all) through every page; `max_items` caps them (0: all).
+pub fn square_catalog_list(types: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let filter = if types.is_empty() { json!({}) } else { json!({ "types": types }) };
+    walk_get("/v2/catalog/list", &filter, "objects", max_items)
+}
+
+/// Deletes a catalog object, and its children. Gives the ids deleted.
+pub fn square_catalog_delete(id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("DELETE", &format!("/v2/catalog/object/{}", enc(id)), None)?["deleted_object_ids"].clone())
+}
+
+fn sign(notification_url: &str, body: &str, signature_key: &str) -> String {
+    let mut m = Hmac::<Sha256>::new_from_slice(signature_key.as_bytes()).expect("HMAC takes any key");
+    m.update(notification_url.as_bytes());
+    m.update(body.as_bytes());
+    STANDARD.encode(m.finalize().into_bytes())
+}
+
+/// Checks a webhook: `notification_url` exactly as subscribed, `body` the raw body, `signature` the `x-square-hmacsha256-signature` header, `signature_key` the subscription's. Gives the event, or an error saying why it is refused.
+pub fn square_webhook(notification_url: &str, body: &str, signature: &str, signature_key: &str) -> Result<serde_json::Value, String> {
+    if signature.is_empty() {
+        return Err("no x-square-hmacsha256-signature header: this did not come from Square".into());
+    }
+    let want = sign(notification_url, body, signature_key);
+    if want.len() != signature.len() || want.bytes().zip(signature.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {
+        return Err("the webhook's signature does not match: a wrong signature key, a notification URL not exactly as subscribed, or a changed body".into());
+    }
+    serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))
+}
+
+/// Signs a webhook body as Square does, for tests.
+pub fn square_webhook_sign(notification_url: &str, body: &str, signature_key: &str) -> String {
+    sign(notification_url, body, signature_key)
+}

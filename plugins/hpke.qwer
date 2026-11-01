@@ -1,0 +1,328 @@
+//! Hybrid Public Key Encryption (RFC 9180): messages sealed to a public key and opened with the private one, in base, PSK, auth and auth-PSK modes, several messages on one context, secrets exported, on X25519, P-256, P-384 and P-521 with AES-GCM or ChaCha20-Poly1305, checked against the RFC's test vectors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "std", "x25519", "p256", "p384", "p521"] }
+//! rand_core = "0.9"
+//! getrandom = "0.2"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hpke::aead::{Aead as AeadTrait, AesGcm128, AesGcm256, ChaCha20Poly1305, ExportOnlyAead};
+use hpke::kdf::{HkdfSha256, HkdfSha384, HkdfSha512, Kdf as KdfTrait};
+use hpke::kem::{DhP256HkdfSha256, DhP384HkdfSha384, DhP521HkdfSha512, X25519HkdfSha256};
+use hpke::{Deserializable, HpkeError, Kem as KemTrait, OpModeR, OpModeS, PskBundle, Serializable};
+use rand_core::{CryptoRng, RngCore};
+use serde_json::{json, Value};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// The operating system's randomness, or fixed bytes when checking a test vector.
+struct Source(Option<(Vec<u8>, usize)>);
+
+impl RngCore for Source {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        match &mut self.0 {
+            Some((b, at)) if b.len() >= *at + out.len() => {
+                out.copy_from_slice(&b[*at..*at + out.len()]);
+                *at += out.len();
+            }
+            _ => getrandom::getrandom(out).expect("the system has no randomness"),
+        }
+    }
+}
+
+impl CryptoRng for Source {}
+
+struct Suite {
+    kem: u16,
+    kdf: u16,
+    aead: u16,
+}
+
+fn kem_of(s: &str) -> Option<u16> {
+    Some(match s {
+        "x25519" | "dhkem-x25519" | "32" | "0x20" => 0x20,
+        "p256" | "p-256" | "16" | "0x10" => 0x10,
+        "p384" | "p-384" | "17" | "0x11" => 0x11,
+        "p521" | "p-521" | "18" | "0x12" => 0x12,
+        _ => return None,
+    })
+}
+
+fn kdf_of(s: &str) -> Option<u16> {
+    Some(match s {
+        "sha256" | "hkdf-sha256" | "1" => 1,
+        "sha384" | "hkdf-sha384" | "2" => 2,
+        "sha512" | "hkdf-sha512" | "3" => 3,
+        _ => return None,
+    })
+}
+
+fn aead_of(s: &str) -> Option<u16> {
+    Some(match s {
+        "aes128gcm" | "aes-128-gcm" | "1" => 1,
+        "aes256gcm" | "aes-256-gcm" | "2" => 2,
+        "chacha20poly1305" | "chacha20-poly1305" | "3" => 3,
+        "export" | "export-only" | "65535" => 0xffff,
+        _ => return None,
+    })
+}
+
+/// `"x25519-sha256-aes128gcm"`, or { kem, kdf, aead } by those names or RFC 9180's numbers, as `kem_id`, `kdf_id`, `aead_id` too.
+fn suite_of(v: &Value) -> Result<Suite, String> {
+    let text = |k: &[&str]| k.iter().find_map(|n| v.get(*n)).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_default().to_lowercase();
+    let (a, b, c) = match v {
+        Value::String(s) => {
+            let p: Vec<&str> = s.split('-').collect();
+            if p.len() != 3 {
+                return Err(format!("`{}` is not a suite: write kem-kdf-aead, like x25519-sha256-aes128gcm", s));
+            }
+            (p[0].to_lowercase(), p[1].to_lowercase(), p[2].to_lowercase())
+        }
+        Value::Object(_) => (text(&["kem", "kem_id"]), text(&["kdf", "kdf_id"]), text(&["aead", "aead_id"])),
+        _ => return Err("a suite is text or a map".into()),
+    };
+    Ok(Suite {
+        kem: kem_of(&a).ok_or(format!("`{}` is not a KEM: x25519, p256, p384 or p521", a))?,
+        kdf: kdf_of(&b).ok_or(format!("`{}` is not a KDF: sha256, sha384 or sha512", b))?,
+        aead: aead_of(&c).ok_or(format!("`{}` is not an AEAD: aes128gcm, aes256gcm, chacha20poly1305 or export", c))?,
+    })
+}
+
+macro_rules! by_aead {
+    ($s:expr, $f:ident, $k:ty, $d:ty, $r:expr) => {
+        match $s.aead {
+            1 => $f::<$k, $d, AesGcm128>($r),
+            2 => $f::<$k, $d, AesGcm256>($r),
+            3 => $f::<$k, $d, ChaCha20Poly1305>($r),
+            _ => $f::<$k, $d, ExportOnlyAead>($r),
+        }
+    };
+}
+
+macro_rules! by_kdf {
+    ($s:expr, $f:ident, $k:ty, $r:expr) => {
+        match $s.kdf {
+            1 => by_aead!($s, $f, $k, HkdfSha256, $r),
+            2 => by_aead!($s, $f, $k, HkdfSha384, $r),
+            _ => by_aead!($s, $f, $k, HkdfSha512, $r),
+        }
+    };
+}
+
+macro_rules! by_suite {
+    ($s:expr, $f:ident, $r:expr) => {
+        match $s.kem {
+            0x20 => by_kdf!($s, $f, X25519HkdfSha256, $r),
+            0x10 => by_kdf!($s, $f, DhP256HkdfSha256, $r),
+            0x11 => by_kdf!($s, $f, DhP384HkdfSha384, $r),
+            _ => by_kdf!($s, $f, DhP521HkdfSha512, $r),
+        }
+    };
+}
+
+/// Bytes from a value: text as UTF-8, `{ hex }`, or `{ base64 }`.
+fn bytes(v: Option<&Value>) -> Result<Vec<u8>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(s)) => Ok(s.as_bytes().to_vec()),
+        Some(Value::Object(m)) => {
+            if let Some(h) = m.get("hex").and_then(|x| x.as_str()) {
+                return hex::decode(h.trim()).map_err(|_| format!("`{}` is not hex", h.chars().take(40).collect::<String>()));
+            }
+            if let Some(b) = m.get("base64").and_then(|x| x.as_str()) {
+                return B64.decode(b.trim()).map_err(|_| "that is not base64".to_string());
+            }
+            Err("bytes are text, { hex } or { base64 }".into())
+        }
+        Some(_) => Err("bytes are text, { hex } or { base64 }".into()),
+    }
+}
+
+fn key_bytes(hex_text: &str, what: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex_text.trim()).map_err(|_| format!("the {} is not hex", what))
+}
+
+/// What a sealed or opened value is, as hex and, when it reads as such, as text.
+fn shown(b: &[u8]) -> Value {
+    match std::str::from_utf8(b) {
+        Ok(t) => json!({ "hex": hex::encode(b), "text": t }),
+        Err(_) => json!({ "hex": hex::encode(b), "text": null }),
+    }
+}
+
+fn why(e: HpkeError) -> String {
+    match e {
+        HpkeError::OpenError => "the message cannot be opened: the wrong key, sender, info or aad, or it was changed".to_string(),
+        HpkeError::ValidationError => "a key is not valid for this KEM".to_string(),
+        HpkeError::IncorrectInputLength(want, got) => format!("a key or value is {} bytes where {} are wanted", got, want),
+        HpkeError::InvalidPskBundle => "psk and psk_id go together: give both or neither".to_string(),
+        other => other.to_string(),
+    }
+}
+
+struct Req {
+    key: Vec<u8>,
+    enc: Vec<u8>,
+    info: Vec<u8>,
+    messages: Vec<(Vec<u8>, Vec<u8>)>,
+    exports: Vec<(Vec<u8>, usize)>,
+    sender: Option<Vec<u8>>,
+    psk: Vec<u8>,
+    psk_id: Vec<u8>,
+    ikm_e: Option<Vec<u8>>,
+}
+
+fn req_of(key: &str, enc: &str, o: &Value, sender_opt: &str) -> Result<Req, String> {
+    let sender = o.get(sender_opt).and_then(|s| s.as_str()).map(|s| key_bytes(s, sender_opt)).transpose()?;
+    let exports = o.get("exports").and_then(|e| e.as_array()).into_iter().flatten().map(|e| Ok((bytes(e.get("context"))?, e["length"].as_u64().unwrap_or(32) as usize))).collect::<Result<Vec<_>, String>>()?;
+    Ok(Req { key: key_bytes(key, "key")?, enc: key_bytes(enc, "encapsulated key")?, info: bytes(o.get("info"))?, messages: vec![], exports, sender, psk: bytes(o.get("psk"))?, psk_id: bytes(o.get("psk_id"))?, ikm_e: o.get("test_ikm_e").and_then(|s| s.as_str()).map(|s| key_bytes(s, "test_ikm_e")).transpose()? })
+}
+
+fn seal<K: KemTrait, D: KdfTrait, A: AeadTrait>(r: &Req) -> Result<Value, String> {
+    let pk = K::PublicKey::from_bytes(&r.key).map_err(why)?;
+    let identity = match &r.sender {
+        Some(b) => {
+            let sk = K::PrivateKey::from_bytes(b).map_err(why)?;
+            let public = K::sk_to_pk(&sk);
+            Some((sk, public))
+        }
+        None => None,
+    };
+    let bundle = if r.psk.is_empty() && r.psk_id.is_empty() { None } else { Some(PskBundle::new(&r.psk, &r.psk_id).map_err(why)?) };
+    let mode = match (identity, bundle) {
+        (None, None) => OpModeS::Base,
+        (None, Some(b)) => OpModeS::Psk(b),
+        (Some(k), None) => OpModeS::Auth(k),
+        (Some(k), Some(b)) => OpModeS::AuthPsk(k, b),
+    };
+    let mut rng = Source(r.ikm_e.clone().map(|b| (b, 0)));
+    let (enc, mut ctx) = hpke::setup_sender::<A, D, K, _>(&mode, &pk, &r.info, &mut rng).map_err(why)?;
+    let mut out = vec![];
+    for (pt, aad) in &r.messages {
+        out.push(json!(hex::encode(ctx.seal(pt, aad).map_err(why)?)));
+    }
+    let mut exported = vec![];
+    for (c, n) in &r.exports {
+        let mut b = vec![0; *n];
+        ctx.export(c, &mut b).map_err(why)?;
+        exported.push(json!(hex::encode(b)));
+    }
+    Ok(json!({ "enc": hex::encode(enc.to_bytes()), "ciphertexts": out, "exports": exported }))
+}
+
+fn open<K: KemTrait, D: KdfTrait, A: AeadTrait>(r: &Req) -> Result<Value, String> {
+    let sk = K::PrivateKey::from_bytes(&r.key).map_err(why)?;
+    let enc = K::EncappedKey::from_bytes(&r.enc).map_err(why)?;
+    let sender = r.sender.as_ref().map(|b| K::PublicKey::from_bytes(b)).transpose().map_err(why)?;
+    let bundle = if r.psk.is_empty() && r.psk_id.is_empty() { None } else { Some(PskBundle::new(&r.psk, &r.psk_id).map_err(why)?) };
+    let mode = match (sender, bundle) {
+        (None, None) => OpModeR::Base,
+        (None, Some(b)) => OpModeR::Psk(b),
+        (Some(k), None) => OpModeR::Auth(k),
+        (Some(k), Some(b)) => OpModeR::AuthPsk(k, b),
+    };
+    let mut ctx = hpke::setup_receiver::<A, D, K>(&mode, &sk, &enc, &r.info).map_err(why)?;
+    let mut out = vec![];
+    for (ct, aad) in &r.messages {
+        out.push(shown(&ctx.open(ct, aad).map_err(why)?));
+    }
+    let mut exported = vec![];
+    for (c, n) in &r.exports {
+        let mut b = vec![0; *n];
+        ctx.export(c, &mut b).map_err(why)?;
+        exported.push(json!(hex::encode(b)));
+    }
+    Ok(json!({ "plaintexts": out, "exports": exported }))
+}
+
+fn keys<K: KemTrait, D: KdfTrait, A: AeadTrait>(ikm: &Option<Vec<u8>>) -> Result<Value, String> {
+    let (sk, pk) = match ikm {
+        Some(b) => K::derive_keypair(b),
+        None => K::gen_keypair(&mut Source(None)),
+    };
+    Ok(json!({ "public_key": hex::encode(pk.to_bytes()), "private_key": hex::encode(sk.to_bytes()) }))
+}
+
+fn no_messages_on_export(s: &Suite, n: usize) -> Result<(), String> {
+    if s.aead == 0xffff && n > 0 {
+        return Err("an export-only suite seals nothing: use hpke_export".into());
+    }
+    Ok(())
+}
+
+/// A new key pair for a suite: { public_key, private_key }, hex.
+pub fn hpke_keygen(suite: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    by_suite!(s, keys, &None)
+}
+
+/// The key pair RFC 9180's DeriveKeyPair gives for `ikm`: text, { hex } or { base64 }.
+pub fn hpke_derive_keypair(suite: serde_json::Value, ikm: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    by_suite!(s, keys, &Some(bytes(Some(&ikm))?))
+}
+
+/// Seals one message to a public key (hex): `plaintext` is text, { hex } or { base64 }. Options: info, aad (the same, and both must be given again to open), sender_private (auth mode: the sender's key, hex), psk and psk_id (PSK mode). Gives { enc, ciphertext }, hex, both to send.
+pub fn hpke_seal(suite: serde_json::Value, recipient_public: &str, plaintext: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    no_messages_on_export(&s, 1)?;
+    let mut r = req_of(recipient_public, "", &options, "sender_private")?;
+    r.messages = vec![(bytes(Some(&plaintext))?, bytes(options.get("aad"))?)];
+    let v = by_suite!(s, seal, &r)?;
+    Ok(json!({ "enc": v["enc"], "ciphertext": v["ciphertexts"][0] }))
+}
+
+/// Opens what `hpke_seal` made, with the private key (hex): `enc` and `ciphertext` hex. Options as for sealing, with sender_public for auth mode. Gives { hex, text }; a wrong key, sender, info or aad is an error value.
+pub fn hpke_open(suite: serde_json::Value, recipient_private: &str, enc: &str, ciphertext: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    no_messages_on_export(&s, 1)?;
+    let mut r = req_of(recipient_private, enc, &options, "sender_public")?;
+    r.messages = vec![(key_bytes(ciphertext, "ciphertext")?, bytes(options.get("aad"))?)];
+    let v = by_suite!(s, open, &r)?;
+    Ok(v["plaintexts"][0].clone())
+}
+
+/// Seals a list of messages on one context, where each gets the next nonce: `messages` is [{ plaintext, aad }]. Options as for `hpke_seal`, and exports: [{ context, length }]. Gives { enc, ciphertexts, exports }. `test_ikm_e` fixes the ephemeral key, for a test vector only: a key used twice loses all secrecy.
+pub fn hpke_seal_many(suite: serde_json::Value, recipient_public: &str, messages: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    no_messages_on_export(&s, messages.len())?;
+    let mut r = req_of(recipient_public, "", &options, "sender_private")?;
+    for m in &messages {
+        r.messages.push((bytes(m.get("plaintext"))?, bytes(m.get("aad"))?));
+    }
+    by_suite!(s, seal, &r)
+}
+
+/// Opens a list of messages on one context, in the order they were sealed: `messages` is [{ ciphertext (hex), aad }]. Gives { plaintexts: [{ hex, text }], exports }.
+pub fn hpke_open_many(suite: serde_json::Value, recipient_private: &str, enc: &str, messages: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let s = suite_of(&suite)?;
+    no_messages_on_export(&s, messages.len())?;
+    let mut r = req_of(recipient_private, enc, &options, "sender_public")?;
+    for m in &messages {
+        r.messages.push((key_bytes(m["ciphertext"].as_str().ok_or("a message needs `ciphertext`")?, "ciphertext")?, bytes(m.get("aad"))?));
+    }
+    by_suite!(s, open, &r)
+}
+
+/// A secret both sides can derive: the receiver's side, from its private key and `enc`, `context` and `length` picking it. The sender gets the same through `exports` in `hpke_seal_many`. Gives hex.
+pub fn hpke_export(suite: serde_json::Value, recipient_private: &str, enc: &str, context: serde_json::Value, length: i64, options: serde_json::Value) -> Result<String, String> {
+    let s = suite_of(&suite)?;
+    let mut r = req_of(recipient_private, enc, &options, "sender_public")?;
+    r.exports = vec![(bytes(Some(&context))?, length.max(0) as usize)];
+    let v = by_suite!(s, open, &r)?;
+    Ok(v["exports"][0].as_str().unwrap_or("").to_string())
+}

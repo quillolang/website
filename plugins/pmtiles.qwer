@@ -1,0 +1,495 @@
+//! PMTiles v3 archives read from a file or by HTTP range requests: the header, Hilbert tile ids, directories with their run lengths and leaves, metadata, and tiles by z/x/y, with an archive replaced under the reader noticed by its ETag.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! flate2 = "1"
+//! brotli-decompressor = "4"
+//! ruzstd = "0.7"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
+
+const MAX_LEAF: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct Header {
+    root: (u64, u64),
+    meta: (u64, u64),
+    leaf_offset: u64,
+    leaf_length: u64,
+    data_offset: u64,
+    data_length: u64,
+    addressed: u64,
+    entries: u64,
+    contents: u64,
+    clustered: bool,
+    internal: u8,
+    tile_compression: u8,
+    tile_type: u8,
+    min_zoom: u8,
+    max_zoom: u8,
+    bounds: [f64; 4],
+    center: (u8, f64, f64),
+}
+
+#[derive(Clone, Copy)]
+struct Entry {
+    id: u64,
+    offset: u64,
+    length: u32,
+    run: u32,
+}
+
+struct Open {
+    stamp: String, // ETag, or a file's size and time: when it changes, all this is stale.
+    header: Header,
+    root: Vec<Entry>,
+    leaves: HashMap<(u64, u64), Vec<Entry>>,
+}
+
+fn cache() -> &'static Mutex<HashMap<String, Open>> {
+    static C: OnceLock<Mutex<HashMap<String, Open>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn u64le(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+fn i32e7(b: &[u8], at: usize) -> f64 {
+    i32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as f64 / 1e7
+}
+
+fn parse_header(b: &[u8]) -> Result<Header, String> {
+    if b.len() < 127 {
+        return Err("that is too short to be a PMTiles archive".into());
+    }
+    if &b[..7] != b"PMTiles" {
+        return Err(if b[0] == 0x1f { "that is gzipped, not a PMTiles archive".to_string() } else { "that is not a PMTiles archive: its magic is wrong".to_string() });
+    }
+    if b[7] != 3 {
+        return Err(format!("that is PMTiles version {}; only 3 is read here", b[7]));
+    }
+    Ok(Header {
+        root: (u64le(b, 8), u64le(b, 16)),
+        meta: (u64le(b, 24), u64le(b, 32)),
+        leaf_offset: u64le(b, 40),
+        leaf_length: u64le(b, 48),
+        data_offset: u64le(b, 56),
+        data_length: u64le(b, 64),
+        addressed: u64le(b, 72),
+        entries: u64le(b, 80),
+        contents: u64le(b, 88),
+        clustered: b[96] == 1,
+        internal: b[97],
+        tile_compression: b[98],
+        tile_type: b[99],
+        min_zoom: b[100],
+        max_zoom: b[101],
+        bounds: [i32e7(b, 102), i32e7(b, 106), i32e7(b, 110), i32e7(b, 114)],
+        center: (b[118], i32e7(b, 119), i32e7(b, 123)),
+    })
+}
+
+fn inflate(b: &[u8], kind: u8) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    match kind {
+        0 | 1 => out = b.to_vec(),
+        2 => {
+            flate2::read::MultiGzDecoder::new(b).take(MAX_LEAF * 4).read_to_end(&mut out).map_err(|e| format!("bad gzip: {}", e))?;
+        }
+        3 => {
+            brotli_decompressor::Decompressor::new(b, 4096).take(MAX_LEAF * 4).read_to_end(&mut out).map_err(|e| format!("bad brotli: {}", e))?;
+        }
+        4 => {
+            let d = ruzstd::StreamingDecoder::new(b).map_err(|e| format!("bad zstd: {}", e))?;
+            d.take(MAX_LEAF * 4).read_to_end(&mut out).map_err(|e| format!("bad zstd: {}", e))?;
+        }
+        k => return Err(format!("compression {} is not known", k)),
+    }
+    Ok(out)
+}
+
+fn varint(b: &[u8], at: &mut usize) -> Result<u64, String> {
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let c = *b.get(*at).ok_or("a directory is cut short")?;
+        *at += 1;
+        if shift >= 64 {
+            return Err("a directory holds a varint too long".into());
+        }
+        v |= ((c & 0x7f) as u64) << shift;
+        if c & 0x80 == 0 {
+            return Ok(v);
+        }
+        shift += 7;
+    }
+}
+
+fn directory(b: &[u8]) -> Result<Vec<Entry>, String> {
+    let mut at = 0;
+    let n = varint(b, &mut at)? as usize;
+    if n > b.len() {
+        return Err("a directory says it has more entries than it has bytes".into());
+    }
+    let mut e = vec![Entry { id: 0, offset: 0, length: 0, run: 0 }; n];
+    let mut id = 0u64;
+    for x in e.iter_mut() {
+        id = id.checked_add(varint(b, &mut at)?).ok_or("tile ids overflow")?;
+        x.id = id;
+    }
+    for x in e.iter_mut() {
+        x.run = varint(b, &mut at)? as u32;
+    }
+    for x in e.iter_mut() {
+        x.length = varint(b, &mut at)? as u32;
+    }
+    for i in 0..n {
+        let v = varint(b, &mut at)?;
+        // 0 means right after the previous entry; otherwise it is offset + 1.
+        e[i].offset = if v == 0 {
+            if i == 0 {
+                return Err("the first directory entry has no offset".into());
+            }
+            e[i - 1].offset + e[i - 1].length as u64
+        } else {
+            v - 1
+        };
+    }
+    Ok(e)
+}
+
+/// Where an archive is: a path or an http(s) URL.
+fn is_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+enum Stale {
+    Changed,
+    Fail(String),
+}
+
+// `etag` is sent as If-Match, so a server that replaced the file says 412 rather than mixing two.
+fn read_range(src: &str, offset: u64, length: u64, etag: Option<&str>) -> Result<(Vec<u8>, String), Stale> {
+    if length == 0 {
+        return Ok((vec![], String::new()));
+    }
+    if !is_url(src) {
+        let mut f = std::fs::File::open(src).map_err(|e| Stale::Fail(format!("cannot open {}: {}", src, e)))?;
+        let m = f.metadata().map_err(|e| Stale::Fail(e.to_string()))?;
+        let stamp = format!("{}:{:?}", m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        if let Some(e) = etag {
+            if e != stamp {
+                return Err(Stale::Changed);
+            }
+        }
+        f.seek(SeekFrom::Start(offset)).map_err(|e| Stale::Fail(e.to_string()))?;
+        let mut out = Vec::with_capacity(length.min(1 << 24) as usize);
+        f.take(length).read_to_end(&mut out).map_err(|e| Stale::Fail(e.to_string()))?;
+        return Ok((out, stamp));
+    }
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut req = agent.get(src).set("Range", &format!("bytes={}-{}", offset, offset + length - 1));
+    if let Some(e) = etag {
+        req = req.set("If-Match", e);
+    }
+    match req.call() {
+        Ok(r) => {
+            let status = r.status();
+            let tag = r.header("etag").unwrap_or("").to_string();
+            if status == 200 {
+                return Err(Stale::Fail(format!("{} ignored the Range header and sent the whole file: PMTiles needs a server that answers 206", src)));
+            }
+            if let (Some(want), false) = (etag, tag.is_empty()) {
+                if want != tag {
+                    return Err(Stale::Changed);
+                }
+            }
+            let mut out = Vec::with_capacity(length.min(1 << 24) as usize);
+            r.into_reader().take(length).read_to_end(&mut out).map_err(|e| Stale::Fail(e.to_string()))?;
+            Ok((out, tag))
+        }
+        Err(ureq::Error::Status(412, _)) => Err(Stale::Changed),
+        Err(ureq::Error::Status(416, _)) => Err(Stale::Fail(format!("{} is shorter than its header says: range {}+{} is past its end", src, offset, length))),
+        Err(ureq::Error::Status(c, r)) => Err(Stale::Fail(format!("{} answered {}: {}", src, c, r.into_string().unwrap_or_default().chars().take(200).collect::<String>()))),
+        Err(e) => Err(Stale::Fail(format!("cannot reach {}: {}", src, e))),
+    }
+}
+
+fn load(src: &str) -> Result<Open, Stale> {
+    // The specification keeps the header and root directory in the first 16 KiB.
+    let (b, stamp) = read_range(src, 0, 16384, None)?;
+    let h = parse_header(&b).map_err(Stale::Fail)?;
+    let (ro, rl) = h.root;
+    if rl > 16384 * 2 {
+        return Err(Stale::Fail("the root directory is too large".into()));
+    }
+    let raw = if ro + rl <= b.len() as u64 {
+        b[ro as usize..(ro + rl) as usize].to_vec()
+    } else {
+        read_range(src, ro, rl, Some(&stamp).filter(|s| !s.is_empty()).map(|s| s.as_str()))?.0
+    };
+    let root = directory(&inflate(&raw, h.internal).map_err(Stale::Fail)?).map_err(Stale::Fail)?;
+    Ok(Open { stamp, header: h, root, leaves: HashMap::new() })
+}
+
+fn with_open<T>(src: &str, mut f: impl FnMut(&mut Open) -> Result<T, Stale>) -> Result<T, String> {
+    // A change seen part way empties the cache and starts once more.
+    for _ in 0..2 {
+        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if !c.contains_key(src) {
+            if c.len() > 32 {
+                c.clear();
+            }
+            match load(src) {
+                Ok(o) => {
+                    c.insert(src.to_string(), o);
+                }
+                Err(Stale::Changed) => continue,
+                Err(Stale::Fail(e)) => return Err(e),
+            }
+        }
+        let o = c.get_mut(src).ok_or("gone from the cache")?;
+        match f(o) {
+            Ok(v) => return Ok(v),
+            Err(Stale::Changed) => {
+                c.remove(src);
+            }
+            Err(Stale::Fail(e)) => {
+                return Err(e);
+            }
+        }
+    }
+    Err(format!("{} kept changing while it was read", src))
+}
+
+fn tag(s: &str) -> Option<&str> {
+    Some(s).filter(|x| !x.is_empty() && !x.contains(':'))
+}
+
+fn stamp_of<'a>(src: &str, s: &'a str) -> Option<&'a str> {
+    if is_url(src) { tag(s) } else { Some(s) }
+}
+
+fn find(o: &mut Open, src: &str, id: u64) -> Result<Option<(u64, u32)>, Stale> {
+    let mut dir = o.root.clone();
+    let h = o.header.clone();
+    for _ in 0..4 {
+        // The last entry at or before the id.
+        let i = match dir.binary_search_by_key(&id, |e| e.id) {
+            Ok(i) => i,
+            Err(0) => return Ok(None),
+            Err(i) => i - 1,
+        };
+        let e = dir[i];
+        if e.run == 0 {
+            let key = (h.leaf_offset + e.offset, e.length as u64);
+            if key.1 > MAX_LEAF {
+                return Err(Stale::Fail("a leaf directory is too large".into()));
+            }
+            if let Some(l) = o.leaves.get(&key) {
+                dir = l.clone();
+            } else {
+                let raw = read_range(src, key.0, key.1, stamp_of(src, &o.stamp))?.0;
+                let d = directory(&inflate(&raw, h.internal).map_err(Stale::Fail)?).map_err(Stale::Fail)?;
+                if o.leaves.len() > 64 {
+                    o.leaves.clear();
+                }
+                o.leaves.insert(key, d.clone());
+                dir = d;
+            }
+            continue;
+        }
+        return Ok(if id < e.id + e.run as u64 { Some((h.data_offset + e.offset, e.length)) } else { None });
+    }
+    Err(Stale::Fail("the directories go deeper than the specification's limit".into()))
+}
+
+fn rotate(n: u64, x: &mut u64, y: &mut u64, rx: u64, ry: u64) {
+    if ry == 0 {
+        if rx != 0 {
+            *x = n - 1 - *x;
+            *y = n - 1 - *y;
+        }
+        std::mem::swap(x, y);
+    }
+}
+
+fn zxy_to_id(z: u8, mut x: u64, mut y: u64) -> u64 {
+    let acc = ((1u128 << (2 * z as u32)) as u64 - 1) / 3;
+    let n = 1u64 << z;
+    let mut d = 0;
+    let mut s = n / 2;
+    while s > 0 {
+        let rx = u64::from(x & s > 0);
+        let ry = u64::from(y & s > 0);
+        d += s * s * ((3 * rx) ^ ry);
+        rotate(n, &mut x, &mut y, rx, ry);
+        s /= 2;
+    }
+    acc + d
+}
+
+fn id_to_zxy(id: u64) -> Result<(u8, u64, u64), String> {
+    let mut acc = 0u64;
+    for z in 0..=26u8 {
+        let n = 1u64 << (2 * z as u32);
+        if id < acc + n {
+            let side = 1u64 << z;
+            let (mut x, mut y, mut t) = (0u64, 0u64, id - acc);
+            let mut s = 1u64;
+            while s < side {
+                let rx = 1 & (t / 2);
+                let ry = 1 & (t ^ rx);
+                rotate(s, &mut x, &mut y, rx, ry);
+                x += s * rx;
+                y += s * ry;
+                t /= 4;
+                s *= 2;
+            }
+            return Ok((z, x, y));
+        }
+        acc += n;
+    }
+    Err(format!("tile id {} is past zoom 26", id))
+}
+
+fn compression(c: u8) -> Value {
+    match c {
+        1 => json!("none"),
+        2 => json!("gzip"),
+        3 => json!("brotli"),
+        4 => json!("zstd"),
+        _ => Value::Null,
+    }
+}
+
+fn tile_type(t: u8) -> &'static str {
+    match t {
+        1 => "mvt",
+        2 => "png",
+        3 => "jpeg",
+        4 => "webp",
+        5 => "avif",
+        _ => "unknown",
+    }
+}
+
+fn content_type(t: u8) -> &'static str {
+    match t {
+        1 => "application/x-protobuf",
+        2 => "image/png",
+        3 => "image/jpeg",
+        4 => "image/webp",
+        5 => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn check_tile(z: i64, x: i64, y: i64) -> Result<(), String> {
+    if !(0..=26).contains(&z) {
+        return Err(format!("zoom is 0 to 26, not {}", z));
+    }
+    if x < 0 || y < 0 || x >= 1 << z || y >= 1 << z {
+        return Err(format!("{}/{}/{} is off the map: at zoom {} x and y are 0 to {}", z, x, y, z, (1i64 << z) - 1));
+    }
+    Ok(())
+}
+
+/// The Hilbert tile id of z/x/y: every tile of lower zooms first, then along the curve at its zoom. 12/3423/1763 is 19078479.
+pub fn pmtiles_tile_id(z: i64, x: i64, y: i64) -> Result<i64, String> {
+    check_tile(z, x, y)?;
+    Ok(zxy_to_id(z as u8, x as u64, y as u64) as i64)
+}
+
+/// A tile id back to { z, x, y }.
+pub fn pmtiles_tile_zxy(id: i64) -> Result<Value, String> {
+    if id < 0 {
+        return Err("a tile id cannot be negative".into());
+    }
+    let (z, x, y) = id_to_zxy(id as u64)?;
+    Ok(json!({ "z": z, "x": x, "y": y }))
+}
+
+/// An archive's header: { version, tile_type, tile_compression, internal_compression, min_zoom, max_zoom, bounds, center, addressed_tiles, tile_entries, tile_contents, clustered, root_entries, data_length, stamp }. `source` is a path or a URL; the header is cached until the file or its ETag changes.
+pub fn pmtiles_header(source: &str) -> Result<Value, String> {
+    with_open(source, |o| {
+        let h = &o.header;
+        Ok(json!({
+            "version": 3, "tile_type": tile_type(h.tile_type), "tile_compression": compression(h.tile_compression), "internal_compression": compression(h.internal),
+            "min_zoom": h.min_zoom, "max_zoom": h.max_zoom, "bounds": h.bounds, "center": { "zoom": h.center.0, "lon": h.center.1, "lat": h.center.2 },
+            "addressed_tiles": h.addressed, "tile_entries": h.entries, "tile_contents": h.contents, "clustered": h.clustered,
+            "root_entries": o.root.len(), "data_length": h.data_length, "leaf_directories": h.leaf_length > 0,
+        }))
+    })
+}
+
+/// The archive's JSON metadata: its name, vector layers and whatever else its maker wrote.
+pub fn pmtiles_metadata(source: &str) -> Result<Value, String> {
+    with_open(source, |o| {
+        let (off, len) = o.header.meta;
+        if len == 0 {
+            return Ok(json!({}));
+        }
+        let raw = read_range(source, off, len, stamp_of(source, &o.stamp))?.0;
+        let d = inflate(&raw, o.header.internal).map_err(Stale::Fail)?;
+        serde_json::from_slice(&d).map_err(|e| Stale::Fail(format!("the metadata is not JSON: {}", e)))
+    })
+}
+
+/// The root directory's entries: [{ tile_id, z, x, y, run_length, leaf, offset, length }], `leaf` true where it points at a deeper directory, with up to `limit` given.
+pub fn pmtiles_directory(source: &str, limit: i64) -> Result<Value, String> {
+    with_open(source, |o| {
+        let list: Vec<Value> = o.root.iter().take(limit.max(0) as usize).map(|e| {
+            let (z, x, y) = id_to_zxy(e.id).unwrap_or((0, 0, 0));
+            json!({ "tile_id": e.id, "z": z, "x": x, "y": y, "run_length": e.run, "leaf": e.run == 0, "offset": e.offset, "length": e.length })
+        }).collect();
+        Ok(json!(list))
+    })
+}
+
+fn get(source: &str, z: i64, x: i64, y: i64) -> Result<(Option<Vec<u8>>, Header), String> {
+    check_tile(z, x, y)?;
+    let id = zxy_to_id(z as u8, x as u64, y as u64);
+    with_open(source, |o| {
+        let h = o.header.clone();
+        if (z as u8) < h.min_zoom || (z as u8) > h.max_zoom {
+            return Ok((None, h));
+        }
+        Ok((match find(o, source, id)? {
+            Some((off, len)) => Some(read_range(source, off, len as u64, stamp_of(source, &o.stamp))?.0),
+            None => None,
+        }, h))
+    })
+}
+
+/// A tile by z/x/y: { found, tile_id, bytes, type, compression, content_type, base64 }. `found` false is a tile the archive lacks. The bytes are as stored; Quillo has no bytes value, so they come as base64, and pmtiles_tile_to_file writes them for `file()`. By URL each call costs one range request, plus one for a leaf not yet cached.
+pub fn pmtiles_tile(source: &str, z: i64, x: i64, y: i64) -> Result<Value, String> {
+    let (t, h) = get(source, z, x, y)?;
+    let id = zxy_to_id(z as u8, x as u64, y as u64);
+    Ok(match t {
+        Some(b) => json!({ "found": true, "tile_id": id, "bytes": b.len(), "type": tile_type(h.tile_type), "compression": compression(h.tile_compression), "content_type": content_type(h.tile_type), "base64": base64::engine::general_purpose::STANDARD.encode(&b) }),
+        None => json!({ "found": false, "tile_id": id, "bytes": 0, "type": tile_type(h.tile_type), "compression": null, "content_type": null, "base64": null }),
+    })
+}
+
+/// A tile decompressed and written to a file, to answer a map with `file(to)`: { found, bytes, type, content_type }. Nothing is written for a tile the archive lacks.
+pub fn pmtiles_tile_to_file(source: &str, z: i64, x: i64, y: i64, to: &str) -> Result<Value, String> {
+    let (t, h) = get(source, z, x, y)?;
+    let Some(b) = t else {
+        return Ok(json!({ "found": false, "bytes": 0, "type": tile_type(h.tile_type), "content_type": null }));
+    };
+    let d = inflate(&b, h.tile_compression)?;
+    if let Some(dir) = std::path::Path::new(to).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(to, &d).map_err(|e| format!("cannot write {}: {}", to, e))?;
+    Ok(json!({ "found": true, "bytes": d.len(), "type": tile_type(h.tile_type), "content_type": content_type(h.tile_type) }))
+}

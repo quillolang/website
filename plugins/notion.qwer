@@ -1,0 +1,368 @@
+//! Notion's API: pages made and changed, database queries followed through their cursors, blocks read and appended in batches of 100, and helpers for rich text and properties, with text split at Notion's 2000 characters.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+const VERSION: &str = "2022-06-28";
+const TEXT_LIMIT: usize = 2000;
+const CHILDREN_LIMIT: usize = 100;
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+// Links give ids with no dashes and sometimes a title and a query: both forms work everywhere.
+fn id_of(s: &str) -> Result<String, String> {
+    let tail = s.split(['?', '#']).next().unwrap_or(s).rsplit('/').next().unwrap_or(s).rsplit('-').next().unwrap_or(s);
+    let hex: String = if s.len() == 36 && s.matches('-').count() == 4 { s.replace('-', "") } else { tail.to_string() };
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{:?} is not a Notion id", s));
+    }
+    Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let token = opt(o, "token", "NOTION_TOKEN").ok_or("no token: set NOTION_TOKEN (an integration's secret), or give the option token")?;
+    let base = opt(o, "base_url", "NOTION_API_URL").unwrap_or_else(|| "https://api.notion.com".into());
+    let version = opt(o, "version", "NOTION_VERSION").unwrap_or_else(|| VERSION.into());
+    let url = format!("{}/v1{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let text = body.map(|b| b.to_string());
+    let mut tries = 0;
+    loop {
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Notion-Version", &version).set("User-Agent", "quillo-notion/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Notion's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let kind = v["code"].as_str().unwrap_or("error");
+                // conflict_error is two writes meeting: it passes on a second try.
+                if (code == 429 || code == 503 || kind == "conflict_error") && tries < 3 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                let hint = if kind == "object_not_found" { " (share the page or database with the integration)" } else { "" };
+                return Err(format!("Notion {} {}: {}{}", code, kind, v["message"].as_str().unwrap_or(t.trim()), hint));
+            }
+            Err(e) => return Err(format!("cannot reach Notion at {}: {}", base, e)),
+        }
+    }
+}
+
+/// Calls any endpoint under /v1: `method`, `path`, `body` or null. Options: token (else NOTION_TOKEN), base_url (else NOTION_API_URL), version (else NOTION_VERSION, else 2022-06-28).
+pub fn notion_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+fn segment(text: &str, link: Option<&str>, ann: &Value) -> Value {
+    let mut t = json!({ "content": text });
+    if let Some(u) = link {
+        t["link"] = json!({ "url": u });
+    }
+    let mut r = json!({ "type": "text", "text": t });
+    if ann.is_object() && !ann.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        r["annotations"] = ann.clone();
+    }
+    r
+}
+
+// A text is at most 2000 UTF-16 units; longer ones go in several segments.
+fn chunks(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    let (mut cur, mut n) = (String::new(), 0);
+    for c in text.chars() {
+        if n + c.len_utf16() > TEXT_LIMIT {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+        cur.push(c);
+        n += c.len_utf16();
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Rich text from a plain text, split at Notion's 2000 characters: `annotations` is a map like { bold: true, color: "red" }, or null.
+pub fn notion_text(text: &str, annotations: serde_json::Value) -> Vec<serde_json::Value> {
+    chunks(text).iter().map(|c| segment(c, None, &annotations)).collect()
+}
+
+/// A linked piece of rich text.
+pub fn notion_link(text: &str, url: &str) -> Vec<serde_json::Value> {
+    chunks(text).iter().map(|c| segment(c, Some(url), &Value::Null)).collect()
+}
+
+/// Rich text from a line of Markdown's inline marks: **bold**, *italic*, `code`, ~~struck~~ and [text](url). A mark left open is kept as it is.
+pub fn notion_markdown(text: &str) -> Vec<serde_json::Value> {
+    let mut out: Vec<Value> = vec![];
+    let mut plain = String::new();
+    let mut rest = text;
+    let flush = |plain: &mut String, out: &mut Vec<Value>| {
+        if !plain.is_empty() {
+            out.extend(notion_text(plain, Value::Null));
+            plain.clear();
+        }
+    };
+    while !rest.is_empty() {
+        let mut matched = false;
+        for (mark, key) in [("**", "bold"), ("~~", "strikethrough"), ("`", "code"), ("*", "italic")] {
+            if let Some(after) = rest.strip_prefix(mark) {
+                if let Some(end) = after.find(mark).filter(|e| *e > 0) {
+                    flush(&mut plain, &mut out);
+                    out.extend(notion_text(&after[..end], json!({ key: true })));
+                    rest = &after[end + mark.len()..];
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if matched {
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('[') {
+            if let Some((label, tail)) = after.split_once("](") {
+                if let Some((url, tail2)) = tail.split_once(')') {
+                    if !label.contains(']') {
+                        flush(&mut plain, &mut out);
+                        out.extend(notion_link(label, url));
+                        rest = tail2;
+                        continue;
+                    }
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        plain.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    flush(&mut plain, &mut out);
+    out
+}
+
+/// The plain text of rich text: what a person would read.
+pub fn notion_plain(rich_text: serde_json::Value) -> String {
+    rich_text.as_array().map(|l| l.iter().filter_map(|r| r["plain_text"].as_str().or(r.pointer("/text/content").and_then(|c| c.as_str()))).collect::<Vec<_>>().join("")).unwrap_or_default()
+}
+
+fn rich(v: &Value) -> Value {
+    match v {
+        Value::String(s) => json!(notion_markdown(s)),
+        o => o.clone(),
+    }
+}
+
+fn block(kind: &str, content: Value) -> Value {
+    let mut b = json!({ "object": "block", "type": kind });
+    b[kind] = content;
+    b
+}
+
+/// A paragraph block from Markdown-marked text, or from rich text.
+pub fn notion_paragraph(text: serde_json::Value) -> serde_json::Value {
+    block("paragraph", json!({ "rich_text": rich(&text) }))
+}
+
+/// A heading block, `level` 1 to 3.
+pub fn notion_heading(level: i64, text: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !(1..=3).contains(&level) {
+        return Err(format!("a heading is level 1 to 3, not {}", level));
+    }
+    Ok(block(&format!("heading_{}", level), json!({ "rich_text": rich(&text) })))
+}
+
+/// A bulleted list item.
+pub fn notion_bullet(text: serde_json::Value) -> serde_json::Value {
+    block("bulleted_list_item", json!({ "rich_text": rich(&text) }))
+}
+
+/// A numbered list item.
+pub fn notion_numbered(text: serde_json::Value) -> serde_json::Value {
+    block("numbered_list_item", json!({ "rich_text": rich(&text) }))
+}
+
+/// A to-do item.
+pub fn notion_todo(text: serde_json::Value, checked: bool) -> serde_json::Value {
+    block("to_do", json!({ "rich_text": rich(&text), "checked": checked }))
+}
+
+/// A code block; `language` is Notion's name for it ("javascript", "plain text"...).
+pub fn notion_code(code: &str, language: &str) -> serde_json::Value {
+    block("code", json!({ "rich_text": notion_text(code, Value::Null), "language": if language.is_empty() { "plain text" } else { language } }))
+}
+
+/// A callout block with an emoji.
+pub fn notion_callout(text: serde_json::Value, emoji: &str) -> serde_json::Value {
+    block("callout", json!({ "rich_text": rich(&text), "icon": { "type": "emoji", "emoji": emoji } }))
+}
+
+/// A divider.
+pub fn notion_divider() -> serde_json::Value {
+    block("divider", json!({}))
+}
+
+/// Properties for a page from plain values and a `schema` naming each one's type: { Name: "title", Stage: "select", Tags: "multi_select", Price: "number", Due: "date", Done: "checkbox", Link: "url", Mail: "email", Phone: "phone_number", Notes: "rich_text", Owners: "relation" }.
+pub fn notion_properties(values: serde_json::Value, schema: serde_json::Value) -> Result<serde_json::Value, String> {
+    let m = values.as_object().ok_or("values must be a map")?;
+    let mut out = Map::new();
+    for (k, v) in m {
+        let kind = schema[k].as_str().ok_or(format!("the schema does not say what type `{}` is", k))?;
+        let text = v.as_str().map(str::to_string).unwrap_or(v.to_string());
+        let prop = match kind {
+            "title" => json!({ "title": notion_text(&text, Value::Null) }),
+            "rich_text" => json!({ "rich_text": notion_markdown(&text) }),
+            "select" => if v.is_null() { json!({ "select": null }) } else { json!({ "select": { "name": text } }) },
+            "status" => json!({ "status": { "name": text } }),
+            "multi_select" => json!({ "multi_select": v.as_array().ok_or(format!("`{}` must be a list", k))?.iter().map(|x| json!({ "name": x.as_str().map(str::to_string).unwrap_or(x.to_string()) })).collect::<Vec<_>>() }),
+            "number" => json!({ "number": v.as_f64().ok_or(format!("`{}` must be a number", k))? }),
+            "checkbox" => json!({ "checkbox": v.as_bool().ok_or(format!("`{}` must be true or false", k))? }),
+            "date" => json!({ "date": if v.is_null() { Value::Null } else { json!({ "start": text }) } }),
+            "url" | "email" | "phone_number" => { let mut p = json!({}); p[kind] = v.clone(); p }
+            "relation" => json!({ "relation": v.as_array().ok_or(format!("`{}` must be a list of ids", k))?.iter().map(|x| Ok(json!({ "id": id_of(x.as_str().unwrap_or(""))? }))).collect::<Result<Vec<_>, String>>()? }),
+            o => return Err(format!("`{}` has the type {:?}, which notion_properties does not know", k, o)),
+        };
+        out.insert(k.clone(), prop);
+    }
+    Ok(Value::Object(out))
+}
+
+/// A page's properties as plain values, whatever their types: titles and text as strings, selects as names, dates as their start, and so on. Gives { id, url, created_time, last_edited_time, archived, ...the properties }.
+pub fn notion_row(page: serde_json::Value) -> serde_json::Value {
+    let mut out = json!({ "id": page["id"], "url": page["url"], "created_time": page["created_time"], "last_edited_time": page["last_edited_time"], "archived": page["archived"] });
+    let Some(props) = page["properties"].as_object() else { return out };
+    for (k, p) in props {
+        let kind = p["type"].as_str().unwrap_or("");
+        let v = &p[kind];
+        let plain = match kind {
+            "title" | "rich_text" => json!(notion_plain(v.clone())),
+            "select" | "status" => v.get("name").cloned().unwrap_or(Value::Null),
+            "multi_select" => json!(v.as_array().map(|l| l.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()).unwrap_or_default()),
+            "date" => v.get("start").cloned().unwrap_or(Value::Null),
+            "people" => json!(v.as_array().map(|l| l.iter().map(|x| x.get("name").cloned().unwrap_or(x["id"].clone())).collect::<Vec<_>>()).unwrap_or_default()),
+            "relation" => json!(v.as_array().map(|l| l.iter().map(|x| x["id"].clone()).collect::<Vec<_>>()).unwrap_or_default()),
+            "formula" => { let t = v["type"].as_str().unwrap_or(""); v.get(t).cloned().unwrap_or(Value::Null) }
+            "rollup" => { let t = v["type"].as_str().unwrap_or(""); v.get(t).cloned().unwrap_or(Value::Null) }
+            _ => v.clone(),
+        };
+        out[k] = plain;
+    }
+    out
+}
+
+/// Makes a page: `parent` a database id, or "page:<id>" under a page, `properties` as notion_properties gives them, `children` a list of blocks (any number: past 100 they are appended after). Gives the page.
+pub fn notion_page_create(parent: &str, properties: serde_json::Value, children: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = match parent.strip_prefix("page:") {
+        Some(id) => json!({ "page_id": id_of(id)? }),
+        None => json!({ "database_id": id_of(parent)? }),
+    };
+    let mut body = json!({ "parent": p, "properties": properties });
+    let first: Vec<Value> = children.iter().take(CHILDREN_LIMIT).cloned().collect();
+    if !first.is_empty() {
+        body["children"] = json!(first);
+    }
+    let page = call("POST", "/pages", Some(&body), &options)?;
+    if children.len() > CHILDREN_LIMIT {
+        notion_append(page["id"].as_str().unwrap_or(""), children[CHILDREN_LIMIT..].to_vec(), options)?;
+    }
+    Ok(page)
+}
+
+/// One page.
+pub fn notion_page(id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/pages/{}", id_of(id)?), None, &options)
+}
+
+/// Changes a page's properties.
+pub fn notion_page_update(id: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PATCH", &format!("/pages/{}", id_of(id)?), Some(&json!({ "properties": properties })), &options)
+}
+
+/// Moves a page to the trash, or back with `archived` false.
+pub fn notion_archive(id: &str, archived: bool, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PATCH", &format!("/pages/{}", id_of(id)?), Some(&json!({ "archived": archived })), &options)
+}
+
+/// One page of a database query: `query` holds filter, sorts, page_size, start_cursor. Gives { results, next_cursor, has_more }.
+pub fn notion_query_page(database: &str, query: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = if query.is_null() { json!({}) } else { query };
+    call("POST", &format!("/databases/{}/query", id_of(database)?), Some(&q), &options)
+}
+
+/// Every row of a database query, following the cursor. `query` holds filter and sorts; options add max_items. Gives the pages; pass one to notion_row for its plain values.
+pub fn notion_query(database: &str, query: serde_json::Value, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut q = if query.is_object() { query } else { json!({}) };
+    q["page_size"] = json!(100);
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut out = vec![];
+    loop {
+        let r = notion_query_page(database, q.clone(), options.clone())?;
+        out.extend(r["results"].as_array().cloned().unwrap_or_default());
+        match r["next_cursor"].as_str() {
+            Some(c) if r["has_more"] == true && out.len() < max => q["start_cursor"] = json!(c),
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// A block's children, all pages of them. A block with has_children needs a call of its own.
+pub fn notion_blocks(block_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let id = id_of(block_id)?;
+    let mut out = vec![];
+    let mut cursor: Option<String> = None;
+    loop {
+        let q = cursor.as_ref().map(|c| format!("&start_cursor={}", c)).unwrap_or_default();
+        let r = call("GET", &format!("/blocks/{}/children?page_size=100{}", id, q), None, &options)?;
+        out.extend(r["results"].as_array().cloned().unwrap_or_default());
+        match r["next_cursor"].as_str() {
+            Some(c) if r["has_more"] == true => cursor = Some(c.to_string()),
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// Appends blocks under a page or block, in as many requests of 100 as they take. Gives how many went in.
+pub fn notion_append(block_id: &str, children: Vec<serde_json::Value>, options: serde_json::Value) -> Result<i64, String> {
+    let id = id_of(block_id)?;
+    for chunk in children.chunks(CHILDREN_LIMIT) {
+        call("PATCH", &format!("/blocks/{}/children", id), Some(&json!({ "children": chunk })), &options)?;
+    }
+    Ok(children.len() as i64)
+}
+
+/// Searches the pages and databases shared with the integration by title. Options: filter ("page" or "database"), max_items. Gives what matched, all pages of it.
+pub fn notion_search(query: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut b = json!({ "query": query, "page_size": 100 });
+    if let Some(f) = options.get("filter").and_then(|f| f.as_str()) {
+        b["filter"] = json!({ "property": "object", "value": f });
+    }
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut out = vec![];
+    loop {
+        let r = call("POST", "/search", Some(&b), &options)?;
+        out.extend(r["results"].as_array().cloned().unwrap_or_default());
+        match r["next_cursor"].as_str() {
+            Some(c) if r["has_more"] == true && out.len() < max => b["start_cursor"] = json!(c),
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}

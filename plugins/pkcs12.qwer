@@ -1,0 +1,753 @@
+//! PKCS#12 files (.p12, .pfx) in pure Rust: the private key and certificate chain read out, the MAC and password checked, modern PBES2 with AES handled, files written that OpenSSL and browsers open, and what a file uses told without its password. The older RC2, RC4 and 3DES PBE are refused by name, with how to convert the file.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! aes = "0.8"
+//! cbc = { version = "0.1", features = ["std"] }
+//! hmac = "0.12"
+//! pbkdf2 = "0.12"
+//! sha1 = "0.10"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+const DATA: &str = "1.2.840.113549.1.7.1";
+const ENCRYPTED: &str = "1.2.840.113549.1.7.6";
+const KEY_BAG: &str = "1.2.840.113549.1.12.10.1.1";
+const SHROUDED_BAG: &str = "1.2.840.113549.1.12.10.1.2";
+const CERT_BAG: &str = "1.2.840.113549.1.12.10.1.3";
+const X509_CERT: &str = "1.2.840.113549.1.9.22.1";
+const FRIENDLY: &str = "1.2.840.113549.1.9.20";
+const LOCAL_ID: &str = "1.2.840.113549.1.9.21";
+const PBES2: &str = "1.2.840.113549.1.5.13";
+const PBKDF2: &str = "1.2.840.113549.1.5.12";
+const HMAC_SHA1: &str = "1.2.840.113549.2.7";
+const HMAC_SHA256: &str = "1.2.840.113549.2.9";
+const HMAC_SHA384: &str = "1.2.840.113549.2.10";
+const HMAC_SHA512: &str = "1.2.840.113549.2.11";
+const AES128: &str = "2.16.840.1.101.3.4.1.2";
+const AES192: &str = "2.16.840.1.101.3.4.1.22";
+const AES256: &str = "2.16.840.1.101.3.4.1.42";
+
+// ---- DER, read and written by hand ----
+
+#[derive(Clone, Copy)]
+struct Tlv<'a> {
+    tag: u8,
+    body: &'a [u8],
+    raw: &'a [u8],
+}
+
+fn tlv_at(b: &[u8]) -> Result<(Tlv<'_>, &[u8]), String> {
+    if b.len() < 2 {
+        return Err("cut-off DER".into());
+    }
+    let (len, head) = if b[1] < 0x80 {
+        (b[1] as usize, 2)
+    } else {
+        let n = (b[1] & 0x7f) as usize;
+        if n == 0 || n > 4 || b.len() < 2 + n {
+            return Err("DER with a bad length".into());
+        }
+        (b[2..2 + n].iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
+    };
+    if b.len() < head + len {
+        return Err("cut-off DER".into());
+    }
+    Ok((Tlv { tag: b[0], body: &b[head..head + len], raw: &b[..head + len] }, &b[head + len..]))
+}
+
+fn items(b: &[u8]) -> Result<Vec<Tlv<'_>>, String> {
+    let mut out = vec![];
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (t, r) = tlv_at(rest)?;
+        out.push(t);
+        rest = r;
+    }
+    Ok(out)
+}
+
+impl<'a> Tlv<'a> {
+    fn kids(&self) -> Result<Vec<Tlv<'a>>, String> {
+        items(self.body)
+    }
+    fn oid(&self) -> String {
+        oid_text(self.body)
+    }
+}
+
+fn oid_text(b: &[u8]) -> String {
+    let mut out = vec![];
+    let mut n = 0u64;
+    for (i, x) in b.iter().enumerate() {
+        n = n << 7 | (*x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            if out.is_empty() {
+                let first = (n / 40).min(2);
+                out.push(first);
+                out.push(n - first * 40);
+            } else {
+                out.push(n);
+            }
+            n = 0;
+        }
+        let _ = i;
+    }
+    out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".")
+}
+
+fn mk(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u32).to_be_bytes();
+        let skip = b.iter().position(|x| *x != 0).unwrap_or(3);
+        out.push(0x80 | (4 - skip) as u8);
+        out.extend(&b[skip..]);
+    }
+    out.extend(body);
+    out
+}
+
+fn seq(parts: &[&[u8]]) -> Vec<u8> {
+    mk(0x30, &parts.concat())
+}
+
+fn mk_oid(s: &str) -> Vec<u8> {
+    let p: Vec<u64> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    let mut out = vec![(p[0] * 40 + p[1]) as u8];
+    for x in &p[2..] {
+        let mut b = vec![(*x & 0x7f) as u8];
+        let mut v = *x >> 7;
+        while v > 0 {
+            b.insert(0, (v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.extend(b);
+    }
+    mk(6, &out)
+}
+
+fn mk_int(n: u64) -> Vec<u8> {
+    let b = n.to_be_bytes();
+    let skip = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let mut v = b[skip..].to_vec();
+    if v[0] & 0x80 != 0 {
+        v.insert(0, 0);
+    }
+    mk(2, &v)
+}
+
+fn int_of(t: &Tlv) -> u64 {
+    t.body.iter().fold(0u64, |a, x| a << 8 | *x as u64)
+}
+
+fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
+    let (open, close) = (format!("-----BEGIN {}-----", label), format!("-----END {}-----", label));
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find(&open) {
+        let body = &rest[a + open.len()..];
+        let Some(b) = body.find(&close) else { break };
+        let clean: String = body[..b].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(d) = B64.decode(clean) {
+            out.push(d);
+        }
+        rest = &body[b + close.len()..];
+    }
+    out
+}
+
+fn pem_of(label: &str, der: &[u8]) -> String {
+    let b = B64.encode(der);
+    let lines: Vec<&str> = b.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN {}-----\n{}\n-----END {}-----\n", label, lines.join("\n"), label)
+}
+
+fn iso(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// UTCTime or GeneralizedTime as Unix seconds.
+fn time_of(t: &Tlv) -> Result<i64, String> {
+    let s = std::str::from_utf8(t.body).map_err(|_| "a time that is not text".to_string())?;
+    let s = s.trim_end_matches('Z');
+    let s = s.split('.').next().unwrap_or(s);
+    let full = if t.tag == 0x17 {
+        let yy: i64 = s.get(..2).and_then(|x| x.parse().ok()).ok_or("a bad time")?;
+        format!("{}{}", if yy >= 50 { 19 } else { 20 }, s)
+    } else {
+        s.to_string()
+    };
+    let n = |a: usize, b: usize| -> Result<i64, String> { full.get(a..b).and_then(|x| x.parse().ok()).ok_or(format!("the time `{}` cannot be read", s)) };
+    let (y, mo, d, h, mi, sec) = (n(0, 4)?, n(4, 6)?, n(6, 8)?, n(8, 10)?, n(10, 12)?, full.get(12..14).and_then(|x| x.parse().ok()).unwrap_or(0));
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    Ok((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+// ---- Keys from passwords ----
+
+/// The password as PKCS#12's own KDF wants it: UTF-16BE with two zero bytes at the end.
+fn bmp(password: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = password.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+    out.extend([0, 0]);
+    out
+}
+
+/// RFC 7292 appendix B: only the MAC's key comes from this KDF in the files this reads.
+fn kdf12<D: Digest + Clone>(block: usize, id: u8, pass: &[u8], salt: &[u8], iters: u64, want: usize) -> Vec<u8> {
+    let fill = |s: &[u8]| -> Vec<u8> {
+        if s.is_empty() {
+            return vec![];
+        }
+        let n = block * s.len().div_ceil(block);
+        s.iter().cycle().take(n).copied().collect()
+    };
+    let mut i = [fill(salt), fill(pass)].concat();
+    let mut out = vec![];
+    while out.len() < want {
+        let mut a = D::new().chain_update(vec![id; block]).chain_update(&i).finalize().to_vec();
+        for _ in 1..iters {
+            a = D::digest(&a).to_vec();
+        }
+        out.extend(&a);
+        let b: Vec<u8> = a.iter().cycle().take(block).copied().collect();
+        for chunk in i.chunks_mut(block) {
+            let mut carry = 1u16;
+            for (x, y) in chunk.iter_mut().rev().zip(b.iter().rev()) {
+                let sum = *x as u16 + *y as u16 + carry;
+                *x = sum as u8;
+                carry = sum >> 8;
+            }
+        }
+    }
+    out.truncate(want);
+    out
+}
+
+macro_rules! mac_with {
+    ($d:ty, $pass:expr, $salt:expr, $iters:expr, $data:expr, $block:expr, $len:expr) => {{
+        let key = kdf12::<$d>($block, 3, $pass, $salt, $iters, $len);
+        let mut m = Hmac::<$d>::new_from_slice(&key).expect("HMAC takes any key");
+        m.update($data);
+        m.finalize().into_bytes().to_vec()
+    }};
+}
+
+fn hash_name(oid: &str) -> Option<&'static str> {
+    Some(match oid {
+        "1.3.14.3.2.26" => "sha1",
+        "2.16.840.1.101.3.4.2.1" => "sha256",
+        "2.16.840.1.101.3.4.2.2" => "sha384",
+        "2.16.840.1.101.3.4.2.3" => "sha512",
+        _ => return None,
+    })
+}
+
+fn old_pbe(oid: &str) -> Option<&'static str> {
+    Some(match oid {
+        "1.2.840.113549.1.12.1.1" => "PBE-SHA1-RC4-128",
+        "1.2.840.113549.1.12.1.2" => "PBE-SHA1-RC4-40",
+        "1.2.840.113549.1.12.1.3" => "PBE-SHA1-3DES",
+        "1.2.840.113549.1.12.1.4" => "PBE-SHA1-2DES",
+        "1.2.840.113549.1.12.1.5" => "PBE-SHA1-RC2-128",
+        "1.2.840.113549.1.12.1.6" => "PBE-SHA1-RC2-40",
+        "1.2.840.113549.1.5.3" => "PBE-MD5-DES",
+        "1.2.840.113549.1.5.10" => "PBE-SHA1-DES",
+        _ => return None,
+    })
+}
+
+fn refuse_old(name: &str) -> String {
+    format!("this file uses {}, an old cipher left out on purpose. Convert it: openssl pkcs12 -in old.p12 -legacy -nodes -out all.pem, then openssl pkcs12 -export -in all.pem -out new.p12 -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256", name)
+}
+
+struct Pbes2 {
+    salt: Vec<u8>,
+    iters: u32,
+    prf: String,
+    cipher: String,
+    iv: Vec<u8>,
+}
+
+fn pbes2_params(alg: &Tlv) -> Result<Pbes2, String> {
+    let k = alg.kids()?;
+    let oid = k.first().ok_or("an empty algorithm")?.oid();
+    if let Some(n) = old_pbe(&oid) {
+        return Err(refuse_old(n));
+    }
+    if oid != PBES2 {
+        return Err(format!("the encryption {} is not one this reads", oid));
+    }
+    let p = k.get(1).ok_or("PBES2 without parameters")?.kids()?;
+    let (kdf, scheme) = (p.first().ok_or("PBES2 without a KDF")?.kids()?, p.get(1).ok_or("PBES2 without a cipher")?.kids()?);
+    if kdf.first().map(|o| o.oid()) != Some(PBKDF2.to_string()) {
+        return Err("PBES2 with a KDF other than PBKDF2".into());
+    }
+    let kp = kdf.get(1).ok_or("PBKDF2 without parameters")?.kids()?;
+    let salt = kp.first().filter(|s| s.tag == 4).ok_or("PBKDF2 without an inline salt")?.body.to_vec();
+    let iters = int_of(kp.get(1).ok_or("PBKDF2 without a count")?) as u32;
+    if iters > 50_000_000 {
+        return Err("the file asks for an absurd number of PBKDF2 rounds".into());
+    }
+    let prf = kp.iter().skip(2).find(|x| x.tag == 0x30).and_then(|x| x.kids().ok()).and_then(|x| x.first().map(|o| o.oid())).unwrap_or(HMAC_SHA1.to_string());
+    let cipher = scheme.first().ok_or("PBES2 without a cipher")?.oid();
+    let iv = scheme.get(1).filter(|x| x.tag == 4).ok_or("the cipher has no IV")?.body.to_vec();
+    Ok(Pbes2 { salt, iters, prf, cipher, iv })
+}
+
+fn stretch(p: &Pbes2, password: &str, n: usize) -> Result<Vec<u8>, String> {
+    let mut key = vec![0; n];
+    let (pw, s, i) = (password.as_bytes(), &p.salt[..], p.iters);
+    let done = match p.prf.as_str() {
+        HMAC_SHA1 => pbkdf2::pbkdf2::<Hmac<Sha1>>(pw, s, i, &mut key),
+        HMAC_SHA256 => pbkdf2::pbkdf2::<Hmac<Sha256>>(pw, s, i, &mut key),
+        HMAC_SHA384 => pbkdf2::pbkdf2::<Hmac<Sha384>>(pw, s, i, &mut key),
+        HMAC_SHA512 => pbkdf2::pbkdf2::<Hmac<Sha512>>(pw, s, i, &mut key),
+        other => return Err(format!("the PRF {} is not one this reads", other)),
+    };
+    done.map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
+fn decrypt(alg: &Tlv, data: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    let p = pbes2_params(alg)?;
+    let bad = |_| "wrong password, or the data is damaged".to_string();
+    match p.cipher.as_str() {
+        AES128 => cbc::Decryptor::<aes::Aes128>::new_from_slices(&stretch(&p, password, 16)?, &p.iv).map_err(|e| e.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(bad),
+        AES192 => cbc::Decryptor::<aes::Aes192>::new_from_slices(&stretch(&p, password, 24)?, &p.iv).map_err(|e| e.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(bad),
+        AES256 => cbc::Decryptor::<aes::Aes256>::new_from_slices(&stretch(&p, password, 32)?, &p.iv).map_err(|e| e.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(bad),
+        other => Err(format!("the cipher {} is not one this reads", other)),
+    }
+}
+
+// ---- Reading ----
+
+/// The SafeContents held by a ContentInfo, as its raw content, and how it was protected.
+struct Part<'a> {
+    kind: String,
+    bytes: &'a [u8],
+    alg: Option<Tlv<'a>>,
+}
+
+fn parts<'a>(pfx: &'a [u8], holder: &'a mut Vec<u8>) -> Result<(Vec<Part<'a>>, Option<Tlv<'a>>), String> {
+    let _ = holder;
+    let (top, _) = tlv_at(pfx).map_err(|_| "this is not a PKCS#12 file".to_string())?;
+    let t = top.kids().map_err(|_| "this is not a PKCS#12 file".to_string())?;
+    if top.tag != 0x30 || t.len() < 2 || t[0].tag != 2 {
+        return Err("this is not a PKCS#12 file".into());
+    }
+    if int_of(&t[0]) != 3 {
+        return Err(format!("PKCS#12 version {} is not 3", int_of(&t[0])));
+    }
+    let auth = t[1].kids()?;
+    if auth.first().map(|o| o.oid()) != Some(DATA.to_string()) {
+        return Err("a file protected by public keys cannot be read here".into());
+    }
+    let octets = auth.get(1).ok_or("no content")?.kids()?;
+    let inner = octets.first().ok_or("no content")?;
+    let (list, _) = tlv_at(inner.body)?;
+    let mut out = vec![];
+    for ci in list.kids()? {
+        let c = ci.kids()?;
+        let oid = c.first().ok_or("an empty ContentInfo")?.oid();
+        let val = c.get(1).ok_or("a ContentInfo with no content")?;
+        if oid == DATA {
+            let o = val.kids()?;
+            out.push(Part { kind: "data".into(), bytes: o.first().ok_or("no data")?.body, alg: None });
+        } else if oid == ENCRYPTED {
+            let enc = val.kids()?;
+            let e = enc.first().ok_or("no encrypted data")?.kids()?;
+            let info = e.get(1).ok_or("no encrypted content info")?.kids()?;
+            let alg = *info.get(1).ok_or("no algorithm")?;
+            let ct = info.get(2).ok_or("no encrypted content")?;
+            out.push(Part { kind: "encrypted".into(), bytes: ct.body, alg: Some(alg) });
+        } else {
+            return Err(format!("content type {} is not one this reads", oid));
+        }
+    }
+    Ok((out, t.get(2).copied()))
+}
+
+fn check_mac(pfx: &[u8], mac: &Tlv, password: &str) -> Result<(), String> {
+    let (top, _) = tlv_at(pfx)?;
+    let t = top.kids()?;
+    let auth = t[1].kids()?;
+    let data = auth[1].kids()?[0].body;
+    let m = mac.kids()?;
+    let di = m.first().ok_or("no MAC digest")?.kids()?;
+    let alg = di.first().ok_or("no MAC algorithm")?.kids()?.first().ok_or("no MAC algorithm")?.oid();
+    let want = di.get(1).ok_or("no MAC value")?.body;
+    let salt = m.get(1).ok_or("no MAC salt")?.body;
+    let iters = m.get(2).map_or(1, int_of);
+    if iters > 50_000_000 {
+        return Err("the file asks for an absurd number of MAC rounds".into());
+    }
+    if alg == "1.2.840.113549.1.5.14" {
+        return Err("this file uses PBMAC1 (RFC 9579), which this does not read yet: export with -macalg sha256".into());
+    }
+    let tries: Vec<Vec<u8>> = if password.is_empty() { vec![bmp(""), vec![]] } else { vec![bmp(password)] };
+    for pass in tries {
+        let got = match hash_name(&alg) {
+            Some("sha1") => mac_with!(Sha1, &pass, salt, iters, data, 64, 20),
+            Some("sha256") => mac_with!(Sha256, &pass, salt, iters, data, 64, 32),
+            Some("sha384") => mac_with!(Sha384, &pass, salt, iters, data, 128, 48),
+            Some("sha512") => mac_with!(Sha512, &pass, salt, iters, data, 128, 64),
+            _ => return Err(format!("the MAC hash {} is not one this reads", alg)),
+        };
+        if got == want {
+            return Ok(());
+        }
+    }
+    Err("wrong password: the file's MAC does not match".into())
+}
+
+struct Bag {
+    key: Option<Vec<u8>>,
+    cert: Option<Vec<u8>>,
+    name: Option<String>,
+    local_id: Option<String>,
+}
+
+fn read_attrs(attrs: Option<&Tlv>) -> Result<(Option<String>, Option<String>), String> {
+    let (mut name, mut id) = (None, None);
+    if let Some(a) = attrs {
+        for attr in a.kids()? {
+            let k = attr.kids()?;
+            let oid = k.first().ok_or("an empty attribute")?.oid();
+            let vals = k.get(1).ok_or("an attribute with no value")?.kids()?;
+            let Some(v) = vals.first() else { continue };
+            if oid == FRIENDLY {
+                let u: Vec<u16> = v.body.chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                name = Some(String::from_utf16_lossy(&u));
+            } else if oid == LOCAL_ID {
+                id = Some(hex::encode(v.body));
+            }
+        }
+    }
+    Ok((name, id))
+}
+
+fn read_bags(contents: &[u8], password: &str, out: &mut Vec<Bag>) -> Result<(), String> {
+    let (list, _) = tlv_at(contents).map_err(|_| "wrong password, or the data is damaged".to_string())?;
+    for bag in list.kids()? {
+        let b = bag.kids()?;
+        let oid = b.first().ok_or("an empty bag")?.oid();
+        let val = b.get(1).ok_or("a bag with no value")?.kids()?;
+        let inner = val.first().ok_or("a bag with no value")?;
+        let (name, local_id) = read_attrs(b.get(2))?;
+        let mut item = Bag { key: None, cert: None, name, local_id };
+        match oid.as_str() {
+            KEY_BAG => item.key = Some(inner.raw.to_vec()),
+            SHROUDED_BAG => {
+                let e = inner.kids()?;
+                item.key = Some(decrypt(e.first().ok_or("no key algorithm")?, e.get(1).ok_or("no encrypted key")?.body, password)?);
+            }
+            CERT_BAG => {
+                let c = inner.kids()?;
+                if c.first().map(|o| o.oid()) != Some(X509_CERT.to_string()) {
+                    continue; // An SDSI certificate, say, which no one uses.
+                }
+                item.cert = Some(c.get(1).ok_or("a certificate bag with nothing in it")?.kids()?.first().ok_or("a certificate bag with nothing in it")?.body.to_vec());
+            }
+            _ => continue,
+        }
+        out.push(item);
+    }
+    Ok(())
+}
+
+/// The DN and validity of a certificate, enough to tell a chain's order.
+fn cert_info(der: &[u8]) -> Result<Value, String> {
+    let (c, _) = tlv_at(der)?;
+    let tbs_all = c.kids()?;
+    let t = tbs_all.first().ok_or("an empty certificate")?.kids()?;
+    let start = usize::from(t.first().is_some_and(|x| x.tag == 0xa0));
+    let name = |n: &Tlv| -> String {
+        n.kids().unwrap_or_default().iter().rev().filter_map(|rdn| {
+            let a = rdn.kids().ok()?;
+            let k = a.first()?.kids().ok()?;
+            let short = match k.first()?.oid().as_str() { "2.5.4.3" => "CN", "2.5.4.10" => "O", "2.5.4.11" => "OU", "2.5.4.6" => "C", "2.5.4.7" => "L", "2.5.4.8" => "ST", o => return Some(format!("{}={}", o, String::from_utf8_lossy(k.get(1)?.body))) };
+            Some(format!("{}={}", short, String::from_utf8_lossy(k.get(1)?.body)))
+        }).collect::<Vec<_>>().join(",")
+    };
+    let (issuer, validity, subject) = (t.get(start + 2).ok_or("no issuer")?, t.get(start + 3).ok_or("no validity")?.kids()?, t.get(start + 4).ok_or("no subject")?);
+    Ok(json!({
+        "subject": name(subject), "issuer": name(issuer), "serial": hex::encode(t[start].body),
+        "not_before": iso(time_of(&validity[0])?), "not_after": iso(time_of(&validity[1])?),
+        "sha256": hex::encode(Sha256::digest(der)), "pem": pem_of("CERTIFICATE", der),
+        "_subject_der": hex::encode(subject.raw), "_issuer_der": hex::encode(issuer.raw),
+    }))
+}
+
+/// Leaf first, then each issuer, as far as the file goes; those in no chain stay at the end.
+fn order_chain(mut certs: Vec<Value>, leaf: Option<usize>) -> Vec<Value> {
+    let mut out = vec![];
+    let start = leaf.or_else(|| {
+        // No key to go by: the one that issued nothing here is the leaf.
+        (0..certs.len()).find(|&i| !certs.iter().enumerate().any(|(j, c)| j != i && c["_issuer_der"] == certs[i]["_subject_der"]))
+    });
+    let mut at = start;
+    while let Some(i) = at {
+        let c = certs.remove(i);
+        let issuer = c["_issuer_der"].clone();
+        let own = c["_subject_der"] == issuer;
+        out.push(c);
+        at = if own { None } else { certs.iter().position(|x| x["_subject_der"] == issuer) };
+    }
+    out.extend(certs);
+    for c in out.iter_mut() {
+        if let Some(m) = c.as_object_mut() {
+            m.remove("_subject_der");
+            m.remove("_issuer_der");
+        }
+    }
+    out
+}
+
+fn key_kind(pkcs8: &[u8]) -> String {
+    let inner = || -> Result<String, String> {
+        let (k, _) = tlv_at(pkcs8)?;
+        let t = k.kids()?;
+        let alg = t.get(1).ok_or("no algorithm")?.kids()?;
+        let oid = alg.first().ok_or("no algorithm")?.oid();
+        Ok(match oid.as_str() {
+            "1.2.840.113549.1.1.1" => "rsa".to_string(),
+            "1.2.840.10045.2.1" => match alg.get(1).map(|c| c.oid()).as_deref() {
+                Some("1.2.840.10045.3.1.7") => "ec p-256".to_string(),
+                Some("1.3.132.0.34") => "ec p-384".to_string(),
+                Some("1.3.132.0.35") => "ec p-521".to_string(),
+                _ => "ec".to_string(),
+            },
+            "1.3.101.112" => "ed25519".to_string(),
+            other => other.to_string(),
+        })
+    };
+    inner().unwrap_or("unknown".into())
+}
+
+fn read(pfx: &[u8], password: &str) -> Result<Value, String> {
+    let mut hold = vec![];
+    let (ps, mac) = parts(pfx, &mut hold)?;
+    if let Some(m) = &mac {
+        check_mac(pfx, m, password)?;
+    }
+    let mut bags = vec![];
+    for p in &ps {
+        match &p.alg {
+            None => read_bags(p.bytes, password, &mut bags)?,
+            Some(a) => read_bags(&decrypt(a, p.bytes, password)?, password, &mut bags)?,
+        }
+    }
+    let keys: Vec<&Bag> = bags.iter().filter(|b| b.key.is_some()).collect();
+    let key = keys.first();
+    let certs: Vec<(Value, Option<String>, Option<String>)> = bags.iter().filter_map(|b| b.cert.as_ref().map(|c| (b, c))).map(|(b, c)| Ok::<_, String>((cert_info(c)?, b.local_id.clone(), b.name.clone()))).collect::<Result<_, _>>()?;
+    let leaf = key.and_then(|k| k.local_id.as_ref()).and_then(|id| certs.iter().position(|c| c.1.as_deref() == Some(id)));
+    let name = key.and_then(|k| k.name.clone()).or_else(|| leaf.and_then(|i| certs[i].2.clone()));
+    let local = key.and_then(|k| k.local_id.clone());
+    let chain = order_chain(certs.into_iter().map(|c| c.0).collect(), leaf);
+    let pem = key.and_then(|k| k.key.as_ref()).map(|k| pem_of("PRIVATE KEY", k));
+    Ok(json!({
+        "private_key": pem, "key_type": key.and_then(|k| k.key.as_ref()).map(|k| key_kind(k)), "friendly_name": name, "local_key_id": local,
+        "certificate": chain.first().map(|c| c["pem"].clone()), "chain": chain, "keys": keys.len(), "protected_by_mac": mac.is_some(),
+    }))
+}
+
+fn b64_in(text: &str) -> Result<Vec<u8>, String> {
+    let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    B64.decode(clean).map_err(|_| "that is not base64".to_string())
+}
+
+/// Reads a .p12 from base64 with its password: { private_key (PKCS#8 PEM), key_type, friendly_name, local_key_id, certificate, chain: [{ subject, issuer, serial, not_before, not_after, sha256, pem }], keys, protected_by_mac }, the chain leaf first. A wrong password is an error value saying so, as is a file on the old ciphers, by name.
+pub fn pkcs12_read(data_base64: &str, password: &str) -> Result<serde_json::Value, String> {
+    read(&b64_in(data_base64)?, password)
+}
+
+/// Reads a .p12 or .pfx file with its password.
+pub fn pkcs12_read_file(path: &str, password: &str) -> Result<serde_json::Value, String> {
+    read(&std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?, password)
+}
+
+fn describe_alg(a: &Tlv) -> Value {
+    let oid = a.kids().ok().and_then(|k| k.first().map(|o| o.oid())).unwrap_or_default();
+    if let Some(n) = old_pbe(&oid) {
+        return json!({ "name": n, "readable": false });
+    }
+    match pbes2_params(a) {
+        Ok(p) => {
+            let cipher = match p.cipher.as_str() { AES128 => "aes-128-cbc", AES192 => "aes-192-cbc", AES256 => "aes-256-cbc", o => o };
+            let prf = match p.prf.as_str() { HMAC_SHA1 => "hmac-sha1", HMAC_SHA256 => "hmac-sha256", HMAC_SHA384 => "hmac-sha384", HMAC_SHA512 => "hmac-sha512", o => o };
+            json!({ "name": "pbes2", "cipher": cipher, "prf": prf, "iterations": p.iters, "readable": true })
+        }
+        Err(e) => json!({ "name": oid, "readable": false, "why": e }),
+    }
+}
+
+/// What protects a file, without its password: { mac: { hash, iterations }, parts: [{ kind, name, cipher, prf, iterations, readable }], readable }. Parts in `data` hold a shrouded key whose own cipher shows too.
+pub fn pkcs12_info(data_base64: &str) -> Result<serde_json::Value, String> {
+    let pfx = b64_in(data_base64)?;
+    let mut hold = vec![];
+    let (ps, mac) = parts(&pfx, &mut hold)?;
+    let mut list = vec![];
+    for p in &ps {
+        match &p.alg {
+            Some(a) => {
+                let mut d = describe_alg(a);
+                d["kind"] = json!("encrypted certificates");
+                list.push(d);
+            }
+            None => {
+                if let Ok((all, _)) = tlv_at(p.bytes) {
+                    for bag in all.kids()? {
+                        let b = bag.kids()?;
+                        if b.first().map(|o| o.oid()) == Some(SHROUDED_BAG.to_string()) {
+                            let v = b[1].kids()?;
+                            let e = v[0].kids()?;
+                            let mut d = describe_alg(&e[0]);
+                            d["kind"] = json!("shrouded key");
+                            list.push(d);
+                        } else if b.first().map(|o| o.oid()) == Some(KEY_BAG.to_string()) {
+                            list.push(json!({ "kind": "plain key", "readable": true }));
+                        } else if b.first().map(|o| o.oid()) == Some(CERT_BAG.to_string()) {
+                            list.push(json!({ "kind": "plain certificate", "readable": true }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let m = match &mac {
+        Some(mac) => {
+            let k = mac.kids()?;
+            let oid = k[0].kids()?[0].kids()?[0].oid();
+            json!({ "hash": hash_name(&oid), "iterations": k.get(2).map_or(1, int_of) })
+        }
+        None => Value::Null,
+    };
+    let readable = list.iter().all(|p| p["readable"] == true);
+    Ok(json!({ "mac": m, "parts": list, "readable": readable }))
+}
+
+// ---- Writing ----
+
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    let mut b = vec![0; n];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(b)
+}
+
+fn pbes2_alg(salt: &[u8], iters: u32, iv: &[u8]) -> Vec<u8> {
+    let kdf = seq(&[&mk_oid(PBKDF2), &seq(&[&mk(4, salt), &mk_int(iters as u64), &seq(&[&mk_oid(HMAC_SHA256), &[5, 0]])])]);
+    let scheme = seq(&[&mk_oid(AES256), &mk(4, iv)]);
+    seq(&[&mk_oid(PBES2), &seq(&[&kdf, &scheme])])
+}
+
+fn encrypt(data: &[u8], password: &str, iters: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (salt, iv) = (random(16)?, random(16)?);
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, iters, &mut key).map_err(|e| e.to_string())?;
+    let ct = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key, &iv).map_err(|e| e.to_string())?.encrypt_padded_vec_mut::<Pkcs7>(data);
+    Ok((pbes2_alg(&salt, iters, &iv), ct))
+}
+
+fn attrs_of(name: Option<&str>, id: &[u8]) -> Vec<u8> {
+    let mut list = vec![];
+    if let Some(n) = name {
+        let b: Vec<u8> = n.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+        list.push(seq(&[&mk_oid(FRIENDLY), &mk(0x31, &mk(0x1e, &b))]));
+    }
+    if !id.is_empty() {
+        list.push(seq(&[&mk_oid(LOCAL_ID), &mk(0x31, &mk(4, id))]));
+    }
+    if list.is_empty() { vec![] } else { mk(0x31, &list.concat()) }
+}
+
+/// A key as PKCS#8: as it is, or a PKCS#1 RSA key wrapped. An encrypted PEM is refused: decrypt it first.
+fn to_pkcs8(pem: &str) -> Result<Vec<u8>, String> {
+    if pem.contains("ENCRYPTED") {
+        return Err("the private key is encrypted: give it decrypted".into());
+    }
+    if let Some(k) = pem_blocks(pem, "PRIVATE KEY").into_iter().next() {
+        return Ok(k);
+    }
+    if let Some(k) = pem_blocks(pem, "RSA PRIVATE KEY").into_iter().next() {
+        return Ok(seq(&[&mk_int(0), &seq(&[&mk_oid("1.2.840.113549.1.1.1"), &[5, 0]]), &mk(4, &k)]));
+    }
+    Err("no private key: PEM PRIVATE KEY or RSA PRIVATE KEY".into())
+}
+
+fn write(spec: &Value, password: &str) -> Result<Vec<u8>, String> {
+    let certs_text = spec.get("certificates").and_then(|c| c.as_array()).map(|l| l.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>().join("\n")).or_else(|| spec.get("certificate").and_then(|c| c.as_str()).map(str::to_string)).unwrap_or_default();
+    let certs = pem_blocks(&certs_text, "CERTIFICATE");
+    if certs.is_empty() {
+        return Err("no certificate: give `certificate` or `certificates`, PEM, the leaf first".into());
+    }
+    let key = spec.get("private_key").and_then(|k| k.as_str()).map(to_pkcs8).transpose()?;
+    let iters = spec.get("iterations").and_then(|i| i.as_u64()).unwrap_or(600_000).clamp(1000, 10_000_000) as u32;
+    let name = spec.get("friendly_name").and_then(|n| n.as_str());
+    let id = Sha256::digest(&certs[0])[..20].to_vec();
+    let mut cert_bags = vec![];
+    for (i, c) in certs.iter().enumerate() {
+        let inner = seq(&[&mk_oid(X509_CERT), &mk(0xa0, &mk(4, c))]);
+        let attrs = if i == 0 { attrs_of(name, &id) } else { vec![] };
+        cert_bags.push(seq(&[&mk_oid(CERT_BAG), &mk(0xa0, &inner), &attrs]));
+    }
+    let contents = mk(0x30, &cert_bags.concat());
+    let (alg, ct) = encrypt(&contents, password, iters)?;
+    let enc_info = seq(&[&mk_oid(DATA), &alg, &mk(0x80, &ct)]);
+    let enc_part = seq(&[&mk_oid(ENCRYPTED), &mk(0xa0, &seq(&[&mk_int(0), &enc_info]))]);
+    let mut list = enc_part;
+    if let Some(k) = key {
+        let (alg, ct) = encrypt(&k, password, iters)?;
+        let shrouded = seq(&[&alg, &mk(4, &ct)]);
+        let bag = seq(&[&mk_oid(SHROUDED_BAG), &mk(0xa0, &shrouded), &attrs_of(name, &id)]);
+        let safe = mk(0x30, &bag);
+        list.extend(seq(&[&mk_oid(DATA), &mk(0xa0, &mk(4, &safe))]));
+    }
+    let auth = mk(0x30, &list);
+    let salt = random(16)?;
+    let mac = mac_with!(Sha256, &bmp(password), &salt, 2048, &auth, 64, 32);
+    let mac_data = seq(&[&seq(&[&seq(&[&mk_oid("2.16.840.1.101.3.4.2.1"), &[5, 0]]), &mk(4, &mac)]), &mk(4, &salt), &mk_int(2048)]);
+    Ok(seq(&[&mk_int(3), &seq(&[&mk_oid(DATA), &mk(0xa0, &mk(4, &auth))]), &mac_data]))
+}
+
+/// Writes a .p12 and gives its base64: `spec` is { certificate or certificates (PEM, the leaf first), private_key (PEM; leave out for a trust store), friendly_name, iterations (600,000) }. AES-256-CBC with PBKDF2-HMAC-SHA256 and a SHA-256 MAC, which OpenSSL 1.1.1 on, Windows 10 on and Java 12 on read.
+pub fn pkcs12_write(spec: serde_json::Value, password: &str) -> Result<String, String> {
+    Ok(B64.encode(write(&spec, password)?))
+}
+
+/// Writes a .p12 to a file. Gives its size.
+pub fn pkcs12_write_file(path: &str, spec: serde_json::Value, password: &str) -> Result<i64, String> {
+    let b = write(&spec, password)?;
+    std::fs::write(path, &b).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    Ok(b.len() as i64)
+}

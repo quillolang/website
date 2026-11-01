@@ -1,0 +1,538 @@
+//! STUN (RFC 8489, RFC 5389) over UDP, for WebRTC and NAT traversal: Binding requests retransmitted with backoff, XOR-MAPPED-ADDRESS read for your public address, MESSAGE-INTEGRITY and FINGERPRINT made and checked, long-term credentials answered after a 401, whether a NAT keeps one mapping for two servers, ICE connectivity attributes, and messages read and answered for a server on `udp.listen`.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha1 = "0.10"
+//! md-5 = "0.10"
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use md5::{Digest, Md5};
+use serde_json::{json, Value};
+use sha1::Sha1;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+const MAGIC: u32 = 0x2112_a442;
+const BINDING: u16 = 0x0001;
+const BINDING_OK: u16 = 0x0101;
+const BINDING_ERR: u16 = 0x0111;
+
+const MAPPED: u16 = 0x0001;
+const USERNAME: u16 = 0x0006;
+const INTEGRITY: u16 = 0x0008;
+const ERROR_CODE: u16 = 0x0009;
+const UNKNOWN_ATTRS: u16 = 0x000a;
+const REALM: u16 = 0x0014;
+const NONCE: u16 = 0x0015;
+const XOR_MAPPED: u16 = 0x0020;
+const PRIORITY: u16 = 0x0024;
+const USE_CANDIDATE: u16 = 0x0025;
+const SOFTWARE: u16 = 0x8022;
+const FINGERPRINT: u16 = 0x8028;
+const ICE_CONTROLLED: u16 = 0x8029;
+const ICE_CONTROLLING: u16 = 0x802a;
+const RESPONSE_ORIGIN: u16 = 0x802b;
+const OTHER_ADDRESS: u16 = 0x802c;
+const XOR_MAPPED_OLD: u16 = 0x8020; // RFC 3489's drafts, still sent
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xffff_ffffu32;
+    for b in data {
+        c ^= *b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 };
+        }
+    }
+    !c
+}
+
+fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
+    let mut m = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("any length");
+    for p in parts {
+        m.update(p);
+    }
+    m.finalize().into_bytes().into()
+}
+
+fn long_term_key(user: &str, realm: &str, password: &str) -> Vec<u8> {
+    Md5::digest(format!("{}:{}:{}", user, realm, password).as_bytes()).to_vec()
+}
+
+struct Msg {
+    bytes: Vec<u8>,
+}
+
+impl Msg {
+    fn new(kind: u16, id: &[u8; 12]) -> Msg {
+        let mut b = kind.to_be_bytes().to_vec();
+        b.extend([0, 0]);
+        b.extend(MAGIC.to_be_bytes());
+        b.extend(id);
+        Msg { bytes: b }
+    }
+    fn set_len(&mut self, n: usize) {
+        self.bytes[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+    }
+    fn attr(&mut self, kind: u16, value: &[u8], pad: u8) {
+        self.bytes.extend(kind.to_be_bytes());
+        self.bytes.extend((value.len() as u16).to_be_bytes());
+        self.bytes.extend(value);
+        while self.bytes.len() % 4 != 0 {
+            self.bytes.push(pad);
+        }
+        let n = self.bytes.len() - 20;
+        self.set_len(n);
+    }
+    fn integrity(&mut self, key: &[u8]) {
+        // The length counts the attribute about to be added.
+        let n = self.bytes.len() - 20 + 24;
+        self.set_len(n);
+        let mac = hmac_sha1(key, &[&self.bytes]);
+        self.attr(INTEGRITY, &mac, 0);
+    }
+    fn fingerprint(&mut self) {
+        let n = self.bytes.len() - 20 + 8;
+        self.set_len(n);
+        let v = crc32(&self.bytes) ^ 0x5354_554e;
+        self.attr(FINGERPRINT, &v.to_be_bytes(), 0);
+    }
+}
+
+fn new_id() -> Result<[u8; 12], String> {
+    let mut id = [0u8; 12];
+    getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+fn xor_address(v: &[u8], head: &[u8]) -> Option<(IpAddr, u16)> {
+    let port = u16::from_be_bytes([*v.get(2)?, *v.get(3)?]) ^ (MAGIC >> 16) as u16;
+    match v[1] {
+        1 => {
+            let a = v.get(4..8)?;
+            let m = MAGIC.to_be_bytes();
+            Some((IpAddr::V4(Ipv4Addr::new(a[0] ^ m[0], a[1] ^ m[1], a[2] ^ m[2], a[3] ^ m[3])), port))
+        }
+        2 => {
+            let a = v.get(4..20)?;
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = a[i] ^ head[4 + i];
+            }
+            Some((IpAddr::V6(Ipv6Addr::from(o)), port))
+        }
+        _ => None,
+    }
+}
+
+fn plain_address(v: &[u8]) -> Option<(IpAddr, u16)> {
+    let port = u16::from_be_bytes([*v.get(2)?, *v.get(3)?]);
+    match v[1] {
+        1 => {
+            let a = v.get(4..8)?;
+            Some((IpAddr::V4(Ipv4Addr::new(a[0], a[1], a[2], a[3])), port))
+        }
+        2 => {
+            let a: [u8; 16] = v.get(4..20)?.try_into().ok()?;
+            Some((IpAddr::V6(Ipv6Addr::from(a)), port))
+        }
+        _ => None,
+    }
+}
+
+fn address_attr(ip: IpAddr, port: u16, id: &[u8; 12]) -> Vec<u8> {
+    let mut v = vec![0];
+    let mut mask = MAGIC.to_be_bytes().to_vec();
+    mask.extend(id);
+    v.push(if ip.is_ipv4() { 1 } else { 2 });
+    v.extend((port ^ (MAGIC >> 16) as u16).to_be_bytes());
+    let bytes: Vec<u8> = match ip {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    };
+    v.extend(bytes.iter().zip(&mask).map(|(a, b)| a ^ b));
+    v
+}
+
+fn attrs(b: &[u8]) -> Result<Vec<(u16, &[u8], usize)>, String> {
+    if b.len() < 20 {
+        return Err(format!("{} bytes is too short for STUN's 20-byte header", b.len()));
+    }
+    if b[0] & 0xc0 != 0 {
+        return Err("not a STUN message: the first two bits are not zero".into());
+    }
+    if u32::from_be_bytes([b[4], b[5], b[6], b[7]]) != MAGIC {
+        return Err("not a STUN message: no magic cookie".into());
+    }
+    let len = u16::from_be_bytes([b[2], b[3]]) as usize;
+    if len % 4 != 0 || len + 20 != b.len() {
+        return Err(format!("the header says {} bytes of attributes, and {} came", len, b.len() - 20));
+    }
+    let mut out = vec![];
+    let mut i = 20;
+    while i < b.len() {
+        if i + 4 > b.len() {
+            return Err("an attribute's header is cut off".into());
+        }
+        let kind = u16::from_be_bytes([b[i], b[i + 1]]);
+        let n = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        let v = b.get(i + 4..i + 4 + n).ok_or(format!("attribute 0x{:04x} runs past the end", kind))?;
+        out.push((kind, v, i));
+        i += 4 + (n + 3) / 4 * 4;
+    }
+    Ok(out)
+}
+
+fn text(v: &[u8]) -> String {
+    String::from_utf8_lossy(v).to_string()
+}
+
+fn kind_name(t: u16) -> &'static str {
+    match t & 0x0110 {
+        0x0000 => "request",
+        0x0010 => "indication",
+        0x0100 => "success",
+        _ => "error",
+    }
+}
+
+fn read(b: &[u8]) -> Result<Value, String> {
+    let list = attrs(b)?;
+    let t = u16::from_be_bytes([b[0], b[1]]);
+    let method = (t & 0x000f) | ((t & 0x00e0) >> 1) | ((t & 0x3e00) >> 2);
+    let mut m = json!({
+        "class": kind_name(t),
+        "method": if method == 1 { json!("binding") } else { json!(method) },
+        "transaction": hex::encode(&b[8..20]),
+    });
+    let mut unknown = vec![];
+    for (k, v, _) in &list {
+        match *k {
+            XOR_MAPPED | XOR_MAPPED_OLD => {
+                if let Some((ip, port)) = xor_address(v, b) {
+                    m["address"] = json!(ip.to_string());
+                    m["port"] = json!(port);
+                    m["family"] = json!(if ip.is_ipv4() { "ipv4" } else { "ipv6" });
+                }
+            }
+            MAPPED => {
+                if let Some((ip, port)) = plain_address(v) {
+                    if m.get("address").is_none() {
+                        m["address"] = json!(ip.to_string());
+                        m["port"] = json!(port);
+                        m["family"] = json!(if ip.is_ipv4() { "ipv4" } else { "ipv6" });
+                    }
+                }
+            }
+            RESPONSE_ORIGIN => {
+                if let Some((ip, port)) = plain_address(v) {
+                    m["response_origin"] = json!(format!("{}:{}", ip, port));
+                }
+            }
+            OTHER_ADDRESS => {
+                if let Some((ip, port)) = plain_address(v) {
+                    m["other_address"] = json!(format!("{}:{}", ip, port));
+                }
+            }
+            USERNAME => m["username"] = json!(text(v)),
+            SOFTWARE => m["software"] = json!(text(v)),
+            REALM => m["realm"] = json!(text(v)),
+            NONCE => m["nonce"] = json!(text(v)),
+            ERROR_CODE if v.len() >= 4 => {
+                m["error_code"] = json!((v[2] & 7) as u32 * 100 + v[3] as u32);
+                m["reason"] = json!(text(&v[4..]));
+            }
+            UNKNOWN_ATTRS => m["unknown_attributes"] = json!(v.chunks(2).filter(|c| c.len() == 2).map(|c| format!("0x{:04x}", u16::from_be_bytes([c[0], c[1]]))).collect::<Vec<_>>()),
+            PRIORITY if v.len() == 4 => m["priority"] = json!(u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+            USE_CANDIDATE => m["use_candidate"] = json!(true),
+            ICE_CONTROLLING => m["ice_role"] = json!("controlling"),
+            ICE_CONTROLLED => m["ice_role"] = json!("controlled"),
+            INTEGRITY => m["has_integrity"] = json!(true),
+            FINGERPRINT => m["has_fingerprint"] = json!(true),
+            x if x < 0x8000 => unknown.push(format!("0x{:04x}", x)),
+            _ => {}
+        }
+    }
+    if !unknown.is_empty() {
+        m["comprehension_required"] = json!(unknown);
+    }
+    Ok(m)
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex".to_string()),
+        _ => Err("give a message as hex or a list of numbers".into()),
+    }
+}
+
+/// Reads a STUN message (`p.bytes` from `udp.listen`, or hex): class, method, transaction, the mapped `address` and `port`, and the other attributes by name. Checks lengths and the magic cookie.
+pub fn stun_parse(message: serde_json::Value) -> Result<Value, String> {
+    read(&bytes_of(&message)?)
+}
+
+fn verify_integrity(b: &[u8], key: &[u8]) -> Result<bool, String> {
+    let list = attrs(b)?;
+    let (_, v, at) = list.iter().find(|a| a.0 == INTEGRITY).ok_or("the message has no MESSAGE-INTEGRITY")?;
+    let mut head = b[..*at].to_vec();
+    head[2..4].copy_from_slice(&((*at - 20 + 24) as u16).to_be_bytes());
+    Ok(hmac_sha1(key, &[&head]) == *v)
+}
+
+fn verify_fingerprint(b: &[u8]) -> Result<bool, String> {
+    let list = attrs(b)?;
+    let (_, v, at) = list.iter().find(|a| a.0 == FINGERPRINT).ok_or("the message has no FINGERPRINT")?;
+    if v.len() != 4 {
+        return Ok(false);
+    }
+    Ok(crc32(&b[..*at]) ^ 0x5354_554e == u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+/// True when a message's FINGERPRINT is right.
+pub fn stun_check_fingerprint(message: serde_json::Value) -> Result<bool, String> {
+    verify_fingerprint(&bytes_of(&message)?)
+}
+
+/// True when a message's MESSAGE-INTEGRITY is right: `credentials` is `{ password }` for short-term (ICE), or `{ username, realm, password }` for long-term.
+pub fn stun_check_integrity(message: serde_json::Value, credentials: serde_json::Value) -> Result<bool, String> {
+    verify_integrity(&bytes_of(&message)?, &key_of(&credentials)?)
+}
+
+fn key_of(c: &Value) -> Result<Vec<u8>, String> {
+    let p = c.get("password").and_then(|v| v.as_str()).ok_or("credentials need `password`")?;
+    Ok(match (c.get("username").and_then(|v| v.as_str()), c.get("realm").and_then(|v| v.as_str())) {
+        (Some(u), Some(r)) => long_term_key(u, r, p),
+        _ => p.as_bytes().to_vec(),
+    })
+}
+
+fn build(id: &[u8; 12], o: &Value, extra: Option<(&str, &str)>) -> Result<Vec<u8>, String> {
+    let mut m = Msg::new(BINDING, id);
+    if let Some(s) = o.get("software").and_then(|v| v.as_str()) {
+        m.attr(SOFTWARE, s.as_bytes(), 0);
+    }
+    if let Some(p) = o.get("priority").and_then(|v| v.as_u64()) {
+        m.attr(PRIORITY, &(p as u32).to_be_bytes(), 0);
+    }
+    if o.get("use_candidate").and_then(|v| v.as_bool()).unwrap_or(false) {
+        m.attr(USE_CANDIDATE, &[], 0);
+    }
+    if let Some(t) = o.get("ice_controlling").and_then(|v| v.as_str()) {
+        m.attr(ICE_CONTROLLING, &hex::decode(t).map_err(|_| "ice_controlling is 8 bytes of hex")?, 0);
+    }
+    if let Some(t) = o.get("ice_controlled").and_then(|v| v.as_str()) {
+        m.attr(ICE_CONTROLLED, &hex::decode(t).map_err(|_| "ice_controlled is 8 bytes of hex")?, 0);
+    }
+    let user = o.get("username").and_then(|v| v.as_str());
+    if let Some(u) = user {
+        if u.len() > 513 {
+            return Err("USERNAME is at most 513 bytes".into());
+        }
+        m.attr(USERNAME, u.as_bytes(), 0);
+    }
+    let mut key = None;
+    if let Some((realm, nonce)) = extra {
+        m.attr(REALM, realm.as_bytes(), 0);
+        m.attr(NONCE, nonce.as_bytes(), 0);
+        let p = o.get("password").and_then(|v| v.as_str()).ok_or("the server wants a password")?;
+        key = Some(long_term_key(user.ok_or("the server wants a username")?, realm, p));
+    } else if let Some(p) = o.get("password").and_then(|v| v.as_str()) {
+        key = Some(p.as_bytes().to_vec()); // short-term, as ICE uses
+    }
+    if let Some(k) = key {
+        m.integrity(&k);
+    }
+    if o.get("fingerprint").and_then(|v| v.as_bool()).unwrap_or(false) {
+        m.fingerprint();
+    }
+    Ok(m.bytes)
+}
+
+/// A Binding request as bytes, for sending yourself: options `software`, `username`, `password` (short-term), `priority`, `use_candidate`, `ice_controlling`, `ice_controlled`, `fingerprint`, `transaction` (hex, random unless given).
+pub fn stun_request(options: serde_json::Value) -> Result<Vec<u8>, String> {
+    let id = match options.get("transaction").and_then(|v| v.as_str()) {
+        Some(t) => <[u8; 12]>::try_from(hex::decode(t).map_err(|_| "transaction is hex")?.as_slice()).map_err(|_| "transaction is 12 bytes")?,
+        None => new_id()?,
+    };
+    build(&id, &options, None)
+}
+
+fn resolve(server: &str) -> Result<SocketAddr, String> {
+    let s = server.trim_start_matches("stun:");
+    let t = if s.contains(':') && !s.starts_with('[') || s.contains("]:") { s.to_string() } else { format!("{}:3478", s) };
+    t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.next().ok_or(format!("{}: no address", t))
+}
+
+fn exchange(sock: &UdpSocket, to: SocketAddr, packet: &[u8], id: &[u8; 12], o: &Value) -> Result<(Vec<u8>, u64, u32), String> {
+    // RFC 8489: 500 ms, doubling, seven sends in all; `timeout_ms` caps the whole wait.
+    let rto = o.get("rto_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+    let total = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000);
+    let tries = o.get("retries").and_then(|v| v.as_u64()).unwrap_or(6);
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(total);
+    let mut wait = Duration::from_millis(rto);
+    let mut buf = [0u8; 1500];
+    let mut sent = 0;
+    for n in 0..=tries {
+        sock.send_to(packet, to).map_err(|e| format!("cannot send to {}: {}", to, e))?;
+        sent += 1;
+        let end = (Instant::now() + wait).min(deadline);
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            sock.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            match sock.recv_from(&mut buf) {
+                Ok((k, from)) => {
+                    // Only what answers this transaction, from where it was sent.
+                    if from.ip() == to.ip() && k >= 20 && buf[8..20] == id[..] {
+                        return Ok((buf[..k].to_vec(), start.elapsed().as_millis() as u64, sent));
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Err(e) => return Err(format!("{}: {}", to, e)),
+            }
+        }
+        if Instant::now() >= deadline || n == tries {
+            break;
+        }
+        wait *= 2;
+    }
+    Err(format!("no answer from {} after {} sends in {} ms", to, sent, start.elapsed().as_millis()))
+}
+
+/// Asks a STUN server ("host", port 3478, or "host:port") where this machine appears from: `{ address, port, family, rtt_ms, sent, server, software }`. A server that answers 401 is answered back with `username` and `password` from `options`. Options also: `timeout_ms`, `rto_ms`, `retries`, `local_port`, `fingerprint`, and anything `stun_request` takes.
+pub fn stun_binding(server: &str, options: serde_json::Value) -> Result<Value, String> {
+    let to = resolve(server)?;
+    let local = options.get("local_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let bind: SocketAddr = if to.is_ipv4() { SocketAddr::from(([0, 0, 0, 0], local)) } else { SocketAddr::from(([0u16; 8], local)) };
+    let sock = UdpSocket::bind(bind).map_err(|e| format!("cannot bind UDP port {}: {}", local, e))?;
+    binding_on(&sock, to, server, &options)
+}
+
+fn binding_on(sock: &UdpSocket, to: SocketAddr, server: &str, o: &Value) -> Result<Value, String> {
+    let mut id = new_id()?;
+    let mut packet = build(&id, o, None)?;
+    let mut challenge: Option<(String, String)> = None;
+    for round in 0..3 {
+        let (reply, rtt, sent) = exchange(sock, to, &packet, &id, o)?;
+        let m = read(&reply)?;
+        let t = u16::from_be_bytes([reply[0], reply[1]]);
+        if t == BINDING_OK {
+            if m.get("comprehension_required").is_some() {
+                return Err(format!("{} sent attributes this cannot read: {}", server, m["comprehension_required"]));
+            }
+            if let Some(((realm, _), pw)) = challenge.as_ref().zip(o.get("password").and_then(|v| v.as_str())) {
+                let key = long_term_key(o.get("username").and_then(|v| v.as_str()).unwrap_or(""), realm, pw);
+                if !verify_integrity(&reply, &key).unwrap_or(false) {
+                    return Err(format!("{}'s answer failed MESSAGE-INTEGRITY: not from a server that knows the password", server));
+                }
+            }
+            if m.get("address").is_none() {
+                return Err(format!("{} answered without a mapped address", server));
+            }
+            let mut out = json!({ "address": m["address"], "port": m["port"], "family": m["family"], "rtt_ms": rtt, "sent": sent, "server": to.to_string() });
+            if let Some(s) = m.get("software") {
+                out["software"] = s.clone();
+            }
+            if let Some(s) = m.get("other_address") {
+                out["other_address"] = s.clone();
+            }
+            return Ok(out);
+        }
+        if t != BINDING_ERR {
+            return Err(format!("{} answered message type 0x{:04x}", server, t));
+        }
+        let code = m["error_code"].as_u64().unwrap_or(0);
+        let reason = m["reason"].as_str().unwrap_or("").to_string();
+        match code {
+            // 401 asks for credentials; 438 says the nonce went stale, with a new one.
+            401 if challenge.is_some() => return Err(format!("{} refused the credentials: 401 {}", server, reason)),
+            401 | 438 if round < 2 && o.get("password").is_some() => {
+                let realm = m["realm"].as_str().ok_or(format!("{} sent {} with no realm", server, code))?.to_string();
+                let nonce = m["nonce"].as_str().ok_or(format!("{} sent {} with no nonce", server, code))?.to_string();
+                id = new_id()?;
+                packet = build(&id, o, Some((&realm, &nonce)))?;
+                challenge = Some((realm, nonce));
+            }
+            401 => return Err(format!("{} wants credentials: 401 {}", server, reason)),
+            300 => return Err(format!("{} says to try another server (300 {}); ALTERNATE-SERVER is not followed", server, reason)),
+            _ => return Err(format!("{} refused: {} {}", server, code, reason)),
+        }
+    }
+    Err(format!("{} kept refusing the credentials", server))
+}
+
+/// Your public address from the first server that answers in the list, with the failures of those before it in `tried`.
+pub fn stun_public_address(servers: Vec<String>, options: serde_json::Value) -> Result<Value, String> {
+    let mut tried = vec![];
+    for s in &servers {
+        match stun_binding(s, options.clone()) {
+            Ok(mut r) => {
+                r["tried"] = json!(tried);
+                return Ok(r);
+            }
+            Err(e) => tried.push(e),
+        }
+    }
+    Err(format!("no STUN server answered: {}", tried.join("; ")))
+}
+
+/// Asks two servers from one socket: when they see one address and port the NAT maps by endpoint (peer-to-peer usually works), when they differ it is symmetric and WebRTC needs a TURN relay. Answers `{ first, second, mapping, behind_nat }`, with `local` the address this socket has.
+pub fn stun_nat_check(first: &str, second: &str, options: serde_json::Value) -> Result<Value, String> {
+    let (a, b) = (resolve(first)?, resolve(second)?);
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let local = sock.local_addr().map_err(|e| e.to_string())?.port();
+    let x = binding_on(&sock, a, first, &options)?;
+    let y = binding_on(&sock, b, second, &options)?;
+    let same = x["address"] == y["address"] && x["port"] == y["port"];
+    Ok(json!({
+        "first": x, "second": y,
+        "mapping": if same { "endpoint-independent" } else { "symmetric" },
+        "behind_nat": x["port"] != json!(local),
+    }))
+}
+
+/// Answers a Binding request for a server of your own on `udp.listen`: `request` is `p.bytes` and `from` is `p.from`. Answers the response's bytes with XOR-MAPPED-ADDRESS, or null for what is not a Binding request. Options: `software`, `password` (signs it, short-term, as ICE wants), `fingerprint`.
+pub fn stun_reply(request: Vec<i64>, from: serde_json::Value, options: serde_json::Value) -> Result<Option<Vec<u8>>, String> {
+    let b: Vec<u8> = request.iter().map(|x| *x as u8).collect();
+    if attrs(&b).is_err() || u16::from_be_bytes([b[0], b[1]]) != BINDING {
+        return Ok(None);
+    }
+    let id: [u8; 12] = b[8..20].try_into().map_err(|_| "cut off")?;
+    let ip: IpAddr = from.get("host").and_then(|v| v.as_str()).ok_or("`from` needs host")?.parse().map_err(|_| "`from.host` is not an address")?;
+    let port = from.get("port").and_then(|v| v.as_u64()).ok_or("`from` needs port")? as u16;
+    let mut m = Msg::new(BINDING_OK, &id);
+    if let Some(s) = options.get("software").and_then(|v| v.as_str()) {
+        m.attr(SOFTWARE, s.as_bytes(), 0x20);
+    }
+    m.attr(XOR_MAPPED, &address_attr(ip, port, &id), 0);
+    if let Some(p) = options.get("password").and_then(|v| v.as_str()) {
+        m.integrity(p.as_bytes());
+    }
+    if options.get("fingerprint").and_then(|v| v.as_bool()).unwrap_or(false) {
+        m.fingerprint();
+    }
+    Ok(Some(m.bytes))
+}
+
+/// An ICE candidate's priority (RFC 8445): `stun_ice_priority("host", 65535, 1)`. Kinds: host, srflx, prflx, relay.
+pub fn stun_ice_priority(kind: &str, local_preference: i64, component: i64) -> Result<i64, String> {
+    let t: i64 = match kind {
+        "host" => 126,
+        "prflx" => 110,
+        "srflx" => 100,
+        "relay" => 0,
+        k => return Err(format!("`{}` is not a candidate type: host, srflx, prflx or relay", k)),
+    };
+    if !(0..=65535).contains(&local_preference) || !(1..=256).contains(&component) {
+        return Err("local_preference is 0 to 65535, component 1 to 256".into());
+    }
+    Ok((t << 24) + (local_preference << 8) + 256 - component)
+}

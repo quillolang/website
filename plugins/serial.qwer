@@ -1,0 +1,431 @@
+//! Serial ports for scales, sensors and instruments (the `serialport` crate): ports listed with their USB details, opened with baud, data bits, parity, stop bits and flow control, lines and bytes read with timeouts, reads up to a marker, question and answer, and the weight lines scales send, read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serialport = { version = "4.10", default-features = false }
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortType, StopBits};
+use std::collections::HashMap;
+use std::io::{ErrorKind, Read, Write};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const MAX_BUFFER: usize = 1 << 20;
+const DEFAULT_TIMEOUT: u64 = 1000;
+
+struct Port {
+    io: Box<dyn SerialPort>,
+    buf: Vec<u8>,
+    path: String,
+    timeout: u64,
+    line_ending: Vec<u8>,
+}
+
+fn ports() -> &'static Mutex<HashMap<String, Arc<Mutex<Port>>>> {
+    static P: OnceLock<Mutex<HashMap<String, Arc<Mutex<Port>>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn port(name: &str) -> Result<Arc<Mutex<Port>>, String> {
+    ports().lock().map_err(|_| "lock")?.get(name).cloned().ok_or(format!("no serial port `{}`: call serial_open first", name))
+}
+
+fn with<T>(name: &str, f: impl FnOnce(&mut Port) -> Result<T, String>) -> Result<T, String> {
+    let p = port(name)?;
+    let mut g = p.lock().map_err(|_| "lock")?;
+    f(&mut g)
+}
+
+fn data_bits(o: &Value) -> Result<DataBits, String> {
+    Ok(match o.get("data_bits").and_then(|v| v.as_u64()).unwrap_or(8) {
+        5 => DataBits::Five,
+        6 => DataBits::Six,
+        7 => DataBits::Seven,
+        8 => DataBits::Eight,
+        n => return Err(format!("{} data bits: 5, 6, 7 or 8", n)),
+    })
+}
+
+fn parity(o: &Value) -> Result<Parity, String> {
+    Ok(match o.get("parity").and_then(|v| v.as_str()).unwrap_or("none") {
+        "none" | "n" => Parity::None,
+        "even" | "e" => Parity::Even,
+        "odd" | "o" => Parity::Odd,
+        p => return Err(format!("`{}` is not a parity: none, even or odd", p)),
+    })
+}
+
+fn stop_bits(o: &Value) -> Result<StopBits, String> {
+    Ok(match o.get("stop_bits").and_then(|v| v.as_u64()).unwrap_or(1) {
+        1 => StopBits::One,
+        2 => StopBits::Two,
+        n => return Err(format!("{} stop bits: 1 or 2", n)),
+    })
+}
+
+fn flow(o: &Value) -> Result<FlowControl, String> {
+    Ok(match o.get("flow").and_then(|v| v.as_str()).unwrap_or("none") {
+        "none" => FlowControl::None,
+        "hardware" | "rts" => FlowControl::Hardware,
+        "software" | "xon" => FlowControl::Software,
+        f => return Err(format!("`{}` is not flow control: none, hardware or software", f)),
+    })
+}
+
+/// The serial ports on this machine: `{ name, type }`, and for a USB adapter its `vid`, `pid`, `serial`, `manufacturer` and `product`.
+pub fn serial_ports() -> Result<Vec<Value>, String> {
+    let list = serialport::available_ports().map_err(|e| e.to_string())?;
+    Ok(list
+        .into_iter()
+        .map(|p| match p.port_type {
+            SerialPortType::UsbPort(u) => json!({
+                "name": p.port_name, "type": "usb", "vid": format!("{:04x}", u.vid), "pid": format!("{:04x}", u.pid),
+                "serial": u.serial_number, "manufacturer": u.manufacturer, "product": u.product,
+            }),
+            SerialPortType::PciPort => json!({ "name": p.port_name, "type": "pci" }),
+            SerialPortType::BluetoothPort => json!({ "name": p.port_name, "type": "bluetooth" }),
+            SerialPortType::Unknown => json!({ "name": p.port_name, "type": "unknown" }),
+        })
+        .collect())
+}
+
+fn builder(path: &str, baud: u32, o: &Value) -> Result<serialport::SerialPortBuilder, String> {
+    Ok(serialport::new(path, baud).data_bits(data_bits(o)?).parity(parity(o)?).stop_bits(stop_bits(o)?).flow_control(flow(o)?).timeout(Duration::from_millis(100)))
+}
+
+/// Opens a port under `name`: `options` takes `baud` (9600), `data_bits` (8), `parity` (none, even, odd), `stop_bits` (1), `flow` (none, hardware, software), `timeout_ms` (1000, the wait for reads that give none), `line_ending` ("\n"), and `dtr`. A port held by another program is an error saying so.
+pub fn serial_open(name: &str, path: &str, options: serde_json::Value) -> Result<Value, String> {
+    let baud = options.get("baud").and_then(|v| v.as_u64()).unwrap_or(9600);
+    if baud == 0 || baud > 4_000_000 {
+        return Err(format!("{} is not a baud rate", baud));
+    }
+    let baud = baud as u32;
+    let mut pseudo = false;
+    let io = match builder(path, baud, &options)?.open() {
+        Ok(p) => p,
+        // macOS sets speed with an ioctl that a pseudo-terminal refuses: it has no line speed.
+        Err(e) if cfg!(target_os = "macos") && e.to_string().contains("Not a typewriter") => {
+            pseudo = true;
+            builder(path, 0, &options)?.open().map_err(|e| format!("cannot open {}: {}", path, e))?
+        }
+        Err(e) => {
+            let m = e.to_string();
+            return Err(match e.kind() {
+                serialport::ErrorKind::NoDevice => format!("{}: no such port, or another program has it open ({})", path, m),
+                serialport::ErrorKind::Io(ErrorKind::NotFound) => format!("{}: no such port", path),
+                serialport::ErrorKind::Io(ErrorKind::PermissionDenied) => format!("{}: permission denied (on Linux, add the user to `dialout`)", path),
+                _ => format!("cannot open {}: {}", path, m),
+            });
+        }
+    };
+    let mut io = io;
+    if let Some(d) = options.get("dtr").and_then(|v| v.as_bool()) {
+        let _ = io.write_data_terminal_ready(d);
+    }
+    let timeout = options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT);
+    let line_ending = options.get("line_ending").and_then(|v| v.as_str()).unwrap_or("\n").as_bytes().to_vec();
+    if line_ending.is_empty() {
+        return Err("line_ending cannot be empty".into());
+    }
+    let p = Port { io, buf: vec![], path: path.to_string(), timeout, line_ending };
+    let info = describe(&p, pseudo);
+    ports().lock().map_err(|_| "lock")?.insert(name.to_string(), Arc::new(Mutex::new(p)));
+    Ok(info)
+}
+
+fn describe(p: &Port, pseudo: bool) -> Value {
+    json!({
+        "path": p.path,
+        "baud": p.io.baud_rate().ok(),
+        "data_bits": p.io.data_bits().ok().map(u8::from),
+        "parity": p.io.parity().ok().map(|x| x.to_string().to_lowercase()),
+        "stop_bits": p.io.stop_bits().ok().map(u8::from),
+        "pseudo_terminal": pseudo,
+    })
+}
+
+/// Changes an open port's settings: `baud`, `data_bits`, `parity`, `stop_bits`, `flow`, `timeout_ms`.
+pub fn serial_configure(name: &str, options: serde_json::Value) -> Result<Value, String> {
+    with(name, |p| {
+        if let Some(b) = options.get("baud").and_then(|v| v.as_u64()) {
+            p.io.set_baud_rate(b as u32).map_err(|e| e.to_string())?;
+        }
+        if options.get("data_bits").is_some() {
+            p.io.set_data_bits(data_bits(&options)?).map_err(|e| e.to_string())?;
+        }
+        if options.get("parity").is_some() {
+            p.io.set_parity(parity(&options)?).map_err(|e| e.to_string())?;
+        }
+        if options.get("stop_bits").is_some() {
+            p.io.set_stop_bits(stop_bits(&options)?).map_err(|e| e.to_string())?;
+        }
+        if options.get("flow").is_some() {
+            p.io.set_flow_control(flow(&options)?).map_err(|e| e.to_string())?;
+        }
+        if let Some(t) = options.get("timeout_ms").and_then(|v| v.as_u64()) {
+            p.timeout = t;
+        }
+        Ok(describe(p, false))
+    })
+}
+
+/// Closes a port, so another program can have it; true when it was open.
+pub fn serial_close(name: &str) -> Result<bool, String> {
+    Ok(ports().lock().map_err(|_| "lock")?.remove(name).is_some())
+}
+
+fn put(p: &mut Port, b: &[u8]) -> Result<(), String> {
+    p.io.write_all(b).map_err(|e| format!("cannot write to {}: {}", p.path, e))?;
+    p.io.flush().map_err(|e| format!("cannot write to {}: {}", p.path, e))
+}
+
+/// Writes text as it is; add your device's line ending. Answers the bytes written.
+pub fn serial_write(name: &str, text: &str) -> Result<i64, String> {
+    with(name, |p| {
+        put(p, text.as_bytes())?;
+        Ok(text.len() as i64)
+    })
+}
+
+/// Writes a list of byte values.
+pub fn serial_write_bytes(name: &str, data: Vec<i64>) -> Result<i64, String> {
+    let b: Vec<u8> = data.iter().map(|x| u8::try_from(*x).map_err(|_| format!("{} is not a byte", x))).collect::<Result<_, _>>()?;
+    with(name, |p| {
+        put(p, &b)?;
+        Ok(b.len() as i64)
+    })
+}
+
+// More bytes into the buffer, up to the deadline; false when none came.
+fn fill(p: &mut Port, end: Instant) -> Result<bool, String> {
+    let left = end.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Ok(false);
+    }
+    p.io.set_timeout(left).map_err(|e| e.to_string())?;
+    let mut t = [0u8; 1024];
+    match p.io.read(&mut t) {
+        Ok(0) => Ok(false),
+        Ok(n) => {
+            p.buf.extend(&t[..n]);
+            if p.buf.len() > MAX_BUFFER {
+                return Err(format!("{} sent over 1 MiB without what was being waited for", p.path));
+            }
+            Ok(true)
+        }
+        Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => Ok(false),
+        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(true),
+        Err(e) => Err(format!("cannot read {}: {}", p.path, e)),
+    }
+}
+
+fn find(b: &[u8], m: &[u8]) -> Option<usize> {
+    b.windows(m.len()).position(|w| w == m)
+}
+
+fn until(p: &mut Port, marker: &[u8], ms: u64, what: &str) -> Result<Vec<u8>, String> {
+    let end = Instant::now() + Duration::from_millis(ms);
+    let mut from = 0;
+    loop {
+        if let Some(i) = find(&p.buf[from..], marker) {
+            let at = from + i;
+            let out = p.buf[..at].to_vec();
+            p.buf.drain(..at + marker.len());
+            return Ok(out);
+        }
+        from = p.buf.len().saturating_sub(marker.len() - 1);
+        if !fill(p, end)? {
+            if Instant::now() >= end {
+                return Err(format!("timed out after {} ms waiting for {}; {} bytes are waiting", ms, what, p.buf.len()));
+            }
+        }
+    }
+}
+
+fn wait(o: &Value, p: &Port) -> u64 {
+    o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(p.timeout)
+}
+
+fn line(p: &mut Port, o: &Value) -> Result<String, String> {
+    let ending = p.line_ending.clone();
+    let got = until(p, &ending, wait(o, p), "a line")?;
+    let t = String::from_utf8_lossy(&got).to_string();
+    Ok(t.strip_suffix('\r').map(String::from).unwrap_or(t))
+}
+
+/// Reads one line, without its ending or a carriage return. On a timeout it is an error and what came so far stays for the next read. Options: `timeout_ms`.
+pub fn serial_read_line(name: &str, options: serde_json::Value) -> Result<String, String> {
+    with(name, |p| line(p, &options))
+}
+
+/// Reads lines until a line equals `last` (which is left out), or until nothing more comes for `timeout_ms` when `last` is empty, for a device that prints a block and stops.
+pub fn serial_read_lines(name: &str, last: &str, options: serde_json::Value) -> Result<Vec<String>, String> {
+    with(name, |p| {
+        let mut out = vec![];
+        loop {
+            match line(p, &options) {
+                Ok(l) if !last.is_empty() && l == last => return Ok(out),
+                Ok(l) => out.push(l),
+                Err(_) if last.is_empty() => return Ok(out),
+                Err(e) => return Err(format!("{} after {} lines", e, out.len())),
+            }
+        }
+    })
+}
+
+/// Reads up to a marker, text like "END" or "> "; answers what came before it.
+pub fn serial_read_until(name: &str, marker: &str, options: serde_json::Value) -> Result<String, String> {
+    if marker.is_empty() {
+        return Err("a marker cannot be empty".into());
+    }
+    with(name, |p| {
+        let ms = wait(&options, p);
+        let got = until(p, marker.as_bytes(), ms, &format!("{:?}", marker))?;
+        Ok(String::from_utf8_lossy(&got).to_string())
+    })
+}
+
+/// Reads exactly `count` bytes, as a list of numbers, for binary protocols. On a timeout the ones that came stay for the next read.
+pub fn serial_read_bytes(name: &str, count: i64, options: serde_json::Value) -> Result<Vec<u8>, String> {
+    if count < 0 || count as usize > MAX_BUFFER {
+        return Err("count must be from 0 to 1048576".into());
+    }
+    let n = count as usize;
+    with(name, |p| {
+        let ms = wait(&options, p);
+        let end = Instant::now() + Duration::from_millis(ms);
+        while p.buf.len() < n {
+            if !fill(p, end)? && Instant::now() >= end {
+                return Err(format!("timed out after {} ms: {} of {} bytes came", ms, p.buf.len(), n));
+            }
+        }
+        Ok(p.buf.drain(..n).collect())
+    })
+}
+
+/// Whatever has arrived, as text, waiting at most `options.timeout_ms` (0 unless given) for the first byte.
+pub fn serial_read_available(name: &str, options: serde_json::Value) -> Result<String, String> {
+    with(name, |p| {
+        let end = Instant::now() + Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0));
+        if p.buf.is_empty() {
+            fill(p, end)?;
+        }
+        while p.io.bytes_to_read().unwrap_or(0) > 0 {
+            if !fill(p, Instant::now() + Duration::from_millis(5))? {
+                break;
+            }
+        }
+        let t = String::from_utf8_lossy(&p.buf).to_string();
+        p.buf.clear();
+        Ok(t)
+    })
+}
+
+/// Question and answer: drops anything waiting, writes `text`, and reads the line that comes back, which is how most scales and meters work.
+pub fn serial_query(name: &str, text: &str, options: serde_json::Value) -> Result<String, String> {
+    with(name, |p| {
+        p.buf.clear();
+        p.io.clear(ClearBuffer::Input).map_err(|e| e.to_string())?;
+        put(p, text.as_bytes())?;
+        line(p, &options)
+    })
+}
+
+/// Drops whatever is waiting to be read; answers how many bytes went.
+pub fn serial_clear(name: &str) -> Result<i64, String> {
+    with(name, |p| {
+        let n = p.buf.len() as i64 + p.io.bytes_to_read().unwrap_or(0) as i64;
+        p.buf.clear();
+        p.io.clear(ClearBuffer::All).map_err(|e| e.to_string())?;
+        Ok(n)
+    })
+}
+
+/// The modem lines, null for each one the port cannot report: `{ cts, dsr, ri, cd }`.
+pub fn serial_signals(name: &str) -> Result<Value, String> {
+    with(name, |p| Ok(json!({ "cts": p.io.read_clear_to_send().ok(), "dsr": p.io.read_data_set_ready().ok(), "ri": p.io.read_ring_indicator().ok(), "cd": p.io.read_carrier_detect().ok() })))
+}
+
+fn weight_of(s: &str) -> Option<(f64, String)> {
+    let t = s.trim();
+    let end = t.rfind(|c: char| c.is_ascii_digit())?;
+    let unit = t[end + 1..].trim().to_string();
+    let start = t[..=end].rfind(|c: char| !(c.is_ascii_digit() || c == '.' || c == ' ' || c == '+' || c == '-' || c == ',')).map_or(0, |i| i + 1);
+    let n: String = t[start..=end].chars().filter(|c| !c.is_whitespace()).map(|c| if c == ',' { '.' } else { c }).collect();
+    n.parse().ok().map(|v| (v, unit))
+}
+
+/// Reads a scale's weight line: the common `ST,GS,+  12.345kg` (stable or unstable, gross or net), Mettler Toledo's MT-SICS `S S  100.00 g` and `S D ...`, and a bare `  12.34 lb`. Answers `{ value, unit, stable, kind }`, or an error for an overload.
+pub fn serial_parse_weight(line: &str) -> Result<Value, String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return Err("an empty line".into());
+    }
+    if let Some(rest) = t.strip_prefix("S ") {
+        let rest = rest.trim_start();
+        match rest.chars().next() {
+            Some('+') if rest.len() == 1 => return Err("the scale is overloaded".into()),
+            Some('-') if rest.len() == 1 => return Err("the scale is underloaded".into()),
+            Some('I') => return Err("the scale is busy".into()),
+            Some('S') | Some('D') => {
+                let stable = rest.starts_with('S');
+                let (v, u) = weight_of(&rest[1..]).ok_or(format!("no weight in `{}`", t))?;
+                return Ok(json!({ "value": v, "unit": u, "stable": stable, "kind": "net" }));
+            }
+            _ => {}
+        }
+    }
+    let p: Vec<&str> = t.splitn(3, ',').collect();
+    if p.len() == 3 && p[0].len() == 2 && p[1].len() == 2 {
+        let state = p[0].to_uppercase();
+        if state == "OL" {
+            return Err("the scale is overloaded".into());
+        }
+        let kind = match p[1].to_uppercase().as_str() {
+            "GS" => "gross",
+            "NT" => "net",
+            "TR" => "tare",
+            _ => "unknown",
+        };
+        let (v, u) = weight_of(p[2]).ok_or(format!("no weight in `{}`", t))?;
+        return Ok(json!({ "value": v, "unit": u, "stable": state == "ST", "kind": kind }));
+    }
+    let (v, u) = weight_of(t).ok_or(format!("no weight in `{}`", t))?;
+    Ok(json!({ "value": v, "unit": u, "stable": Value::Null, "kind": "unknown" }))
+}
+
+/// Reads a sensor's `T=21.5;H=40` or `temp:21.5, rh:40` line into a map, numbers as numbers. The separators are `;`, `,` or spaces between pairs, and `=` or `:` inside them.
+pub fn serial_parse_fields(line: &str) -> Value {
+    let mut m = Map::new();
+    for p in line.split(|c: char| c == ';' || c == ',' || c == ' ' || c == '\t') {
+        if let Some((k, v)) = p.split_once(|c| c == '=' || c == ':') {
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() {
+                continue;
+            }
+            let val = match v.parse::<i64>() {
+                Ok(n) => json!(n),
+                Err(_) => match v.parse::<f64>() {
+                    Ok(f) if f.is_finite() => json!(f),
+                    _ => json!(v),
+                },
+            };
+            m.insert(k.to_string(), val);
+        }
+    }
+    Value::Object(m)
+}
+
+/// A checksum of a text, the two kinds serial protocols use: `xor` (NMEA's) or `sum` (the low byte of the total), as two hex digits.
+pub fn serial_checksum(text: &str, kind: &str) -> Result<String, String> {
+    let b = text.as_bytes();
+    let v = match kind {
+        "xor" => b.iter().fold(0u8, |a, x| a ^ x),
+        "sum" => b.iter().fold(0u8, |a, x| a.wrapping_add(*x)),
+        k => return Err(format!("`{}` is not a checksum: xor or sum", k)),
+    };
+    Ok(hex::encode_upper([v]))
+}

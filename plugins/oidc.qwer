@@ -1,0 +1,391 @@
+//! OpenID Connect sign-in: discovery, auth URLs with state, nonce and PKCE, the code exchanged, ID tokens checked against the provider's JWKS (RS256 and ES256, issuer, audience, expiry, nonce), userinfo and refresh, in pure Rust.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! ureq = "2"
+//! base64 = "0.22"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+//! rsa = { version = "0.9", default-features = false, features = ["std"] }
+//! getrandom = "0.2"
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const META_LIFE: Duration = Duration::from_secs(3600);
+/// A kid nobody knows fetches the keys again, but no more often than this: a forged token must not make us flood the provider.
+const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
+
+static META: Mutex<Option<HashMap<String, (Value, Instant)>>> = Mutex::new(None);
+static JWKS: Mutex<Option<HashMap<String, (Value, Instant, Option<Instant>)>>> = Mutex::new(None);
+
+fn b64(x: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(x)
+}
+
+fn unb64(x: &str) -> Result<Vec<u8>, String> {
+    URL_SAFE_NO_PAD.decode(x.trim_end_matches('=')).map_err(|_| "not base64url".to_string())
+}
+
+fn random_text(n: usize) -> Result<String, String> {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(b64(&b))
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn enc(x: &str) -> String {
+    x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0).build()
+}
+
+/// Only a provider on TLS is believed, but for this machine, where tests live.
+fn safe_url(u: &str, what: &str) -> Result<(), String> {
+    let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| u.starts_with(p));
+    if u.starts_with("https://") || local { Ok(()) } else { Err(format!("{} `{}` is not https", what, u)) }
+}
+
+fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
+    let mut r = agent().get(url).set("Accept", "application/json");
+    if let Some(t) = bearer {
+        r = r.set("Authorization", &format!("Bearer {}", t));
+    }
+    match r.call() {
+        Ok(a) => serde_json::from_str(&a.into_string().map_err(|e| e.to_string())?).map_err(|e| format!("{}: the answer is not JSON: {}", url, e)),
+        Err(ureq::Error::Status(s, a)) => {
+            let www = a.header("www-authenticate").map(str::to_string);
+            let t = a.into_string().unwrap_or_default();
+            let body: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            let why = body["error_description"].as_str().or(body["error"].as_str()).map(str::to_string).or(www).unwrap_or(t);
+            Err(format!("{}: {} {}", url, s, why))
+        }
+        Err(e) => Err(format!("{}: {}", url, e)),
+    }
+}
+
+/// The provider's metadata from `<issuer>/.well-known/openid-configuration`, kept an hour. Its `issuer` must be the one asked for, character for character, and it must name the authorization, token and JWKS addresses.
+pub fn oidc_discover(issuer: &str) -> Result<Value, String> {
+    if let Some((m, at)) = META.lock().unwrap().as_ref().and_then(|c| c.get(issuer)) {
+        if at.elapsed() < META_LIFE {
+            return Ok(m.clone());
+        }
+    }
+    safe_url(issuer, "issuer")?;
+    let m = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')), None)?;
+    if m["issuer"].as_str() != Some(issuer) {
+        return Err(format!("the provider says its issuer is {}, and {} was asked for", m["issuer"], issuer));
+    }
+    for k in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        let u = m[k].as_str().ok_or(format!("the provider's metadata has no {}", k))?;
+        safe_url(u, k)?;
+    }
+    META.lock().unwrap().get_or_insert_with(HashMap::new).insert(issuer.to_string(), (m.clone(), Instant::now()));
+    Ok(m)
+}
+
+/// Starts a sign-in: `client` is `{ client_id, redirect_uri, scope }`, `options` may hold `prompt`, `login_hint`, `max_age`, `audience`, `extra` (a map of more parameters). Gives `{ url, state, nonce, code_verifier }`: keep the last three in the visitor's session and send them to `url`. PKCE is always S256; a provider that says it cannot do it is refused.
+pub fn oidc_start(issuer: &str, client: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let m = oidc_discover(issuer)?;
+    let id = client["client_id"].as_str().filter(|x| !x.is_empty()).ok_or("client: no client_id")?;
+    let redirect = client["redirect_uri"].as_str().filter(|x| !x.is_empty()).ok_or("client: no redirect_uri")?;
+    if let Some(list) = m["code_challenge_methods_supported"].as_array() {
+        if !list.iter().any(|x| x == "S256") {
+            return Err("the provider does not offer PKCE with S256".into());
+        }
+    }
+    let (state, nonce, verifier) = (random_text(24)?, random_text(24)?, random_text(48)?);
+    let challenge = b64(&Sha256::digest(verifier.as_bytes()));
+    let scope = client["scope"].as_str().filter(|x| !x.is_empty()).unwrap_or("openid profile email");
+    if !scope.split(' ').any(|x| x == "openid") {
+        return Err(format!("scope `{}` lacks openid, without which there is no ID token", scope));
+    }
+    let mut q = vec![("response_type".to_string(), "code".to_string()), ("client_id".into(), id.into()), ("redirect_uri".into(), redirect.into()), ("scope".into(), scope.into()), ("state".into(), state.clone()), ("nonce".into(), nonce.clone()), ("code_challenge".into(), challenge), ("code_challenge_method".into(), "S256".into())];
+    for k in ["prompt", "login_hint", "audience"] {
+        if let Some(v) = options[k].as_str() {
+            q.push((k.to_string(), v.to_string()));
+        }
+    }
+    if let Some(v) = options["max_age"].as_i64() {
+        q.push(("max_age".into(), v.to_string()));
+    }
+    if let Some(x) = options["extra"].as_object() {
+        for (k, v) in x {
+            q.push((k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+        }
+    }
+    let base = m["authorization_endpoint"].as_str().unwrap();
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let query: Vec<String> = q.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect();
+    Ok(json!({ "url": format!("{}{}{}", base, sep, query.join("&")), "state": state, "nonce": nonce, "code_verifier": verifier }))
+}
+
+/// Reads what came back to the redirect URI: `query` is the request's query, `state` what `oidc_start` gave. Gives the `code`. A provider's `error`, a state that differs, or an `iss` naming another issuer (RFC 9207, against mix-up attacks) is an error.
+pub fn oidc_callback(issuer: &str, query: std::collections::HashMap<String, String>, state: &str) -> Result<String, String> {
+    if let Some(e) = query.get("error") {
+        return Err(format!("sign-in refused: {}{}", e, query.get("error_description").map(|d| format!(": {}", d)).unwrap_or_default()));
+    }
+    if state.is_empty() || query.get("state").map(String::as_str) != Some(state) {
+        return Err("the state does not match: this answer is not to a sign-in this visitor started".into());
+    }
+    if let Some(i) = query.get("iss") {
+        if i != issuer {
+            return Err(format!("the answer comes from {}, and {} was asked", i, issuer));
+        }
+    }
+    query.get("code").filter(|c| !c.is_empty()).cloned().ok_or("the answer has no code".into())
+}
+
+fn token_call(issuer: &str, client: &Value, mut form: Vec<(String, String)>) -> Result<Value, String> {
+    let m = oidc_discover(issuer)?;
+    let url = m["token_endpoint"].as_str().unwrap();
+    let id = client["client_id"].as_str().ok_or("client: no client_id")?;
+    let secret = client["client_secret"].as_str().filter(|x| !x.is_empty());
+    let methods = m["token_endpoint_auth_methods_supported"].as_array();
+    let basic = secret.is_some() && methods.map_or(true, |l| l.iter().any(|x| x == "client_secret_basic"));
+    let mut req = agent().post(url).set("Accept", "application/json");
+    if basic {
+        // RFC 6749 section 2.3.1: both parts are form-encoded before Basic's base64.
+        let raw = format!("{}:{}", enc(id).replace("%20", "+"), enc(secret.unwrap()).replace("%20", "+"));
+        req = req.set("Authorization", &format!("Basic {}", STANDARD.encode(raw)));
+    } else {
+        form.push(("client_id".into(), id.into()));
+        if let Some(s) = secret {
+            form.push(("client_secret".into(), s.into()));
+        }
+    }
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    match req.send_form(&pairs) {
+        Ok(a) => serde_json::from_str(&a.into_string().map_err(|e| e.to_string())?).map_err(|e| format!("the token answer is not JSON: {}", e)),
+        Err(ureq::Error::Status(s, a)) => {
+            let t = a.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            Err(format!("the token endpoint said {}: {}{}", s, v["error"].as_str().unwrap_or(&t), v["error_description"].as_str().map(|d| format!(": {}", d)).unwrap_or_default()))
+        }
+        Err(e) => Err(format!("the token endpoint: {}", e)),
+    }
+}
+
+/// Exchanges the code for tokens: `{ access_token, id_token, refresh_token, expires_in, ... }`. With `client_secret` in `client` it signs in by Basic, or in the form when the provider only offers that; without one it is a public client, relying on PKCE.
+pub fn oidc_exchange(issuer: &str, client: serde_json::Value, code: &str, code_verifier: &str) -> Result<Value, String> {
+    let redirect = client["redirect_uri"].as_str().ok_or("client: no redirect_uri")?.to_string();
+    token_call(issuer, &client, vec![("grant_type".into(), "authorization_code".into()), ("code".into(), code.into()), ("redirect_uri".into(), redirect), ("code_verifier".into(), code_verifier.into())])
+}
+
+/// New tokens from a refresh token. Providers may send a new refresh token: keep it when they do.
+pub fn oidc_refresh(issuer: &str, client: serde_json::Value, refresh_token: &str) -> Result<Value, String> {
+    token_call(issuer, &client, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), refresh_token.into())])
+}
+
+fn keys(issuer: &str, fresh: bool) -> Result<Value, String> {
+    let held = JWKS.lock().unwrap().as_ref().and_then(|c| c.get(issuer).cloned());
+    if let Some((k, at, forced)) = &held {
+        // Asked again for an unknown kid: only if nobody just did, and an old set is dropped anyway, or a withdrawn key stays trusted.
+        let wait = if fresh { forced.is_some_and(|f| f.elapsed() < JWKS_COOLDOWN) } else { at.elapsed() < META_LIFE };
+        if wait {
+            return Ok(k.clone());
+        }
+    }
+    let m = oidc_discover(issuer)?;
+    let k = get_json(m["jwks_uri"].as_str().unwrap(), None)?;
+    if !k["keys"].is_array() {
+        return Err("the provider's JWKS has no keys".into());
+    }
+    let forced = if fresh { Some(Instant::now()) } else { held.and_then(|h| h.2) };
+    JWKS.lock().unwrap().get_or_insert_with(HashMap::new).insert(issuer.to_string(), (k.clone(), Instant::now(), forced));
+    Ok(k)
+}
+
+fn pick<'a>(set: &'a Value, alg: &str, kid: Option<&str>) -> Option<&'a Value> {
+    let kty = if alg == "RS256" { "RSA" } else { "EC" };
+    let fit: Vec<&Value> = set["keys"].as_array()?.iter().filter(|k| k["kty"] == kty && k["use"].as_str().map_or(true, |u| u == "sig") && k["alg"].as_str().map_or(true, |a| a == alg)).collect();
+    match kid {
+        Some(id) => fit.into_iter().find(|k| k["kid"] == id),
+        None if fit.len() == 1 => fit.into_iter().next(),
+        None => None,
+    }
+}
+
+fn check_signature(alg: &str, key: &Value, signed: &[u8], sig: &[u8]) -> Result<bool, String> {
+    let part = |k: &str| -> Result<Vec<u8>, String> { unb64(key[k].as_str().ok_or(format!("the JWK has no {}", k))?).map_err(|_| format!("the JWK's {} is not base64url", k)) };
+    if alg == "RS256" {
+        let (n, e) = (part("n")?, part("e")?);
+        if n.len() < 256 {
+            return Err("the provider's RSA key is under 2048 bits".into());
+        }
+        let k = rsa::RsaPublicKey::new(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e)).map_err(|e| e.to_string())?;
+        return Ok(k.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(signed), sig).is_ok());
+    }
+    use p256::ecdsa::signature::Verifier;
+    if key["crv"] != "P-256" {
+        return Err(format!("ES256 needs a P-256 key, and this one is {}", key["crv"]));
+    }
+    let (x, y) = (part("x")?, part("y")?);
+    if x.len() != 32 || y.len() != 32 {
+        return Err("the JWK's coordinates should be 32 bytes".into());
+    }
+    let mut point = vec![4u8];
+    point.extend_from_slice(&x);
+    point.extend_from_slice(&y);
+    let k = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(|_| "the JWK is not on P-256")?;
+    // A JWS holds r and s side by side, not DER.
+    let Ok(s) = p256::ecdsa::Signature::from_slice(sig) else { return Ok(false) };
+    Ok(k.verify(signed, &s).is_ok())
+}
+
+/// Checks an ID token and gives its claims. The signature against the provider's keys, fetched again once when a `kid` is new; only RS256 and ES256 pass, never `none` or HS256. Then `iss`, `aud` (with `azp` when there are several), `exp`, `iat`, `nbf` and `nonce`. `options`: `leeway` (seconds, 60 by default), `access_token` (also checks `at_hash`), `max_age` (needs a recent `auth_time`).
+pub fn oidc_verify(issuer: &str, client_id: &str, id_token: &str, nonce: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut parts = id_token.split('.');
+    let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err("an ID token has three parts".into());
+    };
+    let head: Value = serde_json::from_slice(&unb64(h).map_err(|_| "the token's header is not base64url")?).map_err(|_| "the token's header is not JSON")?;
+    let alg = head["alg"].as_str().unwrap_or("");
+    if alg != "RS256" && alg != "ES256" {
+        return Err(format!("algorithm `{}` is refused: only RS256 and ES256 are taken", alg));
+    }
+    let kid = head["kid"].as_str();
+    let set = keys(issuer, false)?;
+    let found = pick(&set, alg, kid).cloned();
+    let key = match found {
+        Some(k) => k,
+        None => {
+            let again = keys(issuer, true)?;
+            pick(&again, alg, kid).cloned().ok_or(format!("no key in the provider's JWKS for kid {}", kid.unwrap_or("(none)")))?
+        }
+    };
+    let sig = unb64(s).map_err(|_| "the token's signature is not base64url")?;
+    let signed = format!("{}.{}", h, p);
+    if !check_signature(alg, &key, signed.as_bytes(), &sig)? {
+        return Err("the ID token's signature is wrong".into());
+    }
+    let c: Value = serde_json::from_slice(&unb64(p).map_err(|_| "the token's claims are not base64url")?).map_err(|_| "the token's claims are not JSON")?;
+    if c["iss"].as_str() != Some(issuer) {
+        return Err(format!("the issuer is {}, not {}", c["iss"], issuer));
+    }
+    let aud: Vec<&str> = match &c["aud"] {
+        Value::String(a) => vec![a.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => vec![],
+    };
+    if !aud.contains(&client_id) {
+        return Err(format!("the token is for {}, not for {}", c["aud"], client_id));
+    }
+    if aud.len() > 1 && c["azp"].as_str() != Some(client_id) {
+        return Err(format!("the token has several audiences, and its azp is {}", c["azp"]));
+    }
+    let t = now();
+    let leeway = options["leeway"].as_i64().unwrap_or(60);
+    let exp = c["exp"].as_i64().ok_or("the token has no exp")?;
+    if t > exp + leeway {
+        return Err(format!("the token expired {} seconds ago", t - exp));
+    }
+    let iat = c["iat"].as_i64().ok_or("the token has no iat")?;
+    if iat > t + leeway {
+        return Err("the token says it was issued in the future".into());
+    }
+    if c["nbf"].as_i64().is_some_and(|n| n > t + leeway) {
+        return Err("the token is not valid yet".into());
+    }
+    if !nonce.is_empty() && c["nonce"].as_str() != Some(nonce) {
+        return Err("the nonce does not match: this token may be a replay".into());
+    }
+    if nonce.is_empty() && !c["nonce"].is_null() {
+        return Err("the token has a nonce, and none was expected".into());
+    }
+    if c["sub"].as_str().unwrap_or("").is_empty() {
+        return Err("the token has no sub".into());
+    }
+    if let Some(a) = options["access_token"].as_str() {
+        if let Some(want) = c["at_hash"].as_str() {
+            let d = Sha256::digest(a.as_bytes());
+            if b64(&d[..16]) != want {
+                return Err("the at_hash does not match the access token".into());
+            }
+        }
+    }
+    if let Some(max) = options["max_age"].as_i64() {
+        let at = c["auth_time"].as_i64().ok_or("max_age was asked for, and the token has no auth_time")?;
+        if t > at + max + leeway {
+            return Err(format!("the user signed in {} seconds ago, more than max_age allows", t - at));
+        }
+    }
+    Ok(c)
+}
+
+/// The user's claims from the provider. `sub` is the id token's: they must agree, or the answer is refused, as the specification says.
+pub fn oidc_userinfo(issuer: &str, access_token: &str, sub: &str) -> Result<Value, String> {
+    let m = oidc_discover(issuer)?;
+    let url = m["userinfo_endpoint"].as_str().ok_or("the provider has no userinfo_endpoint")?;
+    let v = get_json(url, Some(access_token))?;
+    if v["sub"].as_str() != Some(sub) {
+        return Err(format!("userinfo is about {}, and the ID token about {}", v["sub"], sub));
+    }
+    Ok(v)
+}
+
+/// The whole return trip: `oidc_callback`, `oidc_exchange`, `oidc_verify` and, if the provider has it, `oidc_userinfo`. `saved` is what `oidc_start` gave, `options` as for `oidc_verify`. Gives `{ claims, userinfo, tokens }`.
+pub fn oidc_finish(issuer: &str, client: serde_json::Value, query: std::collections::HashMap<String, String>, saved: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let code = oidc_callback(issuer, query, saved["state"].as_str().unwrap_or(""))?;
+    let tokens = oidc_exchange(issuer, client.clone(), &code, saved["code_verifier"].as_str().unwrap_or(""))?;
+    let id_token = tokens["id_token"].as_str().ok_or("the token answer has no id_token")?;
+    let access = tokens["access_token"].as_str().unwrap_or("");
+    let mut o = if options.is_object() { options } else { json!({}) };
+    o["access_token"] = json!(access);
+    let claims = oidc_verify(issuer, client["client_id"].as_str().unwrap_or(""), id_token, saved["nonce"].as_str().unwrap_or(""), o)?;
+    let m = oidc_discover(issuer)?;
+    let userinfo = if m["userinfo_endpoint"].is_string() { oidc_userinfo(issuer, access, claims["sub"].as_str().unwrap_or(""))? } else { Value::Null };
+    Ok(json!({ "claims": claims, "userinfo": userinfo, "tokens": tokens }))
+}
+
+/// The query of a URL as a map, decoded: what came back when the redirect is read by hand, in a desktop or phone app's loopback listener or a test.
+pub fn oidc_query(url: &str) -> HashMap<String, String> {
+    let q = url.split_once('?').map_or("", |x| x.1);
+    let q = q.split('#').next().unwrap_or("");
+    let dec = |x: &str| -> String {
+        let b = x.as_bytes();
+        let (mut i, mut out) = (0, Vec::with_capacity(b.len()));
+        while i < b.len() {
+            match (b[i], x.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+                (b'%', Some(h)) => { out.push(h); i += 3; }
+                (b'+', _) => { out.push(b' '); i += 1; }
+                (c, _) => { out.push(c); i += 1; }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    q.split('&').filter(|p| !p.is_empty()).map(|p| { let (k, v) = p.split_once('=').unwrap_or((p, "")); (dec(k), dec(v)) }).collect()
+}
+
+/// A token's `{ header, claims }` with nothing checked, for logs and debugging. Never decide anything on it: `oidc_verify` is for that.
+pub fn oidc_peek(token: &str) -> Result<Value, String> {
+    let mut parts = token.split('.');
+    let mut part = |what: &str| -> Result<Value, String> { serde_json::from_slice(&unb64(parts.next().unwrap_or("")).map_err(|_| format!("the {} is not base64url", what))?).map_err(|_| format!("the {} is not JSON", what)) };
+    let header = part("header")?;
+    let claims = part("claims")?;
+    Ok(json!({ "header": header, "claims": claims }))
+}
+
+/// Where to send a visitor to sign out at the provider, or an error if it has no `end_session_endpoint`.
+pub fn oidc_logout_url(issuer: &str, id_token: &str, post_logout_redirect_uri: &str, state: &str) -> Result<String, String> {
+    let m = oidc_discover(issuer)?;
+    let base = m["end_session_endpoint"].as_str().ok_or("the provider has no end_session_endpoint")?;
+    let mut q = vec![];
+    for (k, v) in [("id_token_hint", id_token), ("post_logout_redirect_uri", post_logout_redirect_uri), ("state", state)] {
+        if !v.is_empty() {
+            q.push(format!("{}={}", k, enc(v)));
+        }
+    }
+    Ok(format!("{}?{}", base, q.join("&")))
+}

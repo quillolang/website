@@ -1,0 +1,262 @@
+//! Typesense's API: collections made, documents imported as JSONL with each line's result read, searches with filters, facets and every page walked, filter values quoted, and scoped search keys made offline so that each tenant's browser carries its own filter.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// TYPESENSE_API_URL is the server (http://localhost:8108 when not set), TYPESENSE_API_KEY the admin
+// key. TYPESENSE_SEARCH_KEY is a search-only key, the parent of scoped keys.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("TYPESENSE_API_URL").unwrap_or_else(|| "http://localhost:8108".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().map(text).collect::<Vec<_>>().join(","),
+        o => o.to_string(),
+    }
+}
+
+fn query(params: &Value) -> String {
+    params.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null()).map(|(k, v)| format!("{}={}", enc(k), enc(&text(v)))).collect::<Vec<_>>().join("&")
+}
+
+struct Answer {
+    status: u16,
+    text: String,
+}
+
+fn raw_with(key: Option<String>, method: &str, path: &str, body: Option<(&str, String)>) -> Result<Answer, String> {
+    let key = key.or_else(|| env("TYPESENSE_API_KEY")).ok_or("TYPESENSE_API_KEY is not set")?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let url = format!("{}{}", base(), path);
+    for attempt in 0..4 {
+        let req = agent.request(method, &url).set("X-TYPESENSE-API-KEY", &key);
+        let res = match &body {
+            Some((kind, b)) => req.set("Content-Type", kind).send_string(b),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                return Ok(Answer { status, text: r.into_string().map_err(|e| e.to_string())? });
+            }
+            // 503 is "Not Ready or Lagging", worth a short wait; a write refused with 429 too.
+            Err(ureq::Error::Status(c, _)) if (c == 503 || c == 429) && attempt < 3 => std::thread::sleep(Duration::from_millis(250 << attempt)),
+            Err(ureq::Error::Status(c, r)) => return Ok(Answer { status: c, text: r.into_string().unwrap_or_default() }),
+            Err(e) => return Err(format!("cannot reach Typesense at {}: {}", base(), e)),
+        }
+    }
+    Err("Typesense stayed busy through four tries".into())
+}
+
+fn json_with(key: Option<String>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let a = raw_with(key, method, path, body.map(|b| ("application/json", b.to_string())))?;
+    let v: Value = serde_json::from_str(&a.text).unwrap_or(Value::Null);
+    if a.status >= 300 {
+        let m = v["message"].as_str().map(str::to_string).unwrap_or_else(|| a.text.chars().take(300).collect());
+        return Err(format!("Typesense answered {}: {}", a.status, m));
+    }
+    Ok(v)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    json_with(None, method, path, body)
+}
+
+/// Makes a collection from its schema, `{ name, fields: [{ name, type, facet, optional }], default_sorting_field }`. True when made, false when one of that name exists.
+pub fn typesense_create_collection(schema: serde_json::Value) -> Result<bool, String> {
+    if !schema["name"].is_string() || !schema["fields"].is_array() {
+        return Err("a schema needs a `name` and a list of `fields`".into());
+    }
+    match call("POST", "/collections", Some(&schema)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.starts_with("Typesense answered 409") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// A collection's schema and `num_documents`, or null when there is none.
+pub fn typesense_collection(name: &str) -> Result<Value, String> {
+    match call("GET", &format!("/collections/{}", enc(name)), None) {
+        Err(e) if e.starts_with("Typesense answered 404") => Ok(Value::Null),
+        o => o,
+    }
+}
+
+/// Deletes a collection; true when it was there.
+pub fn typesense_delete_collection(name: &str) -> Result<bool, String> {
+    match call("DELETE", &format!("/collections/{}", enc(name)), None) {
+        Ok(_) => Ok(true),
+        Err(e) if e.starts_with("Typesense answered 404") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes one document, replacing any with the same `id`; gives it back as stored.
+pub fn typesense_upsert(collection: &str, document: serde_json::Value) -> Result<Value, String> {
+    call("POST", &format!("/collections/{}/documents?action=upsert", enc(collection)), Some(&document))
+}
+
+/// A document by id, or null.
+pub fn typesense_get(collection: &str, id: &str) -> Result<Value, String> {
+    match call("GET", &format!("/collections/{}/documents/{}", enc(collection), enc(id)), None) {
+        Err(e) if e.starts_with("Typesense answered 404") => Ok(Value::Null),
+        o => o,
+    }
+}
+
+/// Deletes a document; true when it was there.
+pub fn typesense_delete(collection: &str, id: &str) -> Result<bool, String> {
+    match call("DELETE", &format!("/collections/{}/documents/{}", enc(collection), enc(id)), None) {
+        Ok(_) => Ok(true),
+        Err(e) if e.starts_with("Typesense answered 404") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Deletes every document matching a `filter_by`; gives how many went.
+pub fn typesense_delete_where(collection: &str, filter_by: &str) -> Result<i64, String> {
+    let r = call("DELETE", &format!("/collections/{}/documents?filter_by={}&batch_size=1000", enc(collection), enc(filter_by)), None)?;
+    Ok(r["num_deleted"].as_i64().unwrap_or(0))
+}
+
+/// Imports many documents as JSONL; `action` "create", "upsert", "update" or "emplace" ("" is upsert). The answer has a line per document and a request that succeeds can hold refused lines, so each is read: `{ imported, failed: [{ position, code, error, id }] }`.
+pub fn typesense_import(collection: &str, documents: Vec<serde_json::Value>, action: &str) -> Result<Value, String> {
+    let action = if action.is_empty() { "upsert" } else { action };
+    if !["create", "upsert", "update", "emplace"].contains(&action) {
+        return Err(format!("{:?} is not an import action: use create, upsert, update or emplace", action));
+    }
+    if documents.is_empty() {
+        return Ok(json!({ "imported": 0, "failed": [] }));
+    }
+    let body = documents.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
+    let path = format!("/collections/{}/documents/import?action={}", enc(collection), action);
+    let a = raw_with(None, "POST", &path, Some(("text/plain", body)))?;
+    if a.status >= 300 {
+        let v: Value = serde_json::from_str(&a.text).unwrap_or(Value::Null);
+        return Err(format!("Typesense answered {}: {}", a.status, v["message"].as_str().unwrap_or(&a.text)));
+    }
+    let (mut imported, mut failed) = (0, vec![]);
+    let lines: Vec<&str> = a.text.lines().collect();
+    if lines.len() != documents.len() {
+        return Err(format!("the import answered {} lines for {} documents", lines.len(), documents.len()));
+    }
+    for (position, line) in lines.iter().enumerate() {
+        let r: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        if r["success"] == true {
+            imported += 1;
+        } else {
+            failed.push(json!({ "position": position, "code": r["code"], "error": r["error"], "id": documents[position]["id"] }));
+        }
+    }
+    Ok(json!({ "imported": imported, "failed": failed }))
+}
+
+fn shaped(r: &Value) -> Value {
+    let docs: Vec<Value> = r["hits"].as_array().into_iter().flatten().map(|h| {
+        let mut o = Map::new();
+        for (k, v) in h["document"].as_object().into_iter().flatten() {
+            o.insert(k.clone(), v.clone());
+        }
+        if let Some(t) = h.get("text_match") {
+            o.insert("_text_match".into(), t.clone());
+        }
+        if let Some(t) = h.get("highlight") {
+            o.insert("_highlight".into(), t.clone());
+        }
+        Value::Object(o)
+    }).collect();
+    json!({ "found": r["found"], "page": r["page"], "out_of": r["out_of"], "search_time_ms": r["search_time_ms"], "hits": docs, "facets": r["facet_counts"] })
+}
+
+/// A search. `params` are Typesense's: `q` ("*" for all), `query_by`, `filter_by`, `sort_by`, `facet_by`, `per_page`, `page`; lists are joined with commas. Gives `{ found, page, out_of, hits, facets }`, each hit the document with `_text_match`.
+pub fn typesense_search(collection: &str, params: serde_json::Value) -> Result<Value, String> {
+    if params.get("q").is_none() {
+        return Err("a search needs `q` (\"*\" for everything)".into());
+    }
+    Ok(shaped(&call("GET", &format!("/collections/{}/documents/search?{}", enc(collection), query(&params)), None)?))
+}
+
+/// The same search with another key, a scoped one say, as a browser would make it.
+pub fn typesense_search_as(key: &str, collection: &str, params: serde_json::Value) -> Result<Value, String> {
+    Ok(shaped(&json_with(Some(key.to_string()), "GET", &format!("/collections/{}/documents/search?{}", enc(collection), query(&params)), None)?))
+}
+
+/// Every hit of a search, page after page, up to `max`: `{ found, hits, complete }`.
+pub fn typesense_search_all(collection: &str, params: serde_json::Value, max: i64) -> Result<Value, String> {
+    let per = params["per_page"].as_i64().unwrap_or(100).clamp(1, 250);
+    let mut p = params;
+    p["per_page"] = json!(per);
+    let (mut hits, mut page, mut found) = (vec![], 1, json!(0));
+    loop {
+        p["page"] = json!(page);
+        let r = typesense_search(collection, p.clone())?;
+        found = r["found"].clone();
+        let got = r["hits"].as_array().cloned().unwrap_or_default();
+        let n = got.len() as i64;
+        hits.extend(got);
+        if hits.len() as i64 >= max {
+            hits.truncate(max.max(0) as usize);
+            let complete = found.as_i64() == Some(hits.len() as i64);
+            return Ok(json!({ "found": found, "hits": hits, "complete": complete }));
+        }
+        if n < per || Some(hits.len() as i64) >= found.as_i64() {
+            return Ok(json!({ "found": found, "hits": hits, "complete": true }));
+        }
+        page += 1;
+    }
+}
+
+/// A value for `filter_by`: in backticks when it holds something the filter syntax would read as its own, like a comma, a parenthesis or an operator. Backticks in the value itself are refused.
+pub fn typesense_filter_value(value: &str) -> Result<String, String> {
+    if value.contains('`') {
+        return Err("a filter value cannot hold a backtick".into());
+    }
+    if !value.is_empty() && value.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Ok(value.to_string());
+    }
+    Ok(format!("`{}`", value))
+}
+
+/// A scoped search key, made here with no request: it carries `params` (like `{ filter_by: "shop_id:=7", expires_at: 1906000000 }`) which the server enforces and the browser cannot change. TYPESENSE_SEARCH_KEY is its parent, and must be a search-only key.
+pub fn typesense_scoped_key(params: serde_json::Value) -> Result<String, String> {
+    let parent = env("TYPESENSE_SEARCH_KEY").ok_or("TYPESENSE_SEARCH_KEY is not set: a scoped key is made from a search-only key")?;
+    if !params.is_object() {
+        return Err("a scoped key's parameters are a map, like { filter_by: \"shop_id:=7\" }".into());
+    }
+    if parent.len() < 4 {
+        return Err("TYPESENSE_SEARCH_KEY is too short to be a key".into());
+    }
+    let embedded = params.to_string();
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(parent.as_bytes()).expect("HMAC takes any key");
+    m.update(embedded.as_bytes());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let digest = b64.encode(m.finalize().into_bytes());
+    let prefix: String = parent.chars().take(4).collect();
+    Ok(b64.encode(format!("{}{}{}", digest, prefix, embedded)))
+}
+
+/// Makes an API key on the server: `{ description, actions, collections, expires_at }`. Gives it with its `value`, shown only this once.
+pub fn typesense_create_key(spec: serde_json::Value) -> Result<Value, String> {
+    call("POST", "/keys", Some(&spec))
+}

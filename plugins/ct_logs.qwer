@@ -1,0 +1,631 @@
+//! Certificate Transparency: the SCTs inside a certificate read and checked against a log's key, get-sth, get-entries, get-sth-consistency and get-proof-by-hash asked of a log, tree heads verified, and Merkle consistency and audit proofs computed as RFC 6962 and RFC 9162 define them.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha1 = { version = "0.10", features = ["oid"] }
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! rsa = "0.9"
+//! p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use rsa::pkcs8::DecodePublicKey;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const SCT_LIST: &str = "1.3.6.1.4.1.11129.2.4.2";
+
+// ---- DER, read and written by hand ----
+
+#[derive(Clone, Copy)]
+struct Tlv<'a> {
+    tag: u8,
+    body: &'a [u8],
+    raw: &'a [u8],
+}
+
+fn tlv_at(b: &[u8]) -> Result<(Tlv<'_>, &[u8]), String> {
+    if b.len() < 2 {
+        return Err("cut-off DER".into());
+    }
+    let (len, head) = if b[1] < 0x80 {
+        (b[1] as usize, 2)
+    } else {
+        let n = (b[1] & 0x7f) as usize;
+        if n == 0 || n > 4 || b.len() < 2 + n {
+            return Err("DER with a bad length".into());
+        }
+        (b[2..2 + n].iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
+    };
+    if b.len() < head + len {
+        return Err("cut-off DER".into());
+    }
+    Ok((Tlv { tag: b[0], body: &b[head..head + len], raw: &b[..head + len] }, &b[head + len..]))
+}
+
+fn items(b: &[u8]) -> Result<Vec<Tlv<'_>>, String> {
+    let mut out = vec![];
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (t, r) = tlv_at(rest)?;
+        out.push(t);
+        rest = r;
+    }
+    Ok(out)
+}
+
+impl<'a> Tlv<'a> {
+    fn kids(&self) -> Result<Vec<Tlv<'a>>, String> {
+        items(self.body)
+    }
+    fn oid(&self) -> String {
+        oid_text(self.body)
+    }
+}
+
+fn oid_text(b: &[u8]) -> String {
+    let mut out = vec![];
+    let mut n = 0u64;
+    for (i, x) in b.iter().enumerate() {
+        n = n << 7 | (*x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            if out.is_empty() {
+                let first = (n / 40).min(2);
+                out.push(first);
+                out.push(n - first * 40);
+            } else {
+                out.push(n);
+            }
+            n = 0;
+        }
+        let _ = i;
+    }
+    out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".")
+}
+
+fn mk(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u32).to_be_bytes();
+        let skip = b.iter().position(|x| *x != 0).unwrap_or(3);
+        out.push(0x80 | (4 - skip) as u8);
+        out.extend(&b[skip..]);
+    }
+    out.extend(body);
+    out
+}
+
+fn seq(parts: &[&[u8]]) -> Vec<u8> {
+    mk(0x30, &parts.concat())
+}
+
+fn mk_oid(s: &str) -> Vec<u8> {
+    let p: Vec<u64> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    let mut out = vec![(p[0] * 40 + p[1]) as u8];
+    for x in &p[2..] {
+        let mut b = vec![(*x & 0x7f) as u8];
+        let mut v = *x >> 7;
+        while v > 0 {
+            b.insert(0, (v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.extend(b);
+    }
+    mk(6, &out)
+}
+
+fn mk_int(n: u64) -> Vec<u8> {
+    let b = n.to_be_bytes();
+    let skip = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let mut v = b[skip..].to_vec();
+    if v[0] & 0x80 != 0 {
+        v.insert(0, 0);
+    }
+    mk(2, &v)
+}
+
+fn int_of(t: &Tlv) -> u64 {
+    t.body.iter().fold(0u64, |a, x| a << 8 | *x as u64)
+}
+
+fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
+    let (open, close) = (format!("-----BEGIN {}-----", label), format!("-----END {}-----", label));
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find(&open) {
+        let body = &rest[a + open.len()..];
+        let Some(b) = body.find(&close) else { break };
+        let clean: String = body[..b].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(d) = B64.decode(clean) {
+            out.push(d);
+        }
+        rest = &body[b + close.len()..];
+    }
+    out
+}
+
+fn pem_of(label: &str, der: &[u8]) -> String {
+    let b = B64.encode(der);
+    let lines: Vec<&str> = b.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN {}-----\n{}\n-----END {}-----\n", label, lines.join("\n"), label)
+}
+
+fn iso(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// UTCTime or GeneralizedTime as Unix seconds.
+fn time_of(t: &Tlv) -> Result<i64, String> {
+    let s = std::str::from_utf8(t.body).map_err(|_| "a time that is not text".to_string())?;
+    let s = s.trim_end_matches('Z');
+    let s = s.split('.').next().unwrap_or(s);
+    let full = if t.tag == 0x17 {
+        let yy: i64 = s.get(..2).and_then(|x| x.parse().ok()).ok_or("a bad time")?;
+        format!("{}{}", if yy >= 50 { 19 } else { 20 }, s)
+    } else {
+        s.to_string()
+    };
+    let n = |a: usize, b: usize| -> Result<i64, String> { full.get(a..b).and_then(|x| x.parse().ok()).ok_or(format!("the time `{}` cannot be read", s)) };
+    let (y, mo, d, h, mi, sec) = (n(0, 4)?, n(4, 6)?, n(6, 8)?, n(8, 10)?, n(10, 12)?, full.get(12..14).and_then(|x| x.parse().ok()).unwrap_or(0));
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    Ok((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+// ---- Certificates and signatures ----
+
+struct Cert {
+    der: Vec<u8>,
+    tbs: Vec<u8>,
+    issuer: Vec<u8>,
+    subject: Vec<u8>,
+    serial: Vec<u8>,
+    spki: Vec<u8>,
+    key_bits: Vec<u8>,
+    not_before: i64,
+    not_after: i64,
+    exts: Vec<(String, Vec<u8>)>,
+    sig_alg: String,
+    signature: Vec<u8>,
+}
+
+fn cert_of(der: &[u8]) -> Result<Cert, String> {
+    let (c, _) = tlv_at(der).map_err(|_| "that is not a certificate".to_string())?;
+    let top = c.kids().map_err(|_| "that is not a certificate".to_string())?;
+    if top.len() != 3 {
+        return Err("that is not a certificate".into());
+    }
+    let t = top[0].kids()?;
+    let s = usize::from(t.first().is_some_and(|x| x.tag == 0xa0));
+    let get = |i: usize| t.get(s + i).ok_or("a certificate cut short".to_string());
+    let validity = get(3)?.kids()?;
+    let spki = get(5)?;
+    let mut exts = vec![];
+    if let Some(e) = t.iter().find(|x| x.tag == 0xa3) {
+        for x in e.kids()?.first().ok_or("empty extensions")?.kids()? {
+            let k = x.kids()?;
+            exts.push((k[0].oid(), k.last().ok_or("an empty extension")?.body.to_vec()));
+        }
+    }
+    Ok(Cert {
+        der: c.raw.to_vec(), tbs: top[0].raw.to_vec(), issuer: get(2)?.raw.to_vec(), subject: get(4)?.raw.to_vec(), serial: get(0)?.body.to_vec(), spki: spki.raw.to_vec(),
+        key_bits: spki.kids()?.get(1).ok_or("no public key")?.body.get(1..).unwrap_or(&[]).to_vec(),
+        not_before: time_of(&validity[0])?, not_after: time_of(&validity[1])?, exts,
+        sig_alg: top[1].kids()?.first().ok_or("no signature algorithm")?.oid(), signature: top[2].body.get(1..).unwrap_or(&[]).to_vec(),
+    })
+}
+
+fn pem_cert(text: &str, what: &str) -> Result<Cert, String> {
+    let der = pem_blocks(text, "CERTIFICATE").into_iter().next().ok_or(format!("{} is not a PEM certificate", what))?;
+    cert_of(&der)
+}
+
+/// Whether `sig` is a good signature over `msg`. `alg` is an X.509 signature algorithm's OID.
+fn verify_sig(spki: &[u8], alg: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    use rsa::signature::Verifier;
+    macro_rules! with_rsa {
+        ($h:ty) => {{
+            let key = rsa::RsaPublicKey::from_public_key_der(spki).map_err(|_| "the key is not RSA".to_string())?;
+            let s = rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(rsa::pkcs1v15::VerifyingKey::<$h>::new(key).verify(msg, &s).is_ok())
+        }};
+    }
+    match alg {
+        "1.2.840.113549.1.1.5" => with_rsa!(sha1::Sha1),
+        "1.2.840.113549.1.1.11" => with_rsa!(Sha256),
+        "1.2.840.113549.1.1.12" => with_rsa!(sha2::Sha384),
+        "1.2.840.113549.1.1.13" => with_rsa!(sha2::Sha512),
+        "1.2.840.10045.4.3.2" => {
+            let key = p256::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-256".to_string())?;
+            let s = p256::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        "1.2.840.10045.4.3.3" => {
+            let key = p384::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-384".to_string())?;
+            let s = p384::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        other => Err(format!("the signature algorithm {} is not one this checks", other)),
+    }
+}
+
+fn b64(text: &str, what: &str) -> Result<Vec<u8>, String> {
+    B64.decode(text.trim()).map_err(|_| format!("{} is not base64", what))
+}
+
+/// A log's key: base64 of its SPKI, as the log lists publish it, or PEM.
+fn log_key(text: &str) -> Result<Vec<u8>, String> {
+    pem_blocks(text, "PUBLIC KEY").into_iter().next().map_or_else(|| b64(text, "the log key"), Ok)
+}
+
+fn sig_alg_oid(hash: u8, sig: u8) -> Result<&'static str, String> {
+    match (hash, sig) {
+        (4, 3) => Ok("1.2.840.10045.4.3.2"),
+        (5, 3) => Ok("1.2.840.10045.4.3.3"),
+        (4, 1) => Ok("1.2.840.113549.1.1.11"),
+        (5, 1) => Ok("1.2.840.113549.1.1.12"),
+        (6, 1) => Ok("1.2.840.113549.1.1.13"),
+        _ => Err(format!("hash {} with signature {} is not a pair CT logs use", hash, sig)),
+    }
+}
+
+/// A TLS DigitallySigned: hash, signature, then two bytes of length.
+fn verify_tls(key: &[u8], signed: &[u8], ds: &[u8]) -> Result<bool, String> {
+    if ds.len() < 4 {
+        return Err("a cut-off signature".into());
+    }
+    let alg = sig_alg_oid(ds[0], ds[1])?;
+    let n = u16::from_be_bytes([ds[2], ds[3]]) as usize;
+    let sig = ds.get(4..4 + n).ok_or("a cut-off signature")?;
+    verify_sig(key, alg, signed, sig)
+}
+
+fn sct_list(c: &Cert) -> Result<Vec<Vec<u8>>, String> {
+    let Some((_, v)) = c.exts.iter().find(|(o, _)| o == SCT_LIST) else { return Ok(vec![]) };
+    // The extension's value is an OCTET STRING around the TLS list.
+    let inner = tlv_at(v).ok().filter(|(t, _)| t.tag == 4).map_or(&v[..], |(t, _)| t.body);
+    let n = u16::from_be_bytes([*inner.first().ok_or("an empty SCT list")?, *inner.get(1).ok_or("an empty SCT list")?]) as usize;
+    let mut rest = inner.get(2..2 + n).ok_or("a cut-off SCT list")?;
+    let mut out = vec![];
+    while !rest.is_empty() {
+        let m = u16::from_be_bytes([rest[0], *rest.get(1).ok_or("a cut-off SCT")?]) as usize;
+        out.push(rest.get(2..2 + m).ok_or("a cut-off SCT")?.to_vec());
+        rest = &rest[2 + m..];
+    }
+    Ok(out)
+}
+
+struct Sct {
+    version: u8,
+    log_id: Vec<u8>,
+    timestamp: u64,
+    extensions: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+fn parse_sct(b: &[u8]) -> Result<Sct, String> {
+    if b.len() < 43 {
+        return Err("a cut-off SCT".into());
+    }
+    let n = u16::from_be_bytes([b[41], b[42]]) as usize;
+    let ext = b.get(43..43 + n).ok_or("a cut-off SCT")?;
+    Ok(Sct { version: b[0], log_id: b[1..33].to_vec(), timestamp: u64::from_be_bytes(b[33..41].try_into().unwrap_or_default()), extensions: ext.to_vec(), signature: b[43 + n..].to_vec() })
+}
+
+/// The TBSCertificate with the SCT extension out, as it was when the log saw the precertificate: lengths written again, and the extensions field gone if nothing is left in it.
+fn precert_tbs(c: &Cert) -> Result<Vec<u8>, String> {
+    let (tbs, _) = tlv_at(&c.tbs)?;
+    let mut body = vec![];
+    for f in tbs.kids()? {
+        if f.tag != 0xa3 {
+            body.extend(f.raw);
+            continue;
+        }
+        let list = f.kids()?;
+        let kept: Vec<&[u8]> = list.first().ok_or("empty extensions")?.kids()?.iter().filter(|e| e.kids().ok().and_then(|k| k.first().map(|o| o.oid())).as_deref() != Some(SCT_LIST)).map(|e| e.raw).collect();
+        if !kept.is_empty() {
+            body.extend(mk(0xa3, &mk(0x30, &kept.concat())));
+        }
+    }
+    Ok(mk(0x30, &body))
+}
+
+/// The SCTs embedded in a certificate: [{ version, log_id (base64), timestamp (ms), time, signature_hash, signature_type, extensions }].
+pub fn ct_scts(cert: &str) -> Result<Vec<serde_json::Value>, String> {
+    let c = pem_cert(cert, "the certificate")?;
+    sct_list(&c)?.iter().map(|b| {
+        let s = parse_sct(b)?;
+        Ok(json!({ "version": s.version + 1, "log_id": B64.encode(&s.log_id), "timestamp": s.timestamp, "time": iso((s.timestamp / 1000) as i64), "signature_hash": s.signature.first(), "signature_type": s.signature.get(1), "extensions": hex::encode(&s.extensions) }))
+    }).collect()
+}
+
+/// A log's id: the SHA-256 of its key, base64, to find it in a log list.
+pub fn ct_log_id(key: &str) -> Result<String, String> {
+    Ok(B64.encode(Sha256::digest(log_key(key)?)))
+}
+
+fn check_one(s: &Sct, c: &Cert, issuer: &Cert, key: &[u8]) -> Result<bool, String> {
+    let tbs = precert_tbs(c)?;
+    let mut m = vec![0u8, 0];
+    m.extend(s.timestamp.to_be_bytes());
+    m.extend([0, 1]);
+    m.extend(Sha256::digest(&issuer.spki));
+    m.extend(&(tbs.len() as u32).to_be_bytes()[1..]);
+    m.extend(&tbs);
+    m.extend((s.extensions.len() as u16).to_be_bytes());
+    m.extend(&s.extensions);
+    verify_tls(key, &m, &s.signature)
+}
+
+/// Checks a certificate's embedded SCTs against known logs: `logs` is a list of { key (base64 SPKI), name }. Gives { valid, unknown, invalid, logs, future }: `valid` counts SCTs that verify, `unknown` those from logs not given, `invalid` those whose signature fails, and `logs` names the valid ones. An SCT dated after now counts as invalid, as Chrome has it.
+pub fn ct_verify_scts(cert: &str, issuer: &str, logs: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (c, i) = (pem_cert(cert, "the certificate")?, pem_cert(issuer, "the issuer")?);
+    let list = logs.as_array().ok_or("logs is a list of { key, name }")?;
+    let mut known = vec![];
+    for l in list {
+        let k = log_key(l["key"].as_str().ok_or("a log needs `key`")?)?;
+        known.push((Sha256::digest(&k).to_vec(), k, l.get("name").cloned().unwrap_or(Value::Null)));
+    }
+    let (mut valid, mut unknown, mut invalid) = (0, 0, 0);
+    let mut names = vec![];
+    for b in sct_list(&c)? {
+        let s = parse_sct(&b)?;
+        if s.version != 0 {
+            unknown += 1;
+            continue;
+        }
+        let Some((_, key, name)) = known.iter().find(|(id, _, _)| *id == s.log_id) else {
+            unknown += 1;
+            continue;
+        };
+        if check_one(&s, &c, &i, key)? && (s.timestamp / 1000) as i64 <= now() {
+            valid += 1;
+            names.push(name.clone());
+        } else {
+            invalid += 1;
+        }
+    }
+    Ok(json!({ "valid": valid, "unknown": unknown, "invalid": invalid, "logs": names }))
+}
+
+// ---- Merkle trees ----
+
+fn node(l: &[u8], r: &[u8]) -> Vec<u8> {
+    Sha256::new().chain_update([1u8]).chain_update(l).chain_update(r).finalize().to_vec()
+}
+
+fn h32(v: &Value, what: &str) -> Result<Vec<u8>, String> {
+    let b = b64(v.as_str().ok_or(format!("{} is not text", what))?, what)?;
+    if b.len() != 32 {
+        return Err(format!("{} is {} bytes, not 32", what, b.len()));
+    }
+    Ok(b)
+}
+
+/// A leaf's hash from its `leaf_input` (base64), as the proofs ask for it: base64.
+pub fn ct_leaf_hash(leaf_input: &str) -> Result<String, String> {
+    let b = b64(leaf_input, "the leaf")?;
+    Ok(B64.encode(Sha256::new().chain_update([0u8]).chain_update(&b).finalize()))
+}
+
+/// Checks an audit (inclusion) proof by RFC 9162 section 2.1.3.2: does the leaf at `index` in a tree of `size` lead to `root`? All base64. True or false; a proof of a shape that cannot be is false.
+pub fn ct_verify_audit(leaf_hash: &str, index: i64, size: i64, proof: serde_json::Value, root: &str) -> Result<bool, String> {
+    let list = proof.as_array().ok_or("the proof is a list")?;
+    if index < 0 || index >= size {
+        return Ok(false);
+    }
+    let (mut f, mut l) = (index as u64, (size - 1) as u64);
+    let mut r = h32(&json!(leaf_hash), "the leaf hash")?;
+    for p in list {
+        if l == 0 {
+            return Ok(false);
+        }
+        let c = h32(p, "a proof node")?;
+        if f & 1 == 1 || f == l {
+            r = node(&c, &r);
+            if f & 1 == 0 {
+                while f & 1 == 0 && f != 0 {
+                    f >>= 1;
+                    l >>= 1;
+                }
+            }
+        } else {
+            r = node(&r, &c);
+        }
+        f >>= 1;
+        l >>= 1;
+    }
+    Ok(l == 0 && r == h32(&json!(root), "the root")?)
+}
+
+/// Checks a consistency proof by RFC 9162 section 2.1.4.2: is the tree of `first` size and `first_root` a prefix of the tree of `second` size and `second_root`? So a log has not rewritten history.
+pub fn ct_verify_consistency(first: i64, second: i64, first_root: &str, second_root: &str, proof: serde_json::Value) -> Result<bool, String> {
+    let list = proof.as_array().ok_or("the proof is a list")?;
+    let (r1, r2) = (h32(&json!(first_root), "the first root")?, h32(&json!(second_root), "the second root")?);
+    if first < 0 || first > second {
+        return Ok(false);
+    }
+    if first == second {
+        return Ok(list.is_empty() && r1 == r2);
+    }
+    if first == 0 {
+        return Ok(list.is_empty());
+    }
+    if list.is_empty() {
+        return Ok(false);
+    }
+    let mut nodes = list.iter().map(|p| h32(p, "a proof node")).collect::<Result<Vec<_>, _>>()?;
+    // A power of two has its root as a node of the larger tree, unstated.
+    if (first as u64).is_power_of_two() {
+        nodes.insert(0, r1.clone());
+    }
+    let (mut f, mut s) = ((first - 1) as u64, (second - 1) as u64);
+    while f & 1 == 1 {
+        f >>= 1;
+        s >>= 1;
+    }
+    let (mut fr, mut sr) = (nodes[0].clone(), nodes[0].clone());
+    for c in &nodes[1..] {
+        if s == 0 {
+            return Ok(false);
+        }
+        if f & 1 == 1 || f == s {
+            fr = node(c, &fr);
+            sr = node(c, &sr);
+            if f & 1 == 0 {
+                while f & 1 == 0 && f != 0 {
+                    f >>= 1;
+                    s >>= 1;
+                }
+            }
+        } else {
+            sr = node(&sr, c);
+        }
+        f >>= 1;
+        s >>= 1;
+    }
+    Ok(s == 0 && fr == r1 && sr == r2)
+}
+
+// ---- A log's API ----
+
+fn get(log: &str, path: &str, query: &str) -> Result<Value, String> {
+    let url = format!("{}/ct/v1/{}{}", log.trim_end_matches('/'), path, query);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match agent.get(&url).call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|e| format!("the log: not JSON: {}", e));
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let wait = r.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = r.into_string().unwrap_or_default();
+                if (c == 429 || c == 503) && tries < 4 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1).min(20)));
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                return Err(format!("the log answered {}: {}", c, v["error_message"].as_str().map(str::to_string).unwrap_or_else(|| t.chars().take(160).collect())));
+            }
+            Err(e) => return Err(format!("cannot reach the log at {}: {}", log, e)),
+        }
+    }
+}
+
+/// A log's newest tree head, its signature checked when `key` is given (base64 SPKI; "" takes it unchecked): { tree_size, timestamp, time, sha256_root_hash, verified }.
+pub fn ct_get_sth(log: &str, key: &str) -> Result<serde_json::Value, String> {
+    let v = get(log, "get-sth", "")?;
+    let size = v["tree_size"].as_u64().ok_or("no tree_size in the answer")?;
+    let ts = v["timestamp"].as_u64().ok_or("no timestamp in the answer")?;
+    let root = h32(&v["sha256_root_hash"], "the root")?;
+    let mut verified = false;
+    if !key.is_empty() {
+        let ds = b64(v["tree_head_signature"].as_str().ok_or("no tree_head_signature")?, "the signature")?;
+        let mut m = vec![0u8, 1];
+        m.extend(ts.to_be_bytes());
+        m.extend(size.to_be_bytes());
+        m.extend(&root);
+        if !verify_tls(&log_key(key)?, &m, &ds)? {
+            return Err("the tree head's signature does not match this log's key".into());
+        }
+        verified = true;
+    }
+    Ok(json!({ "tree_size": size, "timestamp": ts, "time": iso((ts / 1000) as i64), "sha256_root_hash": B64.encode(&root), "verified": verified }))
+}
+
+fn u24(b: &[u8], at: usize) -> Option<usize> {
+    let s = b.get(at..at + 3)?;
+    Some((s[0] as usize) << 16 | (s[1] as usize) << 8 | s[2] as usize)
+}
+
+/// A MerkleTreeLeaf read out: { version, timestamp, time, entry_type, certificate (PEM, for a final certificate) or issuer_key_hash and tbs_size (a precertificate), leaf_hash }.
+pub fn ct_read_leaf(leaf_input: &str) -> Result<serde_json::Value, String> {
+    let b = b64(leaf_input, "the leaf")?;
+    if b.len() < 12 || b[1] != 0 {
+        return Err("this is not a timestamped entry".into());
+    }
+    let ts = u64::from_be_bytes(b[2..10].try_into().unwrap_or_default());
+    let kind = u16::from_be_bytes([b[10], b[11]]);
+    let mut out = json!({ "version": b[0] + 1, "timestamp": ts, "time": iso((ts / 1000) as i64), "leaf_hash": ct_leaf_hash(leaf_input)? });
+    match kind {
+        0 => {
+            let n = u24(&b, 12).ok_or("a cut-off entry")?;
+            let der = b.get(15..15 + n).ok_or("a cut-off entry")?;
+            out["entry_type"] = json!("x509");
+            out["certificate"] = json!(pem_of("CERTIFICATE", der));
+        }
+        1 => {
+            let hash = b.get(12..44).ok_or("a cut-off entry")?;
+            out["entry_type"] = json!("precert");
+            out["issuer_key_hash"] = json!(B64.encode(hash));
+            out["tbs_size"] = json!(u24(&b, 44).ok_or("a cut-off entry")?);
+        }
+        k => return Err(format!("entry type {} is unknown", k)),
+    }
+    Ok(out)
+}
+
+/// Entries `start` to `end`, inclusive, read out as `ct_read_leaf` does. Logs give fewer than asked, so this asks again until all have come.
+pub fn ct_get_entries(log: &str, start: i64, end: i64) -> Result<Vec<serde_json::Value>, String> {
+    if start < 0 || end < start {
+        return Err("start must be 0 or more, and end at least start".into());
+    }
+    let mut out = vec![];
+    let mut at = start;
+    while at <= end {
+        let v = get(log, "get-entries", &format!("?start={}&end={}", at, end))?;
+        let list = v["entries"].as_array().cloned().unwrap_or_default();
+        if list.is_empty() {
+            return Err(format!("the log gave no entries from {}", at));
+        }
+        for e in &list {
+            let mut leaf = ct_read_leaf(e["leaf_input"].as_str().ok_or("an entry with no leaf_input")?)?;
+            leaf["index"] = json!(at);
+            leaf["extra_data_size"] = json!(e["extra_data"].as_str().map_or(0, |x| x.len() / 4 * 3));
+            out.push(leaf);
+            at += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Asks a log to prove a leaf is in the tree of `size`, and checks the proof against `root`: { index, verified }. `leaf_hash` is base64. A leaf the log does not know is an error value.
+pub fn ct_audit(log: &str, leaf_hash: &str, size: i64, root: &str) -> Result<serde_json::Value, String> {
+    let q = format!("?hash={}&tree_size={}", leaf_hash.trim().replace('+', "%2B").replace('/', "%2F").replace('=', "%3D"), size);
+    let v = get(log, "get-proof-by-hash", &q)?;
+    let index = v["leaf_index"].as_i64().ok_or("no leaf_index in the answer")?;
+    let verified = ct_verify_audit(leaf_hash, index, size, v["audit_path"].clone(), root)?;
+    Ok(json!({ "index": index, "verified": verified, "path_length": v["audit_path"].as_array().map_or(0, |a| a.len()) }))
+}
+
+/// Asks a log to prove the tree at `first` size is a prefix of the one at `second`, and checks the proof against both roots: true, or false when the log has rewritten history.
+pub fn ct_consistency(log: &str, first: i64, second: i64, first_root: &str, second_root: &str) -> Result<bool, String> {
+    let v = get(log, "get-sth-consistency", &format!("?first={}&second={}", first, second))?;
+    ct_verify_consistency(first, second, first_root, second_root, v["consistency"].clone())
+}

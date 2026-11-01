@@ -1,0 +1,389 @@
+//! GitHub's REST API: issues, comments, pull requests and check runs, every list followed by its Link header, rate limits waited out or named, webhook signatures checked, and a GitHub App's JWT and installation tokens made here.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! hex = "0.4"
+//! base64 = "0.22"
+//! rsa = "0.9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs1v15::SigningKey;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::signature::{SignatureEncoding, Signer};
+use rsa::RsaPrivateKey;
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct Conf {
+    base: String,
+    token: Option<String>,
+    max_wait: u64,
+}
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn conf(o: &Value) -> Conf {
+    Conf {
+        base: opt(o, "base_url", "GITHUB_API_URL").unwrap_or_else(|| "https://api.github.com".into()).trim_end_matches('/').to_string(),
+        token: opt(o, "token", "GITHUB_TOKEN"),
+        max_wait: o.get("max_wait_s").and_then(|v| v.as_u64()).unwrap_or(60),
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn repo_ok(repo: &str) -> Result<&str, String> {
+    let ok = repo.split_once('/').map(|(a, b)| !a.is_empty() && !b.is_empty() && !b.contains('/')).unwrap_or(false);
+    if ok { Ok(repo) } else { Err(format!("{:?} is not owner/name", repo)) }
+}
+
+// `Link: <url>; rel="next", <url>; rel="last"`
+fn link(header: &str, rel: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        if params.split(';').any(|p| p.trim() == format!("rel=\"{}\"", rel)) { Some(url.trim().trim_matches(['<', '>']).to_string()) } else { None }
+    })
+}
+
+fn error_text(code: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let msg = v["message"].as_str().map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    // A 422 lists what was wrong, as { resource, field, code } or a text.
+    let details: Vec<String> = v["errors"].as_array().map(|l| l.iter().map(|e| match e {
+        Value::String(s) => s.clone(),
+        o => match (o["resource"].as_str(), o["field"].as_str(), o["code"].as_str(), o["message"].as_str()) {
+            (_, _, _, Some(m)) => m.to_string(),
+            (r, f, c, _) => format!("{} {} {}", r.unwrap_or(""), f.unwrap_or(""), c.unwrap_or("")).trim().to_string(),
+        },
+    }).collect()).unwrap_or_default();
+    let hint = match code {
+        401 => " (check GITHUB_TOKEN)",
+        404 => " (or this token may not see it: private things answer 404)",
+        _ => "",
+    };
+    let more = if details.is_empty() { String::new() } else { format!(": {}", details.join("; ")) };
+    format!("GitHub {}: {}{}{}", code, msg, more, hint)
+}
+
+struct Answer {
+    status: u16,
+    body: Value,
+    next: Option<String>,
+    rate: Value,
+}
+
+fn call(c: &Conf, method: &str, target: &str, body: Option<&Value>) -> Result<Answer, String> {
+    let url = if target.starts_with("http") {
+        if !target.starts_with(&format!("{}/", c.base)) {
+            return Err(format!("{} is not on {}", target, c.base));
+        }
+        target.to_string()
+    } else {
+        format!("{}{}", c.base, target)
+    };
+    let text = body.map(|b| b.to_string());
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let mut r = agent.request(method, &url).set("Accept", "application/vnd.github+json").set("X-GitHub-Api-Version", "2022-11-28").set("User-Agent", "quillo-github/1.0");
+        if let Some(t) = &c.token {
+            r = r.set("Authorization", &format!("Bearer {}", t));
+        }
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let status = resp.status();
+                let next = resp.header("link").and_then(|h| link(h, "next"));
+                let rate = json!({
+                    "limit": resp.header("x-ratelimit-limit").and_then(|h| h.parse::<i64>().ok()),
+                    "remaining": resp.header("x-ratelimit-remaining").and_then(|h| h.parse::<i64>().ok()),
+                    "reset": resp.header("x-ratelimit-reset").and_then(|h| h.parse::<i64>().ok()),
+                    "resource": resp.header("x-ratelimit-resource"),
+                });
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                let body = if t.trim().is_empty() { Value::Null } else { serde_json::from_str(&t).unwrap_or(json!(t)) };
+                return Ok(Answer { status, body, next, rate });
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let after = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let spent = resp.header("x-ratelimit-remaining") == Some("0");
+                let reset = resp.header("x-ratelimit-reset").and_then(|h| h.parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                // A secondary limit gives retry-after; a spent primary one, the time it comes back.
+                let wait = match (code, after, spent, reset) {
+                    (403 | 429, Some(a), _, _) => Some(a),
+                    (403 | 429, None, true, Some(r)) => Some(r.saturating_sub(now())),
+                    (500 | 502 | 503 | 504, _, _, _) if method == "GET" => Some(1),
+                    _ => None,
+                };
+                match wait {
+                    Some(w) if w <= c.max_wait && tries < 2 => {
+                        std::thread::sleep(Duration::from_secs(w));
+                        tries += 1;
+                    }
+                    Some(w) if code == 403 || code == 429 => return Err(format!("{} (rate limited: comes back in {} s)", error_text(code, &t), w)),
+                    _ => return Err(error_text(code, &t)),
+                }
+            }
+            Err(e) => return Err(format!("cannot reach {}: {}", c.base, e)),
+        }
+    }
+}
+
+/// Calls any endpoint: `method`, `path` like /repos/o/r/issues (with its query), `body` or null. Options: token (else GITHUB_TOKEN), base_url (else GITHUB_API_URL, for GitHub Enterprise), max_wait_s (60, the longest a rate limit is waited out). Gives { status, body, next, rate: { limit, remaining, reset, resource } }.
+pub fn github_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = if body.is_null() { None } else { Some(&body) };
+    let a = call(&conf(&options), &method.to_uppercase(), path, b)?;
+    Ok(json!({ "status": a.status, "body": a.body, "next": a.next, "rate": a.rate }))
+}
+
+/// Every item of a list, following the Link header at 100 a page. Options add max_items.
+pub fn github_all(path: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let c = conf(&options);
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut target = format!("{}{}per_page=100", path, if path.contains('?') { "&" } else { "?" });
+    let mut out = vec![];
+    loop {
+        let a = call(&c, "GET", &target, None)?;
+        // Some lists are wrapped: { total_count, check_runs: [...] }.
+        let items = match a.body {
+            Value::Array(l) => l,
+            Value::Object(m) => m.into_iter().find_map(|(_, v)| if let Value::Array(l) = v { Some(l) } else { None }).unwrap_or_default(),
+            _ => vec![],
+        };
+        out.extend(items);
+        match a.next {
+            Some(n) if out.len() < max => target = n,
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// What is left of the token's rate limits: { core, search, graphql, ... }, each { limit, remaining, reset, used }.
+pub fn github_rate_limit(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", "/rate_limit", None)?.body["resources"].clone())
+}
+
+fn query(o: &Value, keys: &[&str]) -> String {
+    let mut q = vec![];
+    for k in keys {
+        match o.get(*k) {
+            Some(Value::String(s)) if !s.is_empty() => q.push(format!("{}={}", k, enc(s))),
+            Some(Value::Number(n)) => q.push(format!("{}={}", k, n)),
+            _ => {}
+        }
+    }
+    if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
+}
+
+/// Opens an issue: `params` holds title (needed), body, labels, assignees, milestone. Gives the issue.
+pub fn github_issue_create(repo: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "POST", &format!("/repos/{}/issues", repo_ok(repo)?), Some(&params))?.body)
+}
+
+/// One issue by number.
+pub fn github_issue(repo: &str, number: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", &format!("/repos/{}/issues/{}", repo_ok(repo)?, number), None)?.body)
+}
+
+/// Changes an issue: title, body, state ("open", "closed"), state_reason, labels, assignees.
+pub fn github_issue_update(repo: &str, number: i64, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "PATCH", &format!("/repos/{}/issues/{}", repo_ok(repo)?, number), Some(&params))?.body)
+}
+
+/// A repository's issues, all pages, without the pull requests that endpoint also gives. Options: state, labels, assignee, since, sort, direction, max_items.
+pub fn github_issues(repo: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/repos/{}/issues{}", repo_ok(repo)?, query(&options, &["state", "labels", "assignee", "since", "sort", "direction"]));
+    Ok(github_all(&path, options)?.into_iter().filter(|i| i.get("pull_request").is_none()).collect())
+}
+
+/// Comments on an issue or pull request. Gives the comment.
+pub fn github_comment(repo: &str, number: i64, body: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if body.trim().is_empty() {
+        return Err("a comment needs a body".into());
+    }
+    Ok(call(&conf(&options), "POST", &format!("/repos/{}/issues/{}/comments", repo_ok(repo)?, number), Some(&json!({ "body": body })))?.body)
+}
+
+/// Every comment on an issue or pull request.
+pub fn github_comments(repo: &str, number: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    github_all(&format!("/repos/{}/issues/{}/comments", repo_ok(repo)?, number), options)
+}
+
+/// Opens a pull request: `params` holds title, head (the branch, or owner:branch from a fork), base, body, draft.
+pub fn github_pr_create(repo: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["title", "head", "base"] {
+        if params.get(k).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+            return Err(format!("a pull request needs `{}`", k));
+        }
+    }
+    Ok(call(&conf(&options), "POST", &format!("/repos/{}/pulls", repo_ok(repo)?), Some(&params))?.body)
+}
+
+/// One pull request by number. `mergeable` may be null while GitHub works it out; ask again in a moment.
+pub fn github_pr(repo: &str, number: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&conf(&options), "GET", &format!("/repos/{}/pulls/{}", repo_ok(repo)?, number), None)?.body)
+}
+
+/// A repository's pull requests, all pages. Options: state, head, base, sort, direction, max_items.
+pub fn github_prs(repo: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/repos/{}/pulls{}", repo_ok(repo)?, query(&options, &["state", "head", "base", "sort", "direction"]));
+    github_all(&path, options)
+}
+
+/// The files a pull request changes: { filename, status, additions, deletions, patch }.
+pub fn github_pr_files(repo: &str, number: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    github_all(&format!("/repos/{}/pulls/{}/files", repo_ok(repo)?, number), options)
+}
+
+/// Merges a pull request: `params` holds merge_method (merge, squash, rebase), commit_title, commit_message, sha (refuse unless the head is this). GitHub answers 405 when it cannot be merged, 409 when the sha moved.
+pub fn github_pr_merge(repo: &str, number: i64, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let p = if params.is_null() { json!({}) } else { params };
+    Ok(call(&conf(&options), "PUT", &format!("/repos/{}/pulls/{}/merge", repo_ok(repo)?, number), Some(&p))?.body)
+}
+
+/// Creates a check run on a commit (a GitHub App's token is needed): `params` holds name, head_sha, status (queued, in_progress, completed), conclusion (when completed: success, failure, neutral...), output ({ title, summary, text, annotations }), details_url, external_id.
+pub fn github_check_create(repo: &str, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["name", "head_sha"] {
+        if params.get(k).and_then(|v| v.as_str()).is_none() {
+            return Err(format!("a check run needs `{}`", k));
+        }
+    }
+    if params["status"] == "completed" && params.get("conclusion").is_none() {
+        return Err("a completed check run needs a `conclusion`".into());
+    }
+    Ok(call(&conf(&options), "POST", &format!("/repos/{}/check-runs", repo_ok(repo)?), Some(&params))?.body)
+}
+
+/// Updates a check run by id, usually to finish it. At most 50 annotations go in one request; this sends the rest in further requests.
+pub fn github_check_update(repo: &str, id: i64, params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options);
+    let path = format!("/repos/{}/check-runs/{}", repo_ok(repo)?, id);
+    let notes = params.pointer("/output/annotations").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    if notes.len() <= 50 {
+        return Ok(call(&c, "PATCH", &path, Some(&params))?.body);
+    }
+    let mut last = Value::Null;
+    for chunk in notes.chunks(50) {
+        let mut p = params.clone();
+        p["output"]["annotations"] = json!(chunk);
+        last = call(&c, "PATCH", &path, Some(&p))?.body;
+    }
+    Ok(last)
+}
+
+/// The check runs on a commit (a sha, branch or tag), all pages.
+pub fn github_check_runs(repo: &str, git_ref: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    github_all(&format!("/repos/{}/commits/{}/check-runs", repo_ok(repo)?, enc(git_ref)), options)
+}
+
+fn hmac_hex(secret: &str, body: &str) -> String {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+/// Whether a webhook is really GitHub's: the raw `body`, its X-Hub-Signature-256 header (`sha256=...`) and the hook's `secret`, compared in constant time.
+pub fn github_signature_ok(body: &str, header: &str, secret: &str) -> bool {
+    let want = format!("sha256={}", hmac_hex(secret, body));
+    !secret.is_empty() && want.len() == header.len() && want.bytes().zip(header.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A webhook checked and read: `headers` are the request's. Gives { event, delivery, action, repository, sender, payload }, or an error when the signature is wrong or missing.
+pub fn github_webhook(headers: std::collections::HashMap<String, serde_json::Value>, body: &str, secret: &str) -> Result<serde_json::Value, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.as_str()).map(str::to_string);
+    let sig = h("x-hub-signature-256").ok_or("no X-Hub-Signature-256 header: give the hook a secret")?;
+    if !github_signature_ok(body, &sig, secret) {
+        return Err("the webhook's signature does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    let p: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "event": h("x-github-event"), "delivery": h("x-github-delivery"), "action": p.get("action").cloned().unwrap_or(Value::Null), "repository": p.pointer("/repository/full_name").cloned().unwrap_or(Value::Null), "sender": p.pointer("/sender/login").cloned().unwrap_or(Value::Null), "payload": p }))
+}
+
+fn private_key(pem: &str) -> Result<RsaPrivateKey, String> {
+    // A key kept in an env var often has its line breaks written as \n.
+    let pem = pem.replace("\\n", "\n");
+    let t = pem.trim();
+    if t.contains("BEGIN RSA PRIVATE KEY") {
+        RsaPrivateKey::from_pkcs1_pem(t).map_err(|e| format!("the private key does not parse: {}", e))
+    } else if t.contains("BEGIN PRIVATE KEY") {
+        RsaPrivateKey::from_pkcs8_pem(t).map_err(|e| format!("the private key does not parse: {}", e))
+    } else {
+        Err("the private key is not a PEM: it is the .pem GitHub gave for the App".into())
+    }
+}
+
+fn app_jwt(app_id: &str, key: &RsaPrivateKey, at: u64) -> String {
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // Issued a minute ago against clock drift; GitHub takes ten minutes at most.
+    let claims = json!({ "iat": at - 60, "exp": at + 540, "iss": app_id });
+    let unsigned = format!("{}.{}", b64.encode(json!({ "alg": "RS256", "typ": "JWT" }).to_string()), b64.encode(claims.to_string()));
+    let sig = SigningKey::<Sha256>::new(key.clone()).sign(unsigned.as_bytes());
+    format!("{}.{}", unsigned, b64.encode(sig.to_bytes()))
+}
+
+/// A GitHub App's JSON Web Token, signed RS256 with its private key (a PEM, PKCS#1 or PKCS#8; "" for GITHUB_APP_PRIVATE_KEY), `app_id` "" for GITHUB_APP_ID. Good for nine minutes.
+pub fn github_app_jwt(app_id: &str, pem: &str) -> Result<String, String> {
+    let id = if app_id.is_empty() { std::env::var("GITHUB_APP_ID").map_err(|_| "no app id: set GITHUB_APP_ID".to_string())? } else { app_id.to_string() };
+    let p = if pem.is_empty() { std::env::var("GITHUB_APP_PRIVATE_KEY").map_err(|_| "no private key: set GITHUB_APP_PRIVATE_KEY".to_string())? } else { pem.to_string() };
+    Ok(app_jwt(&id, &private_key(&p)?, now()))
+}
+
+fn cache() -> &'static Mutex<HashMap<i64, (String, u64)>> {
+    static C: OnceLock<Mutex<HashMap<i64, (String, u64)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// `2026-11-01T11:00:00Z` as seconds since 1970.
+fn parse_time(t: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| t.get(r)?.parse::<i64>().ok();
+    let (y, m, d, h, min, s) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let (y2, m2) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let days = 365 * y2 + y2 / 4 - y2 / 100 + y2 / 400 + (153 * (m2 - 3) + 2) / 5 + d - 719469;
+    Some((days * 86400 + h * 3600 + min * 60 + s) as u64)
+}
+
+/// An installation's token, for acting as the App in an organisation: made with github_app_jwt and kept until five minutes before its hour is up. Pass it as the option `token`. Options: app_id, private_key, repositories, permissions (narrower than the App's), base_url.
+pub fn github_installation_token(installation_id: i64, options: serde_json::Value) -> Result<String, String> {
+    if let Some((t, until)) = cache().lock().map_err(|e| e.to_string())?.get(&installation_id) {
+        if now() + 300 < *until {
+            return Ok(t.clone());
+        }
+    }
+    let jwt = github_app_jwt(options.get("app_id").and_then(|v| v.as_str()).unwrap_or(""), options.get("private_key").and_then(|v| v.as_str()).unwrap_or(""))?;
+    let mut c = conf(&options);
+    c.token = Some(jwt);
+    let mut body = json!({});
+    for k in ["repositories", "permissions"] {
+        if let Some(v) = options.get(k) {
+            body[k] = v.clone();
+        }
+    }
+    let r = call(&c, "POST", &format!("/app/installations/{}/access_tokens", installation_id), Some(&body))?.body;
+    let t = r["token"].as_str().ok_or(format!("no token in the answer: {}", r))?.to_string();
+    let until = r["expires_at"].as_str().and_then(parse_time).unwrap_or(now() + 3000);
+    cache().lock().map_err(|e| e.to_string())?.insert(installation_id, (t.clone(), until));
+    Ok(t)
+}

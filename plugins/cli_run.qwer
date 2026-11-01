@@ -1,0 +1,448 @@
+//! Runs other programs from a Quillo program: the command and its arguments as a list, never a shell string; a timeout that ends the whole process group, an output limit, stdin, environment, working folder, and the exit status or signal reported. Pipelines without a shell, and long-running commands watched in the background.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! libc = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const DEFAULT_TIMEOUT: u64 = 30_000;
+const DEFAULT_LIMIT: u64 = 10 << 20;
+const OPTIONS: [&str; 10] = ["timeout_ms", "grace_ms", "max_output", "on_limit", "stdin", "env", "clear_env", "cwd", "stderr", "leave_children"];
+
+fn signal_name(n: i32) -> String {
+    match n {
+        1 => "SIGHUP".into(),
+        2 => "SIGINT".into(),
+        3 => "SIGQUIT".into(),
+        4 => "SIGILL".into(),
+        6 => "SIGABRT".into(),
+        8 => "SIGFPE".into(),
+        9 => "SIGKILL".into(),
+        10 => if cfg!(target_os = "linux") { "SIGUSR1".into() } else { "SIGBUS".into() },
+        11 => "SIGSEGV".into(),
+        13 => "SIGPIPE".into(),
+        14 => "SIGALRM".into(),
+        15 => "SIGTERM".into(),
+        x => format!("signal {}", x),
+    }
+}
+
+fn check_options(o: &Value) -> Result<(), String> {
+    for k in o.as_object().into_iter().flat_map(|m| m.keys()) {
+        if !OPTIONS.contains(&k.as_str()) {
+            return Err(format!("no option `{}`; there are {}", k, OPTIONS.join(", ")));
+        }
+    }
+    Ok(())
+}
+
+fn command(program: &str, args: &[String], o: &Value) -> Result<Command, String> {
+    check_options(o)?;
+    if program.is_empty() {
+        return Err("no program given".into());
+    }
+    if program.contains('\0') || args.iter().any(|a| a.contains('\0')) {
+        return Err("an argument cannot hold a NUL byte".into());
+    }
+    if program.contains(' ') && !program.contains('/') {
+        return Err(format!("`{}` looks like a shell line: give the program, and its arguments as a list", program));
+    }
+    let mut c = Command::new(program);
+    c.args(args);
+    if o.get("clear_env").and_then(|v| v.as_bool()).unwrap_or(false) {
+        c.env_clear();
+    }
+    if let Some(m) = o.get("env") {
+        for (k, v) in m.as_object().ok_or("`env` is a map")? {
+            if k.is_empty() || k.contains(['=', '\0']) {
+                return Err(format!("`{}` is not an environment variable's name", k));
+            }
+            match v {
+                Value::Null => {
+                    c.env_remove(k);
+                }
+                Value::String(s) => {
+                    c.env(k, s);
+                }
+                x => {
+                    c.env(k, x.to_string());
+                }
+            }
+        }
+    }
+    if let Some(d) = o.get("cwd").and_then(|v| v.as_str()) {
+        if !Path::new(d).is_dir() {
+            return Err(format!("`{}` is not a folder", d));
+        }
+        c.current_dir(d);
+    }
+    // Its own process group, so that a timeout reaches what it started as well.
+    c.process_group(0);
+    Ok(c)
+}
+
+fn spawn_problem(program: &str, e: std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!("`{}` is not installed, or not on PATH", program),
+        std::io::ErrorKind::PermissionDenied => format!("`{}`: permission denied", program),
+        _ => format!("cannot run `{}`: {}", program, e),
+    }
+}
+
+fn kill_group(pgid: i32, signal: i32) {
+    // SAFETY: kill(2) with a negative pid signals a group; nothing is touched in memory.
+    unsafe {
+        libc::kill(-pgid, signal);
+    }
+}
+
+struct Sink {
+    buf: Mutex<Vec<u8>>,
+    total: Mutex<u64>,
+    limit: u64,
+    over: AtomicBool,
+}
+
+fn reader(mut pipe: impl Read + Send + 'static, sink: Arc<Sink>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut t = [0u8; 16384];
+        loop {
+            match pipe.read(&mut t) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut total = sink.total.lock().unwrap();
+                    *total += n as u64;
+                    let mut b = sink.buf.lock().unwrap();
+                    let room = (sink.limit as usize).saturating_sub(b.len());
+                    b.extend(&t[..n.min(room)]);
+                    if n > room {
+                        sink.over.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).to_string()
+}
+
+fn status_fields(m: &mut Value, status: ExitStatus) {
+    m["status"] = json!(status.code());
+    m["signal"] = json!(status.signal());
+    m["signal_name"] = status.signal().map_or(Value::Null, |s| json!(signal_name(s)));
+    m["ok"] = json!(status.success());
+}
+
+/// Runs a program and waits: `args` is a list, and nothing goes through a shell, so nothing in it can be taken for a command. Options: `timeout_ms` (30000, then SIGTERM to the process group and SIGKILL after `grace_ms`, 2000), `max_output` (10 MiB each for stdout and stderr), `on_limit` ("kill" or "truncate"), `stdin`, `env` (null removes one), `clear_env`, `cwd`, `stderr: "merge"`, `leave_children`. Answers `{ ok, status, signal, signal_name, stdout, stderr, timed_out, output_limit_hit, truncated, duration_ms, pid }`; a failed program is an answer, and only a program that cannot start is an error.
+pub fn cli_run(program: &str, args: Vec<String>, options: serde_json::Value) -> Result<Value, String> {
+    let mut c = command(program, &args, &options)?;
+    let timeout = Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT));
+    let grace = Duration::from_millis(options.get("grace_ms").and_then(|v| v.as_u64()).unwrap_or(2000));
+    let limit = options.get("max_output").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_LIMIT);
+    let on_limit = options.get("on_limit").and_then(|v| v.as_str()).unwrap_or("kill");
+    if on_limit != "kill" && on_limit != "truncate" {
+        return Err(format!("`{}` is not what to do at the limit: kill or truncate", on_limit));
+    }
+    let merge = options.get("stderr").and_then(|v| v.as_str()) == Some("merge");
+    let input = options.get("stdin").and_then(|v| v.as_str()).map(String::from);
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    c.stdout(Stdio::piped());
+    c.stderr(Stdio::piped());
+    let start = Instant::now();
+    let mut child = c.spawn().map_err(|e| spawn_problem(program, e))?;
+    let pid = child.id() as i32;
+    let out = Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) });
+    let err = if merge { out.clone() } else { Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) }) };
+    let readers = vec![reader(child.stdout.take().expect("piped"), out.clone()), reader(child.stderr.take().expect("piped"), err.clone())];
+    if let (Some(t), Some(mut pipe)) = (input, child.stdin.take()) {
+        // A program that does not read must not hold this up.
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(t.as_bytes());
+        });
+    }
+    let (mut timed_out, mut limited) = (false, false);
+    let deadline = start + timeout;
+    let mut term_at: Option<Instant> = None;
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
+            break s;
+        }
+        let now = Instant::now();
+        let over = on_limit == "kill" && (out.over.load(Ordering::Relaxed) || err.over.load(Ordering::Relaxed));
+        if term_at.is_none() {
+            if now >= deadline {
+                timed_out = true;
+            }
+            if over {
+                limited = true;
+            }
+            if timed_out || limited {
+                kill_group(pid, libc::SIGTERM);
+                term_at = Some(now);
+            }
+        } else if term_at.map_or(false, |t| now >= t + grace) {
+            kill_group(pid, libc::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let duration = start.elapsed().as_millis() as u64;
+    // What it left behind in its group would hold the pipes open.
+    if !options.get("leave_children").and_then(|v| v.as_bool()).unwrap_or(false) {
+        kill_group(pid, libc::SIGKILL);
+    }
+    let wait_end = Instant::now() + Duration::from_millis(500);
+    for r in readers {
+        while !r.is_finished() && Instant::now() < wait_end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if r.is_finished() {
+            let _ = r.join();
+        }
+    }
+    let (stdout, stderr) = (out.buf.lock().unwrap().clone(), err.buf.lock().unwrap().clone());
+    let mut m = json!({
+        "command": program, "args": args, "pid": pid,
+        "stdout": text(&stdout), "stderr": if merge { String::new() } else { text(&stderr) },
+        "stdout_bytes": *out.total.lock().unwrap(), "stderr_bytes": *err.total.lock().unwrap(),
+        "truncated": out.over.load(Ordering::Relaxed) || err.over.load(Ordering::Relaxed),
+        "timed_out": timed_out, "output_limit_hit": limited, "duration_ms": duration,
+    });
+    status_fields(&mut m, status);
+    Ok(m)
+}
+
+/// Runs a program for its output: stdout with the last line break trimmed, or an error with the exit status and stderr when it fails, times out or is killed. Options as for `cli_run`.
+pub fn cli_output(program: &str, args: Vec<String>, options: serde_json::Value) -> Result<String, String> {
+    let r = cli_run(program, args, options)?;
+    if r["ok"] == true {
+        return Ok(r["stdout"].as_str().unwrap_or("").trim_end_matches(['\n', '\r']).to_string());
+    }
+    let tail = r["stderr"].as_str().unwrap_or("").trim().to_string();
+    let how = if r["timed_out"] == true {
+        format!("timed out after {} ms", r["duration_ms"])
+    } else if r["output_limit_hit"] == true {
+        "stopped: it wrote more than max_output".to_string()
+    } else if !r["signal_name"].is_null() {
+        format!("killed by {}", r["signal_name"].as_str().unwrap_or(""))
+    } else {
+        format!("exit status {}", r["status"])
+    };
+    Err(if tail.is_empty() { format!("{}: {}", program, how) } else { format!("{}: {}: {}", program, how, tail) })
+}
+
+/// Where a program is on PATH, null when it is not there.
+pub fn cli_which(program: &str) -> Option<String> {
+    if program.contains('/') {
+        return is_executable(Path::new(program)).then(|| program.to_string());
+    }
+    let path = std::env::var("PATH").ok()?;
+    path.split(':').map(|d| Path::new(if d.is_empty() { "." } else { d }).join(program)).find(|p| is_executable(p)).map(|p| p.display().to_string())
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata().map_or(false, |m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Quotes a word for a shell, for showing a command to a person, or logging one. Not used to run anything here.
+pub fn cli_quote(word: &str) -> String {
+    if !word.is_empty() && word.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_./=:@,+%".contains(&c)) {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Runs a pipeline without a shell: `steps` is a list of lists, each a program and its arguments, the first reading `options.stdin` and each one's stdout going to the next. All are one process group, ended together on a timeout. Answers `{ ok, stdout, stderr, statuses, timed_out, duration_ms }`: `ok` means every step succeeded, as `pipefail` does.
+pub fn cli_pipeline(steps: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    if steps.is_empty() {
+        return Err("a pipeline needs at least one step".into());
+    }
+    let timeout = Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT));
+    let limit = options.get("max_output").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_LIMIT);
+    let start = Instant::now();
+    let mut kids: Vec<Child> = vec![];
+    let mut prev = None;
+    let mut group = 0i32;
+    let err = Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) });
+    let mut readers = vec![];
+    let mut first_in = None;
+    let n = steps.len();
+    for (i, st) in steps.iter().enumerate() {
+        let words: Vec<String> = st.as_array().ok_or("each step is a list: the program, then its arguments")?.iter().map(|w| w.as_str().map(String::from).ok_or("a step holds text".to_string())).collect::<Result<_, _>>()?;
+        let (program, args) = words.split_first().ok_or("an empty step")?;
+        let mut opts = options.clone();
+        if let Some(o) = opts.as_object_mut() {
+            o.remove("stdin");
+            o.remove("timeout_ms");
+            o.remove("max_output");
+        }
+        let mut c = command(program, args, &opts)?;
+        c.process_group(group);
+        match prev.take() {
+            Some(p) => {
+                c.stdin(p);
+            }
+            None => {
+                c.stdin(if options.get("stdin").is_some() { Stdio::piped() } else { Stdio::null() });
+            }
+        }
+        c.stdout(Stdio::piped());
+        c.stderr(Stdio::piped());
+        let mut kid = match c.spawn() {
+            Ok(k) => k,
+            Err(e) => {
+                if group != 0 {
+                    kill_group(group, libc::SIGKILL);
+                }
+                for mut k in kids {
+                    let _ = k.wait();
+                }
+                return Err(spawn_problem(program, e));
+            }
+        };
+        if group == 0 {
+            group = kid.id() as i32;
+            first_in = kid.stdin.take();
+        }
+        readers.push(reader(kid.stderr.take().expect("piped"), err.clone()));
+        if i + 1 < n {
+            prev = kid.stdout.take().map(Stdio::from);
+        }
+        kids.push(kid);
+    }
+    if let (Some(mut pipe), Some(t)) = (first_in, options.get("stdin").and_then(|v| v.as_str()).map(String::from)) {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(t.as_bytes());
+        });
+    }
+    let out = Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) });
+    let last = kids.last_mut().expect("at least one").stdout.take().expect("piped");
+    readers.push(reader(last, out.clone()));
+    let deadline = start + timeout;
+    let mut timed_out = false;
+    let mut statuses: Vec<Option<ExitStatus>> = kids.iter().map(|_| None).collect();
+    while statuses.iter().any(|s| s.is_none()) {
+        for (i, k) in kids.iter_mut().enumerate() {
+            if statuses[i].is_none() {
+                statuses[i] = k.try_wait().map_err(|e| e.to_string())?;
+            }
+        }
+        if !timed_out && Instant::now() >= deadline {
+            timed_out = true;
+            kill_group(group, libc::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    kill_group(group, libc::SIGKILL);
+    for r in readers {
+        let _ = r.join();
+    }
+    let list: Vec<Value> = statuses.iter().flatten().map(|s| json!({ "status": s.code(), "signal": s.signal(), "ok": s.success() })).collect();
+    let all = statuses.iter().flatten().all(|s| s.success());
+    let (o, e) = (out.buf.lock().unwrap().clone(), err.buf.lock().unwrap().clone());
+    Ok(json!({ "ok": all && !timed_out, "stdout": text(&o), "stderr": text(&e), "statuses": list, "timed_out": timed_out, "duration_ms": start.elapsed().as_millis() as u64 }))
+}
+
+struct Job {
+    child: Mutex<Child>,
+    pid: i32,
+    out: Arc<Sink>,
+    err: Arc<Sink>,
+    read_out: Mutex<usize>,
+    read_err: Mutex<usize>,
+}
+
+fn jobs() -> &'static Mutex<HashMap<String, Arc<Job>>> {
+    static J: OnceLock<Mutex<HashMap<String, Arc<Job>>>> = OnceLock::new();
+    J.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn job(name: &str) -> Result<Arc<Job>, String> {
+    jobs().lock().map_err(|_| "lock")?.get(name).cloned().ok_or(format!("no command `{}`: call cli_start first", name))
+}
+
+/// Starts a program in the background under `name` and answers its pid; read it with `cli_poll`, end it with `cli_stop`. Options: `stdin`, `env`, `clear_env`, `cwd`, `max_output`.
+pub fn cli_start(name: &str, program: &str, args: Vec<String>, options: serde_json::Value) -> Result<i64, String> {
+    if jobs().lock().map_err(|_| "lock")?.contains_key(name) {
+        return Err(format!("`{}` is already started; cli_stop it first", name));
+    }
+    let mut c = command(program, &args, &options)?;
+    let input = options.get("stdin").and_then(|v| v.as_str()).map(String::from);
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    c.stdout(Stdio::piped());
+    c.stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| spawn_problem(program, e))?;
+    let limit = options.get("max_output").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_LIMIT);
+    let out = Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) });
+    let err = Arc::new(Sink { buf: Mutex::new(vec![]), total: Mutex::new(0), limit, over: AtomicBool::new(false) });
+    reader(child.stdout.take().expect("piped"), out.clone());
+    reader(child.stderr.take().expect("piped"), err.clone());
+    if let (Some(t), Some(mut pipe)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(t.as_bytes());
+        });
+    }
+    let pid = child.id() as i32;
+    jobs().lock().map_err(|_| "lock")?.insert(name.to_string(), Arc::new(Job { child: Mutex::new(child), pid, out, err, read_out: Mutex::new(0), read_err: Mutex::new(0) }));
+    Ok(pid as i64)
+}
+
+/// What a background command has written since the last look: `{ running, stdout, stderr, status, signal }`. Once it has ended and been looked at, its name is free again.
+pub fn cli_poll(name: &str) -> Result<Value, String> {
+    let j = job(name)?;
+    let done = j.child.lock().map_err(|_| "lock")?.try_wait().map_err(|e| e.to_string())?;
+    if done.is_some() {
+        std::thread::sleep(Duration::from_millis(20)); // what was in the pipes
+    }
+    let fresh = |s: &Sink, at: &Mutex<usize>| -> String {
+        let b = s.buf.lock().unwrap();
+        let mut a = at.lock().unwrap();
+        let t = text(&b[(*a).min(b.len())..]);
+        *a = b.len();
+        t
+    };
+    let mut m = json!({ "running": done.is_none(), "pid": j.pid, "stdout": fresh(&j.out, &j.read_out), "stderr": fresh(&j.err, &j.read_err) });
+    if let Some(s) = done {
+        status_fields(&mut m, s);
+        jobs().lock().map_err(|_| "lock")?.remove(name);
+    }
+    Ok(m)
+}
+
+/// Ends a background command's whole process group: SIGTERM, then SIGKILL after `grace_ms` (0 for at once). Answers how it ended.
+pub fn cli_stop(name: &str, grace_ms: i64) -> Result<Value, String> {
+    let j = job(name)?;
+    kill_group(j.pid, libc::SIGTERM);
+    let end = Instant::now() + Duration::from_millis(grace_ms.max(0) as u64);
+    let mut status = None;
+    while Instant::now() < end {
+        status = j.child.lock().map_err(|_| "lock")?.try_wait().map_err(|e| e.to_string())?;
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if status.is_none() {
+        kill_group(j.pid, libc::SIGKILL);
+        status = Some(j.child.lock().map_err(|_| "lock")?.wait().map_err(|e| e.to_string())?);
+    }
+    jobs().lock().map_err(|_| "lock")?.remove(name);
+    let mut m = json!({ "stopped": true });
+    if let Some(s) = status {
+        status_fields(&mut m, s);
+    }
+    Ok(m)
+}

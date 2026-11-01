@@ -1,0 +1,420 @@
+//! OpenAI's API and any server that speaks it: chat completions, the Responses API, embeddings and tool calls, streams collected into one answer, 429s retried as the headers say, with the base URL from the environment.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Read};
+use std::time::Duration;
+
+const OPENAI: &str = "https://api.openai.com/v1";
+
+struct Conf {
+    key: Option<String>,
+    base: String,
+    org: Option<String>,
+    project: Option<String>,
+    retries: u32,
+    timeout: Duration,
+}
+
+fn txt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn conf(o: &Value) -> Result<Conf, String> {
+    let base = txt(o, "base_url").or_else(|| env("OPENAI_BASE_URL")).or_else(|| env("OPENAI_API_URL")).unwrap_or_else(|| OPENAI.into());
+    let base = base.trim_end_matches('/').to_string();
+    let key = txt(o, "api_key").or_else(|| env("OPENAI_API_KEY"));
+    // A local server often takes no key at all; OpenAI's own always wants one.
+    if key.is_none() && base == OPENAI {
+        return Err("no API key: set OPENAI_API_KEY, or give the option api_key".into());
+    }
+    Ok(Conf {
+        key,
+        base,
+        org: txt(o, "organization").or_else(|| env("OPENAI_ORG_ID")),
+        project: txt(o, "project").or_else(|| env("OPENAI_PROJECT_ID")),
+        retries: o.get("retries").and_then(|v| v.as_i64()).unwrap_or(2).clamp(0, 8) as u32,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(600_000).clamp(100, 3_600_000) as u64),
+    })
+}
+
+fn error_text(c: &Conf, status: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    // An object with `message`, or on some compatible servers a plain text under `error`.
+    let msg = v.pointer("/error/message").and_then(|x| x.as_str()).or_else(|| v.get("error").and_then(|x| x.as_str())).or_else(|| v.get("message").and_then(|x| x.as_str())).map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let code = v.pointer("/error/code").and_then(|x| x.as_str()).or_else(|| v.pointer("/error/type").and_then(|x| x.as_str())).unwrap_or("error");
+    let hint = match (status, code) {
+        (401, _) => " (check OPENAI_API_KEY)",
+        (429, "insufficient_quota") => " (the account is out of quota: waiting will not help)",
+        (404, "model_not_found") => " (check the model id)",
+        _ => "",
+    };
+    format!("{} answered {} {}: {}{}", if c.base == OPENAI { "OpenAI" } else { "the API" }, status, code, msg, hint)
+}
+
+fn retry_wait(attempt: u32, resp: &ureq::Response) -> f64 {
+    if let Some(ms) = resp.header("retry-after-ms").and_then(|h| h.trim().parse::<f64>().ok()) {
+        return ms / 1000.0;
+    }
+    if let Some(s) = resp.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok()) {
+        return s;
+    }
+    (0.5 * 2f64.powi(attempt as i32)).min(8.0)
+}
+
+fn send(c: &Conf, method: &str, path: &str, body: Option<&Value>) -> Result<ureq::Response, String> {
+    let text = body.map(|b| b.to_string());
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(30)).timeout_read(c.timeout).build();
+    let mut attempt = 0;
+    loop {
+        let mut r = agent.request(method, &format!("{}{}", c.base, path)).set("User-Agent", "quillo-openai/1.0");
+        if let Some(k) = &c.key { r = r.set("Authorization", &format!("Bearer {}", k)); }
+        if let Some(o) = &c.org { r = r.set("OpenAI-Organization", o); }
+        if let Some(p) = &c.project { r = r.set("OpenAI-Project", p); }
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = retry_wait(attempt, &resp);
+                let t = resp.into_string().unwrap_or_default();
+                let quota = t.contains("insufficient_quota");
+                let retry = !quota && (code == 408 || code == 409 || code == 429 || code >= 500);
+                if !retry || attempt >= c.retries || wait > 60.0 {
+                    return Err(error_text(c, code, &t));
+                }
+                std::thread::sleep(Duration::from_secs_f64(wait.max(0.0)));
+            }
+            Err(e) => {
+                if attempt >= c.retries {
+                    return Err(format!("cannot reach {}: {}", c.base, e));
+                }
+                std::thread::sleep(Duration::from_secs_f64((0.5 * 2f64.powi(attempt as i32)).min(8.0)));
+            }
+        }
+        attempt += 1;
+    }
+}
+
+fn json_of(resp: ureq::Response) -> Result<Value, String> {
+    let t = resp.into_string().map_err(|e| format!("reading the answer: {}", e))?;
+    serde_json::from_str(&t).map_err(|_| format!("the answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+}
+
+fn model(p: &Map<String, Value>, o: &Value, var: &str) -> Result<Value, String> {
+    if let Some(m) = p.get("model") {
+        return Ok(m.clone());
+    }
+    txt(o, "model").or_else(|| env(var)).map(Value::String).ok_or(format!("no model: set {}, or give the option model", var))
+}
+
+fn chat_params(params: &Value, o: &Value) -> Result<Map<String, Value>, String> {
+    let mut p = match params {
+        Value::Object(m) => m.clone(),
+        Value::String(s) => {
+            let mut m = Map::new();
+            m.insert("messages".into(), json!([{ "role": "user", "content": s }]));
+            m
+        }
+        _ => return Err("params must be a map like { messages, tools } or the text of one question".into()),
+    };
+    if let Some(Value::String(s)) = p.get("messages") {
+        let m = json!([{ "role": "user", "content": s }]);
+        p.insert("messages".into(), m);
+    }
+    if !matches!(p.get("messages"), Some(Value::Array(l)) if !l.is_empty()) {
+        return Err("`messages` must hold at least one message".into());
+    }
+    let m = model(&p, o, "OPENAI_MODEL")?;
+    p.insert("model".into(), m);
+    Ok(p)
+}
+
+fn chat_shape(r: Value) -> Value {
+    let choice = r.pointer("/choices/0").cloned().unwrap_or(json!({}));
+    let message = choice.get("message").cloned().unwrap_or(json!({}));
+    let tool_calls: Vec<Value> = message["tool_calls"].as_array().map(|l| l.iter().map(|t| {
+        let raw = t.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("");
+        let mut call = json!({ "id": t["id"], "name": t.pointer("/function/name").cloned().unwrap_or(Value::Null) });
+        // The model writes the arguments as text, and can write them badly.
+        match serde_json::from_str::<Value>(raw) {
+            Ok(v) => call["arguments"] = v,
+            Err(e) => {
+                call["arguments"] = json!({});
+                call["arguments_error"] = json!(format!("the arguments are not valid JSON: {}", e));
+                call["arguments_text"] = json!(raw);
+            }
+        }
+        call
+    }).collect()).unwrap_or_default();
+    let finish = choice.get("finish_reason").cloned().unwrap_or(Value::Null);
+    json!({
+        "id": r.get("id").cloned().unwrap_or(Value::Null),
+        "model": r.get("model").cloned().unwrap_or(Value::Null),
+        "text": message["content"].as_str().unwrap_or(""),
+        "tool_calls": tool_calls,
+        "finish_reason": finish,
+        "refusal": message.get("refusal").cloned().unwrap_or(Value::Null),
+        "truncated": finish == "length",
+        "usage": r.get("usage").cloned().unwrap_or(json!({})),
+        "message": message,
+    })
+}
+
+/// A chat completion: `params` as the API documents them (`messages`, `tools`, `response_format`, `max_completion_tokens`...), or one question as text. Options: model (else OPENAI_MODEL), api_key, base_url (else OPENAI_BASE_URL), organization, project, retries (2), timeout_ms. Gives { id, model, text, tool_calls, finish_reason, refusal, truncated, usage, message }, each tool call's `arguments` already parsed.
+pub fn openai_chat(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let p = chat_params(&params, &options)?;
+    Ok(chat_shape(json_of(send(&c, "POST", "/chat/completions", Some(&Value::Object(p)))?)?))
+}
+
+/// One question with a `system` prompt (or "") and the text of the answer; a refusal or a cut-off answer is an error.
+pub fn openai_ask(question: &str, system: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut messages = vec![];
+    if !system.is_empty() {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": question }));
+    let r = openai_chat(json!({ "messages": messages }), options)?;
+    if let Some(why) = r["refusal"].as_str() {
+        return Err(format!("the model refused: {}", why));
+    }
+    if r["truncated"] == true {
+        return Err("the answer stopped at the token limit: raise max_completion_tokens".into());
+    }
+    Ok(r["text"].as_str().unwrap_or("").to_string())
+}
+
+// Hands over each `data:` payload of a stream, stopping at `[DONE]` or its end.
+fn each_event(r: impl Read, mut f: impl FnMut(Value) -> Result<(), String>) -> Result<(), String> {
+    let mut lines = BufReader::new(r);
+    let mut line = String::new();
+    let mut data = String::new();
+    loop {
+        line.clear();
+        let n = lines.read_line(&mut line).map_err(|e| format!("the stream broke: {}", e))?;
+        let t = line.trim_end_matches(['\r', '\n']);
+        if n == 0 || t.is_empty() {
+            if data == "[DONE]" {
+                return Ok(());
+            }
+            if !data.is_empty() {
+                let v: Value = serde_json::from_str(&data).map_err(|e| format!("a stream event is not JSON: {}", e))?;
+                data.clear();
+                f(v)?;
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("data:") {
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+}
+
+/// The same as openai_chat, streamed and collected, for long answers; asks the server for the usage as its last event. Tool calls come in pieces and are put together.
+pub fn openai_chat_stream(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let mut p = chat_params(&params, &options)?;
+    p.insert("stream".into(), json!(true));
+    p.entry("stream_options").or_insert(json!({ "include_usage": true }));
+    let resp = send(&c, "POST", "/chat/completions", Some(&Value::Object(p)))?;
+    let mut text = String::new();
+    let mut refusal = String::new();
+    let mut calls: Vec<Value> = vec![];
+    let mut finish = Value::Null;
+    let (mut id, mut mdl, mut usage) = (Value::Null, Value::Null, json!({}));
+    each_event(resp.into_reader(), |ev| {
+        if ev.get("error").map(|e| !e.is_null()).unwrap_or(false) {
+            return Err(error_text(&c, 200, &ev.to_string()));
+        }
+        if id.is_null() { id = ev["id"].clone(); }
+        if mdl.is_null() { mdl = ev["model"].clone(); }
+        if ev["usage"].is_object() { usage = ev["usage"].clone(); }
+        let Some(ch) = ev.pointer("/choices/0") else { return Ok(()) };
+        if !ch["finish_reason"].is_null() { finish = ch["finish_reason"].clone(); }
+        let d = &ch["delta"];
+        if let Some(t) = d["content"].as_str() { text.push_str(t); }
+        if let Some(t) = d["refusal"].as_str() { refusal.push_str(t); }
+        for t in d["tool_calls"].as_array().into_iter().flatten() {
+            let i = t["index"].as_u64().unwrap_or(0) as usize;
+            while calls.len() <= i {
+                calls.push(json!({ "id": null, "type": "function", "function": { "name": "", "arguments": "" } }));
+            }
+            let call = &mut calls[i];
+            if t["id"].is_string() { call["id"] = t["id"].clone(); }
+            if let Some(n) = t.pointer("/function/name").and_then(|x| x.as_str()) {
+                let s = format!("{}{}", call["function"]["name"].as_str().unwrap_or(""), n);
+                call["function"]["name"] = json!(s);
+            }
+            if let Some(a) = t.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                let s = format!("{}{}", call["function"]["arguments"].as_str().unwrap_or(""), a);
+                call["function"]["arguments"] = json!(s);
+            }
+        }
+        Ok(())
+    })?;
+    if finish.is_null() {
+        return Err("the stream ended before a finish_reason".into());
+    }
+    let mut message = json!({ "role": "assistant", "content": if text.is_empty() && !calls.is_empty() { Value::Null } else { json!(text) } });
+    if !calls.is_empty() { message["tool_calls"] = json!(calls); }
+    if !refusal.is_empty() { message["refusal"] = json!(refusal); }
+    Ok(chat_shape(json!({ "id": id, "model": mdl, "usage": usage, "choices": [{ "message": message, "finish_reason": finish }] })))
+}
+
+/// A function the model may call, for `tools`: its name, what it does, and a JSON Schema of its arguments.
+pub fn openai_tool(name: &str, description: &str, parameters: serde_json::Value) -> Result<serde_json::Value, String> {
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!("{:?} is not a function name: 1 to 64 of a-z, A-Z, 0-9, _ and -", name));
+    }
+    Ok(json!({ "type": "function", "function": { "name": name, "description": description, "parameters": parameters } }))
+}
+
+/// The `tool` message answering one call: `content` is a text, or anything else as JSON.
+pub fn openai_tool_result(tool_call_id: &str, content: serde_json::Value) -> serde_json::Value {
+    let body = match content {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    json!({ "role": "tool", "tool_call_id": tool_call_id, "content": body })
+}
+
+/// The messages for the next turn: `messages`, the `response`'s assistant message unchanged, then the tool messages. Refuses when a call has no result.
+pub fn openai_continue(messages: Vec<serde_json::Value>, response: serde_json::Value, results: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = messages;
+    out.push(response.get("message").cloned().ok_or("the response has no message: pass what openai_chat gave")?);
+    for t in response["tool_calls"].as_array().into_iter().flatten() {
+        if !results.iter().any(|r| r["tool_call_id"] == t["id"]) {
+            return Err(format!("the call {} has no result", t["id"].as_str().unwrap_or("?")));
+        }
+    }
+    out.extend(results);
+    Ok(out)
+}
+
+/// Embeddings for a text or a list of texts: the options add `dimensions`, and `model` is else OPENAI_EMBEDDING_MODEL, else text-embedding-3-small. Gives { vectors, model, usage }, the vectors in the order of the input, whatever order they came in.
+pub fn openai_embeddings(input: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    match &input {
+        Value::String(s) if !s.is_empty() => {}
+        Value::Array(l) if !l.is_empty() && l.iter().all(|x| x.as_str().map(|s| !s.is_empty()).unwrap_or(false)) => {}
+        _ => return Err("the input is a text or a list of texts, none of them empty".into()),
+    }
+    let mut p = json!({ "model": txt(&options, "model").or_else(|| env("OPENAI_EMBEDDING_MODEL")).unwrap_or_else(|| "text-embedding-3-small".into()), "input": input, "encoding_format": "float" });
+    if let Some(d) = options.get("dimensions").and_then(|v| v.as_i64()) {
+        p["dimensions"] = json!(d);
+    }
+    let r = json_of(send(&c, "POST", "/embeddings", Some(&p))?)?;
+    let mut data = r["data"].as_array().cloned().unwrap_or_default();
+    data.sort_by_key(|d| d["index"].as_i64().unwrap_or(0));
+    Ok(json!({ "vectors": data.iter().map(|d| d["embedding"].clone()).collect::<Vec<_>>(), "model": r["model"], "usage": r["usage"] }))
+}
+
+fn responses_params(params: &Value, o: &Value) -> Result<Map<String, Value>, String> {
+    let mut p = match params {
+        Value::Object(m) => m.clone(),
+        Value::String(s) => {
+            let mut m = Map::new();
+            m.insert("input".into(), json!(s));
+            m
+        }
+        _ => return Err("params must be a map like { input, instructions, tools } or the text of the input".into()),
+    };
+    if !p.contains_key("input") && !p.contains_key("previous_response_id") {
+        return Err("a response needs `input`".into());
+    }
+    let m = model(&p, o, "OPENAI_MODEL")?;
+    p.insert("model".into(), m);
+    Ok(p)
+}
+
+fn response_shape(r: Value) -> Value {
+    let output = r["output"].as_array().cloned().unwrap_or_default();
+    let mut text = String::new();
+    let mut calls = vec![];
+    let mut refusal = Value::Null;
+    for item in &output {
+        match item["type"].as_str().unwrap_or("") {
+            "message" => {
+                for c in item["content"].as_array().into_iter().flatten() {
+                    match c["type"].as_str().unwrap_or("") {
+                        "output_text" => text.push_str(c["text"].as_str().unwrap_or("")),
+                        "refusal" => refusal = c["refusal"].clone(),
+                        _ => {}
+                    }
+                }
+            }
+            "function_call" => {
+                let args = serde_json::from_str::<Value>(item["arguments"].as_str().unwrap_or("")).unwrap_or(json!({}));
+                calls.push(json!({ "id": item["call_id"], "name": item["name"], "arguments": args }));
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "id": r["id"], "status": r["status"], "model": r["model"], "text": text, "tool_calls": calls, "refusal": refusal,
+        "error": r.get("error").cloned().unwrap_or(Value::Null),
+        "incomplete": r.pointer("/incomplete_details/reason").cloned().unwrap_or(Value::Null),
+        "usage": r.get("usage").cloned().unwrap_or(json!({})),
+        "output": output,
+    })
+}
+
+/// The Responses API: `params` as documented (`input`, `instructions`, `tools`, `previous_response_id`, `store`...), or the input as text. Gives { id, status, model, text, tool_calls, refusal, error, incomplete, usage, output }; a response that failed is an error.
+pub fn openai_response(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let p = responses_params(&params, &options)?;
+    let r = response_shape(json_of(send(&c, "POST", "/responses", Some(&Value::Object(p)))?)?);
+    if r["status"] == "failed" {
+        return Err(format!("the response failed: {}", r["error"]));
+    }
+    Ok(r)
+}
+
+/// openai_response streamed and collected: the text pieces are ignored for the `response.completed` event, which holds the whole answer. `response.failed` and `error` events are errors.
+pub fn openai_response_stream(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = conf(&options)?;
+    let mut p = responses_params(&params, &options)?;
+    p.insert("stream".into(), json!(true));
+    let resp = send(&c, "POST", "/responses", Some(&Value::Object(p)))?;
+    let mut last = None;
+    each_event(resp.into_reader(), |ev| {
+        match ev["type"].as_str().unwrap_or("") {
+            "response.completed" | "response.incomplete" => last = Some(ev["response"].clone()),
+            "response.failed" => return Err(format!("the response failed: {}", ev.pointer("/response/error").cloned().unwrap_or(Value::Null))),
+            "error" => return Err(format!("the stream failed: {}", ev.get("message").and_then(|m| m.as_str()).unwrap_or("no message"))),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    last.map(response_shape).ok_or("the stream ended before response.completed".to_string())
+}
+
+/// The input item answering a Responses API function call, to send with previous_response_id.
+pub fn openai_function_output(call_id: &str, output: serde_json::Value) -> serde_json::Value {
+    let body = match output {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    json!({ "type": "function_call_output", "call_id": call_id, "output": body })
+}
+
+/// The ids of the models the server offers.
+pub fn openai_models(options: serde_json::Value) -> Result<Vec<String>, String> {
+    let c = conf(&options)?;
+    let r = json_of(send(&c, "GET", "/models", None)?)?;
+    Ok(r["data"].as_array().map(|l| l.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect()).unwrap_or_default())
+}

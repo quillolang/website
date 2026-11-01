@@ -1,0 +1,473 @@
+//! LDIF read and written: base64 values, continuation lines, attribute options, change records, the changes between two directories, and DNs taken apart.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+/// RFC 2849's logical lines: folded lines joined, comments gone. `(line number, text)`, with an empty one between records.
+fn unfold(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = vec![];
+    let mut comment = false;
+    for (i, raw) in text.trim_start_matches('\u{feff}').split('\n').enumerate() {
+        let l = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(rest) = l.strip_prefix(' ') {
+            if comment {
+                continue;
+            }
+            if let Some(last) = out.last_mut().filter(|x| !x.1.is_empty()) {
+                last.1.push_str(rest);
+                continue;
+            }
+        }
+        comment = l.starts_with('#');
+        if !comment {
+            out.push((i + 1, l.to_string()));
+        }
+    }
+    out
+}
+
+fn decode(b: &str, line: usize) -> Result<Value, String> {
+    let clean: String = b.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = STANDARD.decode(clean).map_err(|e| format!("line {}: bad base64: {}", line, e))?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(t) => json!(t),
+        Err(e) => json!({ "base64": STANDARD.encode(e.as_bytes()) }),
+    })
+}
+
+/// One `name: value`, `name:: base64` or `name:< url`.
+fn pair(t: &str, n: usize) -> Result<(String, Value), String> {
+    let (k, rest) = t.split_once(':').ok_or(format!("line {}: `{}` has no colon", n, t))?;
+    if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ';' || c == '.') {
+        return Err(format!("line {}: `{}` is not an attribute name", n, k));
+    }
+    let v = if let Some(b) = rest.strip_prefix(':') {
+        decode(b, n)?
+    } else if let Some(u) = rest.strip_prefix('<') {
+        json!({ "url": u.trim_start() })
+    } else {
+        json!(rest.strip_prefix(' ').map_or(rest.trim_start(), |x| x.trim_start_matches(' ')))
+    };
+    Ok((k.to_string(), v))
+}
+
+fn text_of(v: &Value) -> Option<&str> {
+    v.as_str()
+}
+
+fn push_attr(m: &mut Map<String, Value>, k: &str, v: Value) {
+    match m.get_mut(k) {
+        Some(Value::Array(a)) => a.push(v),
+        _ => {
+            m.insert(k.to_string(), json!([v]));
+        }
+    }
+}
+
+fn parse_record(lines: &[(usize, String)]) -> Result<Value, String> {
+    let (first_n, first) = &lines[0];
+    let (k, dn) = pair(first, *first_n)?;
+    if !k.eq_ignore_ascii_case("dn") {
+        return Err(format!("line {}: a record starts with dn:, not `{}`", first_n, k));
+    }
+    let dn = text_of(&dn).ok_or(format!("line {}: a dn must be text", first_n))?.to_string();
+    let mut at = 1;
+    let mut controls = vec![];
+    while at < lines.len() && lines[at].1.to_lowercase().starts_with("control:") {
+        let (_, v) = pair(&lines[at].1, lines[at].0)?;
+        let t = v.as_str().unwrap_or("");
+        let mut parts = t.splitn(3, ' ');
+        let oid = parts.next().unwrap_or("");
+        let second = parts.next();
+        let third = parts.next();
+        let (critical, value) = match second {
+            Some("true") => (true, third),
+            Some("false") => (false, third),
+            other => (false, other),
+        };
+        controls.push(json!({ "oid": oid, "critical": critical, "value": value }));
+        at += 1;
+    }
+    let change = lines.get(at).filter(|l| l.1.to_lowercase().starts_with("changetype:"));
+    let Some((cn, ct)) = change else {
+        let mut attrs = Map::new();
+        for (n, l) in &lines[at..] {
+            let (k, v) = pair(l, *n)?;
+            push_attr(&mut attrs, &k, v);
+        }
+        return Ok(json!({ "dn": dn, "attributes": attrs }));
+    };
+    let (_, kind) = pair(ct, *cn)?;
+    let kind = kind.as_str().unwrap_or("").to_lowercase();
+    at += 1;
+    let mut rec = json!({ "dn": dn, "change": kind });
+    if !controls.is_empty() {
+        rec["controls"] = json!(controls);
+    }
+    match kind.as_str() {
+        "add" => {
+            let mut attrs = Map::new();
+            for (n, l) in &lines[at..] {
+                let (k, v) = pair(l, *n)?;
+                push_attr(&mut attrs, &k, v);
+            }
+            if attrs.is_empty() {
+                return Err(format!("line {}: an add with no attributes", cn));
+            }
+            rec["attributes"] = Value::Object(attrs);
+        }
+        "delete" => {
+            if at < lines.len() {
+                return Err(format!("line {}: a delete takes nothing after it", lines[at].0));
+            }
+        }
+        "modrdn" | "moddn" => {
+            for (n, l) in &lines[at..] {
+                let (k, v) = pair(l, *n)?;
+                match k.to_lowercase().as_str() {
+                    "newrdn" => rec["new_rdn"] = v,
+                    "deleteoldrdn" => rec["delete_old_rdn"] = json!(v.as_str() == Some("1")),
+                    "newsuperior" => rec["new_superior"] = v,
+                    o => return Err(format!("line {}: `{}` does not belong in a {}", n, o, kind)),
+                }
+            }
+            if rec.get("new_rdn").is_none() || rec.get("delete_old_rdn").is_none() {
+                return Err(format!("line {}: a {} needs newrdn and deleteoldrdn", cn, kind));
+            }
+        }
+        "modify" => {
+            let mut mods = vec![];
+            while at < lines.len() {
+                let (n, l) = &lines[at];
+                let (op, attr) = pair(l, *n)?;
+                let op = op.to_lowercase();
+                if !["add", "delete", "replace", "increment"].contains(&op.as_str()) {
+                    return Err(format!("line {}: `{}` is not a modification", n, op));
+                }
+                let attr = attr.as_str().ok_or(format!("line {}: an attribute name must be text", n))?.to_string();
+                at += 1;
+                let mut values = vec![];
+                let mut closed = false;
+                while at < lines.len() {
+                    if lines[at].1 == "-" {
+                        at += 1;
+                        closed = true;
+                        break;
+                    }
+                    let (k, v) = pair(&lines[at].1, lines[at].0)?;
+                    if !k.eq_ignore_ascii_case(&attr) {
+                        return Err(format!("line {}: `{}` inside a change to {}", lines[at].0, k, attr));
+                    }
+                    values.push(v);
+                    at += 1;
+                }
+                if !closed {
+                    return Err(format!("line {}: a modification must end with -", n));
+                }
+                mods.push(json!({ "op": op, "attribute": attr, "values": values }));
+            }
+            rec["modifications"] = json!(mods);
+        }
+        o => return Err(format!("line {}: `{}` is not a change type", cn, o)),
+    }
+    Ok(rec)
+}
+
+/// Reads LDIF: `{ version, records }`, each `{ dn, attributes }` or a change `{ dn, change, ... }`. A value that is not UTF-8 is `{ base64 }`, a `:<` value `{ url }`.
+pub fn ldif_parse(text: &str) -> Result<Value, String> {
+    let lines = unfold(text);
+    let mut version = Value::Null;
+    let mut records = vec![];
+    let mut block: Vec<(usize, String)> = vec![];
+    let mut seen_any = false;
+    for (n, l) in lines.into_iter().chain(std::iter::once((0, String::new()))) {
+        if l.is_empty() {
+            if !block.is_empty() {
+                records.push(parse_record(&block)?);
+                block.clear();
+            }
+            continue;
+        }
+        if !seen_any {
+            seen_any = true;
+            if let Some(v) = l.to_lowercase().strip_prefix("version:") {
+                match v.trim() {
+                    "1" => {
+                        version = json!(1);
+                        continue;
+                    }
+                    o => return Err(format!("line {}: LDIF version {} is not known", n, o)),
+                }
+            }
+        }
+        block.push((n, l));
+    }
+    Ok(json!({ "version": version, "records": records }))
+}
+
+/// Reads an LDIF file from a path, as `ldif_parse` does.
+pub fn ldif_read_file(path: &str) -> Result<Value, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    ldif_parse(&t)
+}
+
+/// RFC 2849's SAFE-STRING: whether a value can go as it is, or needs base64.
+fn safe(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return true;
+    }
+    if matches!(b[0], b' ' | b':' | b'<') || b[b.len() - 1] == b' ' {
+        return false;
+    }
+    b.iter().all(|c| *c != 0 && *c != b'\n' && *c != b'\r' && *c < 128)
+}
+
+fn fold(line: &str, width: usize, out: &mut String) {
+    let c: Vec<char> = line.chars().collect();
+    let mut at = 0;
+    let mut first = true;
+    while at < c.len() || first {
+        let room = if first { width } else { width - 1 };
+        let end = (at + room).min(c.len());
+        if !first {
+            out.push(' ');
+        }
+        out.extend(&c[at..end]);
+        out.push('\n');
+        at = end;
+        first = false;
+    }
+}
+
+fn write_value(k: &str, v: &Value, width: usize, out: &mut String) -> Result<(), String> {
+    let line = match v {
+        Value::Object(o) if o.contains_key("base64") => format!("{}:: {}", k, o["base64"].as_str().ok_or("`base64` must be text")?),
+        Value::Object(o) if o.contains_key("url") => format!("{}:< {}", k, o["url"].as_str().ok_or("`url` must be text")?),
+        Value::String(s) if safe(s) => if s.is_empty() { format!("{}:", k) } else { format!("{}: {}", k, s) },
+        Value::String(s) => format!("{}:: {}", k, STANDARD.encode(s)),
+        Value::Number(_) | Value::Bool(_) => format!("{}: {}", k, v),
+        _ => return Err(format!("{}: a value must be text, a number, or {{ base64 }} or {{ url }}", k)),
+    };
+    fold(&line, width, out);
+    Ok(())
+}
+
+fn values_of(v: &Value) -> Vec<&Value> {
+    match v {
+        Value::Array(a) => a.iter().collect(),
+        x => vec![x],
+    }
+}
+
+fn write_record(r: &Value, width: usize, out: &mut String) -> Result<(), String> {
+    let dn = r.get("dn").and_then(Value::as_str).ok_or("a record needs a `dn`")?;
+    write_value("dn", &json!(dn), width, out)?;
+    for c in r.get("controls").and_then(Value::as_array).into_iter().flatten() {
+        let oid = c.get("oid").and_then(Value::as_str).ok_or("a control needs an `oid`")?;
+        let mut t = oid.to_string();
+        if c.get("critical") == Some(&json!(true)) {
+            t.push_str(" true");
+        }
+        if let Some(v) = c.get("value").and_then(Value::as_str) {
+            t.push(' ');
+            t.push_str(v);
+        }
+        fold(&format!("control: {}", t), width, out);
+    }
+    match r.get("change").and_then(Value::as_str) {
+        None => {
+            for (k, v) in r.get("attributes").and_then(Value::as_object).ok_or(format!("{}: a record needs `attributes` or `change`", dn))? {
+                for x in values_of(v) {
+                    write_value(k, x, width, out)?;
+                }
+            }
+        }
+        Some("add") => {
+            out.push_str("changetype: add\n");
+            for (k, v) in r.get("attributes").and_then(Value::as_object).ok_or(format!("{}: an add needs `attributes`", dn))? {
+                for x in values_of(v) {
+                    write_value(k, x, width, out)?;
+                }
+            }
+        }
+        Some("delete") => out.push_str("changetype: delete\n"),
+        Some(k @ ("modrdn" | "moddn")) => {
+            out.push_str(&format!("changetype: {}\n", k));
+            write_value("newrdn", r.get("new_rdn").ok_or(format!("{}: needs `new_rdn`", dn))?, width, out)?;
+            out.push_str(&format!("deleteoldrdn: {}\n", if r.get("delete_old_rdn") == Some(&json!(false)) { 0 } else { 1 }));
+            if let Some(s) = r.get("new_superior") {
+                write_value("newsuperior", s, width, out)?;
+            }
+        }
+        Some("modify") => {
+            out.push_str("changetype: modify\n");
+            for m in r.get("modifications").and_then(Value::as_array).ok_or(format!("{}: a modify needs `modifications`", dn))? {
+                let op = m.get("op").and_then(Value::as_str).unwrap_or("");
+                if !["add", "delete", "replace", "increment"].contains(&op) {
+                    return Err(format!("{}: `{}` is not a modification", dn, op));
+                }
+                let attr = m.get("attribute").and_then(Value::as_str).ok_or(format!("{}: a modification needs an `attribute`", dn))?;
+                out.push_str(&format!("{}: {}\n", op, attr));
+                for v in m.get("values").map(values_of).unwrap_or_default() {
+                    write_value(attr, v, width, out)?;
+                }
+                out.push_str("-\n");
+            }
+        }
+        Some(o) => return Err(format!("{}: `{}` is not a change type", dn, o)),
+    }
+    Ok(())
+}
+
+/// Writes records as LDIF, version line first: lines folded at 76, values base64-encoded where RFC 2849 says they must be.
+pub fn ldif_write(records: Vec<serde_json::Value>) -> Result<String, String> {
+    let mut out = String::from("version: 1\n\n");
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        write_record(r, 76, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+/// One DN by RFC 4514: `[[{ attribute, value }, ...], ...]`, an inner list for each RDN, multi-valued ones with `+`, and escapes undone.
+pub fn ldif_dn_parse(dn: &str) -> Result<Vec<Value>, String> {
+    let b = dn.as_bytes();
+    let mut rdns: Vec<Value> = vec![];
+    let mut cur: Vec<Value> = vec![];
+    let mut i = 0;
+    if dn.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    loop {
+        let start = i;
+        while i < b.len() && b[i] != b'=' {
+            if matches!(b[i], b',' | b'+') {
+                return Err(format!("`{}` has no = at `{}`", dn, &dn[start..]));
+            }
+            i += 1;
+        }
+        if i >= b.len() {
+            return Err(format!("`{}` has no = at `{}`", dn, &dn[start..]));
+        }
+        let attr = dn[start..i].trim();
+        if attr.is_empty() {
+            return Err(format!("`{}` has an empty attribute", dn));
+        }
+        i += 1;
+        let mut v: Vec<u8> = vec![];
+        let mut last_escaped = 0;
+        if i < b.len() && b[i] == b'#' {
+            let s = i;
+            while i < b.len() && !matches!(b[i], b',' | b'+') {
+                i += 1;
+            }
+            v.extend_from_slice(dn[s..i].trim().as_bytes());
+        } else {
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            while i < b.len() && !matches!(b[i], b',' | b'+' | b';') {
+                if b[i] == b'\\' {
+                    i += 1;
+                    let x = *b.get(i).ok_or(format!("`{}` ends in a backslash", dn))?;
+                    if let (Some(h), Some(l)) = (hex_val(x), b.get(i + 1).copied().and_then(hex_val)) {
+                        v.push(h * 16 + l);
+                        i += 2;
+                    } else {
+                        v.push(x);
+                        i += 1;
+                    }
+                    last_escaped = v.len();
+                } else {
+                    v.push(b[i]);
+                    i += 1;
+                }
+            }
+            while v.len() > last_escaped && v.last() == Some(&b' ') {
+                v.pop();
+            }
+        }
+        cur.push(json!({ "attribute": attr, "value": String::from_utf8_lossy(&v) }));
+        if i >= b.len() {
+            rdns.push(Value::Array(std::mem::take(&mut cur)));
+            return Ok(rdns);
+        }
+        if b[i] != b'+' {
+            rdns.push(Value::Array(std::mem::take(&mut cur)));
+        }
+        i += 1;
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+    }
+}
+
+fn dn_key(dn: &str) -> String {
+    match ldif_dn_parse(dn) {
+        Ok(r) => r.iter().map(|rdn| {
+            let mut parts: Vec<String> = rdn.as_array().into_iter().flatten().map(|x| format!("{}={}", x["attribute"].as_str().unwrap_or("").to_lowercase(), x["value"].as_str().unwrap_or("").to_lowercase())).collect();
+            parts.sort();
+            parts.join("+")
+        }).collect::<Vec<_>>().join(","),
+        Err(_) => dn.to_lowercase(),
+    }
+}
+
+fn norm(v: &Value) -> Vec<String> {
+    values_of(v).into_iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect()
+}
+
+/// The change records that turn `before` into `after`, as parsed by `ldif_parse`: adds, deletes and modifies, one `replace` for each changed attribute. DNs compare as DNs, not as text.
+pub fn ldif_diff(before: &str, after: &str) -> Result<Vec<Value>, String> {
+    let a = ldif_parse(before).map_err(|e| format!("before: {}", e))?;
+    let b = ldif_parse(after).map_err(|e| format!("after: {}", e))?;
+    let index = |d: &Value| -> BTreeMap<String, Value> { d["records"].as_array().into_iter().flatten().filter(|r| r.get("attributes").is_some() && r.get("change").is_none()).map(|r| (dn_key(r["dn"].as_str().unwrap_or("")), r.clone())).collect() };
+    let (ia, ib) = (index(&a), index(&b));
+    let mut out = vec![];
+    for (k, r) in &ib {
+        match ia.get(k) {
+            None => out.push(json!({ "dn": r["dn"], "change": "add", "attributes": r["attributes"] })),
+            Some(old) => {
+                let (oa, na) = (old["attributes"].as_object().unwrap(), r["attributes"].as_object().unwrap());
+                let mut mods = vec![];
+                for (attr, v) in na {
+                    let found = oa.iter().find(|(x, _)| x.eq_ignore_ascii_case(attr));
+                    let (mut x, mut y) = (norm(v), found.map(|f| norm(f.1)).unwrap_or_default());
+                    x.sort();
+                    y.sort();
+                    if x != y {
+                        mods.push(json!({ "op": "replace", "attribute": attr, "values": v }));
+                    }
+                }
+                for attr in oa.keys() {
+                    if !na.keys().any(|x| x.eq_ignore_ascii_case(attr)) {
+                        mods.push(json!({ "op": "delete", "attribute": attr, "values": [] }));
+                    }
+                }
+                if !mods.is_empty() {
+                    out.push(json!({ "dn": r["dn"], "change": "modify", "modifications": mods }));
+                }
+            }
+        }
+    }
+    // Children go before parents when deleting: the deepest first.
+    let mut gone: Vec<&Value> = ia.iter().filter(|(k, _)| !ib.contains_key(*k)).map(|x| x.1).collect();
+    gone.sort_by_key(|r| std::cmp::Reverse(dn_key(r["dn"].as_str().unwrap_or("")).matches(',').count()));
+    for r in gone {
+        out.push(json!({ "dn": r["dn"], "change": "delete" }));
+    }
+    Ok(out)
+}

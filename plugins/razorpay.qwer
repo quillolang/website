@@ -1,0 +1,260 @@
+//! Razorpay's API without an SDK: orders in paise, the checkout's payment signature checked, payments read and captured, refunds, lists through count and skip, webhook signatures and their event ids, Razorpay's error objects read, and rupees written with Indian digit grouping.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET are the key pair (rzp_test_... or rzp_live_...);
+// RAZORPAY_API_URL the API (https://api.razorpay.com/v1 when not set).
+
+const ZERO: &[&str] = &["BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"];
+const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "OMR", "TND"];
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("RAZORPAY_API_URL").unwrap_or_else(|| "https://api.razorpay.com/v1".into()).trim_end_matches('/').to_string()
+}
+
+fn secret() -> Result<String, String> {
+    setting("RAZORPAY_KEY_SECRET").ok_or("RAZORPAY_KEY_SECRET is not set".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let e = &v["error"];
+    let Some(code) = e["code"].as_str() else {
+        return format!("Razorpay {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    };
+    let mut t = format!("Razorpay {} {}: {}", status, code, e["description"].as_str().unwrap_or(""));
+    if let Some(f) = e["field"].as_str().filter(|f| *f != "NA") {
+        t.push_str(&format!(" (field {})", f));
+    }
+    if let Some(r) = e["reason"].as_str().filter(|r| *r != "NA") {
+        t.push_str(&format!(" [{}]", r));
+    }
+    if status == 401 {
+        t.push_str(" (check RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET, and that test keys meet test data)");
+    }
+    t
+}
+
+// Only reads are repeated: a repeated POST could capture or refund twice.
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let id = setting("RAZORPAY_KEY_ID").ok_or("RAZORPAY_KEY_ID is not set")?;
+    let auth = STANDARD.encode(format!("{}:{}", id, secret()?));
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let tries = if method == "GET" { 4u32 } else { 1 };
+    for attempt in 0..tries {
+        let req = agent.request(method, &url).set("Authorization", &format!("Basic {}", auth));
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).map_err(|_| format!("Razorpay's answer is not JSON: {}", t.chars().take(200).collect::<String>()));
+            }
+            Err(ureq::Error::Status(429 | 502 | 503 | 504, _)) if attempt + 1 < tries => std::thread::sleep(Duration::from_millis(300u64 << attempt)),
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Razorpay at {}: {}", api(), e)),
+        }
+    }
+    Err("Razorpay stayed busy through four tries".into())
+}
+
+/// An amount in the currency's smallest unit: `razorpay_amount("499.50", "INR")` is 49950 paise, `("100", "JPY")` 100, `("1.250", "KWD")` 1250. Takes text so no float rounding creeps in.
+pub fn razorpay_amount(amount: &str, currency: &str) -> Result<i64, String> {
+    let c = currency.to_uppercase();
+    let places = if ZERO.contains(&c.as_str()) { 0 } else if THREE.contains(&c.as_str()) { 3 } else { 2 };
+    let a = amount.trim().replace(',', "");
+    let (whole, frac) = a.split_once('.').unwrap_or((&a, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > places {
+        return Err(format!("{} has {} decimals; {} has {}", amount, frac.len(), c, places));
+    }
+    format!("{}{}{}", whole, frac, "0".repeat(places - frac.len())).parse().map_err(|_| format!("`{}` is too large", amount))
+}
+
+/// Paise written for an Indian reader, grouped in lakhs and crores: `razorpay_rupees(1234567890)` is "₹1,23,45,678.90".
+pub fn razorpay_rupees(paise: i64) -> String {
+    let (sign, abs) = if paise < 0 { ("-", -paise) } else { ("", paise) };
+    let digits = (abs / 100).to_string();
+    let grouped = if digits.len() <= 3 {
+        digits
+    } else {
+        let (head, tail) = digits.split_at(digits.len() - 3);
+        let mut parts = vec![];
+        let mut end = head.len();
+        while end > 2 {
+            parts.push(&head[end - 2..end]);
+            end -= 2;
+        }
+        parts.push(&head[..end]);
+        parts.reverse();
+        format!("{},{}", parts.join(","), tail)
+    };
+    format!("{}₹{}.{:02}", sign, grouped, abs % 100)
+}
+
+/// Makes an order: `amount` in the smallest unit (at least 100 paise), `receipt` your reference (at most 40 characters, "" for none), `notes` a map of at most 15 texts. Gives the order; hand its `id` to Checkout.
+pub fn razorpay_order_create(amount: i64, currency: &str, receipt: &str, notes: serde_json::Value) -> Result<serde_json::Value, String> {
+    if amount <= 0 {
+        return Err("an amount is in the smallest unit and more than 0: see razorpay_amount".into());
+    }
+    if receipt.len() > 40 {
+        return Err(format!("a receipt is at most 40 characters, not {}", receipt.len()));
+    }
+    if notes.as_object().map_or(false, |n| n.len() > 15) {
+        return Err("an order takes at most 15 notes".into());
+    }
+    let mut b = json!({ "amount": amount, "currency": currency.to_uppercase() });
+    if !receipt.is_empty() {
+        b["receipt"] = json!(receipt);
+    }
+    if notes.is_object() {
+        b["notes"] = notes;
+    }
+    call("POST", "/orders", Some(&b))
+}
+
+/// One order by id.
+pub fn razorpay_order(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/orders/{}", enc(id)), None)
+}
+
+/// The payments tried on an order.
+pub fn razorpay_order_payments(id: &str) -> Result<Vec<serde_json::Value>, String> {
+    Ok(call("GET", &format!("/orders/{}/payments", enc(id)), None)?["items"].as_array().cloned().unwrap_or_default())
+}
+
+// Lists take `count` (at most 100) and `skip`; a page short of the count is the last.
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut q = String::new();
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            q.push_str(&format!("&{}={}", enc(k), enc(&t)));
+        }
+    }
+    let mut out: Vec<Value> = vec![];
+    loop {
+        let v = call("GET", &format!("{}?count=100&skip={}{}", path, out.len(), q), None)?;
+        let items = v["items"].as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < 100 {
+            return Ok(out);
+        }
+    }
+}
+
+/// Orders through every page; `filter` is Razorpay's (`from`, `to` as unix seconds, `authorized`, `receipt`), `max_items` caps them (0: all).
+pub fn razorpay_orders(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/orders", &filter, max_items)
+}
+
+/// Payments through every page; `filter` is `from` and `to`, `max_items` caps them (0: all).
+pub fn razorpay_payments(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/payments", &filter, max_items)
+}
+
+/// One payment by id.
+pub fn razorpay_payment(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/payments/{}", enc(id)), None)
+}
+
+/// Captures an authorized payment; `amount` must be the amount authorized, in the smallest unit.
+pub fn razorpay_capture(id: &str, amount: i64, currency: &str) -> Result<serde_json::Value, String> {
+    call("POST", &format!("/payments/{}/capture", enc(id)), Some(&json!({ "amount": amount, "currency": currency.to_uppercase() })))
+}
+
+/// Refunds a captured payment: `amount` in the smallest unit (0: all that is left). `params` adds `speed` ("normal" or "optimum"), `receipt`, `notes`.
+pub fn razorpay_refund(payment_id: &str, amount: i64, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = if params.is_object() { params } else { json!({}) };
+    if amount > 0 {
+        b["amount"] = json!(amount);
+    }
+    call("POST", &format!("/payments/{}/refund", enc(payment_id)), Some(&b))
+}
+
+/// One refund by id.
+pub fn razorpay_refund_get(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/refunds/{}", enc(id)), None)
+}
+
+/// A payment's refunds.
+pub fn razorpay_refunds(payment_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/payments/{}/refunds", enc(payment_id)), &Value::Null, 0)
+}
+
+fn hex_hmac(key: &str, text: &str) -> String {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key");
+    m.update(text.as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The signature Razorpay gives Checkout for a payment: the hex HMAC-SHA256 of `order_id|payment_id` with the key secret. For tests.
+pub fn razorpay_payment_sign(order_id: &str, payment_id: &str) -> Result<String, String> {
+    Ok(hex_hmac(&secret()?, &format!("{}|{}", order_id, payment_id)))
+}
+
+/// Checks what Checkout's handler gave the page: `order_id` must be your own stored order's, not one sent by the browser. `fields` is { razorpay_payment_id, razorpay_signature }. Gives the payment id, or an error; only then is the payment believed.
+pub fn razorpay_check_payment(order_id: &str, fields: serde_json::Value) -> Result<String, String> {
+    let pid = fields["razorpay_payment_id"].as_str().ok_or("no razorpay_payment_id")?;
+    let sig = fields["razorpay_signature"].as_str().ok_or("no razorpay_signature")?;
+    if !same(&hex_hmac(&secret()?, &format!("{}|{}", order_id, pid)), sig) {
+        return Err("the payment's signature does not match: not this order's, or not from Razorpay".into());
+    }
+    Ok(pid.to_string())
+}
+
+/// As razorpay_check_payment for a subscription's first payment, where the signed text is `payment_id|subscription_id`.
+pub fn razorpay_check_subscription(subscription_id: &str, fields: serde_json::Value) -> Result<String, String> {
+    let pid = fields["razorpay_payment_id"].as_str().ok_or("no razorpay_payment_id")?;
+    let sig = fields["razorpay_signature"].as_str().ok_or("no razorpay_signature")?;
+    if !same(&hex_hmac(&secret()?, &format!("{}|{}", pid, subscription_id)), sig) {
+        return Err("the payment's signature does not match: not this subscription's, or not from Razorpay".into());
+    }
+    Ok(pid.to_string())
+}
+
+/// Checks a webhook: `body` raw, `signature` the X-Razorpay-Signature header, `webhook_secret` the one set on the webhook (not the key secret). Gives the event { event, payload, created_at, ... }. Keep the x-razorpay-event-id header to skip repeats: Razorpay delivers at least once.
+pub fn razorpay_webhook(body: &str, signature: &str, webhook_secret: &str) -> Result<serde_json::Value, String> {
+    if signature.is_empty() {
+        return Err("no X-Razorpay-Signature header: this did not come from Razorpay".into());
+    }
+    if !same(&hex_hmac(webhook_secret, body), &signature.to_ascii_lowercase()) {
+        return Err("the webhook's signature does not match: a wrong webhook secret, or the body was changed (use the raw body)".into());
+    }
+    serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))
+}

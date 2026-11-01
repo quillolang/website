@@ -1,0 +1,201 @@
+//! Microsoft Teams incoming webhooks: Adaptive Cards built from small parts and checked, posted to a channel through a Workflows or classic connector URL, with Teams' errors that arrive as a 200 read as errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// Teams refuses a message over about 28 KB.
+const MAX_BYTES: usize = 28_000;
+const CARD_VERSION: &str = "1.5";
+
+/// A line of text for a card's body. Options: size (small, default, medium, large, extraLarge), weight (bolder), color (good, warning, attention, accent), wrap (true unless false), subtle, spacing, separator. The text may hold Teams' small Markdown.
+pub fn teams_text(text: &str, options: serde_json::Value) -> serde_json::Value {
+    let mut b = json!({ "type": "TextBlock", "text": text, "wrap": true });
+    for k in ["size", "weight", "color", "wrap", "isSubtle", "spacing", "separator"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    if let Some(v) = options.get("subtle") {
+        b["isSubtle"] = v.clone();
+    }
+    b
+}
+
+/// A heading for a card: large and bold.
+pub fn teams_heading(text: &str) -> serde_json::Value {
+    json!({ "type": "TextBlock", "text": text, "wrap": true, "size": "large", "weight": "bolder", "style": "heading" })
+}
+
+/// A list of labelled values: `facts` is a map of title to value, in order, or a list of [title, value]. Numbers and the like are written as text.
+pub fn teams_facts(facts: serde_json::Value) -> Result<serde_json::Value, String> {
+    let show = |v: &Value| v.as_str().map(str::to_string).unwrap_or(v.to_string());
+    let list: Vec<Value> = match &facts {
+        Value::Object(m) => m.iter().map(|(k, v)| json!({ "title": k, "value": show(v) })).collect(),
+        Value::Array(l) => l.iter().map(|p| {
+            let (t, v) = (p.get(0).ok_or("each fact is [title, value]")?, p.get(1).ok_or("each fact is [title, value]")?);
+            Ok(json!({ "title": show(t), "value": show(v) }))
+        }).collect::<Result<_, String>>()?,
+        _ => return Err("facts is a map, or a list of [title, value]".into()),
+    };
+    if list.is_empty() {
+        return Err("there are no facts".into());
+    }
+    Ok(json!({ "type": "FactSet", "facts": list }))
+}
+
+/// An image: its https `url`, and the text a screen reader says.
+pub fn teams_image(url: &str, alt: &str) -> Result<serde_json::Value, String> {
+    if !url.starts_with("https://") && !url.starts_with("data:") {
+        return Err(format!("a card's image is an https URL, not {:?}", url));
+    }
+    Ok(json!({ "type": "Image", "url": url, "altText": alt }))
+}
+
+/// Blocks in columns: `columns` is a list of lists of blocks, in equal widths.
+pub fn teams_columns(columns: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({ "type": "ColumnSet", "columns": columns.into_iter().map(|c| json!({ "type": "Column", "width": "stretch", "items": c })).collect::<Vec<_>>() })
+}
+
+/// A coloured block around other blocks: `style` is default, emphasis, good, warning, attention or accent.
+pub fn teams_container(items: Vec<serde_json::Value>, style: &str) -> Result<serde_json::Value, String> {
+    if !["default", "emphasis", "good", "warning", "attention", "accent"].contains(&style) {
+        return Err(format!("{:?} is not a container style", style));
+    }
+    Ok(json!({ "type": "Container", "style": style, "items": items }))
+}
+
+/// A button that opens a link, for a card's `actions`. Incoming webhooks can only carry links: there is nothing to receive a press.
+pub fn teams_open_url(title: &str, url: &str) -> serde_json::Value {
+    json!({ "type": "Action.OpenUrl", "title": title, "url": url })
+}
+
+fn check(block: &Value, path: &str) -> Result<(), String> {
+    let kind = block["type"].as_str().ok_or(format!("{} has no `type`", path))?;
+    match kind {
+        "TextBlock" if block["text"].as_str().map(|t| t.is_empty()).unwrap_or(true) => Err(format!("{} is a TextBlock with no text", path)),
+        "FactSet" if !block["facts"].is_array() => Err(format!("{} is a FactSet with no facts", path)),
+        "Image" if block["url"].as_str().is_none() => Err(format!("{} is an Image with no url", path)),
+        "Container" => block["items"].as_array().ok_or(format!("{} is a Container with no items", path))?.iter().enumerate().try_for_each(|(i, b)| check(b, &format!("{}.items[{}]", path, i))),
+        "ColumnSet" => {
+            for (i, c) in block["columns"].as_array().ok_or(format!("{} is a ColumnSet with no columns", path))?.iter().enumerate() {
+                for (j, b) in c["items"].as_array().into_iter().flatten().enumerate() {
+                    check(b, &format!("{}.columns[{}].items[{}]", path, i, j))?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// An Adaptive Card from `body` (blocks from the functions above) and `actions` (buttons), full width in the channel. Checked for the mistakes Teams answers with a blank card or a vague error.
+pub fn teams_card(body: Vec<serde_json::Value>, actions: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    if body.is_empty() {
+        return Err("a card needs at least one block".into());
+    }
+    for (i, b) in body.iter().enumerate() {
+        check(b, &format!("body[{}]", i))?;
+    }
+    for (i, a) in actions.iter().enumerate() {
+        if a["type"] != "Action.OpenUrl" {
+            return Err(format!("actions[{}]: an incoming webhook carries only Action.OpenUrl buttons", i));
+        }
+    }
+    let mut card = json!({
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": CARD_VERSION,
+        "body": body,
+        "msteams": { "width": "Full" },
+    });
+    if !actions.is_empty() {
+        card["actions"] = json!(actions);
+    }
+    Ok(card)
+}
+
+/// The message a webhook takes: the card in an attachment of type application/vnd.microsoft.card.adaptive.
+pub fn teams_message(card: serde_json::Value) -> Result<serde_json::Value, String> {
+    if card["type"] != "AdaptiveCard" {
+        return Err("this is not an Adaptive Card: build it with teams_card".into());
+    }
+    Ok(json!({ "type": "message", "attachments": [{ "contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": null, "content": card }] }))
+}
+
+fn target(url: &str) -> Result<String, String> {
+    let u = if url.is_empty() { std::env::var("TEAMS_WEBHOOK_URL").unwrap_or_default() } else { url.to_string() };
+    if u.is_empty() {
+        return Err("no webhook: set TEAMS_WEBHOOK_URL, or pass the URL".into());
+    }
+    Ok(u)
+}
+
+// The URL is a secret, so it is left out of every message.
+fn post(url: &str, message: &Value) -> Result<Value, String> {
+    let body = message.to_string();
+    if body.len() > MAX_BYTES {
+        return Err(format!("the message is {} bytes; Teams takes about {}: shorten the card", body.len(), MAX_BYTES));
+    }
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut tries = 0;
+    loop {
+        let res = agent.post(url).set("Content-Type", "application/json").send_string(&body);
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.into_string().unwrap_or_default();
+                // The classic connector answers 200 "1"; its failures can also be a 200 with words.
+                let t = text.trim();
+                if t.is_empty() || t == "1" {
+                    return Ok(json!({ "ok": true, "status": status }));
+                }
+                if t.contains("429") && tries < 2 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    tries += 1;
+                    continue;
+                }
+                if t.contains("failed") || t.contains("error") {
+                    return Err(format!("Teams took the request but did not deliver it: {}", t));
+                }
+                return Ok(json!({ "ok": true, "status": status, "answer": t }));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let wait = r.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = r.into_string().unwrap_or_default();
+                if (code == 429 || code >= 500) && tries < 2 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1).min(30)));
+                    tries += 1;
+                    continue;
+                }
+                let hint = match code {
+                    400 => " (the card does not parse)",
+                    403 | 404 => " (the webhook was removed, or its flow is off)",
+                    413 => " (the message is too large)",
+                    _ => "",
+                };
+                return Err(format!("Teams answered {}{}: {}", code, hint, t.chars().take(300).collect::<String>()));
+            }
+            Err(ureq::Error::Transport(t)) => return Err(format!("cannot reach the Teams webhook: {}", t.kind())),
+        }
+    }
+}
+
+/// Posts a card to a channel: `url` the webhook's (a Workflows URL or a classic connector's; "" for TEAMS_WEBHOOK_URL). A 429 is waited out twice. Gives { ok, status }.
+pub fn teams_post(url: &str, card: serde_json::Value) -> Result<serde_json::Value, String> {
+    let u = target(url)?;
+    post(&u, &teams_message(card)?)
+}
+
+/// Posts plain text as a one-line card, so it looks the same on both kinds of webhook.
+pub fn teams_post_text(url: &str, text: &str) -> Result<serde_json::Value, String> {
+    if text.trim().is_empty() {
+        return Err("there is nothing to post".into());
+    }
+    let u = target(url)?;
+    post(&u, &teams_message(teams_card(vec![teams_text(text, Value::Null)], vec![])?)?)
+}

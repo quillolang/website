@@ -1,0 +1,374 @@
+//! Microsoft Graph as an app: client-credentials tokens kept until they expire, any call with 429s and 503s waited out as Retry-After says, every @odata.nextLink page followed, mail read and sent, calendar views and events, OneDrive folders, uploads small and by session, downloads, batches, and OData values quoted.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::io::Read;
+use std::sync::Mutex;
+use std::time::Duration;
+
+// MSGRAPH_TENANT_ID, MSGRAPH_CLIENT_ID and MSGRAPH_CLIENT_SECRET are the app registration's.
+// MSGRAPH_API_URL is the API (https://graph.microsoft.com/v1.0 when not set), MSGRAPH_LOGIN_URL the
+// sign-in host (https://login.microsoftonline.com when not set), MSGRAPH_SCOPE_HOST the host in the
+// token's scope (https://graph.microsoft.com when not set); national clouds differ in all three.
+// An app acts on named users: `user` below is an id or a user principal name, and the app needs the
+// application permission for each call (Mail.Send, Calendars.ReadWrite, Files.ReadWrite.All).
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn need(k: &str) -> Result<String, String> {
+    env(k).ok_or(format!("{} is not set", k))
+}
+
+fn api() -> String {
+    env("MSGRAPH_API_URL").unwrap_or_else(|| "https://graph.microsoft.com/v1.0".into()).trim_end_matches('/').to_string()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+static TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn clear_token() {
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn token() -> Result<String, String> {
+    if let Some((t, until)) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *until > now() + 120 {
+            return Ok(t.clone());
+        }
+    }
+    let login = env("MSGRAPH_LOGIN_URL").unwrap_or_else(|| "https://login.microsoftonline.com".into());
+    let url = format!("{}/{}/oauth2/v2.0/token", login.trim_end_matches('/'), need("MSGRAPH_TENANT_ID")?);
+    // The API's own address gives the scope: https://graph.microsoft.com/.default.
+    let scope = format!("{}/.default", env("MSGRAPH_SCOPE_HOST").unwrap_or_else(|| "https://graph.microsoft.com".into()));
+    let res = ureq::post(&url).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "client_credentials"), ("client_id", &need("MSGRAPH_CLIENT_ID")?), ("client_secret", &need("MSGRAPH_CLIENT_SECRET")?), ("scope", &scope)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("sign-in refused ({}): {} {}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b).lines().next().unwrap_or("")));
+        }
+        Err(e) => return Err(format!("cannot reach the sign-in server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("no access_token in the answer")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((tok.clone(), now() + v["expires_in"].as_i64().unwrap_or(3599)));
+    Ok(tok)
+}
+
+fn error_text(status: u16, v: &Value, text: &str) -> String {
+    let e = &v["error"];
+    match (e["code"].as_str(), e["message"].as_str()) {
+        (Some(c), Some(m)) => format!("Graph answered {} {}: {}", status, c, m),
+        _ => format!("Graph answered {}: {}", status, text.chars().take(300).collect::<String>()),
+    }
+}
+
+/// A path or a full address, as @odata.nextLink gives one. The token only goes to the API's own host.
+fn url_of(path: &str) -> Result<String, String> {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        let host = |u: &str| u.split('/').nth(2).unwrap_or("").to_string();
+        if host(path) != host(&api()) {
+            return Err(format!("{} is not on the API's host: the token will not be sent there", path));
+        }
+        return Ok(path.to_string());
+    }
+    Ok(format!("{}{}{}", api(), if path.starts_with('/') { "" } else { "/" }, path))
+}
+
+enum Sent<'a> {
+    Nothing,
+    Json(&'a Value),
+    Raw(&'a str, &'a [u8]),
+}
+
+/// A request with waits for throttling: 429 and 503 say how long in Retry-After, and an expired token is replaced once.
+fn send(method: &str, path: &str, body: Sent, headers: &[(&str, &str)]) -> Result<ureq::Response, String> {
+    let url = url_of(path)?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
+    let mut renewed = false;
+    for attempt in 0..6 {
+        let mut req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token()?));
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        let res = match &body {
+            Sent::Nothing => req.call(),
+            Sent::Json(v) => req.set("Content-Type", "application/json").send_string(&v.to_string()),
+            Sent::Raw(k, b) => req.set("Content-Type", k).send_bytes(b),
+        };
+        match res {
+            Ok(r) => return Ok(r),
+            Err(ureq::Error::Status(c, r)) if (c == 429 || c == 503 || c == 504) && attempt < 5 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1 << attempt);
+                std::thread::sleep(Duration::from_secs(wait.min(120)));
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                clear_token();
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                return Err(error_text(c, &serde_json::from_str(&t).unwrap_or(Value::Null), &t));
+            }
+            Err(e) => return Err(format!("cannot reach Graph at {}: {}", api(), e)),
+        }
+    }
+    Err("Graph kept throttling through six tries".into())
+}
+
+fn json_of(r: ureq::Response) -> Result<Value, String> {
+    let mut t = String::new();
+    r.into_reader().read_to_string(&mut t).map_err(|e| e.to_string())?;
+    if t.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&t).map_err(|e| e.to_string())
+}
+
+fn user_path(user: &str) -> Result<String, String> {
+    if user.is_empty() {
+        return Err("name the user: an id or a user principal name".into());
+    }
+    Ok(format!("/users/{}", enc(user)))
+}
+
+/// A drive path as Graph's path addressing wants it: `root:/a%20b/c.txt:`, or `root` for the top.
+fn drive_item(path: &str) -> String {
+    let p = path.trim_matches('/');
+    if p.is_empty() {
+        return "root".into();
+    }
+    format!("root:/{}:", p.split('/').map(enc).collect::<Vec<_>>().join("/"))
+}
+
+/// A text as an OData string value, for `$filter`: in single quotes, its own quotes doubled.
+pub fn msgraph_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Any call: `method`, a `path` like "/users?$top=5" (or an @odata.nextLink), and `body` (null for none). Gives the JSON, or null for a 204.
+pub fn msgraph_request(method: &str, path: &str, body: serde_json::Value) -> Result<Value, String> {
+    let sent = if body.is_null() { Sent::Nothing } else { Sent::Json(&body) };
+    json_of(send(&method.to_uppercase(), path, sent, &[])?)
+}
+
+/// Every item of a collection, following each `@odata.nextLink`, until the page that reaches `max` ends (so it can give a little more, and nothing is skipped by going on): `{ items, complete, next }`, `next` the link to go on from when `max` stopped it.
+pub fn msgraph_list(path: &str, max: i64) -> Result<Value, String> {
+    let (mut items, mut at): (Vec<Value>, String) = (vec![], path.to_string());
+    loop {
+        let r = json_of(send("GET", &at, Sent::Nothing, &[("ConsistencyLevel", "eventual")])?)?;
+        items.extend(r["value"].as_array().cloned().unwrap_or_default());
+        let next = r["@odata.nextLink"].as_str().map(str::to_string);
+        match next {
+            Some(n) if (items.len() as i64) < max => at = n,
+            next => return Ok(json!({ "items": items, "complete": next.is_none(), "next": next })),
+        }
+    }
+}
+
+fn recipients(v: &Value) -> Result<Vec<Value>, String> {
+    let list: Vec<&Value> = match v {
+        Value::Null => vec![],
+        Value::Array(a) => a.iter().collect(),
+        o => vec![o],
+    };
+    list.iter().map(|x| {
+        let a = x.as_str().ok_or("recipients are email addresses")?;
+        if !a.contains('@') {
+            return Err(format!("{:?} is not an email address", a));
+        }
+        Ok(json!({ "emailAddress": { "address": a } }))
+    }).collect()
+}
+
+/// Sends mail from `user`. `message`: `to`, `cc`, `bcc` (an address or a list), `subject`, and `text` or `html`. `save` keeps it in Sent Items. Graph answers 202 at once, so this means accepted, not delivered.
+pub fn msgraph_send_mail(user: &str, message: serde_json::Value, save: bool) -> Result<bool, String> {
+    let to = recipients(&message["to"])?;
+    if to.is_empty() {
+        return Err("a message needs a `to`".into());
+    }
+    let (kind, content) = match (message["html"].as_str(), message["text"].as_str()) {
+        (Some(h), _) => ("HTML", h),
+        (None, Some(t)) => ("Text", t),
+        _ => return Err("a message needs `text` or `html`".into()),
+    };
+    let b = json!({ "message": {
+        "subject": message["subject"].as_str().unwrap_or(""),
+        "body": { "contentType": kind, "content": content },
+        "toRecipients": to, "ccRecipients": recipients(&message["cc"])?, "bccRecipients": recipients(&message["bcc"])?,
+    }, "saveToSentItems": save });
+    send("POST", &format!("{}/sendMail", user_path(user)?), Sent::Json(&b), &[])?;
+    Ok(true)
+}
+
+/// A user's mail, newest first. `options`: `folder` ("inbox", "sentitems", an id), `filter` (OData; see `msgraph_quote`), `search` (Graph's $search; no order then), `select` (fields), `max` (50). Gives `{ items, complete, next }`.
+pub fn msgraph_messages(user: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut p = user_path(user)?;
+    if let Some(f) = options["folder"].as_str() {
+        p.push_str(&format!("/mailFolders/{}", enc(f)));
+    }
+    p.push_str("/messages?$top=25");
+    for (k, q) in [("filter", "$filter"), ("select", "$select")] {
+        if let Some(v) = options[k].as_str() {
+            p.push_str(&format!("&{}={}", q, enc(v)));
+        }
+    }
+    if let Some(s) = options["search"].as_str() {
+        p.push_str(&format!("&$search={}", enc(&format!("\"{}\"", s.replace('"', "")))));
+    } else if options["filter"].is_null() {
+        p.push_str("&$orderby=receivedDateTime%20desc");
+    }
+    msgraph_list(&p, options["max"].as_i64().unwrap_or(50))
+}
+
+/// The events on a user's calendar between two times (ISO 8601), series opened into each occurrence, every time in UTC: `{ items, complete }`, each with `subject`, `start`, `end`, `organizer`.
+pub fn msgraph_calendar(user: &str, start: &str, end: &str, max: i64) -> Result<Value, String> {
+    let p = format!("{}/calendarView?startDateTime={}&endDateTime={}&$orderby=start/dateTime&$top=50", user_path(user)?, enc(start), enc(end));
+    let (mut items, mut at): (Vec<Value>, String) = (vec![], p);
+    loop {
+        let r = json_of(send("GET", &at, Sent::Nothing, &[("Prefer", "outlook.timezone=\"UTC\"")])?)?;
+        items.extend(r["value"].as_array().cloned().unwrap_or_default());
+        match r["@odata.nextLink"].as_str() {
+            Some(n) if (items.len() as i64) < max => at = n.to_string(),
+            n => {
+                let complete = n.is_none() && items.len() as i64 <= max;
+                items.truncate(max.max(0) as usize);
+                return Ok(json!({ "items": items, "complete": complete }));
+            }
+        }
+    }
+}
+
+/// Puts an event on a user's calendar. `event`: `subject`, `start` and `end` (ISO 8601, in UTC unless `zone` says otherwise), `text`, `location`, `attendees` (addresses), `online` (true makes a Teams link). Gives the event as made.
+pub fn msgraph_create_event(user: &str, event: serde_json::Value) -> Result<Value, String> {
+    let zone = event["zone"].as_str().unwrap_or("UTC");
+    let at = |k: &str| -> Result<Value, String> { Ok(json!({ "dateTime": event[k].as_str().ok_or(format!("an event needs `{}`", k))?, "timeZone": zone })) };
+    let mut b = json!({ "subject": event["subject"].as_str().unwrap_or(""), "start": at("start")?, "end": at("end")? });
+    if let Some(t) = event["text"].as_str() {
+        b["body"] = json!({ "contentType": "Text", "content": t });
+    }
+    if let Some(l) = event["location"].as_str() {
+        b["location"] = json!({ "displayName": l });
+    }
+    if !event["attendees"].is_null() {
+        b["attendees"] = Value::Array(recipients(&event["attendees"])?.into_iter().map(|mut r| { r["type"] = json!("required"); r }).collect());
+    }
+    if event["online"] == true {
+        b["isOnlineMeeting"] = json!(true);
+        b["onlineMeetingProvider"] = json!("teamsForBusiness");
+    }
+    json_of(send("POST", &format!("{}/events", user_path(user)?), Sent::Json(&b), &[])?)
+}
+
+/// What is in a OneDrive folder ("" for the top): `{ items, complete }`, each with `name`, `size`, and `file` or `folder`.
+pub fn msgraph_drive_list(user: &str, path: &str, max: i64) -> Result<Value, String> {
+    msgraph_list(&format!("{}/drive/{}/children", user_path(user)?, drive_item(path)), max)
+}
+
+/// A file or folder's item, or null when there is none at that path.
+pub fn msgraph_drive_item(user: &str, path: &str) -> Result<Value, String> {
+    match send("GET", &format!("{}/drive/{}", user_path(user)?, drive_item(path)), Sent::Nothing, &[]) {
+        Ok(r) => json_of(r),
+        Err(e) if e.contains(" itemNotFound:") => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
+/// Uploads text to a OneDrive path, replacing what is there, in one request: Graph takes up to 4 MB this way. Gives its item.
+pub fn msgraph_drive_upload(user: &str, path: &str, content: &str, content_type: &str) -> Result<Value, String> {
+    if content.len() > 4 * 1024 * 1024 {
+        return Err("over 4 MB: use msgraph_drive_upload_file, which uses an upload session".into());
+    }
+    let kind = if content_type.is_empty() { "text/plain" } else { content_type };
+    json_of(send("PUT", &format!("{}/drive/{}/content", user_path(user)?, drive_item(path)), Sent::Raw(kind, content.as_bytes()), &[])?)
+}
+
+/// Uploads a local file by an upload session, in pieces of `chunk_kb` (0 for 3200; a real session wants multiples of 320). The session's address is its own credential, so no token goes with the pieces. Gives its item, with `pieces`.
+pub fn msgraph_drive_upload_file(user: &str, local: &str, path: &str, chunk_kb: i64) -> Result<Value, String> {
+    let bytes = std::fs::read(local).map_err(|e| format!("{}: {}", local, e))?;
+    if bytes.is_empty() {
+        return Err("upload sessions do not take empty files: use msgraph_drive_upload".into());
+    }
+    let s = json_of(send("POST", &format!("{}/drive/{}/createUploadSession", user_path(user)?, drive_item(path)), Sent::Json(&json!({ "item": { "@microsoft.graph.conflictBehavior": "replace" } })), &[])?)?;
+    let url = s["uploadUrl"].as_str().ok_or("Graph gave no uploadUrl")?;
+    let chunk = if chunk_kb > 0 { chunk_kb as usize * 1024 } else { 3200 * 1024 };
+    let total = bytes.len();
+    let (mut at, mut pieces, mut tries) = (0usize, 0, 0);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
+    while at < total {
+        let end = (at + chunk).min(total);
+        let res = agent.put(url).set("Content-Range", &format!("bytes {}-{}/{}", at, end - 1, total)).send_bytes(&bytes[at..end]);
+        match res {
+            Ok(r) if r.status() == 200 || r.status() == 201 => {
+                let mut item = json_of(r)?;
+                item["pieces"] = json!(pieces + 1);
+                return Ok(item);
+            }
+            Ok(r) => {
+                // 202: where to go on from, as nextExpectedRanges says.
+                let v = json_of(r)?;
+                at = v["nextExpectedRanges"][0].as_str().and_then(|x| x.split('-').next()).and_then(|n| n.parse().ok()).unwrap_or(end);
+                pieces += 1;
+                tries = 0;
+            }
+            Err(ureq::Error::Status(c, r)) if (c >= 500 || c == 429) && tries < 4 => {
+                tries += 1;
+                let wait = r.header("Retry-After").and_then(|x| x.parse::<u64>().ok()).unwrap_or(1 << tries);
+                std::thread::sleep(Duration::from_secs(wait.min(60)));
+                let st = json_of(agent.get(url).call().map_err(|e| e.to_string())?)?;
+                at = st["nextExpectedRanges"][0].as_str().and_then(|x| x.split('-').next()).and_then(|n| n.parse().ok()).unwrap_or(at);
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                return Err(error_text(c, &serde_json::from_str(&t).unwrap_or(Value::Null), &t));
+            }
+            Err(e) => return Err(format!("the upload broke off: {}", e)),
+        }
+    }
+    Err("the upload ended without an item".into())
+}
+
+/// A OneDrive file's content as text. Graph answers with a redirect to a short-lived address, which needs no token and is not given it.
+pub fn msgraph_drive_download(user: &str, path: &str) -> Result<String, String> {
+    let r = send("GET", &format!("{}/drive/{}/content", user_path(user)?, drive_item(path)), Sent::Nothing, &[])?;
+    let mut b = Vec::new();
+    r.into_reader().read_to_end(&mut b).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Up to 20 calls in one, each `{ method, url, body }`, the `url` relative, like "/users/x". Gives a list in the same order of `{ status, body }`, one failing without the others.
+pub fn msgraph_batch(requests: Vec<serde_json::Value>) -> Result<Vec<Value>, String> {
+    if requests.is_empty() || requests.len() > 20 {
+        return Err(format!("a batch holds 1 to 20 requests, not {}", requests.len()));
+    }
+    let list: Vec<Value> = requests.iter().enumerate().map(|(i, r)| {
+        let mut o = json!({ "id": (i + 1).to_string(), "method": r["method"].as_str().unwrap_or("GET"), "url": r["url"] });
+        if !r["body"].is_null() {
+            o["body"] = r["body"].clone();
+            o["headers"] = json!({ "Content-Type": "application/json" });
+        }
+        o
+    }).collect();
+    let r = json_of(send("POST", "/$batch", Sent::Json(&json!({ "requests": list })), &[])?)?;
+    let mut out = vec![Value::Null; requests.len()];
+    for x in r["responses"].as_array().into_iter().flatten() {
+        if let Some(i) = x["id"].as_str().and_then(|s| s.parse::<usize>().ok()).filter(|i| *i >= 1 && *i <= out.len()) {
+            out[i - 1] = json!({ "status": x["status"], "body": x["body"] });
+        }
+    }
+    Ok(out)
+}

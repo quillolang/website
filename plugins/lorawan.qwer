@@ -1,0 +1,567 @@
+//! LoRaWAN 1.0.x frames read on a network or application server: PHYPayload parsed, the MIC checked with AES-CMAC, FRMPayload decrypted with AES-128, the 16-bit frame counter widened, join requests and join accepts with their session keys, MAC commands named, frames built for simulators, and Cayenne LPP sensor payloads decoded and encoded.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! aes = "0.8"
+//! cmac = "0.7"
+//! base64 = "0.22"
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::Aes128;
+use base64::Engine;
+use cmac::{Cmac, Mac};
+use serde_json::{json, Map, Value};
+
+// A packet is given as hex, as base64 (what gateways' JSON carries) or as a list of bytes. A key
+// is 32 hex digits.
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a
+            .iter()
+            .map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string()))
+            .collect(),
+        Value::String(s) => {
+            let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            if t.len() % 2 == 0 && t.bytes().all(|c| c.is_ascii_hexdigit()) {
+                hex::decode(&t).map_err(|e| e.to_string())
+            } else {
+                base64::engine::general_purpose::STANDARD.decode(t.trim_end_matches('=').to_string() + &"=".repeat((4 - t.trim_end_matches('=').len() % 4) % 4)).map_err(|_| "not hex or base64".to_string())
+            }
+        }
+        _ => Err("give the bytes as hex, base64 or a list of numbers".into()),
+    }
+}
+
+fn key_of(s: &str, what: &str) -> Result<[u8; 16], String> {
+    let t = s.replace([' ', ':', '-'], "");
+    let b = hex::decode(&t).map_err(|_| format!("{} must be hex", what))?;
+    <[u8; 16]>::try_from(b.as_slice()).map_err(|_| format!("{} must be 16 bytes (32 hex digits), not {}", what, t.len() / 2))
+}
+
+fn key_in(keys: &Value, name: &str) -> Result<[u8; 16], String> {
+    match keys.get(name).and_then(|v| v.as_str()) {
+        Some(s) => key_of(s, name),
+        None => Err(format!("the keys need `{}`", name)),
+    }
+}
+
+fn aes_enc(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
+    let c = Aes128::new(GenericArray::from_slice(key));
+    let mut b = GenericArray::clone_from_slice(block);
+    c.encrypt_block(&mut b);
+    b.into()
+}
+
+fn aes_dec(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
+    let c = Aes128::new(GenericArray::from_slice(key));
+    let mut b = GenericArray::clone_from_slice(block);
+    c.decrypt_block(&mut b);
+    b.into()
+}
+
+fn cmac4(key: &[u8; 16], parts: &[&[u8]]) -> [u8; 4] {
+    let mut m = <Cmac<Aes128> as Mac>::new_from_slice(key).expect("16 bytes");
+    for p in parts {
+        m.update(p);
+    }
+    let t = m.finalize().into_bytes();
+    [t[0], t[1], t[2], t[3]]
+}
+
+fn be_hex(b: &[u8]) -> String {
+    hex::encode_upper(b.iter().rev().cloned().collect::<Vec<u8>>())
+}
+
+const MTYPES: [&str; 8] = ["join-request", "join-accept", "unconfirmed-up", "unconfirmed-down", "confirmed-up", "confirmed-down", "rejoin-request", "proprietary"];
+
+struct Frame {
+    mtype: u8,
+    addr: [u8; 4], // on the wire, little-endian
+    fctrl: u8,
+    fcnt: u16,
+    fopts: Vec<u8>,
+    fport: Option<u8>,
+    frm: Vec<u8>,
+    mic: [u8; 4],
+    body: Vec<u8>, // MHDR to the end of MACPayload
+}
+
+impl Frame {
+    fn uplink(&self) -> bool {
+        self.mtype % 2 == 0
+    }
+}
+
+fn frame(p: &[u8]) -> Result<Frame, String> {
+    if p.len() < 12 {
+        return Err(format!("{} bytes is too short for a data frame: MHDR, DevAddr, FCtrl, FCnt and MIC take 12", p.len()));
+    }
+    let mtype = p[0] >> 5;
+    if !(2..=5).contains(&mtype) {
+        return Err(format!("a {} is not a data frame", MTYPES[mtype as usize]));
+    }
+    let fctrl = p[5];
+    let opts = (fctrl & 0x0f) as usize;
+    let end = p.len() - 4;
+    if 8 + opts > end {
+        return Err(format!("FCtrl says {} bytes of FOpts, which the frame does not hold", opts));
+    }
+    let fport = if end > 8 + opts { Some(p[8 + opts]) } else { None };
+    let start = 9 + opts;
+    Ok(Frame {
+        mtype,
+        addr: [p[1], p[2], p[3], p[4]],
+        fctrl,
+        fcnt: u16::from_le_bytes([p[6], p[7]]),
+        fopts: p[8..8 + opts].to_vec(),
+        fport,
+        frm: if start <= end { p[start..end].to_vec() } else { vec![] },
+        mic: [p[end], p[end + 1], p[end + 2], p[end + 3]],
+        body: p[..end].to_vec(),
+    })
+}
+
+fn mic_of(key: &[u8; 16], body: &[u8], up: bool, addr: &[u8; 4], fcnt: u32) -> [u8; 4] {
+    let mut b0 = [0u8; 16];
+    b0[0] = 0x49;
+    b0[5] = if up { 0 } else { 1 };
+    b0[6..10].copy_from_slice(addr);
+    b0[10..14].copy_from_slice(&fcnt.to_le_bytes());
+    b0[15] = body.len() as u8;
+    cmac4(key, &[&b0, body])
+}
+
+fn crypt(key: &[u8; 16], data: &[u8], up: bool, addr: &[u8; 4], fcnt: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for (i, chunk) in data.chunks(16).enumerate() {
+        let mut a = [0u8; 16];
+        a[0] = 1;
+        a[5] = if up { 0 } else { 1 };
+        a[6..10].copy_from_slice(addr);
+        a[10..14].copy_from_slice(&fcnt.to_le_bytes());
+        a[15] = (i + 1) as u8;
+        let s = aes_enc(key, &a);
+        out.extend(chunk.iter().zip(s.iter()).map(|(x, y)| x ^ y));
+    }
+    out
+}
+
+// The counter's top half is not sent: the nearest value after the last one seen is the answer.
+fn widen(low: u16, last: Option<i64>) -> u32 {
+    match last {
+        None => low as u32,
+        Some(l) => {
+            let l = l.max(0) as u32;
+            let mut c = (l & 0xffff_0000) | low as u32;
+            if c < l && l - c > 0x8000 {
+                c = c.wrapping_add(0x1_0000);
+            }
+            c
+        }
+    }
+}
+
+fn mac_commands(data: &[u8], up: bool) -> Vec<Value> {
+    let table: &[(u8, &str, usize)] = if up {
+        &[(0x02, "LinkCheckReq", 0), (0x03, "LinkADRAns", 1), (0x04, "DutyCycleAns", 0), (0x05, "RXParamSetupAns", 1), (0x06, "DevStatusAns", 2), (0x07, "NewChannelAns", 1), (0x08, "RXTimingSetupAns", 0), (0x09, "TxParamSetupAns", 0), (0x0a, "DlChannelAns", 1), (0x0d, "DeviceTimeReq", 0)]
+    } else {
+        &[(0x02, "LinkCheckAns", 2), (0x03, "LinkADRReq", 4), (0x04, "DutyCycleReq", 1), (0x05, "RXParamSetupReq", 4), (0x06, "DevStatusReq", 0), (0x07, "NewChannelReq", 5), (0x08, "RXTimingSetupReq", 1), (0x09, "TxParamSetupReq", 1), (0x0a, "DlChannelReq", 4), (0x0d, "DeviceTimeAns", 5)]
+    };
+    let mut out = vec![];
+    let mut i = 0;
+    while i < data.len() {
+        let cid = data[i];
+        match table.iter().find(|t| t.0 == cid) {
+            Some((_, name, n)) if i + 1 + n <= data.len() => {
+                let args = &data[i + 1..i + 1 + n];
+                let mut m = json!({ "command": name, "hex": hex::encode(args) });
+                if *name == "DevStatusAns" {
+                    m["battery"] = json!(match args[0] { 0 => json!("external"), 255 => Value::Null, b => json!(b as f64 / 254.0 * 100.0) });
+                    m["margin_db"] = json!((((args[1] & 0x3f) << 2) as i8) >> 2);
+                }
+                if *name == "LinkCheckAns" {
+                    m["margin_db"] = json!(args[0]);
+                    m["gateways"] = json!(args[1]);
+                }
+                out.push(m);
+                i += 1 + n;
+            }
+            _ => {
+                out.push(json!({ "command": format!("unknown 0x{:02x}", cid), "hex": hex::encode(&data[i + 1..]) }));
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn described(f: &Frame) -> Value {
+    let up = f.uplink();
+    let mut m = json!({
+        "type": MTYPES[f.mtype as usize],
+        "direction": if up { "up" } else { "down" },
+        "confirmed": f.mtype >= 4,
+        "dev_addr": be_hex(&f.addr),
+        "adr": f.fctrl & 0x80 != 0,
+        "ack": f.fctrl & 0x20 != 0,
+        "fcnt": f.fcnt,
+        "fport": f.fport,
+        "fopts": hex::encode(&f.fopts),
+        "mac_commands": mac_commands(&f.fopts, up),
+        "frm_payload": hex::encode(&f.frm),
+        "mic": hex::encode_upper(f.mic),
+    });
+    if up {
+        m["adr_ack_req"] = json!(f.fctrl & 0x40 != 0);
+        m["class_b"] = json!(f.fctrl & 0x10 != 0);
+    } else {
+        m["fpending"] = json!(f.fctrl & 0x10 != 0);
+    }
+    m
+}
+
+/// Reads a PHYPayload (hex, base64 or bytes) without keys: frame type, DevAddr, FCtrl's flags, frame counter, port, MAC commands in FOpts and the MIC; for a join request its EUIs and nonce.
+pub fn lorawan_parse(packet: serde_json::Value) -> Result<Value, String> {
+    let p = bytes_of(&packet)?;
+    if p.is_empty() {
+        return Err("an empty packet".into());
+    }
+    if p[0] & 3 != 0 && p[0] >> 5 != 7 {
+        return Err(format!("LoRaWAN major version {} is not one this reads (R1 is 0)", p[0] & 3));
+    }
+    match p[0] >> 5 {
+        0 => {
+            if p.len() != 23 {
+                return Err(format!("a join request is 23 bytes, not {}", p.len()));
+            }
+            Ok(json!({ "type": "join-request", "join_eui": be_hex(&p[1..9]), "dev_eui": be_hex(&p[9..17]), "dev_nonce": be_hex(&p[17..19]), "mic": hex::encode_upper(&p[19..23]) }))
+        }
+        1 => Ok(json!({ "type": "join-accept", "encrypted": true, "length": p.len() })),
+        6 | 7 => Ok(json!({ "type": MTYPES[(p[0] >> 5) as usize], "length": p.len(), "hex": hex::encode(&p) })),
+        _ => Ok(described(&frame(&p)?)),
+    }
+}
+
+/// True when a data frame's MIC matches under `keys.nwk_skey`; `keys.last_fcnt` widens a counter past 65535.
+pub fn lorawan_verify(packet: serde_json::Value, keys: serde_json::Value) -> Result<bool, String> {
+    let f = frame(&bytes_of(&packet)?)?;
+    let k = key_in(&keys, "nwk_skey")?;
+    let cnt = widen(f.fcnt, keys.get("last_fcnt").and_then(|v| v.as_i64()));
+    Ok(mic_of(&k, &f.body, f.uplink(), &f.addr, cnt) == f.mic)
+}
+
+/// Checks a data frame's MIC and decrypts its payload: `keys` holds `nwk_skey`, `app_skey` and optionally `last_fcnt`, the last counter seen, which widens this one to 32 bits and refuses a replay. A bad MIC is an error, never a payload.
+pub fn lorawan_open(packet: serde_json::Value, keys: serde_json::Value) -> Result<Value, String> {
+    let f = frame(&bytes_of(&packet)?)?;
+    let nwk = key_in(&keys, "nwk_skey")?;
+    let last = keys.get("last_fcnt").and_then(|v| v.as_i64());
+    let cnt = widen(f.fcnt, last);
+    let up = f.uplink();
+    let want = mic_of(&nwk, &f.body, up, &f.addr, cnt);
+    if want != f.mic {
+        return Err(format!("MIC check failed for {}: the frame has {}, these keys give {}", be_hex(&f.addr), hex::encode_upper(f.mic), hex::encode_upper(want)));
+    }
+    if let Some(l) = last {
+        if cnt as i64 <= l {
+            return Err(format!("replayed frame: counter {} is not past {}", cnt, l));
+        }
+    }
+    // Port 0 carries MAC commands under the network key; the others, data under the application key.
+    let key = if f.fport == Some(0) { nwk } else { key_in(&keys, "app_skey")? };
+    let plain = crypt(&key, &f.frm, up, &f.addr, cnt);
+    let mut m = described(&f);
+    m["fcnt32"] = json!(cnt);
+    m["verified"] = json!(true);
+    m["payload"] = json!(hex::encode(&plain));
+    m["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&plain));
+    m["text"] = match std::str::from_utf8(&plain) {
+        Ok(t) if t.chars().all(|c| !c.is_control() || c == '\n') => json!(t),
+        _ => Value::Null,
+    };
+    if f.fport == Some(0) {
+        m["mac_commands"] = json!(mac_commands(&plain, up));
+    }
+    Ok(m)
+}
+
+fn hex_field(frame: &Value, k: &str) -> Result<Vec<u8>, String> {
+    match frame.get(k) {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(v) => bytes_of(v),
+    }
+}
+
+/// Builds and signs a data frame, for simulators and downlinks: `frame` has `dev_addr`, `fcnt`, `fport`, `payload` (hex, or `text`), and `type`, `adr`, `ack`, `fopts`; `keys` has `nwk_skey` and `app_skey`. Answers hex.
+pub fn lorawan_build(frame: serde_json::Value, keys: serde_json::Value) -> Result<String, String> {
+    let ty = frame.get("type").and_then(|v| v.as_str()).unwrap_or("unconfirmed-up");
+    let mtype = MTYPES.iter().position(|t| *t == ty).filter(|i| (2..=5).contains(i)).ok_or(format!("`{}` is not a data frame type", ty))? as u8;
+    let addr = hex::decode(frame.get("dev_addr").and_then(|v| v.as_str()).ok_or("the frame needs `dev_addr`")?).map_err(|_| "dev_addr must be hex")?;
+    if addr.len() != 4 {
+        return Err("dev_addr must be 4 bytes (8 hex digits)".into());
+    }
+    let wire = [addr[3], addr[2], addr[1], addr[0]];
+    let cnt = frame.get("fcnt").and_then(|v| v.as_i64()).ok_or("the frame needs `fcnt`")?;
+    if !(0..=0xffff_ffff).contains(&cnt) {
+        return Err("fcnt must fit 32 bits".into());
+    }
+    let cnt = cnt as u32;
+    let fopts = hex_field(&frame, "fopts")?;
+    if fopts.len() > 15 {
+        return Err("FOpts holds at most 15 bytes".into());
+    }
+    let plain = match frame.get("text").and_then(|v| v.as_str()) {
+        Some(t) => t.as_bytes().to_vec(),
+        None => hex_field(&frame, "payload")?,
+    };
+    let port = frame.get("fport").and_then(|v| v.as_i64());
+    if !plain.is_empty() && port.is_none() {
+        return Err("a payload needs `fport`".into());
+    }
+    if let Some(p) = port {
+        if !(0..=255).contains(&p) {
+            return Err("fport must be 0 to 255".into());
+        }
+        if p == 0 && !fopts.is_empty() {
+            return Err("MAC commands go in FOpts or on port 0, never both".into());
+        }
+    }
+    let up = mtype % 2 == 0;
+    let nwk = key_in(&keys, "nwk_skey")?;
+    let mut b = vec![mtype << 5];
+    b.extend(wire);
+    let flag = |k: &str| frame.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    b.push((flag("adr") as u8) << 7 | (flag("ack") as u8) << 5 | fopts.len() as u8);
+    b.extend(((cnt & 0xffff) as u16).to_le_bytes());
+    b.extend(&fopts);
+    if let Some(p) = port {
+        b.push(p as u8);
+        let key = if p == 0 { nwk } else { key_in(&keys, "app_skey")? };
+        b.extend(crypt(&key, &plain, up, &wire, cnt));
+    }
+    let mic = mic_of(&nwk, &b, up, &wire, cnt);
+    b.extend(mic);
+    Ok(hex::encode(b))
+}
+
+/// True when a join request's MIC matches the device's `app_key`.
+pub fn lorawan_join_request_verify(packet: serde_json::Value, app_key: &str) -> Result<bool, String> {
+    let p = bytes_of(&packet)?;
+    if p.len() != 23 || p[0] >> 5 != 0 {
+        return Err("not a join request (23 bytes, MType 0)".into());
+    }
+    let k = key_of(app_key, "app_key")?;
+    Ok(cmac4(&k, &[&p[..19]]) == p[19..23])
+}
+
+/// Builds a join request for a simulated device: `request` has `join_eui`, `dev_eui` and `dev_nonce` in hex as printed, most significant byte first. Answers hex.
+pub fn lorawan_join_request(request: serde_json::Value, app_key: &str) -> Result<String, String> {
+    let field = |k: &str, n: usize| -> Result<Vec<u8>, String> {
+        let v = request.get(k).and_then(|v| v.as_str()).ok_or(format!("the request needs `{}`", k))?;
+        let mut b = hex::decode(v).map_err(|_| format!("{} must be hex", k))?;
+        if b.len() != n {
+            return Err(format!("{} must be {} bytes", k, n));
+        }
+        b.reverse();
+        Ok(b)
+    };
+    let mut b = vec![0u8];
+    b.extend(field("join_eui", 8)?);
+    b.extend(field("dev_eui", 8)?);
+    b.extend(field("dev_nonce", 2)?);
+    let k = key_of(app_key, "app_key")?;
+    let mic = cmac4(&k, &[&b]);
+    b.extend(mic);
+    Ok(hex::encode(b))
+}
+
+fn session_keys(k: &[u8; 16], plain: &[u8], dev_nonce: &[u8]) -> ([u8; 16], [u8; 16]) {
+    let mut block = [0u8; 16];
+    block[1..7].copy_from_slice(&plain[..6]); // AppNonce and NetID, as sent
+    block[7..9].copy_from_slice(dev_nonce);
+    let mut a = block;
+    a[0] = 1;
+    let mut b = block;
+    b[0] = 2;
+    (aes_enc(k, &a), aes_enc(k, &b))
+}
+
+/// Makes the network's answer to a join request: `accept` has `dev_addr`, `net_id`, and `app_nonce` (three bytes, hex; random when left out), `rx1_dr_offset`, `rx2_dr`, `rx_delay`. Answers the encrypted join accept in hex with the session keys derived, 1.0.x style.
+pub fn lorawan_join_accept(join_request: serde_json::Value, accept: serde_json::Value, app_key: &str) -> Result<Value, String> {
+    let req = bytes_of(&join_request)?;
+    if req.len() != 23 || req[0] >> 5 != 0 {
+        return Err("not a join request".into());
+    }
+    let k = key_of(app_key, "app_key")?;
+    if cmac4(&k, &[&req[..19]]) != req[19..23] {
+        return Err("the join request's MIC does not match this app_key".into());
+    }
+    let field = |n: &str, len: usize| -> Result<Option<Vec<u8>>, String> {
+        match accept.get(n).and_then(|v| v.as_str()) {
+            None => Ok(None),
+            Some(s) => {
+                let mut b = hex::decode(s).map_err(|_| format!("{} must be hex", n))?;
+                if b.len() != len {
+                    return Err(format!("{} must be {} bytes", n, len));
+                }
+                b.reverse();
+                Ok(Some(b))
+            }
+        }
+    };
+    let nonce = match field("app_nonce", 3)? {
+        Some(n) => n,
+        None => {
+            let mut n = vec![0u8; 3];
+            getrandom::getrandom(&mut n).map_err(|e| e.to_string())?;
+            n
+        }
+    };
+    let mut plain = nonce;
+    plain.extend(field("net_id", 3)?.ok_or("the accept needs `net_id`")?);
+    plain.extend(field("dev_addr", 4)?.ok_or("the accept needs `dev_addr`")?);
+    let num = |n: &str| accept.get(n).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    plain.push((num("rx1_dr_offset") & 7) << 4 | (num("rx2_dr") & 15));
+    plain.push(num("rx_delay"));
+    let mic = cmac4(&k, &[&[0x20u8], &plain]);
+    let (nwk, app) = session_keys(&k, &plain, &req[17..19]);
+    plain.extend(mic);
+    // The network uses AES's decrypt here, so that a device needs only encrypt to read it.
+    let mut out = vec![0x20u8];
+    for c in plain.chunks(16) {
+        let b: [u8; 16] = c.try_into().map_err(|_| "a join accept is 16 or 32 bytes")?;
+        out.extend(aes_dec(&k, &b));
+    }
+    Ok(json!({ "packet": hex::encode(out), "nwk_skey": hex::encode(nwk), "app_skey": hex::encode(app) }))
+}
+
+/// Reads a join accept as a device does: decrypts it with `app_key`, checks its MIC and derives NwkSKey and AppSKey from the `dev_nonce` of the join request (hex, as printed).
+pub fn lorawan_join_accept_read(packet: serde_json::Value, app_key: &str, dev_nonce: &str) -> Result<Value, String> {
+    let p = bytes_of(&packet)?;
+    if p.first().map(|b| b >> 5) != Some(1) || !(p.len() == 17 || p.len() == 33) {
+        return Err("not a join accept (17 or 33 bytes, MType 1)".into());
+    }
+    let k = key_of(app_key, "app_key")?;
+    let mut plain = vec![];
+    for c in p[1..].chunks(16) {
+        let b: [u8; 16] = c.try_into().map_err(|_| "a join accept is whole blocks")?;
+        plain.extend(aes_enc(&k, &b));
+    }
+    let (body, mic) = plain.split_at(plain.len() - 4);
+    if cmac4(&k, &[&p[..1], body]) != mic {
+        return Err("the join accept's MIC does not match this app_key".into());
+    }
+    let mut nonce = hex::decode(dev_nonce).map_err(|_| "dev_nonce must be hex")?;
+    if nonce.len() != 2 {
+        return Err("dev_nonce must be 2 bytes".into());
+    }
+    nonce.reverse();
+    let (nwk, app) = session_keys(&k, body, &nonce);
+    let mut m = json!({
+        "app_nonce": be_hex(&body[..3]), "net_id": be_hex(&body[3..6]), "dev_addr": be_hex(&body[6..10]),
+        "rx1_dr_offset": (body[10] >> 4) & 7, "rx2_dr": body[10] & 15, "rx_delay": body[11],
+        "nwk_skey": hex::encode(nwk), "app_skey": hex::encode(app),
+    });
+    if body.len() > 12 {
+        m["cf_list"] = json!(hex::encode(&body[12..]));
+    }
+    Ok(m)
+}
+
+// Cayenne LPP: (type, name, field names, bytes per field, divisor, signed).
+const LPP: [(u8, &str, &[&str], usize, f64, bool); 12] = [
+    (0, "digital_input", &[""], 1, 1.0, false),
+    (1, "digital_output", &[""], 1, 1.0, false),
+    (2, "analog_input", &[""], 2, 100.0, true),
+    (3, "analog_output", &[""], 2, 100.0, true),
+    (101, "illuminance", &[""], 2, 1.0, false),
+    (102, "presence", &[""], 1, 1.0, false),
+    (103, "temperature", &[""], 2, 10.0, true),
+    (104, "humidity", &[""], 1, 2.0, false),
+    (113, "accelerometer", &["x", "y", "z"], 2, 1000.0, true),
+    (115, "barometer", &[""], 2, 10.0, false),
+    (134, "gyrometer", &["x", "y", "z"], 2, 100.0, true),
+    (136, "gps", &["latitude", "longitude", "altitude"], 3, 0.0, true),
+];
+
+fn lpp_int(b: &[u8], signed: bool) -> i64 {
+    let v = b.iter().fold(0i64, |a, x| (a << 8) | *x as i64);
+    if signed && b[0] & 0x80 != 0 {
+        v - (1i64 << (8 * b.len()))
+    } else {
+        v
+    }
+}
+
+fn round(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// Decodes a Cayenne LPP payload (hex, base64 or bytes): `{ readings: [{ channel, type, value }], values: { temperature_3: 27.2 } }`. A cut-off reading or an unknown type is an error naming the offset.
+pub fn lorawan_cayenne_decode(payload: serde_json::Value) -> Result<Value, String> {
+    let p = bytes_of(&payload)?;
+    let mut readings = vec![];
+    let mut values = Map::new();
+    let mut i = 0;
+    while i < p.len() {
+        if i + 2 > p.len() {
+            return Err(format!("the payload ends inside a reading's header at byte {}", i));
+        }
+        let (channel, ty) = (p[i], p[i + 1]);
+        let t = LPP.iter().find(|t| t.0 == ty).ok_or(format!("unknown Cayenne type {} on channel {} at byte {}", ty, channel, i + 1))?;
+        let n = t.2.len() * t.3;
+        if i + 2 + n > p.len() {
+            return Err(format!("the {} reading on channel {} needs {} bytes; {} are left", t.1, channel, n, p.len() - i - 2));
+        }
+        let d = &p[i + 2..i + 2 + n];
+        let value = if ty == 136 {
+            json!({ "latitude": round(lpp_int(&d[0..3], true) as f64 / 10000.0), "longitude": round(lpp_int(&d[3..6], true) as f64 / 10000.0), "altitude": round(lpp_int(&d[6..9], true) as f64 / 100.0) })
+        } else if t.2.len() == 3 {
+            let at = |k: usize| round(lpp_int(&d[k * t.3..(k + 1) * t.3], t.5) as f64 / t.4);
+            json!({ "x": at(0), "y": at(1), "z": at(2) })
+        } else {
+            json!(round(lpp_int(d, t.5) as f64 / t.4))
+        };
+        values.insert(format!("{}_{}", t.1, channel), value.clone());
+        readings.push(json!({ "channel": channel, "type": t.1, "value": value }));
+        i += 2 + n;
+    }
+    Ok(json!({ "readings": readings, "values": values }))
+}
+
+/// Encodes readings as Cayenne LPP: a list of `{ channel, type, value }`, the shape the decoder gives. A value that does not fit its field is refused. Answers hex.
+pub fn lorawan_cayenne_encode(readings: Vec<serde_json::Value>) -> Result<String, String> {
+    fn put(out: &mut Vec<u8>, x: f64, size: usize, signed: bool, what: &str) -> Result<(), String> {
+        let v = x.round() as i64;
+        let (lo, hi) = if signed { (-(1i64 << (8 * size - 1)), (1i64 << (8 * size - 1)) - 1) } else { (0, (1i64 << (8 * size)) - 1) };
+        if v < lo || v > hi {
+            return Err(format!("{} does not fit a {} reading", x, what));
+        }
+        out.extend(&v.to_be_bytes()[8 - size..]);
+        Ok(())
+    }
+    let mut out = vec![];
+    for r in &readings {
+        let name = r.get("type").and_then(|v| v.as_str()).ok_or("a reading needs `type`")?;
+        let t = LPP.iter().find(|t| t.1 == name).ok_or(format!("unknown Cayenne type `{}`", name))?;
+        let channel = r.get("channel").and_then(|v| v.as_u64()).filter(|c| *c < 256).ok_or("a reading needs `channel`, 0 to 255")?;
+        out.push(channel as u8);
+        out.push(t.0);
+        let v = r.get("value").ok_or("a reading needs `value`")?;
+        if t.0 == 136 {
+            for (k, d) in [("latitude", 10000.0), ("longitude", 10000.0), ("altitude", 100.0)] {
+                put(&mut out, v.get(k).and_then(|x| x.as_f64()).ok_or(format!("a gps reading needs `{}`", k))? * d, 3, true, name)?;
+            }
+        } else if t.2.len() == 3 {
+            for k in t.2 {
+                put(&mut out, v.get(*k).and_then(|x| x.as_f64()).ok_or(format!("an {} reading needs `{}`", name, k))? * t.4, t.3, t.5, name)?;
+            }
+        } else {
+            put(&mut out, v.as_f64().ok_or("a reading's value must be a number")? * t.4, t.3, t.5, name)?;
+        }
+    }
+    Ok(hex::encode(out))
+}

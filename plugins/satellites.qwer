@@ -1,0 +1,354 @@
+//! Where a satellite is: TLE and OMM read, positions by SGP4, latitude, longitude and height, look angles from a place on the ground, and the passes over it.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! sgp4 = "=2.4.0"
+
+use serde_json::{json, Value};
+use sgp4::chrono::{DateTime, Duration, NaiveDateTime};
+use sgp4::{Constants, Elements, MinutesSinceEpoch};
+use std::f64::consts::{PI, TAU};
+
+const RADIUS: f64 = 6378.137; // WGS84
+const FLAT: f64 = 1.0 / 298.257223563;
+const EARTH_RATE: f64 = 7.292115e-5; // radians a second
+const MU: f64 = 398600.8; // WGS72, what TLEs were fitted with
+const RE72: f64 = 6378.135;
+const STEP_S: i64 = 30;
+const AU: f64 = 149597870.7;
+
+/// TLEs are fitted to the reference SGP4 with WGS72, so that is what they are flown with here.
+struct Sat {
+    e: Elements,
+    c: Constants,
+}
+
+/// Checks a TLE line's mod 10 checksum.
+fn checksum_ok(line: &str) -> bool {
+    let b = line.as_bytes();
+    if b.len() != 69 {
+        return false;
+    }
+    let sum: u32 = b[..68].iter().map(|c| match c { b'0'..=b'9' => (c - b'0') as u32, b'-' => 1, _ => 0 }).sum();
+    (b[68] - b'0') as u32 == sum % 10
+}
+
+/// Whether a TLE line's last digit, its checksum, agrees with the rest.
+pub fn satellites_checksum(line: &str) -> bool {
+    checksum_ok(line.trim_end())
+}
+
+fn read_tle(text: &str) -> Result<Vec<Elements>, String> {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < lines.len() {
+        let (name, a, b) = if lines[i].starts_with("1 ") {
+            (None, lines[i], lines.get(i + 1).copied())
+        } else {
+            (Some(lines[i].trim_start_matches("0 ").trim().to_string()), lines.get(i + 1).copied().unwrap_or(""), lines.get(i + 2).copied())
+        };
+        let b = b.ok_or(format!("line {}: a TLE has two lines", i + 1))?;
+        if !a.starts_with("1 ") || !b.starts_with("2 ") {
+            return Err(format!("line {}: a TLE's lines start with 1 and 2", i + 1));
+        }
+        for (n, l) in [(1, a), (2, b)] {
+            if l.len() != 69 {
+                return Err(format!("TLE line {} is {} characters; it should be 69", n, l.len()));
+            }
+            if !checksum_ok(l) {
+                return Err(format!("TLE line {} of {}: the checksum is wrong", n, name.as_deref().unwrap_or(&a[2..7])));
+            }
+        }
+        out.push(Elements::from_tle(name.clone(), a.as_bytes(), b.as_bytes()).map_err(|e| format!("TLE: {}", e))?);
+        i += if name.is_some() { 3 } else { 2 };
+    }
+    if out.is_empty() {
+        return Err("no TLE in this text".into());
+    }
+    Ok(out)
+}
+
+fn read_omm(text: &str) -> Result<Vec<Elements>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {}", e))?;
+    let list = match v {
+        Value::Array(a) => a,
+        o => vec![o],
+    };
+    list.into_iter().map(|x| serde_json::from_value::<Elements>(x).map_err(|e| format!("OMM: {}", e))).collect()
+}
+
+fn read_all(text: &str) -> Result<Vec<Elements>, String> {
+    if text.trim_start().starts_with(['{', '[']) { read_omm(text) } else { read_tle(text) }
+}
+
+fn sat(text: &str) -> Result<Sat, String> {
+    let e = read_all(text)?.into_iter().next().ok_or("no elements")?;
+    let c = Constants::from_elements_afspc_compatibility_mode(&e).map_err(|x| format!("these elements cannot be flown: {}", x))?;
+    Ok(Sat { e, c })
+}
+
+fn info(e: &Elements) -> Value {
+    let n = e.mean_motion * TAU / 86400.0;
+    let a = (MU / (n * n)).powf(1.0 / 3.0);
+    json!({
+        "name": e.object_name, "norad_id": e.norad_id, "designator": e.international_designator, "epoch": iso(&e.datetime), "inclination": e.inclination, "raan": e.right_ascension,
+        "eccentricity": e.eccentricity, "arg_perigee": e.argument_of_perigee, "mean_anomaly": e.mean_anomaly, "mean_motion": e.mean_motion, "bstar": e.drag_term, "revolution": e.revolution_number,
+        "period_min": round(1440.0 / e.mean_motion, 2), "apogee_km": round(a * (1.0 + e.eccentricity) - RE72, 1), "perigee_km": round(a * (1.0 - e.eccentricity) - RE72, 1),
+    })
+}
+
+/// Reads element sets: TLE text, two lines or three with a name, any number of them, or OMM as JSON, an object or a list, as Celestrak gives it. `[{ name, norad_id, designator, epoch, inclination, raan, eccentricity, arg_perigee, mean_anomaly, mean_motion, bstar, revolution, period_min, apogee_km, perigee_km }]`. A wrong length or checksum is an error.
+pub fn satellites_read(text: &str) -> Result<Vec<Value>, String> {
+    Ok(read_all(text)?.iter().map(info).collect())
+}
+
+fn parse_time(t: &str) -> Result<NaiveDateTime, String> {
+    let s = t.trim();
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Ok(d.naive_utc());
+    }
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").map_err(|_| format!("`{}` is not a time like 2026-11-01T12:00:00Z", t))
+}
+
+fn iso(t: &NaiveDateTime) -> String {
+    format!("{}Z", t.format("%Y-%m-%dT%H:%M:%S"))
+}
+
+fn round(x: f64, places: i32) -> f64 {
+    let p = 10f64.powi(places);
+    (x * p).round() / p
+}
+
+/// Earth rotation angle at a time, radians.
+fn gmst(t: &NaiveDateTime) -> f64 {
+    sgp4::iau_epoch_to_sidereal_time(sgp4::julian_years_since_j2000(t))
+}
+
+/// (TEME position km, TEME velocity km/s).
+fn propagate(s: &Sat, t: &NaiveDateTime) -> Result<([f64; 3], [f64; 3]), String> {
+    let m: MinutesSinceEpoch = s.e.datetime_to_minutes_since_epoch(t).map_err(|e| e.to_string())?;
+    let p = s.c.propagate_afspc_compatibility_mode(m).map_err(|e| format!("propagation failed {:.0} minutes from the elements: {}", m.0, e))?;
+    Ok((p.position, p.velocity))
+}
+
+/// Earth-fixed from TEME: one rotation by sidereal time; polar motion is left out, a matter of metres.
+fn to_ecef(r: [f64; 3], t: &NaiveDateTime) -> [f64; 3] {
+    let g = gmst(t);
+    let (c, s) = (g.cos(), g.sin());
+    [c * r[0] + s * r[1], -s * r[0] + c * r[1], r[2]]
+}
+
+/// Velocity seen from the turning Earth.
+fn ecef_velocity(r: [f64; 3], v: [f64; 3], t: &NaiveDateTime) -> [f64; 3] {
+    let g = gmst(t);
+    let (c, s) = (g.cos(), g.sin());
+    let x = [c * v[0] + s * v[1], -s * v[0] + c * v[1], v[2]];
+    let p = to_ecef(r, t);
+    [x[0] + EARTH_RATE * p[1], x[1] - EARTH_RATE * p[0], x[2]]
+}
+
+fn geodetic(p: [f64; 3]) -> (f64, f64, f64) {
+    let e2 = FLAT * (2.0 - FLAT);
+    let lon = p[1].atan2(p[0]);
+    let d = (p[0] * p[0] + p[1] * p[1]).sqrt();
+    let mut lat = p[2].atan2(d * (1.0 - e2));
+    let mut h = 0.0;
+    for _ in 0..6 {
+        let n = RADIUS / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+        h = d / lat.cos() - n;
+        lat = (p[2] / d / (1.0 - e2 * n / (n + h))).atan();
+    }
+    (lat.to_degrees(), lon.to_degrees(), h)
+}
+
+fn site_ecef(lat: f64, lon: f64, alt_km: f64) -> [f64; 3] {
+    let e2 = FLAT * (2.0 - FLAT);
+    let (phi, lam) = (lat.to_radians(), lon.to_radians());
+    let n = RADIUS / (1.0 - e2 * phi.sin().powi(2)).sqrt();
+    [(n + alt_km) * phi.cos() * lam.cos(), (n + alt_km) * phi.cos() * lam.sin(), (n * (1.0 - e2) + alt_km) * phi.sin()]
+}
+
+struct Place {
+    lat: f64,
+    lon: f64,
+    alt: f64,
+}
+
+fn place(p: &Value) -> Result<Place, String> {
+    let lat = p["latitude"].as_f64().or(p["lat"].as_f64()).ok_or("place: no latitude")?;
+    let lon = p["longitude"].as_f64().or(p["lon"].as_f64()).ok_or("place: no longitude")?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(format!("place: {}, {} is not on Earth", lat, lon));
+    }
+    Ok(Place { lat, lon, alt: p["altitude_m"].as_f64().unwrap_or(0.0) / 1000.0 })
+}
+
+/// (azimuth, elevation, range km, range rate km/s) of a satellite from a place.
+fn look(s: &Sat, here: &Place, t: &NaiveDateTime) -> Result<(f64, f64, f64, f64), String> {
+    let (r, v) = propagate(s, t)?;
+    let p = to_ecef(r, t);
+    let vel = ecef_velocity(r, v, t);
+    let o = site_ecef(here.lat, here.lon, here.alt);
+    let d = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+    let (phi, lam) = (here.lat.to_radians(), here.lon.to_radians());
+    let east = -lam.sin() * d[0] + lam.cos() * d[1];
+    let north = -phi.sin() * lam.cos() * d[0] - phi.sin() * lam.sin() * d[1] + phi.cos() * d[2];
+    let up = phi.cos() * lam.cos() * d[0] + phi.cos() * lam.sin() * d[1] + phi.sin() * d[2];
+    let range = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let az = east.atan2(north).rem_euclid(TAU).to_degrees();
+    let el = (up / range).asin().to_degrees();
+    let rate = (d[0] * vel[0] + d[1] * vel[1] + d[2] * vel[2]) / range;
+    Ok((az, el, range, rate))
+}
+
+fn compass(az: f64) -> &'static str {
+    const N: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    N[((az / 45.0).round() as i64).rem_euclid(8) as usize]
+}
+
+/// The Sun's direction in TEME-like axes, unit vector, by the Astronomical Almanac's low-precision formula.
+fn sun(t: &NaiveDateTime) -> [f64; 3] {
+    let d = sgp4::julian_years_since_j2000(t) * 365.25;
+    let l = (280.460 + 0.9856474 * d).to_radians();
+    let g = (357.528 + 0.9856003 * d).to_radians();
+    let lambda = l + 1.915f64.to_radians() * g.sin() + 0.020f64.to_radians() * (2.0 * g).sin();
+    let e = (23.439 - 0.0000004 * d).to_radians();
+    [lambda.cos(), e.cos() * lambda.sin(), e.sin() * lambda.sin()]
+}
+
+fn sunlit(r: [f64; 3], t: &NaiveDateTime) -> bool {
+    let s = sun(t);
+    let along = r[0] * s[0] + r[1] * s[1] + r[2] * s[2];
+    if along > 0.0 {
+        return true;
+    }
+    // In the cylinder of Earth's shadow, the Sun being far enough.
+    let off = [r[0] - along * s[0], r[1] - along * s[1], r[2] - along * s[2]];
+    (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt() > RADIUS
+}
+
+/// Where a satellite is at `time` (ISO, UTC): `{ time, age_days, latitude, longitude, altitude_km, speed_kms, sunlit, teme: { position, velocity } }`. `age_days` is how old the elements are: past a couple of weeks a low orbit's answer is poor. A satellite that has decayed by then is an error.
+pub fn satellites_position(elements: &str, time: &str) -> Result<Value, String> {
+    let s = sat(elements)?;
+    let t = parse_time(time)?;
+    let (r, v) = propagate(&s, &t)?;
+    let (lat, lon, h) = geodetic(to_ecef(r, &t));
+    Ok(json!({
+        "time": iso(&t), "age_days": round((t - s.e.datetime).num_seconds() as f64 / 86400.0, 2), "latitude": round(lat, 4), "longitude": round(lon, 4), "altitude_km": round(h, 2),
+        "speed_kms": round((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(), 3), "sunlit": sunlit(r, &t), "teme": { "position": r, "velocity": v },
+    }))
+}
+
+/// The state `minutes` from the elements' own epoch, in TEME: `{ position, velocity }`, what the SGP4 verification tables list.
+pub fn satellites_state(elements: &str, minutes: f64) -> Result<Value, String> {
+    let s = sat(elements)?;
+    let p = s.c.propagate_afspc_compatibility_mode(MinutesSinceEpoch(minutes)).map_err(|e| e.to_string())?;
+    Ok(json!({ "position": p.position, "velocity": p.velocity }))
+}
+
+/// How a satellite looks from `place` (`{ latitude, longitude, altitude_m }`): `{ azimuth, elevation, range_km, range_rate_kms, compass, above_horizon }`, azimuth clockwise from true north.
+pub fn satellites_look(elements: &str, place_value: serde_json::Value, time: &str) -> Result<Value, String> {
+    let s = sat(elements)?;
+    let here = place(&place_value)?;
+    let t = parse_time(time)?;
+    let (az, el, range, rate) = look(&s, &here, &t)?;
+    Ok(json!({ "time": iso(&t), "azimuth": round(az, 2), "elevation": round(el, 2), "range_km": round(range, 1), "range_rate_kms": round(rate, 3), "compass": compass(az), "above_horizon": el > 0.0 }))
+}
+
+/// Bisects to the second where elevation crosses `limit` between two times.
+fn crossing(s: &Sat, here: &Place, mut a: NaiveDateTime, mut b: NaiveDateTime, limit: f64, rising: bool) -> Result<NaiveDateTime, String> {
+    while (b - a).num_seconds() > 1 {
+        let m = a + (b - a) / 2;
+        let above = look(s, here, &m)?.1 >= limit;
+        if above == rising { b = m } else { a = m }
+    }
+    Ok(b)
+}
+
+/// The passes over `place` from `start` for `hours`, at most 240, with a peak of at least `min_elevation` degrees: `[{ rise, peak, set, rise_azimuth, rise_compass, peak_elevation, peak_azimuth, set_azimuth, set_compass, duration_s, sunlit_at_peak, observer_dark }]`. Each time is to the second. `observer_dark` says the Sun is 6 degrees below the place's horizon or more; with `sunlit_at_peak` it means a pass you can see with your eyes.
+pub fn satellites_passes(elements: &str, place_value: serde_json::Value, start: &str, hours: f64, min_elevation: f64) -> Result<Vec<Value>, String> {
+    let s = sat(elements)?;
+    let here = place(&place_value)?;
+    let t0 = parse_time(start)?;
+    if !(hours > 0.0 && hours <= 240.0) {
+        return Err(format!("{} hours: passes are looked for up to 240 hours ahead", hours));
+    }
+    let end = t0 + Duration::seconds((hours * 3600.0) as i64);
+    let limit = 0.0;
+    let mut out = vec![];
+    let mut t = t0;
+    let mut prev = look(&s, &here, &t)?.1;
+    let mut rise: Option<NaiveDateTime> = if prev >= limit { Some(t) } else { None };
+    let mut peak = (t, prev);
+    while t < end + Duration::hours(1) {
+        let next = t + Duration::seconds(STEP_S);
+        let el = look(&s, &here, &next)?.1;
+        if rise.is_none() && t >= end {
+            break;
+        }
+        if prev < limit && el >= limit {
+            rise = Some(crossing(&s, &here, t, next, limit, true)?);
+            peak = (next, el);
+        }
+        if rise.is_some() && el > peak.1 {
+            peak = (next, el);
+        }
+        if prev >= limit && el < limit {
+            if let Some(r) = rise.take() {
+                let set = crossing(&s, &here, t, next, limit, false)?;
+                // The peak to the second, by narrowing round the highest step.
+                let (mut a, mut b) = (peak.0 - Duration::seconds(STEP_S), peak.0 + Duration::seconds(STEP_S));
+                while (b - a).num_seconds() > 2 {
+                    let third = (b - a) / 3;
+                    let (x, y) = (a + third, b - third);
+                    if look(&s, &here, &x)?.1 < look(&s, &here, &y)?.1 { a = x } else { b = y }
+                }
+                let top = a + (b - a) / 2;
+                let (paz, pel, _, _) = look(&s, &here, &top)?;
+                if pel >= min_elevation {
+                    let (raz, _, _, _) = look(&s, &here, &r)?;
+                    let (saz, _, _, _) = look(&s, &here, &set)?;
+                    let (rv, _) = propagate(&s, &top)?;
+                    let sun_el = sun_elevation(&here, &top);
+                    out.push(json!({
+                        "rise": iso(&r), "peak": iso(&top), "set": iso(&set), "rise_azimuth": round(raz, 1), "rise_compass": compass(raz), "peak_elevation": round(pel, 1), "peak_azimuth": round(paz, 1),
+                        "set_azimuth": round(saz, 1), "set_compass": compass(saz), "duration_s": (set - r).num_seconds(), "sunlit_at_peak": sunlit(rv, &top), "observer_dark": sun_el <= -6.0,
+                    }));
+                }
+            }
+            peak = (next, f64::MIN);
+        }
+        prev = el;
+        t = next;
+    }
+    Ok(out)
+}
+
+fn sun_elevation(here: &Place, t: &NaiveDateTime) -> f64 {
+    let s = sun(t);
+    let p = to_ecef([s[0] * AU, s[1] * AU, s[2] * AU], t);
+    let (phi, lam) = (here.lat.to_radians(), here.lon.to_radians());
+    let up = (phi.cos() * lam.cos() * p[0] + phi.cos() * lam.sin() * p[1] + phi.sin() * p[2]) / AU;
+    up.clamp(-1.0, 1.0).asin() * 180.0 / PI
+}
+
+/// A ground track for a map: `[{ time, latitude, longitude, altitude_km }]` from `start` every `step_s` seconds for `minutes`, at most 5000 points.
+pub fn satellites_track(elements: &str, start: &str, minutes: f64, step_s: i64) -> Result<Vec<Value>, String> {
+    let s = sat(elements)?;
+    let t0 = parse_time(start)?;
+    if step_s < 1 {
+        return Err("the step must be at least one second".into());
+    }
+    let n = (minutes * 60.0 / step_s as f64).ceil() as i64;
+    if !(0..=5000).contains(&n) {
+        return Err(format!("{} points; at most 5000", n));
+    }
+    (0..=n).map(|i| {
+        let t = t0 + Duration::seconds(i * step_s);
+        let (r, _) = propagate(&s, &t)?;
+        let (lat, lon, h) = geodetic(to_ecef(r, &t));
+        Ok(json!({ "time": iso(&t), "latitude": round(lat, 3), "longitude": round(lon, 3), "altitude_km": round(h, 1) }))
+    }).collect()
+}

@@ -1,0 +1,337 @@
+//! etcd v3 through its JSON gateway: keys and values carried in base64 and the 64-bit numbers in text turned back, gets, puts and deletes, prefix ranges with their computed end and paging past a limit, leases granted, kept alive, looked up and revoked, transactions with compares written plainly, compare-and-swap, and username sign-in.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::Duration;
+
+// ETCD_API_URL is a member's client address (http://localhost:2379 when not set). ETCD_USERNAME
+// with ETCD_PASSWORD signs in, when auth is enabled on the cluster.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("ETCD_API_URL").unwrap_or_else(|| "http://localhost:2379".into()).trim_end_matches('/').to_string()
+}
+
+fn b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+fn unb64(v: &Value) -> Vec<u8> {
+    v.as_str().and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok()).unwrap_or_default()
+}
+
+fn text(v: &Value) -> String {
+    String::from_utf8_lossy(&unb64(v)).into_owned()
+}
+
+/// The gateway sends int64 as text, and leaves out zeros altogether.
+fn int(v: &Value) -> i64 {
+    match v {
+        Value::String(s) => s.parse().unwrap_or(0),
+        Value::Number(n) => n.as_i64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+static TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+fn post(path: &str, body: &Value, token: Option<&str>) -> Result<(u16, Value), String> {
+    let mut req = ureq::post(&format!("{}{}", base(), path)).timeout(Duration::from_secs(30));
+    if let Some(t) = token {
+        req = req.set("Authorization", t);
+    }
+    let res = req.set("Content-Type", "application/json").send_string(&body.to_string());
+    let (status, t) = match res {
+        Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+        Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+        Err(e) => return Err(format!("cannot reach etcd at {}: {}", base(), e)),
+    };
+    Ok((status, serde_json::from_str(&t).unwrap_or(json!({ "message": t }))))
+}
+
+fn sign_in() -> Result<Option<String>, String> {
+    let (Some(u), Some(p)) = (env("ETCD_USERNAME"), env("ETCD_PASSWORD")) else { return Ok(None) };
+    let (status, v) = post("/v3/auth/authenticate", &json!({ "name": u, "password": p }), None)?;
+    if status >= 300 {
+        return Err(format!("etcd refused the sign-in: {}", v["message"].as_str().or(v["error"].as_str()).unwrap_or("")));
+    }
+    let t = v["token"].as_str().ok_or("etcd gave no token")?.to_string();
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
+    Ok(Some(t))
+}
+
+fn call(path: &str, body: &Value) -> Result<Value, String> {
+    let held = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let tok = match held {
+        Some(t) => Some(t),
+        None => sign_in()?,
+    };
+    let (mut status, mut v) = post(path, body, tok.as_deref())?;
+    let message = v["message"].as_str().or(v["error"].as_str()).unwrap_or("").to_string();
+    // A token ends with its TTL, five minutes by default: one sign-in again.
+    if tok.is_some() && status >= 300 && message.contains("invalid auth token") {
+        *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let t = sign_in()?;
+        (status, v) = post(path, body, t.as_deref())?;
+    }
+    if status >= 300 {
+        return Err(format!("etcd refused this: {}", v["message"].as_str().or(v["error"].as_str()).unwrap_or(&v.to_string())));
+    }
+    Ok(v)
+}
+
+/// The end of a prefix's range: the prefix with its last byte raised, dropping trailing 0xff bytes; all 0xff means every key after it, written as one zero byte.
+fn prefix_end(p: &[u8]) -> Vec<u8> {
+    let mut e = p.to_vec();
+    while let Some(last) = e.last().copied() {
+        if last < 0xff {
+            *e.last_mut().unwrap() = last + 1;
+            return e;
+        }
+        e.pop();
+    }
+    vec![0]
+}
+
+fn kv_of(k: &Value, with_value: bool) -> Value {
+    let mut o = json!({ "key": text(&k["key"]), "version": int(&k["version"]), "create_revision": int(&k["create_revision"]), "mod_revision": int(&k["mod_revision"]) });
+    if with_value {
+        o["value"] = json!(text(&k["value"]));
+    }
+    if int(&k["lease"]) != 0 {
+        o["lease"] = json!(k["lease"].as_str().map_or(int(&k["lease"]).to_string(), str::to_string));
+    }
+    o
+}
+
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        o => o.to_string(),
+    }
+}
+
+/// The end of the range of keys under a prefix, in base64, for `etcd_call`: "a/" gives the base64 of "a0".
+pub fn etcd_range_end(prefix: &str) -> String {
+    b64(&prefix_end(prefix.as_bytes()))
+}
+
+/// Stores a value (a text is kept as it is, anything else as JSON). `options`: `lease` (an id from `etcd_lease_grant`), `prev` (true gives the value it replaced). Gives `{ revision, prev }`.
+pub fn etcd_put(key: &str, value: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let mut b = json!({ "key": b64(key.as_bytes()), "value": b64(value_text(&value).as_bytes()) });
+    if let Some(l) = options.get("lease") {
+        b["lease"] = json!(value_text(l));
+    }
+    if options["prev"] == true {
+        b["prev_kv"] = json!(true);
+    }
+    let r = call("/v3/kv/put", &b)?;
+    let prev = if r["prev_kv"].is_null() { Value::Null } else { kv_of(&r["prev_kv"], true) };
+    Ok(json!({ "revision": int(&r["header"]["revision"]), "prev": prev }))
+}
+
+/// A key: `{ key, value, version, create_revision, mod_revision, lease }`, or null. `revision` above 0 reads the past.
+pub fn etcd_get(key: &str, revision: i64) -> Result<Value, String> {
+    let mut b = json!({ "key": b64(key.as_bytes()) });
+    if revision > 0 {
+        b["revision"] = json!(revision.to_string());
+    }
+    let r = call("/v3/kv/range", &b)?;
+    Ok(r["kvs"].get(0).map_or(Value::Null, |k| kv_of(k, true)))
+}
+
+/// One page of the keys under a prefix. `options`: `limit`, `keys_only`, `descending`, `after` (the last key of the page before). Gives `{ kvs, more, count, revision }`, `count` being all that match.
+pub fn etcd_prefix(prefix: &str, options: serde_json::Value) -> Result<Value, String> {
+    let start = match options["after"].as_str() {
+        // The next key after one is that key with a zero byte added.
+        Some(k) => [k.as_bytes(), &[0u8]].concat(),
+        None => prefix.as_bytes().to_vec(),
+    };
+    let mut b = json!({ "key": b64(&start), "range_end": b64(&prefix_end(prefix.as_bytes())), "sort_target": "KEY", "sort_order": if options["descending"] == true { "DESCEND" } else { "ASCEND" } });
+    if let Some(l) = options["limit"].as_i64() {
+        b["limit"] = json!(l.to_string());
+    }
+    if let Some(r) = options["revision"].as_i64() {
+        b["revision"] = json!(r.to_string());
+    }
+    let keys_only = options["keys_only"] == true;
+    if keys_only {
+        b["keys_only"] = json!(true);
+    }
+    let r = call("/v3/kv/range", &b)?;
+    let kvs: Vec<Value> = r["kvs"].as_array().into_iter().flatten().map(|k| kv_of(k, !keys_only)).collect();
+    Ok(json!({ "kvs": kvs, "more": r["more"] == true, "count": int(&r["count"]), "revision": int(&r["header"]["revision"]) }))
+}
+
+/// Every key under a prefix, read page by page at one revision, so that all of it is one moment: up to `max`, `{ kvs, complete, revision }`.
+pub fn etcd_prefix_all(prefix: &str, max: i64) -> Result<Value, String> {
+    let (mut out, mut after, mut rev): (Vec<Value>, Option<String>, Option<i64>) = (vec![], None, None);
+    loop {
+        let mut o = json!({ "limit": 500 });
+        if let Some(a) = &after {
+            o["after"] = json!(a);
+        }
+        if let Some(r) = rev {
+            o["revision"] = json!(r);
+        }
+        let p = etcd_prefix(prefix, o)?;
+        rev = rev.or(p["revision"].as_i64());
+        out.extend(p["kvs"].as_array().cloned().unwrap_or_default());
+        if out.len() as i64 >= max || p["more"] != true {
+            let complete = p["more"] != true && out.len() as i64 <= max;
+            out.truncate(max.max(0) as usize);
+            return Ok(json!({ "kvs": out, "complete": complete, "revision": rev }));
+        }
+        after = out.last().and_then(|k| k["key"].as_str()).map(str::to_string);
+    }
+}
+
+/// Deletes a key; true when it was there.
+pub fn etcd_delete(key: &str) -> Result<bool, String> {
+    Ok(int(&call("/v3/kv/deleterange", &json!({ "key": b64(key.as_bytes()) }))?["deleted"]) > 0)
+}
+
+/// Deletes every key under a prefix, which may not be empty; gives how many.
+pub fn etcd_delete_prefix(prefix: &str) -> Result<i64, String> {
+    if prefix.is_empty() {
+        return Err("an empty prefix would delete every key".into());
+    }
+    Ok(int(&call("/v3/kv/deleterange", &json!({ "key": b64(prefix.as_bytes()), "range_end": b64(&prefix_end(prefix.as_bytes())) }))?["deleted"]))
+}
+
+/// A lease of `ttl` seconds: `{ id, ttl }`, `id` a text as it does not fit a JavaScript number. Keys put with it go when it ends.
+pub fn etcd_lease_grant(ttl: i64) -> Result<Value, String> {
+    let r = call("/v3/lease/grant", &json!({ "TTL": ttl.to_string(), "ID": "0" }))?;
+    Ok(json!({ "id": value_text(&r["ID"]), "ttl": int(&r["TTL"]) }))
+}
+
+/// Renews a lease once; gives its new TTL, or an error when it has ended. Call it within the TTL, from an `every` tick.
+pub fn etcd_lease_keepalive(id: &str) -> Result<i64, String> {
+    let r = call("/v3/lease/keepalive", &json!({ "ID": id }))?;
+    // The gateway streams, a line of { result } at a time; a lease that has ended has a TTL of none.
+    let ttl = int(&r["result"]["TTL"]);
+    if ttl <= 0 {
+        return Err(format!("lease {} has ended", id));
+    }
+    Ok(ttl)
+}
+
+/// What a lease has left: `{ id, ttl, granted, keys }`, `ttl` -1 when it has ended.
+pub fn etcd_lease_info(id: &str) -> Result<Value, String> {
+    let r = call("/v3/lease/timetolive", &json!({ "ID": id, "keys": true }))?;
+    let keys: Vec<String> = r["keys"].as_array().into_iter().flatten().map(text).collect();
+    Ok(json!({ "id": id, "ttl": int(&r["TTL"]), "granted": int(&r["grantedTTL"]), "keys": keys }))
+}
+
+/// Ends a lease now, its keys going with it.
+pub fn etcd_lease_revoke(id: &str) -> Result<bool, String> {
+    call("/v3/lease/revoke", &json!({ "ID": id }))?;
+    Ok(true)
+}
+
+fn compare_of(c: &Value) -> Result<Value, String> {
+    let key = c["key"].as_str().ok_or("a compare needs a `key`")?;
+    let result = match c["op"].as_str().unwrap_or("=") {
+        "=" | "==" => "EQUAL",
+        "!=" => "NOT_EQUAL",
+        ">" => "GREATER",
+        "<" => "LESS",
+        o => return Err(format!("{:?} is not a compare: =, !=, > or <", o)),
+    };
+    let mut o = json!({ "key": b64(key.as_bytes()), "result": result });
+    let target = c["target"].as_str().unwrap_or("value");
+    let v = c.get("value").ok_or("a compare needs a `value`")?;
+    match target {
+        "value" => {
+            o["target"] = json!("VALUE");
+            o["value"] = json!(b64(value_text(v).as_bytes()));
+        }
+        "version" => {
+            o["target"] = json!("VERSION");
+            o["version"] = json!(int(v).to_string());
+        }
+        "create" => {
+            o["target"] = json!("CREATE");
+            o["create_revision"] = json!(int(v).to_string());
+        }
+        "mod" => {
+            o["target"] = json!("MOD");
+            o["mod_revision"] = json!(int(v).to_string());
+        }
+        "lease" => {
+            o["target"] = json!("LEASE");
+            o["lease"] = json!(value_text(v));
+        }
+        t => return Err(format!("{:?} is not a compare target: value, version, create, mod or lease", t)),
+    }
+    Ok(o)
+}
+
+fn op_of(op: &Value) -> Result<Value, String> {
+    if let Some(p) = op.get("put") {
+        let key = p["key"].as_str().ok_or("a put needs a `key`")?;
+        let mut r = json!({ "key": b64(key.as_bytes()), "value": b64(value_text(&p["value"]).as_bytes()) });
+        if let Some(l) = p.get("lease") {
+            r["lease"] = json!(value_text(l));
+        }
+        return Ok(json!({ "request_put": r }));
+    }
+    if let Some(k) = op.get("get").and_then(|g| g.as_str()) {
+        return Ok(json!({ "request_range": { "key": b64(k.as_bytes()) } }));
+    }
+    if let Some(k) = op.get("delete").and_then(|g| g.as_str()) {
+        return Ok(json!({ "request_delete_range": { "key": b64(k.as_bytes()) } }));
+    }
+    Err("an operation is { put: { key, value } }, { get: key } or { delete: key }".into())
+}
+
+/// A transaction: if every compare in `compare` holds, run `then`, otherwise `otherwise`, all at one revision. A compare is `{ key, target, op, value }`, `target` "value" (the default), "version", "create", "mod" or "lease", `op` "=" (the default), "!=", ">" or "<". An operation is `{ put: { key, value, lease } }`, `{ get: key }` or `{ delete: key }`. Gives `{ succeeded, revision, results }`, a `get` giving its key.
+pub fn etcd_txn(compare: Vec<serde_json::Value>, then: Vec<serde_json::Value>, otherwise: Vec<serde_json::Value>) -> Result<Value, String> {
+    let b = json!({
+        "compare": compare.iter().map(compare_of).collect::<Result<Vec<_>, _>>()?,
+        "success": then.iter().map(op_of).collect::<Result<Vec<_>, _>>()?,
+        "failure": otherwise.iter().map(op_of).collect::<Result<Vec<_>, _>>()?,
+    });
+    let r = call("/v3/kv/txn", &b)?;
+    let results: Vec<Value> = r["responses"].as_array().into_iter().flatten().map(|x| {
+        if let Some(g) = x.get("response_range") {
+            return g["kvs"].get(0).map_or(Value::Null, |k| kv_of(k, true));
+        }
+        if let Some(d) = x.get("response_delete_range") {
+            return json!({ "deleted": int(&d["deleted"]) });
+        }
+        json!({ "put": true })
+    }).collect();
+    Ok(json!({ "succeeded": r["succeeded"] == true, "revision": int(&r["header"]["revision"]), "results": results }))
+}
+
+/// Stores `value` only if the key holds `expected`. Gives true when it did.
+pub fn etcd_compare_and_swap(key: &str, expected: serde_json::Value, value: serde_json::Value) -> Result<bool, String> {
+    let r = etcd_txn(vec![json!({ "key": key, "value": expected })], vec![json!({ "put": { "key": key, "value": value } })], vec![])?;
+    Ok(r["succeeded"] == true)
+}
+
+/// Stores a value only if the key has none, its create revision being 0: the base of a lock or an election. `lease` "" for none. True when it did.
+pub fn etcd_put_if_absent(key: &str, value: serde_json::Value, lease: &str) -> Result<bool, String> {
+    let mut put = json!({ "key": key, "value": value });
+    if !lease.is_empty() {
+        put["lease"] = json!(lease);
+    }
+    let r = etcd_txn(vec![json!({ "key": key, "target": "create", "value": 0 })], vec![json!({ "put": put })], vec![])?;
+    Ok(r["succeeded"] == true)
+}
+
+/// Any other gateway call: `path` like "/v3/maintenance/status", `body` a map. Keys there are in base64.
+pub fn etcd_call(path: &str, body: serde_json::Value) -> Result<Value, String> {
+    call(path, &if body.is_null() { json!({}) } else { body })
+}

@@ -1,0 +1,254 @@
+//! rqlite's HTTP API: statements run with `?` and named parameters, in a transaction when asked, reads at each consistency level with rows as maps, the leader's 301 followed with the body sent again, unified requests that mix reads and writes, several nodes tried in turn, and each statement's own error reported.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+fn var(n: &str) -> Option<String> {
+    std::env::var(n).ok().filter(|v| !v.is_empty())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn nodes() -> Vec<String> {
+    let v = var("RQLITE_API_URL").or_else(|| var("RQLITE_HOST")).unwrap_or("http://localhost:4001".into());
+    v.split(',').map(|n| {
+        let n = n.trim().trim_end_matches('/');
+        if n.contains("://") { n.to_string() } else { format!("http://{}", n) }
+    }).collect()
+}
+
+fn auth() -> Option<String> {
+    let u = var("RQLITE_USER")?;
+    let raw = format!("{}:{}", u, var("RQLITE_PASSWORD").unwrap_or_default());
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in raw.as_bytes().chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    Some(format!("Basic {}", out))
+}
+
+/// One request to the cluster. A write to a follower answers 301 with the leader's address; a client must send the POST again there, which ureq will not do, so redirects are followed here. A node that cannot be reached gives way to the next; 503 (no leader yet) waits and goes again.
+fn call(method: &str, path_q: &str, body: Option<&str>, o: &Value) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout_read(Duration::from_millis(o.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(30_000))).redirects(0).build();
+    let list = nodes();
+    let tries = o.get("max_tries").and_then(|v| v.as_u64()).unwrap_or(5);
+    let mut at = 0;
+    let mut url = format!("{}{}", list[0], path_q);
+    let (mut hops, mut wrong) = (0, 0);
+    let mut last = String::new();
+    while wrong < tries + list.len() as u64 {
+        let mut r = agent.request(method, &url);
+        if let Some(a) = auth() {
+            r = r.set("Authorization", &a);
+        }
+        let res = match body {
+            Some(b) => r.set("Content-Type", "application/json").send_string(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(x) if x.status() == 301 || x.status() == 302 || x.status() == 307 => {
+                hops += 1;
+                if hops > 5 {
+                    return Err("rqlite: more than 5 redirects: the cluster has no settled leader".into());
+                }
+                let to = x.header("location").ok_or("rqlite: a redirect with no Location")?.to_string();
+                url = if to.starts_with('/') { format!("{}{}", url.split('/').take(3).collect::<Vec<_>>().join("/"), to) } else { to };
+            }
+            Ok(x) => {
+                let t = x.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&t).or(Ok(json!(t)));
+            }
+            Err(ureq::Error::Status(code, x)) if code == 301 || code == 302 || code == 307 => {
+                let _ = x;
+                return Err(format!("rqlite: unexpected redirect status {}", code));
+            }
+            Err(ureq::Error::Status(503, x)) => {
+                last = format!("rqlite 503: {}", x.into_string().unwrap_or_default().trim());
+                wrong += 1;
+                std::thread::sleep(Duration::from_millis(100 * wrong));
+            }
+            Err(ureq::Error::Status(code, x)) => {
+                let t = x.into_string().unwrap_or_default();
+                let hint = if code == 401 { " (set RQLITE_USER and RQLITE_PASSWORD)" } else { "" };
+                return Err(format!("rqlite {}: {}{}", code, t.trim(), hint));
+            }
+            Err(e) => {
+                last = format!("cannot reach rqlite at {}: {}", url, e);
+                wrong += 1;
+                at = (at + 1) % list.len();
+                url = format!("{}{}", list[at], path_q);
+                hops = 0;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// `"sql"`, `["sql", 1, "two"]`, or `{ sql, params }` with a list or a map of named parameters.
+fn statement(s: &Value) -> Result<Value, String> {
+    match s {
+        Value::String(_) => Ok(json!([s])),
+        Value::Array(a) if a.first().is_some_and(|x| x.is_string()) => Ok(s.clone()),
+        Value::Object(m) => {
+            let sql = m.get("sql").filter(|x| x.is_string()).ok_or("a statement map needs `sql`")?;
+            let mut out = vec![sql.clone()];
+            match m.get("params") {
+                Some(Value::Array(p)) => out.extend(p.iter().cloned()),
+                Some(p @ Value::Object(_)) => out.push(p.clone()),
+                None | Some(Value::Null) => {}
+                Some(_) => return Err("`params` is a list or a map".into()),
+            }
+            Ok(json!(out))
+        }
+        _ => Err(format!("{} is not a statement: text, [sql, params...] or {{ sql, params }}", s)),
+    }
+}
+
+fn statements(s: &Value) -> Result<Value, String> {
+    match s {
+        Value::Array(a) if a.iter().all(|x| !x.is_string()) && !a.is_empty() => Ok(json!(a.iter().map(statement).collect::<Result<Vec<_>, _>>()?)),
+        _ => Ok(json!([statement(s)?])),
+    }
+}
+
+/// Rows as maps; blobs come as base64 text and are left so.
+fn shape(r: &Value) -> Value {
+    if let Some(rows) = r.get("rows").filter(|x| x.is_array()) {
+        return json!({ "rows": rows, "time": r.get("time") });
+    }
+    let cols = r["columns"].as_array().cloned().unwrap_or_default();
+    let rows: Vec<Value> = r["values"].as_array().into_iter().flatten().map(|row| {
+        let mut m = Map::new();
+        for (i, c) in cols.iter().enumerate() {
+            m.insert(c.as_str().unwrap_or("").to_string(), row.get(i).cloned().unwrap_or(Value::Null));
+        }
+        Value::Object(m)
+    }).collect();
+    json!({ "rows": rows, "columns": cols, "types": r.get("types"), "time": r.get("time") })
+}
+
+/// Results with the first statement's error turned into an error value, saying which one.
+fn results(v: &Value) -> Result<Vec<Value>, String> {
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(format!("rqlite: {}", e));
+    }
+    let list = v["results"].as_array().ok_or(format!("rqlite: no results in {}", v))?;
+    for (i, r) in list.iter().enumerate() {
+        if let Some(e) = r.get("error").and_then(|e| e.as_str()) {
+            return Err(format!("rqlite statement {}: {}", i + 1, e));
+        }
+    }
+    Ok(list.clone())
+}
+
+fn flags(o: &Value, names: &[&str]) -> Vec<String> {
+    names.iter().filter(|n| o.get(**n) == Some(&Value::Bool(true))).map(|n| n.to_string()).collect()
+}
+
+/// Runs writes: `statements` is one statement or a list, each text, `[sql, params...]` or `{ sql, params }` with a map for `:named` ones. Options: transaction (all or nothing), queue (a queued write, answered at once), wait and timeout (with queue, like "5s"), timings. Gives [{ rows_affected, last_insert_id, time }]; a statement's failure is an error value naming it, and in a transaction nothing stays.
+pub fn rqlite_execute(statements_in: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q = flags(&options, &["transaction", "queue", "wait", "timings"]);
+    if let Some(t) = options.get("timeout").and_then(|t| t.as_str()) {
+        q.push(format!("timeout={}", enc(t)));
+    }
+    let path = format!("/db/execute{}{}", if q.is_empty() { "" } else { "?" }, q.join("&"));
+    let body = statements(&statements_in)?.to_string();
+    let v = call("POST", &path, Some(&body), &options)?;
+    if options.get("queue") == Some(&Value::Bool(true)) {
+        return Ok(json!({ "queued": true, "sequence_number": v.get("sequence_number") }));
+    }
+    Ok(json!(results(&v)?.iter().map(|r| json!({ "rows_affected": r.get("rows_affected").cloned().unwrap_or(json!(0)), "last_insert_id": r.get("last_insert_id"), "time": r.get("time") })).collect::<Vec<_>>()))
+}
+
+/// Several writes as one, all or nothing: rqlite_execute with `transaction`.
+pub fn rqlite_transaction(statements_in: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut o = if options.is_object() { options } else { json!({}) };
+    o["transaction"] = json!(true);
+    rqlite_execute(statements_in, o)
+}
+
+fn read_flags(o: &Value) -> Result<Vec<String>, String> {
+    let mut q = vec![];
+    if let Some(l) = o.get("level").and_then(|l| l.as_str()) {
+        if !["none", "weak", "linearizable", "strong", "auto"].contains(&l) {
+            return Err(format!("`{}` is not a consistency level: none, weak, linearizable, strong or auto", l));
+        }
+        q.push(format!("level={}", l));
+    }
+    if let Some(f) = o.get("freshness").and_then(|f| f.as_str()) {
+        q.push(format!("freshness={}", enc(f)));
+        if o.get("freshness_strict") == Some(&Value::Bool(true)) {
+            q.push("freshness_strict".to_string());
+        }
+    }
+    if let Some(t) = o.get("linearizable_timeout").and_then(|t| t.as_str()) {
+        q.push(format!("linearizable_timeout={}", enc(t)));
+    }
+    Ok(q)
+}
+
+/// One read: a statement as for `rqlite_execute`. Options: level (none, weak, linearizable, strong, auto), freshness and freshness_strict with `none`. Gives the rows as maps.
+pub fn rqlite_query(statement_in: serde_json::Value, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let r = rqlite_query_many(json!([statement(&statement_in)?]), options)?;
+    Ok(r[0]["rows"].as_array().cloned().unwrap_or_default())
+}
+
+/// Several reads at one level. Gives [{ rows, columns, types, time }], one for each.
+pub fn rqlite_query_many(statements_in: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q = read_flags(&options)?;
+    q.extend(flags(&options, &["timings"]));
+    let path = format!("/db/query{}{}", if q.is_empty() { "" } else { "?" }, q.join("&"));
+    let v = call("POST", &path, Some(&statements(&statements_in)?.to_string()), &options)?;
+    Ok(json!(results(&v)?.iter().map(shape).collect::<Vec<_>>()))
+}
+
+/// Reads and writes in one request, in order: rqlite's unified endpoint, as a transaction with the option transaction. Options as for a query. Gives one result for each: rows for a read, rows_affected for a write.
+pub fn rqlite_request(statements_in: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q = read_flags(&options)?;
+    q.extend(flags(&options, &["transaction", "timings"]));
+    let path = format!("/db/request{}{}", if q.is_empty() { "" } else { "?" }, q.join("&"));
+    let v = call("POST", &path, Some(&statements(&statements_in)?.to_string()), &options)?;
+    Ok(json!(results(&v)?.iter().map(|r| if r.get("columns").is_some() || r.get("rows").is_some() { shape(r) } else { json!({ "rows_affected": r.get("rows_affected").cloned().unwrap_or(json!(0)), "last_insert_id": r.get("last_insert_id") }) }).collect::<Vec<_>>()))
+}
+
+/// The cluster's members: { id, api_addr, addr, leader, reachable, voter }.
+pub fn rqlite_nodes(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let v = call("GET", "/nodes?nonvoters", None, &options)?;
+    // Since 8.x the answer may be { nodes: [...] }; before, a map by id.
+    let body = v.get("nodes").cloned().unwrap_or(v);
+    Ok(match body {
+        Value::Array(a) => a,
+        Value::Object(m) => m.into_iter().map(|(id, mut n)| {
+            n["id"] = json!(id);
+            n
+        }).collect(),
+        _ => vec![],
+    })
+}
+
+/// The address of the leader, or an error value when there is none.
+pub fn rqlite_leader(options: serde_json::Value) -> Result<String, String> {
+    rqlite_nodes(options)?.iter().find(|n| n["leader"] == true).and_then(|n| n["api_addr"].as_str().map(str::to_string)).ok_or("the cluster has no leader".to_string())
+}
+
+/// Whether this node is ready for requests: /readyz.
+pub fn rqlite_ready(options: serde_json::Value) -> Result<bool, String> {
+    Ok(matches!(call("GET", "/readyz", None, &options), Ok(_)))
+}
+
+/// A node's own status: version, store, raft and more, as it gives it.
+pub fn rqlite_status(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", "/status", None, &options)
+}

@@ -1,0 +1,611 @@
+//! HL7 FHIR R4 JSON: resources checked for required fields, codes and formats, Bundles read and built, references resolved, FHIRPath-lite field access, and search parameters with paging for a FHIR server.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+/// For each kind of resource: its required elements (`x|y` for a choice, `value[x]` written as a prefix `value*`).
+const REQUIRED: &[(&str, &[&str])] = &[
+    ("AllergyIntolerance", &["patient"]),
+    ("Appointment", &["status", "participant"]),
+    ("Bundle", &["type"]),
+    ("CarePlan", &["status", "intent", "subject"]),
+    ("Claim", &["status", "type", "use", "patient", "created", "provider", "priority", "insurance"]),
+    ("Composition", &["status", "type", "date", "author", "title"]),
+    ("Condition", &["subject"]),
+    ("Consent", &["status", "scope", "category"]),
+    ("Coverage", &["status", "beneficiary", "payor"]),
+    ("DiagnosticReport", &["status", "code"]),
+    ("DocumentReference", &["status", "content"]),
+    ("Encounter", &["status", "class"]),
+    ("Immunization", &["status", "vaccineCode", "patient", "occurrence*"]),
+    ("Location", &[]),
+    ("Medication", &[]),
+    ("MedicationRequest", &["status", "intent", "medication*", "subject"]),
+    ("MedicationStatement", &["status", "medication*", "subject"]),
+    ("Observation", &["status", "code"]),
+    ("OperationOutcome", &["issue"]),
+    ("Organization", &[]),
+    ("Patient", &[]),
+    ("Practitioner", &[]),
+    ("PractitionerRole", &[]),
+    ("Procedure", &["status", "subject"]),
+    ("Questionnaire", &["status"]),
+    ("QuestionnaireResponse", &["status"]),
+    ("RelatedPerson", &["patient"]),
+    ("ServiceRequest", &["status", "intent", "subject"]),
+    ("Specimen", &[]),
+];
+
+/// Bound value sets of the commonest `code` elements.
+const CODES: &[(&str, &str, &[&str])] = &[
+    ("Patient", "gender", &["male", "female", "other", "unknown"]),
+    ("Practitioner", "gender", &["male", "female", "other", "unknown"]),
+    ("Observation", "status", &["registered", "preliminary", "final", "amended", "corrected", "cancelled", "entered-in-error", "unknown"]),
+    ("DiagnosticReport", "status", &["registered", "partial", "preliminary", "final", "amended", "corrected", "appended", "cancelled", "entered-in-error", "unknown"]),
+    ("Encounter", "status", &["planned", "arrived", "triaged", "in-progress", "onleave", "finished", "cancelled", "entered-in-error", "unknown"]),
+    ("MedicationRequest", "status", &["active", "on-hold", "cancelled", "completed", "entered-in-error", "stopped", "draft", "unknown"]),
+    ("MedicationRequest", "intent", &["proposal", "plan", "order", "original-order", "reflex-order", "filler-order", "instance-order", "option"]),
+    ("Immunization", "status", &["completed", "entered-in-error", "not-done"]),
+    ("Procedure", "status", &["preparation", "in-progress", "not-done", "on-hold", "stopped", "completed", "entered-in-error", "unknown"]),
+    ("Appointment", "status", &["proposed", "pending", "booked", "arrived", "fulfilled", "cancelled", "noshow", "entered-in-error", "checked-in", "waitlist"]),
+    ("Bundle", "type", &["document", "message", "transaction", "transaction-response", "batch", "batch-response", "history", "searchset", "collection"]),
+];
+
+const RESOURCE_TYPES: &[&str] = &["Account", "ActivityDefinition", "AdverseEvent", "Basic", "Binary", "BodyStructure", "CapabilityStatement", "CareTeam", "ChargeItem", "ClinicalImpression", "Communication", "Contract", "Device", "DeviceRequest", "EpisodeOfCare", "ExplanationOfBenefit", "FamilyMemberHistory", "Flag", "Goal", "Group", "HealthcareService", "ImagingStudy", "Invoice", "List", "Media", "MeasureReport", "MedicationAdministration", "MedicationDispense", "NutritionOrder", "Parameters", "Provenance", "RiskAssessment", "Schedule", "Slot", "StructureDefinition", "Subscription", "SupplyRequest", "Task", "ValueSet"];
+
+fn known(t: &str) -> bool {
+    REQUIRED.iter().any(|r| r.0 == t) || RESOURCE_TYPES.contains(&t)
+}
+
+fn date_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    let d = |r: std::ops::Range<usize>| b.get(r.clone()).is_some_and(|x| x.iter().all(u8::is_ascii_digit));
+    let month = |s: &str| s.get(5..7).and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (1..=12).contains(&m));
+    let day = |s: &str| s.get(8..10).and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (1..=31).contains(&m));
+    match s.len() {
+        4 => d(0..4),
+        7 => d(0..4) && b[4] == b'-' && d(5..7) && month(s),
+        10 => d(0..4) && b[4] == b'-' && d(5..7) && b[7] == b'-' && d(8..10) && month(s) && day(s),
+        _ => false,
+    }
+}
+
+fn datetime_ok(s: &str) -> bool {
+    if date_ok(s) {
+        return true;
+    }
+    let Some((date, time)) = s.split_once('T') else { return false };
+    if date.len() != 10 || !date_ok(date) {
+        return false;
+    }
+    let (clock, zone) = if let Some(c) = time.strip_suffix('Z') {
+        (c, "Z")
+    } else if time.len() > 6 && (time.as_bytes()[time.len() - 6] == b'+' || time.as_bytes()[time.len() - 6] == b'-') {
+        time.split_at(time.len() - 6)
+    } else {
+        return false; // FHIR wants a zone whenever a time is given
+    };
+    let clock = clock.split('.').next().unwrap_or("");
+    let n = clock.as_bytes();
+    let hhmmss = clock.len() == 8 && n[2] == b':' && n[5] == b':' && [0, 1, 3, 4, 6, 7].iter().all(|i| n[*i].is_ascii_digit());
+    hhmmss && (zone == "Z" || zone[1..].len() == 5)
+}
+
+fn id_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// Date-like elements checked anywhere in a resource, with the way they are named.
+fn walk(path: &str, v: &Value, p: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                let at = format!("{}.{}", path, k);
+                if let Some(s) = x.as_str() {
+                    let name = k.to_ascii_lowercase();
+                    if name == "birthdate" || name == "issued" || name.ends_with("datetime") || k == "effectiveDateTime" || k == "authoredOn" || k == "start" || k == "end" || k == "recordedDate" {
+                        if !datetime_ok(s) {
+                            p.push(format!("{}: `{}` is not a FHIR date or dateTime (a time needs its zone)", at, s));
+                        }
+                    }
+                    if k == "reference" && (s.is_empty() || s.contains(' ')) {
+                        p.push(format!("{}: `{}` is not a reference", at, s));
+                    }
+                    if s.is_empty() {
+                        p.push(format!("{}: strings may not be empty in FHIR: leave the element out", at));
+                    }
+                }
+                if x.is_null() {
+                    p.push(format!("{}: FHIR has no null outside of arrays lined up with primitive extensions", at));
+                }
+                if k == "contained" {
+                    for (i, c) in x.as_array().into_iter().flatten().enumerate() {
+                        check_one(c, &format!("{}[{}]", at, i), p);
+                    }
+                    continue;
+                }
+                walk(&at, x, p);
+            }
+        }
+        Value::Array(a) => {
+            if a.is_empty() {
+                p.push(format!("{}: arrays may not be empty in FHIR: leave the element out", path));
+            }
+            for (i, x) in a.iter().enumerate() {
+                walk(&format!("{}[{}]", path, i), x, p);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_one(r: &Value, at: &str, p: &mut Vec<String>) {
+    let Some(t) = r.get("resourceType").and_then(Value::as_str) else {
+        p.push(format!("{}: no resourceType", at));
+        return;
+    };
+    let at = if at.is_empty() { t.to_string() } else { format!("{}({})", at, t) };
+    if !known(t) {
+        p.push(format!("{}: `{}` is not a FHIR R4 resource this knows", at, t));
+        return;
+    }
+    if let Some(id) = r.get("id") {
+        if !id.as_str().is_some_and(id_ok) {
+            p.push(format!("{}.id: {} should be 1 to 64 letters, digits, dashes or dots", at, id));
+        }
+    }
+    if let Some((_, need)) = REQUIRED.iter().find(|x| x.0 == t) {
+        for n in *need {
+            let there = match n.strip_suffix('*') {
+                Some(prefix) => r.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with(prefix) && k.len() > prefix.len() && k[prefix.len()..].starts_with(|c: char| c.is_ascii_uppercase()))),
+                None => r.get(*n).is_some(),
+            };
+            if !there {
+                p.push(format!("{}.{}: required, and missing", at, n.trim_end_matches('*')));
+            }
+        }
+    }
+    for (_, field, allowed) in CODES.iter().filter(|c| c.0 == t) {
+        if let Some(v) = r.get(*field) {
+            if !v.as_str().is_some_and(|s| allowed.contains(&s)) {
+                p.push(format!("{}.{}: {} should be one of {}", at, field, v, allowed.join(", ")));
+            }
+        }
+    }
+    match t {
+        "Organization" if r.get("identifier").is_none() && r.get("name").is_none() => p.push(format!("{}: org-1: an Organization needs a name or an identifier", at)),
+        "Observation" if r.get("value").is_some() => p.push(format!("{}.value: write value[x] with its type, such as valueQuantity", at)),
+        "Bundle" => {
+            let kind = r.get("type").and_then(Value::as_str).unwrap_or("");
+            for (i, e) in r.get("entry").and_then(Value::as_array).into_iter().flatten().enumerate() {
+                let here = format!("{}.entry[{}]", at, i);
+                if let Some(res) = e.get("resource") {
+                    check_one(res, &here, p);
+                }
+                if (kind == "transaction" || kind == "batch") && e.get("request").is_none() {
+                    p.push(format!("{}: bdl-3: an entry of a {} needs a request", here, kind));
+                }
+                if kind != "transaction" && kind != "batch" && kind != "transaction-response" && kind != "batch-response" && kind != "history" && e.get("request").is_some() {
+                    p.push(format!("{}: bdl-3: only a batch, transaction or history entry has a request", here));
+                }
+            }
+            if r.get("total").is_some() && kind != "searchset" && kind != "history" {
+                p.push(format!("{}.total: bdl-1: total is only for searchset and history", at));
+            }
+            let mut ids: Vec<String> = r.get("entry").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e["fullUrl"].as_str().map(str::to_string)).collect();
+            ids.sort();
+            ids.dedup_by(|a, b| { if a == b { p.push(format!("{}: bdl-7: fullUrl {} appears twice", at, a)); true } else { false } });
+        }
+        _ => {}
+    }
+    if t != "Bundle" {
+        walk(&at, r, p);
+    }
+}
+
+/// Checks a resource against FHIR R4's rules for it: required elements, bound codes, id, date and dateTime formats, no empty strings, arrays or nulls, the Bundle rules, and what is `contained`. `{ ok, problems }`, each problem naming its path. Not a full profile validator: the resources most in use are covered, and of those their commonest bindings.
+pub fn fhir_check(resource: serde_json::Value) -> Value {
+    let mut p = vec![];
+    check_one(&resource, "", &mut p);
+    json!({ "ok": p.is_empty(), "problems": p })
+}
+
+/// An OperationOutcome, what a FHIR server answers a failure with: `severity` (fatal, error, warning, information), `code` (invalid, not-found, conflict...), and the words.
+pub fn fhir_outcome(severity: &str, code: &str, diagnostics: &str) -> Value {
+    json!({ "resourceType": "OperationOutcome", "issue": [{ "severity": severity, "code": code, "diagnostics": diagnostics }] })
+}
+
+/// Reads a Bundle: `{ type, total, links, entries: [{ full_url, resource_type, id, resource, search_mode, request, response }] }`.
+pub fn fhir_bundle_read(bundle: serde_json::Value) -> Result<Value, String> {
+    if bundle["resourceType"] != "Bundle" {
+        return Err(format!("this is a {}, not a Bundle", bundle["resourceType"]));
+    }
+    let links: Map<String, Value> = bundle["link"].as_array().into_iter().flatten().filter_map(|l| Some((l["relation"].as_str()?.to_string(), l["url"].clone()))).collect();
+    let entries: Vec<Value> = bundle["entry"].as_array().into_iter().flatten().map(|e| json!({
+        "full_url": e["fullUrl"], "resource_type": e["resource"]["resourceType"], "id": e["resource"]["id"], "resource": e["resource"],
+        "search_mode": e["search"]["mode"], "request": e["request"], "response": e["response"],
+    })).collect();
+    Ok(json!({ "type": bundle["type"], "total": bundle["total"], "links": links, "entries": entries }))
+}
+
+fn full_url(r: &Value, base: &str, i: usize) -> Value {
+    let (t, id) = (r["resourceType"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""));
+    if base.is_empty() || id.is_empty() {
+        // Two lines in place of a uuid crate: an id that only has to be unique in this Bundle.
+        json!(format!("urn:uuid:00000000-0000-4000-8000-{:012x}", i + 1))
+    } else {
+        json!(format!("{}/{}/{}", base.trim_end_matches('/'), t, id))
+    }
+}
+
+/// Makes a Bundle of `kind` (collection, transaction, batch, document, searchset...) from resources. For a transaction or batch each entry gets its `request`: PUT by id, POST without one. `base` makes each `fullUrl`; entries without an id get a `urn:uuid:` one, and a reference written `#n`-free as `Patient/temp` keeps working only if you use those fullUrls yourself.
+pub fn fhir_bundle_build(kind: &str, resources: Vec<serde_json::Value>, base: &str) -> Result<Value, String> {
+    if !CODES.iter().find(|c| c.0 == "Bundle").unwrap().2.contains(&kind) {
+        return Err(format!("`{}` is not a Bundle type", kind));
+    }
+    let mut entries = vec![];
+    for (i, r) in resources.iter().enumerate() {
+        let t = r["resourceType"].as_str().ok_or(format!("resource {}: no resourceType", i + 1))?;
+        let mut e = json!({ "fullUrl": full_url(r, base, i), "resource": r });
+        if kind == "transaction" || kind == "batch" {
+            e["request"] = match r["id"].as_str() {
+                Some(id) => json!({ "method": "PUT", "url": format!("{}/{}", t, id) }),
+                None => json!({ "method": "POST", "url": t }),
+            };
+        }
+        entries.push(e);
+    }
+    let mut b = json!({ "resourceType": "Bundle", "type": kind });
+    if kind == "searchset" {
+        b["total"] = json!(entries.len());
+    }
+    b["entry"] = Value::Array(entries);
+    Ok(b)
+}
+
+/// Finds what a reference points to. `reference` is a text or a Reference map; relative (`Patient/1`), absolute (`https://x/fhir/Patient/1`), `urn:uuid:` or `Patient/1/_history/2`. Looked for in the Bundle by `fullUrl`, then by type and id. `#id` is looked for in `from`'s contained resources. Null when not there.
+pub fn fhir_resolve(bundle: serde_json::Value, reference: serde_json::Value, from: serde_json::Value) -> Option<Value> {
+    let r = reference.as_str().or(reference["reference"].as_str())?;
+    if let Some(id) = r.strip_prefix('#') {
+        return from["contained"].as_array()?.iter().find(|c| c["id"] == id).cloned();
+    }
+    let entries = bundle["entry"].as_array()?;
+    if let Some(e) = entries.iter().find(|e| e["fullUrl"] == r) {
+        return Some(e["resource"].clone());
+    }
+    let clean = r.split("/_history/").next().unwrap_or(r);
+    let mut parts = clean.rsplit('/');
+    let (id, t) = (parts.next()?, parts.next()?);
+    entries.iter().find(|e| e["resource"]["resourceType"] == t && e["resource"]["id"] == id).map(|e| e["resource"].clone())
+}
+
+/// Every reference in a resource: `[{ path, reference, display }]`.
+pub fn fhir_references(resource: serde_json::Value) -> Vec<Value> {
+    fn go(path: &str, v: &Value, out: &mut Vec<Value>) {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::String(r)) = m.get("reference") {
+                    out.push(json!({ "path": path, "reference": r, "display": m.get("display") }));
+                }
+                for (k, x) in m {
+                    go(&if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) }, x, out);
+                }
+            }
+            Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    go(&format!("{}[{}]", path, i), x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    go("", &resource, &mut out);
+    out
+}
+
+/// Splits on dots outside brackets, parentheses and quotes.
+fn steps(p: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth, mut quote) = (vec![], String::new(), 0, false);
+    for c in p.chars() {
+        match c {
+            '\'' => { quote = !quote; cur.push(c) }
+            '(' | '[' if !quote => { depth += 1; cur.push(c) }
+            ')' | ']' if !quote => { depth -= 1; cur.push(c) }
+            '.' if !quote && depth == 0 => out.push(std::mem::take(&mut cur)),
+            o => cur.push(o),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn eval_step(items: Vec<Value>, step: &str) -> Result<Vec<Value>, String> {
+    if let Some(cond) = step.strip_prefix("where(").and_then(|s| s.strip_suffix(')')) {
+        let (field, want) = cond.split_once('=').ok_or(format!("where({}) should be where(field='value')", cond))?;
+        let want = want.trim().trim_matches('\'');
+        let mut out = vec![];
+        for x in items {
+            let got = eval_path(&x, field.trim())?;
+            if got.iter().any(|g| g.as_str() == Some(want) || g.to_string() == want) {
+                out.push(x);
+            }
+        }
+        return Ok(out);
+    }
+    match step {
+        "first()" => return Ok(items.into_iter().take(1).collect()),
+        "last()" => return Ok(items.into_iter().last().into_iter().collect()),
+        "count()" => return Ok(vec![json!(items.len())]),
+        "exists()" => return Ok(vec![json!(!items.is_empty())]),
+        "empty()" => return Ok(vec![json!(items.is_empty())]),
+        _ => {}
+    }
+    if step.ends_with(')') {
+        return Err(format!("`{}` is beyond this small FHIRPath: where(), first(), last(), count(), exists(), empty() and [n] are here", step));
+    }
+    let (name, index) = match step.split_once('[') {
+        Some((n, i)) => (n, Some(i.trim_end_matches(']').parse::<usize>().map_err(|_| format!("`{}`: an index is a number", step))?)),
+        None => (step, None),
+    };
+    let mut out = vec![];
+    for x in &items {
+        let found = x.get(name).cloned().or_else(|| {
+            // value finds valueQuantity: a choice element, by its short name.
+            x.as_object()?.iter().find(|(k, _)| k.starts_with(name) && k[name.len()..].starts_with(|c: char| c.is_ascii_uppercase())).map(|(_, v)| v.clone())
+        });
+        match found {
+            Some(Value::Array(a)) => out.extend(a),
+            Some(v) => out.push(v),
+            None => {}
+        }
+    }
+    Ok(match index {
+        Some(i) => out.into_iter().skip(i).take(1).collect(),
+        None => out,
+    })
+}
+
+fn eval_path(r: &Value, path: &str) -> Result<Vec<Value>, String> {
+    let mut items = vec![r.clone()];
+    for (i, s) in steps(path).iter().enumerate() {
+        if i == 0 && s.as_str() == r["resourceType"].as_str().unwrap_or("\0") {
+            continue;
+        }
+        items = eval_step(items, s)?;
+    }
+    Ok(items)
+}
+
+/// A small FHIRPath: every value at `path`, as a list. `name.family`, `Patient.name[0].given`, `telecom.where(system='phone').value`, `value` for a choice like `valueQuantity`, and `first()`, `last()`, `count()`, `exists()`, `empty()`.
+pub fn fhir_path(resource: serde_json::Value, path: &str) -> Result<Vec<Value>, String> {
+    eval_path(&resource, path)
+}
+
+/// The first value at `path`, or null.
+pub fn fhir_get(resource: serde_json::Value, path: &str) -> Result<Value, String> {
+    Ok(eval_path(&resource, path)?.into_iter().next().unwrap_or(Value::Null))
+}
+
+fn dec(x: &str) -> String {
+    let b = x.as_bytes();
+    let (mut i, mut out) = (0, Vec::with_capacity(b.len()));
+    while i < b.len() {
+        match (b[i], x.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(h)) => { out.push(h); i += 3; }
+            (b'+', _) => { out.push(b' '); i += 1; }
+            (c, _) => { out.push(c); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn enc(x: &str) -> String {
+    x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~:,|".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+const PREFIXES: &[&str] = &["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"];
+
+/// Reads a FHIR search's query text: `{ params: [{ name, modifier, values: [{ prefix, value }] }], count, offset, sort, include, revinclude, summary, elements }`. `birthdate=ge1990-01-01`, `name:exact=Ada`, `code=http://loinc.org|1234-5`, a comma being "or" and a repeated parameter "and".
+pub fn fhir_search_parse(query: &str) -> Result<Value, String> {
+    let q = query.split_once('?').map_or(query, |x| x.1);
+    let mut params = vec![];
+    let mut out = json!({ "count": null, "offset": 0, "sort": [], "include": [], "revinclude": [], "summary": null, "elements": [] });
+    for pair in q.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let (k, v) = (dec(k), dec(v));
+        let (name, modifier) = k.split_once(':').map_or((k.as_str(), None), |(a, b)| (a, Some(b)));
+        let number = |what: &str| v.parse::<i64>().ok().filter(|n| *n >= 0).ok_or(format!("{} `{}` should be a whole number", what, v));
+        match name {
+            "_count" => out["count"] = json!(number("_count")?),
+            "_offset" | "_getpagesoffset" => out["offset"] = json!(number("_offset")?),
+            "_sort" => out["sort"] = json!(v.split(',').map(|s| json!({ "field": s.trim_start_matches('-'), "descending": s.starts_with('-') })).collect::<Vec<_>>()),
+            "_include" | "_revinclude" => { let key = name.trim_start_matches('_'); out[key].as_array_mut().unwrap().push(json!(v)); }
+            "_summary" => out["summary"] = json!(v),
+            "_elements" => out["elements"] = json!(v.split(',').collect::<Vec<_>>()),
+            "_format" | "_pretty" => {}
+            _ => {
+                let values: Vec<Value> = v.split(',').map(|x| {
+                    let has = x.len() > 2 && PREFIXES.contains(&&x[..2]) && x.as_bytes()[2].is_ascii_digit();
+                    if has { json!({ "prefix": &x[..2], "value": &x[2..] }) } else { json!({ "prefix": "eq", "value": x }) }
+                }).collect();
+                params.push(json!({ "name": name, "modifier": modifier, "values": values }));
+            }
+        }
+    }
+    out["params"] = Value::Array(params);
+    Ok(out)
+}
+
+/// What a search parameter looks at on a resource: FHIR's definitions of the ones in common use.
+fn search_paths(t: &str, name: &str) -> Vec<&'static str> {
+    match (t, name) {
+        (_, "_id") => vec!["id"],
+        (_, "_lastUpdated") => vec!["meta.lastUpdated"],
+        ("Patient" | "Practitioner", "family") => vec!["name.family"],
+        ("Patient" | "Practitioner", "given") => vec!["name.given"],
+        ("Patient" | "Practitioner", "name") => vec!["name.family", "name.given", "name.text"],
+        ("Patient" | "Practitioner", "gender") => vec!["gender"],
+        ("Patient", "birthdate") => vec!["birthDate"],
+        ("Patient", "identifier") => vec!["identifier"],
+        ("Patient" | "Practitioner", "telecom") => vec!["telecom.value"],
+        ("Patient" | "Practitioner", "email") => vec!["telecom.where(system='email').value"],
+        ("Patient" | "Practitioner", "phone") => vec!["telecom.where(system='phone').value"],
+        ("Patient", "address-city") => vec!["address.city"],
+        ("Organization", "name") => vec!["name"],
+        ("Observation" | "Condition" | "DiagnosticReport" | "Procedure", "code") => vec!["code.coding"],
+        ("Observation", "date") => vec!["effective"],
+        ("Observation" | "DiagnosticReport" | "Encounter" | "Procedure" | "MedicationRequest" | "Condition", "patient" | "subject") => vec!["subject.reference"],
+        ("Observation" | "DiagnosticReport" | "Encounter" | "Procedure" | "MedicationRequest", "status") => vec!["status"],
+        ("Condition", "clinical-status") => vec!["clinicalStatus.coding.code"],
+        ("Encounter", "date") => vec!["period.start"],
+        ("AllergyIntolerance" | "Immunization", "patient") => vec!["patient.reference"],
+        _ => vec![],
+    }
+}
+
+fn prefix_match(got: &str, prefix: &str, want: &str) -> bool {
+    let (a, b) = (got.parse::<f64>(), want.parse::<f64>());
+    let ord = match (a, b) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => {
+            // Dates compare to the precision of the shorter, as `1990` covers the year.
+            let n = got.len().min(want.len());
+            got[..got.floor_char_boundary(n)].cmp(&want[..want.floor_char_boundary(n)])
+        }
+    };
+    match prefix {
+        "eq" => ord.is_eq(),
+        "ne" => ord.is_ne(),
+        "gt" | "sa" => ord.is_gt(),
+        "lt" | "eb" => ord.is_lt(),
+        "ge" => ord.is_ge(),
+        "le" => ord.is_le(),
+        _ => ord.is_eq(),
+    }
+}
+
+/// One value against a search value, by the kind of thing it is: strings start with it, ignoring case; token `system|code` against a Coding or Identifier; a reference by its end.
+fn value_match(got: &Value, name: &str, modifier: Option<&str>, prefix: &str, want: &str) -> bool {
+    if let Some(m) = got.as_object() {
+        if m.contains_key("system") || m.contains_key("code") || m.contains_key("value") {
+            let (sys, code) = want.split_once('|').unwrap_or(("", want));
+            let c = m.get("code").or(m.get("value")).and_then(Value::as_str).unwrap_or("");
+            let s = m.get("system").and_then(Value::as_str).unwrap_or("");
+            return c == code && (!want.contains('|') || sys.is_empty() || s == sys);
+        }
+        return false;
+    }
+    let Some(text) = got.as_str().map(str::to_string).or_else(|| got.as_f64().map(|n| n.to_string())) else { return false };
+    if name == "patient" || name == "subject" {
+        return text == want || text.ends_with(&format!("/{}", want));
+    }
+    match modifier {
+        Some("exact") => text == want,
+        Some("contains") => text.to_lowercase().contains(&want.to_lowercase()),
+        _ if want.as_bytes().first().is_some_and(u8::is_ascii_digit) || prefix != "eq" => prefix_match(&text, prefix, want),
+        _ => text.to_lowercase().starts_with(&want.to_lowercase()),
+    }
+}
+
+/// Runs a search over `resources` as a FHIR server would, and gives a searchset Bundle: `query` as in `fhir_search_parse`, `resource_type` the kind searched, `base` the server's address. `_count` (default 20, at most 500) and `_offset` page it, with `self`, `first`, `previous`, `next` and `last` links. `_sort` by a field, `-` for descending; `_include` brings referenced resources, as entries with mode `include`. An unknown parameter is an error, as `Prefer: handling=strict` asks.
+pub fn fhir_search(resource_type: &str, resources: Vec<serde_json::Value>, query: &str, base: &str) -> Result<Value, String> {
+    let q = fhir_search_parse(query)?;
+    let mut hits: Vec<Value> = resources.iter().filter(|r| r["resourceType"] == resource_type).cloned().collect();
+    for p in q["params"].as_array().into_iter().flatten() {
+        let name = p["name"].as_str().unwrap_or("");
+        let paths = search_paths(resource_type, name);
+        if paths.is_empty() {
+            return Err(format!("{} has no search parameter `{}` here", resource_type, name));
+        }
+        let modifier = p["modifier"].as_str();
+        if let Some(m) = modifier {
+            if m == "missing" {
+                let want = p["values"][0]["value"] == "true";
+                hits.retain(|r| paths.iter().all(|x| eval_path(r, x).map_or(true, |v| v.is_empty())) == want);
+                continue;
+            }
+            if !["exact", "contains"].contains(&m) {
+                return Err(format!("modifier `:{}` is not supported here", m));
+            }
+        }
+        let mut kept = vec![];
+        for r in hits {
+            let mut any = false;
+            for path in &paths {
+                for got in eval_path(&r, path)? {
+                    any = any || p["values"].as_array().unwrap().iter().any(|v| value_match(&got, name, modifier, v["prefix"].as_str().unwrap_or("eq"), v["value"].as_str().unwrap_or("")));
+                }
+            }
+            if any {
+                kept.push(r);
+            }
+        }
+        hits = kept;
+    }
+    for s in q["sort"].as_array().into_iter().flatten().rev() {
+        let field = s["field"].as_str().unwrap_or("");
+        let paths = search_paths(resource_type, field);
+        let path = paths.first().copied().unwrap_or(field);
+        let desc = s["descending"].as_bool().unwrap_or(false);
+        let key = |r: &Value| eval_path(r, path).ok().and_then(|v| v.into_iter().next()).map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+        hits.sort_by(|a, b| { let o = key(a).cmp(&key(b)); if desc { o.reverse() } else { o } });
+    }
+    let total = hits.len() as i64;
+    let count = q["count"].as_i64().unwrap_or(20).clamp(0, 500);
+    let offset = q["offset"].as_i64().unwrap_or(0);
+    let page: Vec<Value> = hits.iter().skip(offset as usize).take(count as usize).cloned().collect();
+    let base = base.trim_end_matches('/');
+    let rest: Vec<String> = query.split_once('?').map_or(query, |x| x.1).split('&').filter(|p| !p.is_empty() && !p.starts_with("_offset=") && !p.starts_with("_count=")).map(str::to_string).collect();
+    let link = |o: i64| { let mut q = rest.clone(); q.push(format!("_count={}", count)); q.push(format!("_offset={}", o)); format!("{}/{}?{}", base, resource_type, q.join("&")) };
+    let mut links = vec![json!({ "relation": "self", "url": link(offset) }), json!({ "relation": "first", "url": link(0) })];
+    if offset > 0 && count > 0 {
+        links.push(json!({ "relation": "previous", "url": link((offset - count).max(0)) }));
+    }
+    if count > 0 && offset + count < total {
+        links.push(json!({ "relation": "next", "url": link(offset + count) }));
+    }
+    if count > 0 && total > 0 {
+        links.push(json!({ "relation": "last", "url": link((total - 1) / count * count) }));
+    }
+    let entry_of = |r: &Value, mode: &str| json!({ "fullUrl": format!("{}/{}/{}", base, r["resourceType"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or("")), "resource": r, "search": { "mode": mode } });
+    let mut entries: Vec<Value> = page.iter().map(|r| entry_of(r, "match")).collect();
+    let mut seen: Vec<String> = vec![];
+    for inc in q["include"].as_array().into_iter().flatten() {
+        let name = inc.as_str().unwrap_or("").split(':').nth(1).unwrap_or("");
+        for r in &page {
+            for path in search_paths(resource_type, name) {
+                for got in eval_path(r, path)? {
+                    let Some(refr) = got.as_str() else { continue };
+                    let mut bits = refr.rsplit('/');
+                    let (id, t) = (bits.next().unwrap_or(""), bits.next().unwrap_or(""));
+                    let key = format!("{}/{}", t, id);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    if let Some(x) = resources.iter().find(|x| x["resourceType"] == t && x["id"] == id) {
+                        seen.push(key);
+                        entries.push(entry_of(x, "include"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({ "resourceType": "Bundle", "type": "searchset", "total": total, "link": links, "entry": entries }))
+}
+
+/// The query text of a request's parsed query, for `fhir_search`: `fhir_query_text(request.query)`. A map holds each parameter once.
+pub fn fhir_query_text(query: std::collections::BTreeMap<String, String>) -> String {
+    query.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+/// `base?params` for a client: a map of parameters to a search address, values percent-encoded.
+pub fn fhir_search_url(base: &str, resource_type: &str, params: std::collections::BTreeMap<String, String>) -> String {
+    let q: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect();
+    format!("{}/{}?{}", base.trim_end_matches('/'), resource_type, q.join("&"))
+}

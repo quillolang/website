@@ -1,0 +1,522 @@
+//! Claude through Anthropic's Messages API: messages with tools and tool results, streaming collected into one answer, token counting, prompt caching and retries on 429 and 529, with no SDK.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Read};
+use std::time::Duration;
+
+// The model is ANTHROPIC_MODEL or an option; this is only what a program gets when it says nothing.
+const DEFAULT_MODEL: &str = "claude-opus-5-5";
+const API_VERSION: &str = "2026-10-21";
+const FALLBACK_DEFAULT_BETA: &str = "server-side-fallback-2026-07-01";
+const FALLBACK_LIST_BETA: &str = "server-side-fallback-2026-06-01";
+// The models with a server-side fallback for a refused request.
+const FALLBACK_MODELS: &[&str] = &["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"];
+
+struct Conf {
+    key: String,
+    base: String,
+    version: String,
+    retries: u32,
+    timeout: Duration,
+    betas: Vec<String>,
+}
+
+fn txt(o: &Value, k: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn conf(o: &Value) -> Result<Conf, String> {
+    let key = txt(o, "api_key").or_else(|| env("ANTHROPIC_API_KEY")).ok_or("no API key: set ANTHROPIC_API_KEY, or give the option api_key")?;
+    let base = txt(o, "base_url").or_else(|| env("ANTHROPIC_API_URL")).or_else(|| env("ANTHROPIC_BASE_URL")).unwrap_or_else(|| "https://api.anthropic.com".into());
+    let mut betas = vec![];
+    match o.get("betas") {
+        Some(Value::String(s)) if !s.is_empty() => betas.push(s.clone()),
+        Some(Value::Array(l)) => {
+            for b in l {
+                betas.push(b.as_str().ok_or("betas must be texts")?.to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(Conf {
+        key,
+        base: base.trim_end_matches('/').to_string(),
+        version: txt(o, "api_version").unwrap_or_else(|| API_VERSION.into()),
+        retries: o.get("retries").and_then(|v| v.as_i64()).unwrap_or(2).clamp(0, 8) as u32,
+        timeout: Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(600_000).clamp(100, 3_600_000) as u64),
+        betas,
+    })
+}
+
+fn request(c: &Conf, method: &str, path: &str) -> ureq::Request {
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(30)).timeout_read(c.timeout).timeout_write(Duration::from_secs(60)).build();
+    let mut r = agent.request(method, &format!("{}{}", c.base, path)).set("x-api-key", &c.key).set("anthropic-version", &c.version).set("User-Agent", "quillo-anthropic/1.0");
+    if !c.betas.is_empty() {
+        r = r.set("anthropic-beta", &c.betas.join(","));
+    }
+    r
+}
+
+fn error_text(status: u16, body: &str, request_id: Option<String>) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let kind = v.pointer("/error/type").and_then(|x| x.as_str()).unwrap_or("error");
+    let msg = v.pointer("/error/message").and_then(|x| x.as_str()).map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let id = v.get("request_id").and_then(|x| x.as_str()).map(str::to_string).or(request_id);
+    let hint = match status {
+        401 => " (check ANTHROPIC_API_KEY)",
+        402 => " (see the account's billing)",
+        404 if kind == "not_found_error" => " (check the model id)",
+        413 => " (the request is too large: send less)",
+        _ => "",
+    };
+    format!("Claude API {} {}: {}{}{}", status, kind, msg, hint, id.map(|i| format!(" [{}]", i)).unwrap_or_default())
+}
+
+// What the API says about trying again wins; otherwise 408, 409, 429 and 5xx (529 is its "overloaded").
+fn should_retry(status: u16, header: Option<&str>) -> bool {
+    match header {
+        Some("true") => true,
+        Some("false") => false,
+        _ => status == 408 || status == 409 || status == 429 || status >= 500,
+    }
+}
+
+fn pause(attempt: u32, retry_after: Option<f64>) -> Result<(), String> {
+    let wait = match retry_after {
+        Some(s) if s > 60.0 => return Err(format!("the API asks to wait {} s, longer than this plugin waits", s)),
+        Some(s) => s.max(0.0),
+        None => (0.5 * 2f64.powi(attempt as i32)).min(8.0),
+    };
+    std::thread::sleep(Duration::from_secs_f64(wait));
+    Ok(())
+}
+
+// Sends one request, trying again as the API allows, and gives back what answered it.
+fn send(c: &Conf, method: &str, path: &str, body: Option<&Value>) -> Result<ureq::Response, String> {
+    let text = body.map(|b| b.to_string());
+    let mut attempt = 0;
+    loop {
+        let r = request(c, method, path);
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, resp)) => {
+                let after = resp.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok());
+                let should = resp.header("x-should-retry").map(str::to_string);
+                let id = resp.header("request-id").map(str::to_string);
+                let t = resp.into_string().unwrap_or_default();
+                if attempt >= c.retries || !should_retry(code, should.as_deref()) {
+                    return Err(error_text(code, &t, id));
+                }
+                pause(attempt, after).map_err(|e| format!("{}: {}", error_text(code, &t, id), e))?;
+            }
+            Err(e) => {
+                if attempt >= c.retries {
+                    return Err(format!("cannot reach the Claude API at {}: {}", c.base, e));
+                }
+                pause(attempt, None)?;
+            }
+        }
+        attempt += 1;
+    }
+}
+
+fn json_of(resp: ureq::Response) -> Result<Value, String> {
+    let t = resp.into_string().map_err(|e| format!("reading the answer: {}", e))?;
+    serde_json::from_str(&t).map_err(|_| format!("the Claude API's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))
+}
+
+fn prepare(params: &Value, o: &Value, c: &mut Conf, default_max: i64, counting: bool) -> Result<Map<String, Value>, String> {
+    let mut p = match params {
+        Value::Object(m) => m.clone(),
+        Value::String(s) => {
+            let mut m = Map::new();
+            m.insert("messages".into(), json!([{ "role": "user", "content": s }]));
+            m
+        }
+        _ => return Err("params must be a map like { messages, system, tools } or the text of one question".into()),
+    };
+    for k in ["temperature", "top_p", "top_k"] {
+        if p.contains_key(k) {
+            return Err(format!("API version {} refuses `{}` on every model: leave it out", API_VERSION, k));
+        }
+    }
+    match p.get("messages") {
+        Some(Value::Array(l)) if !l.is_empty() => {}
+        Some(Value::String(s)) => {
+            let m = json!([{ "role": "user", "content": s }]);
+            p.insert("messages".into(), m);
+        }
+        _ => return Err("`messages` must hold at least one message".into()),
+    }
+    if !p.contains_key("model") {
+        p.insert("model".into(), json!(txt(o, "model").or_else(|| env("ANTHROPIC_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.into())));
+    }
+    if counting {
+        p.remove("max_tokens");
+        p.remove("stream");
+        return Ok(p);
+    }
+    if !p.contains_key("max_tokens") {
+        p.insert("max_tokens".into(), json!(o.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(default_max)));
+    }
+    if let Some(e) = txt(o, "effort") {
+        let mut oc = p.get("output_config").cloned().unwrap_or(json!({}));
+        oc["effort"] = json!(e);
+        p.insert("output_config".into(), oc);
+    }
+    match o.get("cache") {
+        Some(Value::Bool(true)) => {
+            p.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        }
+        Some(Value::String(t)) => {
+            p.insert("cache_control".into(), cache_mark(t)?);
+        }
+        _ => {}
+    }
+    // A request a safety classifier declines is run again on Anthropic's choice of model, where the
+    // model has that; `fallbacks: false` turns it off, a list names the models.
+    let model = p["model"].as_str().unwrap_or("").to_string();
+    if !p.contains_key("fallbacks") {
+        match o.get("fallbacks") {
+            Some(Value::Bool(false)) => {}
+            Some(v @ Value::Array(_)) => {
+                p.insert("fallbacks".into(), v.clone());
+            }
+            _ if FALLBACK_MODELS.contains(&model.as_str()) => {
+                p.insert("fallbacks".into(), json!("default"));
+            }
+            _ => {}
+        }
+    }
+    match p.get("fallbacks") {
+        Some(Value::String(_)) => c.betas.push(FALLBACK_DEFAULT_BETA.into()),
+        Some(Value::Array(_)) => c.betas.push(FALLBACK_LIST_BETA.into()),
+        _ => {}
+    }
+    c.betas.dedup();
+    Ok(p)
+}
+
+fn cache_mark(ttl: &str) -> Result<Value, String> {
+    match ttl {
+        "" | "5m" => Ok(json!({ "type": "ephemeral" })),
+        "1h" => Ok(json!({ "type": "ephemeral", "ttl": "1h" })),
+        t => Err(format!("a cache lasts \"5m\" or \"1h\", not {:?}", t)),
+    }
+}
+
+// The answer in the shape programs want, with `content` kept as it came: it goes back unchanged.
+fn shape(m: Value, tool_errors: Vec<Value>) -> Value {
+    let content = m.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    let text: String = content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("");
+    let tool_uses: Vec<Value> = content.iter().filter(|b| b["type"] == "tool_use").map(|b| {
+        let mut t = json!({ "id": b["id"], "name": b["name"], "input": b["input"] });
+        if let Some(e) = tool_errors.iter().find(|e| e["id"] == b["id"]) {
+            t["input_error"] = e["error"].clone();
+        }
+        t
+    }).collect();
+    let stop = m.get("stop_reason").cloned().unwrap_or(Value::Null);
+    json!({
+        "id": m.get("id").cloned().unwrap_or(Value::Null),
+        "model": m.get("model").cloned().unwrap_or(Value::Null),
+        "text": text,
+        "tool_uses": tool_uses,
+        "stop_reason": stop,
+        "stop_details": m.get("stop_details").cloned().unwrap_or(Value::Null),
+        "refused": stop == "refusal",
+        "truncated": stop == "max_tokens",
+        "usage": m.get("usage").cloned().unwrap_or(json!({})),
+        "content": content,
+    })
+}
+
+/// Sends a Messages request: `params` as the API documents them (`messages`, `system`, `tools`, `tool_choice`, `thinking`, `output_config`, `max_tokens`...), or one question as text. Options: model (else ANTHROPIC_MODEL, else the current default), max_tokens, effort, cache (true or "1h": automatic caching), fallbacks (false, or a list of { model }), betas, api_key, base_url, retries (2), timeout_ms. Gives { id, model, text, tool_uses, stop_reason, stop_details, refused, truncated, usage, content }.
+pub fn anthropic_message(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut c = conf(&options)?;
+    let p = prepare(&params, &options, &mut c, 16000, false)?;
+    Ok(shape(json_of(send(&c, "POST", "/v1/messages", Some(&Value::Object(p)))?)?, vec![]))
+}
+
+/// Asks one question (with a `system` prompt, or "") and gives the text of the answer; a refusal or a cut-off answer is an error. Options as for anthropic_message.
+pub fn anthropic_ask(question: &str, system: &str, options: serde_json::Value) -> Result<String, String> {
+    let mut p = json!({ "messages": [{ "role": "user", "content": question }] });
+    if !system.is_empty() {
+        p["system"] = json!(system);
+    }
+    let r = anthropic_message(p, options)?;
+    plain_text(&r)
+}
+
+fn plain_text(r: &Value) -> Result<String, String> {
+    if r["refused"] == true {
+        let cat = r.pointer("/stop_details/category").and_then(|c| c.as_str()).unwrap_or("unspecified");
+        let why = r.pointer("/stop_details/explanation").and_then(|c| c.as_str()).unwrap_or("no reason given");
+        return Err(format!("Claude declined this request ({}): {}", cat, why));
+    }
+    if r["truncated"] == true {
+        return Err("the answer stopped at max_tokens: raise it".into());
+    }
+    Ok(r["text"].as_str().unwrap_or("").to_string())
+}
+
+struct Stream {
+    msg: Value,
+    blocks: Vec<Value>,
+    partial: Vec<String>,
+    tool_errors: Vec<Value>,
+    done: bool,
+    got_output: bool,
+}
+
+impl Stream {
+    fn block(&mut self, i: usize) -> Result<&mut Value, String> {
+        self.blocks.get_mut(i).ok_or(format!("a delta for block {} before its start", i))
+    }
+
+    fn append(&mut self, i: usize, field: &str, text: &str) -> Result<(), String> {
+        let b = self.block(i)?;
+        let mut s = b[field].as_str().unwrap_or("").to_string();
+        s.push_str(text);
+        b[field] = json!(s);
+        Ok(())
+    }
+
+    fn event(&mut self, d: Value) -> Result<(), (String, bool)> {
+        let plain = |e: String| (e, false);
+        let i = d.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        match d.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "message_start" => self.msg = d.get("message").cloned().unwrap_or(json!({})),
+            "content_block_start" => {
+                while self.blocks.len() <= i {
+                    self.blocks.push(Value::Null);
+                    self.partial.push(String::new());
+                }
+                self.blocks[i] = d.get("content_block").cloned().unwrap_or(json!({}));
+                self.got_output = true;
+            }
+            "content_block_delta" => {
+                let delta = d.get("delta").cloned().unwrap_or(json!({}));
+                let t = |k: &str| delta[k].as_str().unwrap_or("").to_string();
+                match delta["type"].as_str().unwrap_or("") {
+                    "text_delta" => self.append(i, "text", &t("text")).map_err(plain)?,
+                    "thinking_delta" => self.append(i, "thinking", &t("thinking")).map_err(plain)?,
+                    "signature_delta" => self.append(i, "signature", &t("signature")).map_err(plain)?,
+                    "input_json_delta" => {
+                        self.partial.get_mut(i).ok_or(plain(format!("a delta for block {} before its start", i)))?.push_str(delta["partial_json"].as_str().unwrap_or(""));
+                    }
+                    "citations_delta" => {
+                        let b = self.block(i).map_err(plain)?;
+                        if !b["citations"].is_array() {
+                            b["citations"] = json!([]);
+                        }
+                        b["citations"].as_array_mut().unwrap().push(delta["citation"].clone());
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let raw = self.partial.get(i).cloned().unwrap_or_default();
+                if !raw.is_empty() {
+                    match serde_json::from_str::<Value>(&raw) {
+                        Ok(v) => self.block(i).map_err(plain)?["input"] = v,
+                        // With eager_input_streaming the API does not check a tool's input; a cut-off one must not be run.
+                        Err(e) => {
+                            let id = self.block(i).map_err(plain)?["id"].clone();
+                            self.tool_errors.push(json!({ "id": id, "error": format!("the tool's input is not valid JSON: {}", e) }));
+                        }
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(Value::Object(delta)) = d.get("delta") {
+                    for (k, v) in delta {
+                        self.msg[k] = v.clone();
+                    }
+                }
+                if let Some(Value::Object(u)) = d.get("usage") {
+                    if !self.msg["usage"].is_object() {
+                        self.msg["usage"] = json!({});
+                    }
+                    for (k, v) in u {
+                        self.msg["usage"][k] = v.clone();
+                    }
+                }
+            }
+            "message_stop" => self.done = true,
+            "error" => {
+                let kind = d.pointer("/error/type").and_then(|x| x.as_str()).unwrap_or("error");
+                let msg = d.pointer("/error/message").and_then(|x| x.as_str()).unwrap_or("");
+                let retry = !self.got_output && (kind == "overloaded_error" || kind == "rate_limit_error" || kind == "api_error");
+                return Err((format!("Claude API stream {}: {}", kind, msg), retry));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// Reads Server-Sent Events: `data:` lines joined until a blank line.
+fn read_stream(r: impl Read) -> Result<Value, (String, bool)> {
+    let mut s = Stream { msg: json!({}), blocks: vec![], partial: vec![], tool_errors: vec![], done: false, got_output: false };
+    let mut data = String::new();
+    let mut lines = BufReader::new(r);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = lines.read_line(&mut line).map_err(|e| (format!("the stream broke: {}", e), !s.got_output))?;
+        let t = line.trim_end_matches(['\r', '\n']);
+        if n == 0 || t.is_empty() {
+            if !data.is_empty() {
+                let d: Value = serde_json::from_str(&data).map_err(|e| (format!("a stream event is not JSON: {}", e), false))?;
+                data.clear();
+                s.event(d)?;
+            }
+            if n == 0 || s.done {
+                break;
+            }
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+    if !s.done {
+        return Err(("the stream ended before message_stop".into(), !s.got_output));
+    }
+    s.msg["content"] = Value::Array(s.blocks);
+    Ok(shape(s.msg, s.tool_errors))
+}
+
+/// The same request as anthropic_message, sent as a stream and collected: the way to ask for long answers, as nothing waits on one silent connection. A tool's input that came cut off has `input_error` and must not be run.
+pub fn anthropic_stream(params: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut c = conf(&options)?;
+    let mut p = prepare(&params, &options, &mut c, 64000, false)?;
+    p.insert("stream".into(), json!(true));
+    let body = Value::Object(p);
+    let mut attempt = 0;
+    loop {
+        let resp = send(&c, "POST", "/v1/messages", Some(&body))?;
+        match read_stream(resp.into_reader()) {
+            Ok(v) => return Ok(v),
+            Err((e, retry)) => {
+                if !retry || attempt >= c.retries {
+                    return Err(e);
+                }
+                pause(attempt, None)?;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// How many input tokens a request would use on its model: `params` as for anthropic_message, tools and system counted. Gives the number.
+pub fn anthropic_count_tokens(params: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    let mut c = conf(&options)?;
+    let p = prepare(&params, &options, &mut c, 0, true)?;
+    let r = json_of(send(&c, "POST", "/v1/messages/count_tokens", Some(&Value::Object(p)))?)?;
+    r["input_tokens"].as_i64().ok_or(format!("the count has no input_tokens: {}", r))
+}
+
+/// A tool for `tools`: its name, what it does (say when to use it), and a JSON Schema of its input.
+pub fn anthropic_tool(name: &str, description: &str, input_schema: serde_json::Value) -> Result<serde_json::Value, String> {
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!("{:?} is not a tool name: 1 to 64 of a-z, A-Z, 0-9, _ and -", name));
+    }
+    if input_schema.get("type").and_then(|t| t.as_str()) != Some("object") {
+        return Err("a tool's input_schema is a JSON Schema with type \"object\"".into());
+    }
+    Ok(json!({ "name": name, "description": description, "input_schema": input_schema }))
+}
+
+/// One tool's result: `tool_use_id` from tool_uses, `content` a text, a list of blocks, or anything else as JSON, `is_error` true when the tool failed (Claude reads why and can try again).
+pub fn anthropic_tool_result(tool_use_id: &str, content: serde_json::Value, is_error: bool) -> serde_json::Value {
+    let body = match content {
+        Value::String(_) | Value::Array(_) => content,
+        Value::Null => json!(""),
+        other => json!(other.to_string()),
+    };
+    let mut r = json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": body });
+    if is_error {
+        r["is_error"] = json!(true);
+    }
+    r
+}
+
+/// The messages for the next turn: `messages` so far, then the `response`'s content unchanged, then every result in one user message, as Claude must see them. Refuses when a tool_use has no result. With a `pause_turn` answer give [] to let Claude go on.
+pub fn anthropic_continue(messages: Vec<serde_json::Value>, response: serde_json::Value, results: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = messages;
+    let content = response.get("content").cloned().ok_or("the response has no content: pass what anthropic_message gave")?;
+    out.push(json!({ "role": "assistant", "content": content }));
+    let pending: Vec<&str> = response["tool_uses"].as_array().map(|l| l.iter().filter_map(|t| t["id"].as_str()).collect()).unwrap_or_default();
+    for id in &pending {
+        if !results.iter().any(|r| r["tool_use_id"].as_str() == Some(id)) {
+            return Err(format!("the tool_use {} has no result: every call needs one, with is_error true for a failure", id));
+        }
+    }
+    if !results.is_empty() {
+        out.push(json!({ "role": "user", "content": results }));
+    }
+    Ok(out)
+}
+
+/// A `system` prompt marked for caching (`ttl` "", "5m" or "1h"): keep it the same byte for byte between requests, and put what changes in `messages`.
+pub fn anthropic_system(text: &str, ttl: &str) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "type": "text", "text": text });
+    b["cache_control"] = cache_mark(ttl)?;
+    Ok(json!([b]))
+}
+
+/// The messages with a cache breakpoint on the last block of the last message, for a conversation that grows (at most 4 breakpoints in a request).
+pub fn anthropic_cache_last(messages: Vec<serde_json::Value>, ttl: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mark = cache_mark(ttl)?;
+    let mut out = messages;
+    let last = out.last_mut().ok_or("there are no messages to mark")?;
+    if let Some(t) = last.get("content").and_then(|c| c.as_str()).map(str::to_string) {
+        last["content"] = json!([{ "type": "text", "text": t }]);
+    }
+    let block = last["content"].as_array_mut().and_then(|l| l.last_mut()).ok_or("the last message has no blocks")?;
+    block["cache_control"] = mark;
+    Ok(out)
+}
+
+/// What a response's usage says of the cache: { read, written, uncached, total, hit_ratio }. `read` staying 0 across identical requests means the prefix keeps changing.
+pub fn anthropic_cache_usage(response: serde_json::Value) -> serde_json::Value {
+    let n = |k: &str| response.pointer(&format!("/usage/{}", k)).and_then(|v| v.as_i64()).unwrap_or(0);
+    let (read, written, uncached) = (n("cache_read_input_tokens"), n("cache_creation_input_tokens"), n("input_tokens"));
+    let total = read + written + uncached;
+    json!({ "read": read, "written": written, "uncached": uncached, "total": total, "hit_ratio": if total > 0 { read as f64 / total as f64 } else { 0.0 } })
+}
+
+/// The models this key can use, every page followed: each { id, display_name, max_input_tokens, max_tokens, capabilities... }.
+pub fn anthropic_models(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let c = conf(&options)?;
+    let mut out = vec![];
+    let mut after = String::new();
+    for _ in 0..100 {
+        let path = if after.is_empty() { "/v1/models?limit=100".to_string() } else { format!("/v1/models?limit=100&after_id={}", after) };
+        let r = json_of(send(&c, "GET", &path, None)?)?;
+        out.extend(r["data"].as_array().cloned().unwrap_or_default());
+        match (r["has_more"].as_bool(), r["last_id"].as_str()) {
+            (Some(true), Some(l)) if !l.is_empty() => after = l.to_string(),
+            _ => break,
+        }
+    }
+    Ok(out)
+}

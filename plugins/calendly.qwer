@@ -1,0 +1,210 @@
+//! Calendly's API v2 without an SDK: who you are, event types, scheduled events and their invitees, lists through page tokens, cancels, webhook subscriptions, Calendly's error details read, resource addresses shortened to uuids, and the Calendly-Webhook-Signature checked with its timestamp tolerance.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// CALENDLY_TOKEN is a personal access token or an OAuth token; CALENDLY_API_URL the API
+// (https://api.calendly.com when not set).
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("CALENDLY_API_URL").unwrap_or_else(|| "https://api.calendly.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let Some(m) = v["message"].as_str() else {
+        return format!("Calendly {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    };
+    let details: Vec<String> = v["details"].as_array().into_iter().flatten().map(|d| format!("{}: {}", d["parameter"].as_str().unwrap_or("?"), d["message"].as_str().unwrap_or(""))).collect();
+    let tail = if details.is_empty() { String::new() } else { format!(" ({})", details.join("; ")) };
+    format!("Calendly {} {}: {}{}", status, v["title"].as_str().unwrap_or(""), m, tail)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("CALENDLY_TOKEN").ok_or("CALENDLY_TOKEN is not set")?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..5u32 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Calendly's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            Err(ureq::Error::Status(429, r)) if attempt < 4 => {
+                let wait = r.header("Retry-After").or(r.header("X-RateLimit-Reset")).and_then(|s| s.parse::<u64>().ok()).map_or(1000u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(60_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Calendly at {}: {}", api(), e)),
+        }
+    }
+    Err("Calendly stayed over its limit through five tries".into())
+}
+
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut parts = vec!["count=100".to_string()];
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            if !v.is_null() {
+                parts.push(format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+            }
+        }
+    }
+    let base = parts.join("&");
+    let mut token: Option<String> = None;
+    let mut out = vec![];
+    loop {
+        let q = token.as_ref().map_or(base.clone(), |t| format!("{}&page_token={}", base, enc(t)));
+        let v = call("GET", &format!("{}?{}", path, q), None)?;
+        out.extend(v["collection"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match v["pagination"]["next_page_token"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// The last part of a Calendly resource address: `calendly_uuid("https://api.calendly.com/scheduled_events/ABC")` is "ABC". A bare uuid comes back as it is.
+pub fn calendly_uuid(resource: &str) -> String {
+    resource.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// The token's user: { uri, name, email, current_organization... }.
+pub fn calendly_me() -> Result<serde_json::Value, String> {
+    Ok(call("GET", "/users/me", None)?["resource"].clone())
+}
+
+fn owner(filter: serde_json::Value) -> Result<Value, String> {
+    let mut f = if filter.is_object() { filter } else { json!({}) };
+    if f["user"].is_null() && f["organization"].is_null() {
+        f["user"] = calendly_me()?["uri"].clone();
+    }
+    Ok(f)
+}
+
+/// Event types through every page: `filter` takes `user` or `organization` (the token's user if neither), `active`, `sort`; `max_items` caps them (0: all).
+pub fn calendly_event_types(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/event_types", &owner(filter)?, max_items)
+}
+
+/// Scheduled events through every page: `filter` takes `user` or `organization`, `status` ("active", "canceled"), `min_start_time`, `max_start_time`, `invitee_email`, `sort`; `max_items` caps them (0: all).
+pub fn calendly_events(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/scheduled_events", &owner(filter)?, max_items)
+}
+
+/// One scheduled event, by uuid or address.
+pub fn calendly_event(event: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/scheduled_events/{}", enc(&calendly_uuid(event))), None)?["resource"].clone())
+}
+
+/// An event's invitees through every page; `filter` takes `status`, `email`, `sort`; `max_items` caps them (0: all).
+pub fn calendly_invitees(event: &str, filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk(&format!("/scheduled_events/{}/invitees", enc(&calendly_uuid(event))), &filter, max_items)
+}
+
+/// Cancels a scheduled event, telling invitees `reason` (may be ""). Gives Calendly's cancellation.
+pub fn calendly_cancel(event: &str, reason: &str) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &format!("/scheduled_events/{}/cancellation", enc(&calendly_uuid(event))), Some(&json!({ "reason": reason })))?["resource"].clone())
+}
+
+/// Subscribes `url` to `events` ("invitee.created", "invitee.canceled"...): `scope` is "user" or "organization" and `signing_key` a secret of yours, which Calendly signs with. A key left out cannot be fetched later, so this refuses one that is empty.
+pub fn calendly_webhook_create(url: &str, events: Vec<String>, scope: &str, signing_key: &str) -> Result<serde_json::Value, String> {
+    if events.is_empty() {
+        return Err("a subscription needs at least one event".into());
+    }
+    if signing_key.is_empty() {
+        return Err("give a signing key, or nothing can check what arrives".into());
+    }
+    let me = calendly_me()?;
+    let mut b = json!({ "url": url, "events": events, "scope": scope, "organization": me["current_organization"], "signing_key": signing_key });
+    match scope {
+        "user" => b["user"] = me["uri"].clone(),
+        "organization" => {}
+        o => return Err(format!("`{}` is not a scope: \"user\" or \"organization\"", o)),
+    }
+    Ok(call("POST", "/webhook_subscriptions", Some(&b))?["resource"].clone())
+}
+
+/// The subscriptions for a `scope`, through every page.
+pub fn calendly_webhooks(scope: &str) -> Result<Vec<serde_json::Value>, String> {
+    let me = calendly_me()?;
+    let mut f = json!({ "organization": me["current_organization"], "scope": scope });
+    if scope == "user" {
+        f["user"] = me["uri"].clone();
+    }
+    walk("/webhook_subscriptions", &f, 0)
+}
+
+/// Deletes a subscription, by uuid or address.
+pub fn calendly_webhook_delete(id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/webhook_subscriptions/{}", enc(&calendly_uuid(id))), None)?;
+    Ok(true)
+}
+
+fn sign(t: &str, body: &str, key: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key");
+    m.update(t.as_bytes());
+    m.update(b".");
+    m.update(body.as_bytes());
+    m
+}
+
+/// Checks a webhook: `header` the Calendly-Webhook-Signature (`t=...,v1=...`), `body` raw, `signing_key` yours, refused when signed more than `tolerance_seconds` ago (Calendly's example uses 180; 0 skips that). Gives { event, created_at, payload }.
+pub fn calendly_webhook(body: &str, header: &str, signing_key: &str, tolerance_seconds: i64) -> Result<serde_json::Value, String> {
+    if header.is_empty() {
+        return Err("no Calendly-Webhook-Signature header: this did not come from Calendly".into());
+    }
+    let mut t = None;
+    let mut sig = None;
+    for part in header.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", v)) => t = Some(v.to_string()),
+            Some(("v1", v)) => sig = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    let (t, sig) = (t.ok_or("the signature header has no t=")?, sig.ok_or("the signature header has no v1=")?);
+    let raw = hex::decode(&sig).map_err(|_| "the signature is not hex".to_string())?;
+    if sign(&t, body, signing_key).verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match: a wrong signing key, or the body was changed (use the raw body)".into());
+    }
+    let at: i64 = t.parse().map_err(|_| format!("the timestamp `{}` is not a number", t))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if tolerance_seconds > 0 && (now - at).abs() > tolerance_seconds {
+        return Err(format!("the webhook was signed {} s ago, more than the {} s allowed: a replay?", (now - at).abs(), tolerance_seconds));
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "event": v["event"], "created_at": v["created_at"], "payload": v["payload"] }))
+}
+
+/// A Calendly-Webhook-Signature for `body` at time `t` (0: now), for tests.
+pub fn calendly_webhook_sign(body: &str, signing_key: &str, t: i64) -> String {
+    let at = if t > 0 { t } else { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) }.to_string();
+    format!("t={},v1={}", at, hex::encode(sign(&at, body, signing_key).finalize().into_bytes()))
+}

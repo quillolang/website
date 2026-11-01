@@ -1,0 +1,680 @@
+//! M-Bus (Meter-Bus, EN 13757) heat, water and gas meters read through a TCP gateway: long frames with their checksums, variable data records decoded with units, storage numbers and tariffs, BCD and dates, multi-telegram readouts, secondary addresses selected, and a bus scanned.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+
+const ACK: u8 = 0xe5;
+const SND_NKE: u8 = 0x40;
+const SND_UD: u8 = 0x53;
+const REQ_UD2: u8 = 0x5b;
+const FCB: u8 = 0x20;
+const SELECT: u8 = 0xfd; // the network layer's address
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex".to_string()),
+        _ => Err("give a frame as hex or a list of numbers".into()),
+    }
+}
+
+fn sum(b: &[u8]) -> u8 {
+    b.iter().fold(0u8, |a, x| a.wrapping_add(*x))
+}
+
+fn short_frame(c: u8, a: u8) -> Vec<u8> {
+    vec![0x10, c, a, c.wrapping_add(a), 0x16]
+}
+
+fn long_frame(c: u8, a: u8, ci: u8, data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() > 252 {
+        return Err(format!("{} bytes of data do not fit a long frame (252 at most)", data.len()));
+    }
+    let l = 3 + data.len() as u8;
+    let mut f = vec![0x68, l, l, 0x68, c, a, ci];
+    f.extend(data);
+    f.push(sum(&f[4..]));
+    f.push(0x16);
+    Ok(f)
+}
+
+// How far the first frame in `b` reaches, or None when more bytes are needed.
+fn frame_len(b: &[u8]) -> Result<Option<usize>, String> {
+    match b.first() {
+        None => Ok(None),
+        Some(&ACK) => Ok(Some(1)),
+        Some(0x10) => Ok(if b.len() >= 5 { Some(5) } else { None }),
+        Some(0x68) => {
+            if b.len() < 4 {
+                return Ok(None);
+            }
+            if b[1] != b[2] || b[3] != 0x68 {
+                return Err(format!("a long frame's two lengths differ ({} and {}) or its second start is missing", b[1], b[2]));
+            }
+            let n = b[1] as usize + 6;
+            Ok(if b.len() >= n { Some(n) } else { None })
+        }
+        Some(x) => Err(format!("0x{:02x} does not start an M-Bus frame", x)),
+    }
+}
+
+struct Frame {
+    c: u8,
+    a: u8,
+    ci: u8,
+    data: Vec<u8>,
+}
+
+fn check_frame(b: &[u8]) -> Result<Frame, String> {
+    match b.first() {
+        Some(0x68) => {
+            let n = frame_len(b)?.ok_or(format!("a long frame cut off: {} bytes", b.len()))?;
+            if b[1] < 3 {
+                return Err(format!("a long frame's L field must be at least 3, not {}", b[1]));
+            }
+            if b[n - 1] != 0x16 {
+                return Err(format!("the frame ends in 0x{:02x}, not the stop byte 0x16", b[n - 1]));
+            }
+            let (want, have) = (sum(&b[4..n - 2]), b[n - 2]);
+            if want != have {
+                return Err(format!("wrong checksum: the frame has 0x{:02x}, its bytes add to 0x{:02x}", have, want));
+            }
+            Ok(Frame { c: b[4], a: b[5], ci: b[6], data: b[7..n - 2].to_vec() })
+        }
+        Some(0x10) => {
+            if b.len() < 5 {
+                return Err("a short frame cut off".into());
+            }
+            if b[4] != 0x16 {
+                return Err("a short frame with no stop byte".into());
+            }
+            if b[1].wrapping_add(b[2]) != b[3] {
+                return Err("wrong checksum on a short frame".into());
+            }
+            Ok(Frame { c: b[1], a: b[2], ci: 0, data: vec![] })
+        }
+        Some(&ACK) => Ok(Frame { c: 0, a: 0, ci: 0, data: vec![] }),
+        Some(x) => Err(format!("0x{:02x} does not start an M-Bus frame", x)),
+        None => Err("an empty frame".into()),
+    }
+}
+
+const MEDIA: [&str; 16] = ["other", "oil", "electricity", "gas", "heat (outlet)", "steam", "warm water", "water", "heat cost allocator", "compressed air", "cooling (outlet)", "cooling (inlet)", "heat (inlet)", "heat and cooling", "bus or system", "unknown"];
+
+fn medium(m: u8) -> String {
+    match m {
+        0..=0x0f => MEDIA[m as usize].to_string(),
+        0x15 => "hot water".into(),
+        0x16 => "cold water".into(),
+        0x17 => "dual water".into(),
+        0x18 => "pressure".into(),
+        0x19 => "A/D converter".into(),
+        _ => format!("reserved 0x{:02x}", m),
+    }
+}
+
+fn manufacturer(m: u16) -> String {
+    let l = |s: u16| char::from(64 + (s & 31) as u8);
+    format!("{}{}{}", l(m >> 10), l(m >> 5), l(m))
+}
+
+fn bcd(b: &[u8]) -> Result<i64, String> {
+    // A top nibble of F marks a negative number; other letters are not digits.
+    let mut v: i64 = 0;
+    let mut negative = false;
+    for (i, x) in b.iter().enumerate().rev() {
+        let (hi, lo) = (x >> 4, x & 15);
+        if i + 1 == b.len() && hi == 15 {
+            negative = true;
+        } else if hi > 9 {
+            return Err(format!("0x{:02x} is not BCD", x));
+        } else {
+            v = v * 10 + hi as i64;
+        }
+        if lo > 9 {
+            return Err(format!("0x{:02x} is not BCD", x));
+        }
+        v = v * 10 + lo as i64;
+    }
+    Ok(if negative { -v } else { v })
+}
+
+fn int_le(b: &[u8]) -> i64 {
+    let mut v: i64 = 0;
+    for (i, x) in b.iter().enumerate() {
+        v |= (*x as i64) << (8 * i);
+    }
+    if b.len() < 8 && b.last().map_or(false, |x| x & 0x80 != 0) {
+        v -= 1i64 << (8 * b.len());
+    }
+    v
+}
+
+fn unsigned_le(b: &[u8]) -> u64 {
+    b.iter().rev().fold(0u64, |a, x| (a << 8) | *x as u64)
+}
+
+fn date_g(b: &[u8]) -> Value {
+    let (d, m) = (b[0] & 31, b[1] & 15);
+    let y = ((b[0] >> 5) & 7) | ((b[1] >> 1) & 0x78);
+    if d == 0 || m == 0 || m > 12 {
+        return Value::Null;
+    }
+    json!(format!("{:04}-{:02}-{:02}", 2000 + y as u32, m, d))
+}
+
+fn date_f(b: &[u8]) -> Value {
+    if b[0] & 0x80 != 0 {
+        return Value::Null; // the invalid-time bit
+    }
+    let (min, h, d, mon) = (b[0] & 63, b[1] & 31, b[2] & 31, b[3] & 15);
+    let y = ((b[2] >> 5) & 7) | ((b[3] >> 1) & 0x78);
+    if d == 0 || mon == 0 || mon > 12 {
+        return Value::Null;
+    }
+    json!(format!("{:04}-{:02}-{:02}T{:02}:{:02}:00", 2000 + y as u32, mon, d, h, min))
+}
+
+// What a primary VIF means: name, unit and power of ten. `date` means the value is a date.
+fn vif_table(v: u8) -> Option<(&'static str, &'static str, i32)> {
+    let n = (v & 7) as i32;
+    let nn = (v & 3) as i32;
+    Some(match v & 0x7f {
+        0x00..=0x07 => ("energy", "Wh", n - 3),
+        0x08..=0x0f => ("energy", "J", n),
+        0x10..=0x17 => ("volume", "m3", n - 6),
+        0x18..=0x1f => ("mass", "kg", n - 3),
+        0x28..=0x2f => ("power", "W", n - 3),
+        0x30..=0x37 => ("power", "J/h", n),
+        0x38..=0x3f => ("volume flow", "m3/h", n - 6),
+        0x40..=0x47 => ("volume flow", "m3/min", n - 7),
+        0x48..=0x4f => ("volume flow", "m3/s", n - 9),
+        0x50..=0x57 => ("mass flow", "kg/h", n - 3),
+        0x58..=0x5b => ("flow temperature", "°C", nn - 3),
+        0x5c..=0x5f => ("return temperature", "°C", nn - 3),
+        0x60..=0x63 => ("temperature difference", "K", nn - 3),
+        0x64..=0x67 => ("external temperature", "°C", nn - 3),
+        0x68..=0x6b => ("pressure", "bar", nn - 3),
+        0x6e => ("heat cost allocator units", "", 0),
+        0x78 => ("fabrication number", "", 0),
+        0x79 => ("enhanced identification", "", 0),
+        0x7a => ("bus address", "", 0),
+        _ => return None,
+    })
+}
+
+fn duration_unit(k: u8) -> &'static str {
+    ["seconds", "minutes", "hours", "days"][(k & 3) as usize]
+}
+
+fn data_size(dif: u8) -> Option<(usize, &'static str)> {
+    Some(match dif & 15 {
+        0 => (0, "none"),
+        1 => (1, "int"),
+        2 => (2, "int"),
+        3 => (3, "int"),
+        4 => (4, "int"),
+        5 => (4, "real"),
+        6 => (6, "int"),
+        7 => (8, "int"),
+        8 => (0, "selection"),
+        9 => (1, "bcd"),
+        10 => (2, "bcd"),
+        11 => (3, "bcd"),
+        12 => (4, "bcd"),
+        13 => (0, "variable"),
+        14 => (6, "bcd"),
+        _ => return None,
+    })
+}
+
+fn round(x: f64) -> f64 {
+    let s = format!("{:.9}", x);
+    s.parse().unwrap_or(x)
+}
+
+fn records(data: &[u8]) -> Result<(Vec<Value>, bool, Option<String>), String> {
+    let mut out = vec![];
+    let mut i = 0;
+    let mut more = false;
+    let mut manufacturer_data = None;
+    while i < data.len() {
+        let at = i;
+        let dif = data[i];
+        i += 1;
+        if dif == 0x2f {
+            continue; // an idle filler
+        }
+        if dif == 0x0f || dif == 0x1f {
+            more = dif == 0x1f;
+            if i < data.len() {
+                manufacturer_data = Some(hex::encode(&data[i..]));
+            }
+            break;
+        }
+        if dif & 15 == 15 {
+            return Err(format!("special DIF 0x{:02x} at byte {} is not one the standard defines", dif, at));
+        }
+        let function = ["instantaneous", "maximum", "minimum", "error"][((dif >> 4) & 3) as usize];
+        let mut storage = ((dif >> 6) & 1) as u64;
+        let (mut tariff, mut unit) = (0u64, 0u64);
+        let mut ext = dif & 0x80 != 0;
+        let mut k = 0;
+        while ext {
+            let e = *data.get(i).ok_or(format!("the record at byte {} ends in its DIFEs", at))?;
+            i += 1;
+            if k >= 10 {
+                return Err(format!("the record at byte {} has more than 10 DIFEs", at));
+            }
+            storage |= ((e & 15) as u64) << (1 + 4 * k);
+            tariff |= (((e >> 4) & 3) as u64) << (2 * k);
+            unit |= (((e >> 6) & 1) as u64) << k;
+            ext = e & 0x80 != 0;
+            k += 1;
+        }
+        let vif = *data.get(i).ok_or(format!("the record at byte {} has no VIF", at))?;
+        i += 1;
+        let mut name = String::new();
+        let mut unit_name = String::new();
+        let mut power = 0i32;
+        let mut date = false;
+        let mut ext_table = 0u8;
+        let mut plain = None;
+        let mut extra = vec![];
+        match vif & 0x7f {
+            0x7c => {
+                let n = *data.get(i).ok_or("a plain-text VIF is cut off")? as usize;
+                let t = data.get(i + 1..i + 1 + n).ok_or("a plain-text VIF is cut off")?;
+                i += 1 + n;
+                plain = Some(t.iter().rev().map(|c| *c as char).collect::<String>());
+                name = plain.clone().unwrap_or_default();
+            }
+            0x7b => ext_table = 0xfb,
+            0x7d => ext_table = 0xfd,
+            0x7e => name = "any".into(),
+            0x7f => name = "manufacturer specific".into(),
+            0x6c | 0x6d => {
+                name = "time point".into();
+                date = true;
+            }
+            0x20..=0x23 => {
+                name = "on time".into();
+                unit_name = duration_unit(vif).into();
+            }
+            0x24..=0x27 => {
+                name = "operating time".into();
+                unit_name = duration_unit(vif).into();
+            }
+            0x70..=0x73 => {
+                name = "averaging duration".into();
+                unit_name = duration_unit(vif).into();
+            }
+            0x74..=0x77 => {
+                name = "actuality duration".into();
+                unit_name = duration_unit(vif).into();
+            }
+            v => match vif_table(v) {
+                Some((n, u, p)) => {
+                    name = n.into();
+                    unit_name = u.into();
+                    power = p;
+                }
+                None => return Err(format!("VIF 0x{:02x} at byte {} is reserved", vif, i - 1)),
+            },
+        }
+        let mut more_vif = vif & 0x80 != 0;
+        if ext_table != 0 {
+            let e = *data.get(i).ok_or("an extended VIF is cut off")?;
+            i += 1;
+            more_vif = e & 0x80 != 0;
+            let v = e & 0x7f;
+            let n = (v & 7) as i32;
+            if ext_table == 0xfd {
+                match v {
+                    0x00..=0x03 => { name = "credit".into(); power = (v & 3) as i32 - 3; }
+                    0x04..=0x07 => { name = "debit".into(); power = (v & 3) as i32 - 3; }
+                    0x08 => name = "access number".into(),
+                    0x09 => name = "medium".into(),
+                    0x0a => name = "manufacturer".into(),
+                    0x0b => name = "parameter set id".into(),
+                    0x0c => name = "model version".into(),
+                    0x0d => name = "hardware version".into(),
+                    0x0e => name = "firmware version".into(),
+                    0x0f => name = "software version".into(),
+                    0x11 => name = "customer".into(),
+                    0x17 => name = "error flags".into(),
+                    0x40..=0x4f => { name = "voltage".into(); unit_name = "V".into(); power = (v & 15) as i32 - 9; }
+                    0x50..=0x5f => { name = "current".into(); unit_name = "A".into(); power = (v & 15) as i32 - 12; }
+                    0x60 => name = "reset counter".into(),
+                    0x61 => name = "cumulation counter".into(),
+                    _ => name = format!("extension FD {:02x}", v),
+                }
+            } else {
+                match v {
+                    0x00 | 0x01 => { name = "energy".into(); unit_name = "MWh".into(); power = (v & 1) as i32 - 1; }
+                    0x08 | 0x09 => { name = "energy".into(); unit_name = "GJ".into(); power = (v & 1) as i32 - 1; }
+                    0x10 | 0x11 => { name = "volume".into(); unit_name = "m3".into(); power = (v & 1) as i32 + 2; }
+                    0x18 | 0x19 => { name = "mass".into(); unit_name = "t".into(); power = (v & 1) as i32 + 2; }
+                    0x28 | 0x29 => { name = "power".into(); unit_name = "MW".into(); power = (v & 1) as i32 - 1; }
+                    0x58..=0x5f => { name = "power".into(); unit_name = "GJ/h".into(); power = n - 1; }
+                    _ => name = format!("extension FB {:02x}", v),
+                }
+            }
+        }
+        while more_vif {
+            let e = *data.get(i).ok_or("a VIFE is cut off")?;
+            i += 1;
+            more_vif = e & 0x80 != 0;
+            extra.push(format!("{:02x}", e & 0x7f));
+        }
+        let (mut size, mut kind) = data_size(dif).ok_or(format!("bad data field at byte {}", at))?;
+        let mut bcd_var = false;
+        let mut text_var = false;
+        let mut real_var = false;
+        if kind == "variable" {
+            let l = *data.get(i).ok_or("a variable-length record is cut off")? as usize;
+            i += 1;
+            match l {
+                0x00..=0xbf => { size = l; text_var = true; }
+                0xc0..=0xcf => { size = l - 0xc0; bcd_var = true; }
+                0xd0..=0xdf => { size = l - 0xd0; bcd_var = true; }
+                0xe0..=0xef => { size = l - 0xe0; kind = "hex"; }
+                0xf0..=0xf4 => { size = 4 * (l - 0xec); kind = "hex"; }
+                0xf5 => { size = 48; kind = "hex"; }
+                0xf6 => { size = 64; kind = "hex"; }
+                0xf8 => { size = 4; real_var = true; }
+                _ => return Err(format!("variable length code 0x{:02x} at byte {} is reserved", l, i - 1)),
+            }
+        }
+        let d = data.get(i..i + size).ok_or(format!("the record at byte {} wants {} bytes of data, past the end", at, size))?;
+        i += size;
+        let raw: Value = if text_var {
+            json!(d.iter().rev().map(|c| *c as char).collect::<String>())
+        } else if bcd_var || kind == "bcd" {
+            match bcd(d) {
+                Ok(v) => json!(v),
+                Err(_) => json!(hex::encode(d)),
+            }
+        } else if kind == "real" || real_var {
+            json!(f32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64)
+        } else if kind == "int" {
+            json!(int_le(d))
+        } else if kind == "hex" {
+            json!(hex::encode(d))
+        } else {
+            Value::Null
+        };
+        let value: Value = if date && size == 2 {
+            date_g(d)
+        } else if date && size == 4 {
+            date_f(d)
+        } else if name == "fabrication number" || name == "enhanced identification" || name == "bus address" || name.ends_with("version") {
+            raw.clone()
+        } else if let Some(x) = raw.as_f64().filter(|_| power != 0 || kind == "real" || real_var) {
+            let scaled = x * 10f64.powi(power);
+            json!(round(scaled))
+        } else {
+            raw.clone()
+        };
+        let mut r = json!({ "name": name, "value": value, "unit": unit_name, "function": function, "storage": storage, "tariff": tariff, "subunit": unit });
+        if !raw.is_null() && raw != value {
+            r["raw"] = raw;
+        }
+        if !extra.is_empty() {
+            r["vife"] = json!(extra);
+        }
+        if let Some(p) = plain {
+            r["plain_unit"] = json!(p);
+        }
+        out.push(r);
+    }
+    Ok((out, more, manufacturer_data))
+}
+
+fn status_of(s: u8) -> Value {
+    let app = ["ok", "busy", "error", "alarm"][(s & 3) as usize];
+    json!({ "application": app, "power_low": s & 4 != 0, "permanent_error": s & 8 != 0, "temporary_error": s & 16 != 0 })
+}
+
+fn decoded(f: &Frame) -> Result<Value, String> {
+    match f.ci {
+        0x72 | 0x76 => {
+            let d = &f.data;
+            if d.len() < 12 {
+                return Err(format!("variable data needs a 12-byte header; this has {} bytes", d.len()));
+            }
+            let id = bcd(&d[0..4]).map(|v| format!("{:08}", v)).unwrap_or(hex::encode(d[0..4].iter().rev().cloned().collect::<Vec<u8>>()));
+            let (recs, more, extra) = records(&d[12..])?;
+            let mut m = json!({
+                "kind": "variable", "address": f.a, "id": id,
+                "manufacturer": manufacturer(u16::from_le_bytes([d[4], d[5]])), "version": d[6], "medium": medium(d[7]),
+                "access": d[8], "status": status_of(d[9]), "signature": unsigned_le(&d[10..12]),
+                "records": recs, "more": more,
+            });
+            if d[10] != 0 || d[11] != 0 {
+                m["encrypted"] = json!(true);
+            }
+            if let Some(x) = extra {
+                m["manufacturer_data"] = json!(x);
+            }
+            Ok(m)
+        }
+        0x73 | 0x77 | 0x7a | 0x7f => Err(format!("fixed or encrypted data structure (CI 0x{:02x}) is not one this reads", f.ci)),
+        ci => Ok(json!({ "kind": "other", "address": f.a, "control": f.c, "ci": ci, "hex": hex::encode(&f.data) })),
+    }
+}
+
+/// Reads one frame (hex or bytes): the checksum, lengths and stop byte checked, and a variable data response decoded into identity, status and `records`, each with name, value, unit, function, storage and tariff.
+pub fn mbus_parse(frame: serde_json::Value) -> Result<Value, String> {
+    let b = bytes_of(&frame)?;
+    if b.first() == Some(&ACK) {
+        return Ok(json!({ "kind": "ack" }));
+    }
+    let f = check_frame(&b)?;
+    if b[0] == 0x10 {
+        return Ok(json!({ "kind": "short", "control": f.c, "address": f.a }));
+    }
+    decoded(&f)
+}
+
+/// Decodes the records of a variable data block on its own (hex or bytes), without a frame or header.
+pub fn mbus_records(data: serde_json::Value) -> Result<Vec<Value>, String> {
+    Ok(records(&bytes_of(&data)?)?.0)
+}
+
+/// Builds a long frame as hex: control field, address, CI and data (hex or bytes), with its lengths and checksum.
+pub fn mbus_long_frame(control: i64, address: i64, ci: i64, data: serde_json::Value) -> Result<String, String> {
+    if !(0..=255).contains(&control) || !(0..=255).contains(&address) || !(0..=255).contains(&ci) {
+        return Err("control, address and CI are bytes".into());
+    }
+    Ok(hex::encode(long_frame(control as u8, address as u8, ci as u8, &bytes_of(&data)?)?))
+}
+
+/// Builds a short frame as hex: `mbus_short_frame(91, 5)` is REQ_UD2 to address 5.
+pub fn mbus_short_frame(control: i64, address: i64) -> Result<String, String> {
+    if !(0..=255).contains(&control) || !(0..=255).contains(&address) {
+        return Err("control and address are bytes".into());
+    }
+    Ok(hex::encode(short_frame(control as u8, address as u8)))
+}
+
+// A gateway's connection: every call makes its own, with a deadline per answer.
+
+struct Link {
+    s: TcpStream,
+    buf: Vec<u8>,
+    timeout: Duration,
+    retries: u64,
+}
+
+fn opt_u64(o: &Value, k: &str, d: u64) -> u64 {
+    o.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
+}
+
+fn connect(gateway: &str, o: &Value) -> Result<Link, String> {
+    let timeout = Duration::from_millis(opt_u64(o, "timeout_ms", 2000));
+    let target = if gateway.contains(':') { gateway.to_string() } else { format!("{}:10001", gateway) };
+    let addr = target.to_socket_addrs().map_err(|e| format!("{}: {}", target, e))?.next().ok_or(format!("{}: no address", target))?;
+    let s = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("cannot reach the M-Bus gateway {}: {}", target, e))?;
+    s.set_nodelay(true).ok();
+    Ok(Link { s, buf: vec![], timeout, retries: opt_u64(o, "retries", 2) })
+}
+
+impl Link {
+    // The next frame, or None when the meter stayed silent for the timeout.
+    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let end = Instant::now() + self.timeout;
+        loop {
+            // Line noise before a start byte is dropped.
+            while let Some(x) = self.buf.first() {
+                if [0x68u8, 0x10, ACK].contains(x) {
+                    break;
+                }
+                self.buf.remove(0);
+            }
+            if let Some(n) = frame_len(&self.buf)? {
+                return Ok(Some(self.buf.drain(..n).collect()));
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            self.s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+            let mut t = [0u8; 512];
+            match self.s.read(&mut t) {
+                Ok(0) => return Err("the gateway closed the connection".into()),
+                Ok(n) => self.buf.extend(&t[..n]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    fn ask(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        for _ in 0..=self.retries {
+            self.buf.clear();
+            self.s.write_all(frame).map_err(|e| e.to_string())?;
+            if let Some(f) = self.read_frame()? {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Reads a meter at a primary address (0 to 250) through a gateway ("host:port", port 10001 unless given), or one selected before with 253: SND_NKE, then REQ_UD2 with its FCB toggled through every telegram of a multi-telegram readout, records joined. Options: `timeout_ms`, `retries`, `max_telegrams`.
+pub fn mbus_read(gateway: &str, address: i64, options: serde_json::Value) -> Result<Value, String> {
+    if !(0..=254).contains(&address) {
+        return Err(format!("{} is not a meter address: 0 to 250, or 253 for the selected one", address));
+    }
+    let a = address as u8;
+    let mut link = connect(gateway, &options)?;
+    if a != SELECT {
+        link.ask(&short_frame(SND_NKE, a))?.ok_or(format!("no meter answers at address {}", a))?;
+    }
+    let max = opt_u64(&options, "max_telegrams", 16);
+    let mut fcb = true;
+    let mut first: Option<Value> = None;
+    let mut telegrams = 0;
+    loop {
+        let c = REQ_UD2 | if fcb { FCB } else { 0 };
+        let f = link.ask(&short_frame(c, a))?.ok_or(format!("meter {} stopped answering after {} telegrams", a, telegrams))?;
+        let m = decoded(&check_frame(&f)?)?;
+        telegrams += 1;
+        let more = m["more"].as_bool().unwrap_or(false);
+        first = Some(match first {
+            None => m,
+            Some(mut all) => {
+                let add = m["records"].as_array().cloned().unwrap_or_default();
+                if let Some(list) = all["records"].as_array_mut() {
+                    list.extend(add);
+                }
+                all
+            }
+        });
+        if !more {
+            break;
+        }
+        if telegrams >= max {
+            return Err(format!("meter {} still has more after {} telegrams", a, telegrams));
+        }
+        fcb = !fcb;
+    }
+    let mut all = first.ok_or("no telegram")?;
+    all["telegrams"] = json!(telegrams);
+    all["more"] = json!(false);
+    Ok(all)
+}
+
+/// True when a meter at this primary address acknowledges SND_NKE.
+pub fn mbus_ping(gateway: &str, address: i64, options: serde_json::Value) -> Result<bool, String> {
+    let mut link = connect(gateway, &options)?;
+    Ok(link.ask(&short_frame(SND_NKE, address as u8))?.map_or(false, |f| f == [ACK]))
+}
+
+/// Selects a meter by its secondary address: 8 digits of id, with `F` for a digit that may be anything, and optionally `manufacturer`, `version`, `medium` in `options`. Answers true when one meter acknowledged; read it with address 253.
+pub fn mbus_select(gateway: &str, id: &str, options: serde_json::Value) -> Result<bool, String> {
+    let mut link = connect(gateway, &options)?;
+    Ok(link.ask(&select_frame(id, &options)?)?.map_or(false, |f| f == [ACK]))
+}
+
+fn select_frame(id: &str, o: &Value) -> Result<Vec<u8>, String> {
+    if id.len() != 8 || !id.chars().all(|c| c.is_ascii_digit() || c == 'F' || c == 'f') {
+        return Err(format!("`{}` is not a secondary address: 8 digits, F for any", id));
+    }
+    let mut d: Vec<u8> = hex::decode(id).map_err(|e| e.to_string())?;
+    d.reverse();
+    match o.get("manufacturer").and_then(|v| v.as_str()) {
+        Some(m) if m.len() == 3 => {
+            let c: Vec<u16> = m.to_uppercase().bytes().map(|x| (x as u16).wrapping_sub(64)).collect();
+            d.extend((c[0] << 10 | c[1] << 5 | c[2]).to_le_bytes());
+        }
+        Some(m) => return Err(format!("`{}` is not a manufacturer code: three letters", m)),
+        None => d.extend([0xff, 0xff]),
+    }
+    d.push(o.get("version").and_then(|v| v.as_u64()).unwrap_or(0xff) as u8);
+    d.push(o.get("medium").and_then(|v| v.as_u64()).unwrap_or(0xff) as u8);
+    long_frame(SND_UD, SELECT, 0x52, &d)
+}
+
+/// Asks each primary address from `from` to `to` and answers the ones that acknowledge. Each silent address costs the whole timeout, so `timeout_ms` defaults to 300 and retries to 0.
+pub fn mbus_scan(gateway: &str, from: i64, to: i64, options: serde_json::Value) -> Result<Vec<i64>, String> {
+    if !(0..=250).contains(&from) || !(0..=250).contains(&to) {
+        return Err("primary addresses run from 0 to 250".into());
+    }
+    let mut o = options.clone();
+    if !o.is_object() {
+        o = json!({});
+    }
+    if o.get("timeout_ms").is_none() {
+        o["timeout_ms"] = json!(300);
+    }
+    if o.get("retries").is_none() {
+        o["retries"] = json!(0);
+    }
+    let mut link = connect(gateway, &o)?;
+    let mut found = vec![];
+    for a in from..=to {
+        if link.ask(&short_frame(SND_NKE, a as u8))?.map_or(false, |f| f == [ACK]) {
+            found.push(a);
+        }
+    }
+    Ok(found)
+}
+
+/// Changes a meter's primary address with the standard's SND_UD; answers true when it acknowledged.
+pub fn mbus_set_address(gateway: &str, address: i64, new_address: i64, options: serde_json::Value) -> Result<bool, String> {
+    if !(1..=250).contains(&new_address) {
+        return Err("a primary address is 1 to 250".into());
+    }
+    let mut link = connect(gateway, &options)?;
+    let f = long_frame(SND_UD, address as u8, 0x51, &[0x01, 0x7a, new_address as u8])?;
+    Ok(link.ask(&f)?.map_or(false, |f| f == [ACK]))
+}

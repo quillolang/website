@@ -1,0 +1,535 @@
+//! WARC web archive files read and written, gzip per record or plain, digests checked, HTTP records opened, and CDX index lines made.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! base64 = "0.22"
+//! flate2 = "1"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+//! sha1 = "0.10"
+
+use base64::Engine;
+use flate2::read::GzEncoder;
+use flate2::Compression;
+use serde_json::{json, Map, Value};
+use sha1::{Digest, Sha1};
+use std::io::Read;
+
+const MAX_RECORD: u64 = 1 << 30;
+const TYPES: [&str; 8] = ["warcinfo", "response", "resource", "request", "metadata", "revisit", "conversion", "continuation"];
+
+fn base32(b: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let (mut bits, mut acc) = (0, 0u32);
+    for x in b {
+        acc = (acc << 8) | *x as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(A[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(A[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+fn sha1_b32(b: &[u8]) -> String {
+    format!("sha1:{}", base32(&Sha1::digest(b)))
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+struct Record {
+    offset: usize,
+    length: usize,
+    headers: Vec<(String, String)>,
+    version: String,
+    block: Vec<u8>,
+    gzipped: bool,
+}
+
+impl Record {
+    fn get(&self, k: &str) -> Option<&str> {
+        self.headers.iter().find(|h| h.0.eq_ignore_ascii_case(k)).map(|h| h.1.as_str())
+    }
+}
+
+/// One record from the start of `b`: `(record, bytes used)`.
+fn parse_one(b: &[u8], at: usize) -> Result<(Record, usize), String> {
+    let end = find(b, b"\r\n\r\n").ok_or(format!("offset {}: a record's headers never end", at))?;
+    let head = std::str::from_utf8(&b[..end]).map_err(|_| format!("offset {}: the headers are not UTF-8", at))?;
+    let mut lines = head.split("\r\n");
+    let first = lines.next().unwrap_or("");
+    if !first.starts_with("WARC/") {
+        return Err(format!("offset {}: expected WARC/1.x and found `{}`", at, first.chars().take(20).collect::<String>()));
+    }
+    let mut headers: Vec<(String, String)> = vec![];
+    for l in lines {
+        // A line starting with space or tab goes on from the last.
+        if l.starts_with(' ') || l.starts_with('\t') {
+            if let Some(h) = headers.last_mut() {
+                h.1.push(' ');
+                h.1.push_str(l.trim());
+            }
+            continue;
+        }
+        let (k, v) = l.split_once(':').ok_or(format!("offset {}: `{}` is not a header", at, l))?;
+        headers.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    let len: usize = headers.iter().find(|h| h.0.eq_ignore_ascii_case("content-length")).ok_or(format!("offset {}: no Content-Length", at))?.1.parse().map_err(|_| format!("offset {}: Content-Length is not a number", at))?;
+    let start = end + 4;
+    let stop = start.checked_add(len).filter(|e| *e <= b.len()).ok_or(format!("offset {}: the record says {} bytes and the file ends first", at, len))?;
+    let block = b[start..stop].to_vec();
+    let mut used = stop;
+    if b[used..].starts_with(b"\r\n\r\n") {
+        used += 4;
+    } else {
+        return Err(format!("offset {}: the record does not end in two CRLFs", at));
+    }
+    Ok((Record { offset: at, length: used, headers, version: first[5..].to_string(), block, gzipped: false }, used))
+}
+
+/// Walks a file: plain, gzip per record, or one gzip member holding many.
+fn walk(b: &[u8], mut each: impl FnMut(Record) -> Result<bool, String>) -> Result<(), String> {
+    let mut at = 0;
+    while at < b.len() {
+        if b[at] == b'\r' || b[at] == b'\n' {
+            at += 1;
+            continue;
+        }
+        if b[at..].starts_with(&[0x1f, 0x8b]) {
+            let mut d = flate2::bufread::GzDecoder::new(&b[at..]);
+            let mut out = Vec::new();
+            (&mut d).take(MAX_RECORD).read_to_end(&mut out).map_err(|e| format!("offset {}: gzip: {}", at, e))?;
+            let rest = d.into_inner().len();
+            let member = b.len() - at - rest;
+            let mut inner = 0;
+            while inner < out.len() {
+                if out[inner] == b'\r' || out[inner] == b'\n' {
+                    inner += 1;
+                    continue;
+                }
+                let (mut r, used) = parse_one(&out[inner..], at)?;
+                r.gzipped = true;
+                r.length = member;
+                inner += used;
+                if !each(r)? {
+                    return Ok(());
+                }
+            }
+            at += member;
+        } else {
+            let (r, used) = parse_one(&b[at..], at)?;
+            at += used;
+            if !each(r)? {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))
+}
+
+/// Splits an `application/http` block: `(first line, headers, payload)`.
+fn split_http(b: &[u8]) -> Option<(String, Vec<(String, String)>, &[u8])> {
+    let end = find(b, b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&b[..end]);
+    let mut lines = head.split("\r\n");
+    let first = lines.next()?.to_string();
+    let mut h: Vec<(String, String)> = vec![];
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            h.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    Some((first, h, &b[end + 4..]))
+}
+
+fn is_http(r: &Record) -> bool {
+    r.get("content-type").map_or(false, |c| c.to_lowercase().starts_with("application/http"))
+}
+
+fn http_json(r: &Record) -> Value {
+    if !is_http(r) {
+        return Value::Null;
+    }
+    let Some((first, headers, payload)) = split_http(&r.block) else { return Value::Null };
+    let mut p = first.splitn(3, ' ');
+    let (a, b, c) = (p.next().unwrap_or(""), p.next().unwrap_or(""), p.next().unwrap_or(""));
+    let mut h = Map::new();
+    for (k, v) in &headers {
+        let key = k.to_lowercase();
+        match h.get_mut(&key) {
+            Some(Value::String(old)) => { old.push_str(", "); old.push_str(v); }
+            _ => { h.insert(key, json!(v)); }
+        }
+    }
+    if a.starts_with("HTTP/") {
+        json!({ "version": a, "status": b.parse::<i64>().ok(), "reason": c, "headers": h, "payload": payload.len() })
+    } else {
+        json!({ "method": a, "path": b, "version": c, "headers": h, "payload": payload.len() })
+    }
+}
+
+fn digest_check(r: &Record) -> Value {
+    let check = |claim: Option<&str>, data: &[u8]| -> Value {
+        match claim {
+            None => Value::Null,
+            Some(c) => match c.split_once(':') {
+                Some((alg, val)) if alg.eq_ignore_ascii_case("sha1") => {
+                    let sum = Sha1::digest(data);
+                    let hex: String = sum.iter().map(|b| format!("{:02x}", b)).collect();
+                    json!(val.eq_ignore_ascii_case(&base32(&sum)) || val.eq_ignore_ascii_case(&hex))
+                }
+                _ => Value::Null,
+            },
+        }
+    };
+    let payload = if is_http(r) { split_http(&r.block).map_or(&r.block[..], |x| x.2) } else { &r.block[..] };
+    json!({ "block": check(r.get("WARC-Block-Digest"), &r.block), "payload": check(r.get("WARC-Payload-Digest"), payload) })
+}
+
+fn record_json(r: &Record) -> Value {
+    let mut extra = Map::new();
+    for (k, v) in &r.headers {
+        extra.insert(k.clone(), json!(v));
+    }
+    json!({
+        "offset": r.offset, "length": r.length, "gzipped": r.gzipped, "version": r.version,
+        "type": r.get("WARC-Type"), "id": r.get("WARC-Record-ID").map(|i| i.trim_matches(|c| c == '<' || c == '>')),
+        "date": r.get("WARC-Date"), "target_uri": r.get("WARC-Target-URI").map(|i| i.trim_matches(|c| c == '<' || c == '>')),
+        "content_type": r.get("Content-Type"), "content_length": r.block.len(),
+        "refers_to": r.get("WARC-Refers-To"), "profile": r.get("WARC-Profile"),
+        "http": http_json(r), "digests": digest_check(r), "headers": extra,
+    })
+}
+
+/// Reads a WARC file, plain or gzipped, without the bodies: `[{ offset, length, type, id, date, target_uri, content_type, http, digests, headers }]`. `limit` of 0 reads all.
+pub fn warc_read(path: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let b = read_bytes(path)?;
+    let mut out = vec![];
+    walk(&b, |r| {
+        out.push(record_json(&r));
+        Ok(limit <= 0 || (out.len() as i64) < limit)
+    })?;
+    Ok(out)
+}
+
+fn dechunk(b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![];
+    let mut at = 0;
+    loop {
+        let end = at + find(&b[at..], b"\r\n")?;
+        let size = usize::from_str_radix(std::str::from_utf8(&b[at..end]).ok()?.split(';').next()?.trim(), 16).ok()?;
+        at = end + 2;
+        if size == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(b.get(at..at.checked_add(size)?)?);
+        at += size + 2;
+    }
+}
+
+fn gunzip(b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![];
+    flate2::read::MultiGzDecoder::new(b).take(MAX_RECORD).read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// One record by its `offset`, with its body: `body` as text, or `body_base64` when it is not UTF-8. An HTTP payload has chunking and gzip undone.
+pub fn warc_get(path: &str, offset: i64) -> Result<Value, String> {
+    let b = read_bytes(path)?;
+    let at = usize::try_from(offset).ok().filter(|o| *o < b.len()).ok_or(format!("{} has no offset {}", path, offset))?;
+    let mut found = None;
+    walk(&b[at..], |mut r| {
+        r.offset += at;
+        found = Some(r);
+        Ok(false)
+    })?;
+    let r = found.ok_or(format!("{} has no record at {}", path, offset))?;
+    let mut v = record_json(&r);
+    let mut body = r.block.clone();
+    if is_http(&r) {
+        if let Some((_, h, p)) = split_http(&r.block) {
+            let has = |k: &str, w: &str| h.iter().any(|x| x.0.eq_ignore_ascii_case(k) && x.1.to_lowercase().contains(w));
+            body = p.to_vec();
+            if has("transfer-encoding", "chunked") {
+                body = dechunk(&body).unwrap_or(body);
+            }
+            if has("content-encoding", "gzip") {
+                body = gunzip(&body).unwrap_or(body);
+            }
+        }
+    }
+    match String::from_utf8(body) {
+        Ok(t) => v["body"] = json!(t),
+        Err(e) => v["body_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(e.as_bytes())),
+    }
+    Ok(v)
+}
+
+/// Every digest in a file checked: `{ records, checked, bad, gzip_members_ok }`, with `bad` naming the offset and which digest.
+pub fn warc_verify(path: &str) -> Result<Value, String> {
+    let b = read_bytes(path)?;
+    let (mut n, mut checked) = (0, 0);
+    let mut bad = vec![];
+    walk(&b, |r| {
+        n += 1;
+        let d = digest_check(&r);
+        for k in ["block", "payload"] {
+            if d[k].is_boolean() {
+                checked += 1;
+                if d[k] == json!(false) {
+                    bad.push(json!({ "offset": r.offset, "digest": k, "id": r.get("WARC-Record-ID"), "target_uri": r.get("WARC-Target-URI") }));
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(json!({ "records": n, "checked": checked, "bad": bad }))
+}
+
+/// A URL as a SURT key, the sort order archives use: `com,example)/path?a=1&b=2`, lower case, `www` and default ports gone, query sorted.
+pub fn warc_surt(url: &str) -> Result<String, String> {
+    surt(url)
+}
+
+fn surt(url: &str) -> Result<String, String> {
+    let (scheme, rest) = url.split_once("://").ok_or(format!("`{}` has no scheme", url))?;
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let auth = rest[..end].rsplit('@').next().unwrap_or("").to_lowercase();
+    let (host, port) = match auth.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h.to_string(), Some(p.to_string())),
+        _ => (auth.clone(), None),
+    };
+    if host.is_empty() {
+        return Err(format!("`{}` has no host", url));
+    }
+    let default = matches!((scheme.to_lowercase().as_str(), port.as_deref()), ("http", Some("80")) | ("https", Some("443")));
+    let host = {
+        let h = host.strip_prefix("www.").unwrap_or(&host);
+        let digits = h.split_once('.').filter(|(a, _)| a.starts_with("www") && a.len() > 3 && a[3..].bytes().all(|b| b.is_ascii_digit()));
+        digits.map_or(h, |d| d.1).to_string()
+    };
+    let ip = host.split('.').count() == 4 && host.split('.').all(|p| p.parse::<u8>().is_ok());
+    let mut key: String = if ip { host } else { host.split('.').rev().collect::<Vec<_>>().join(",") };
+    if let (Some(p), false) = (port, default) {
+        key.push(':');
+        key.push_str(&p);
+    }
+    key.push(')');
+    let tail = rest[end..].to_lowercase();
+    let (path, query) = match tail.split_once('?') {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (tail, None),
+    };
+    key.push_str(if path.is_empty() { "/" } else { path.trim_end_matches('/') });
+    if path.len() > 1 && path.trim_end_matches('/').is_empty() {
+        key.push('/');
+    }
+    if key.ends_with(')') {
+        key.push('/');
+    }
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        let mut parts: Vec<&str> = q.split('&').collect();
+        parts.sort();
+        key.push('?');
+        key.push_str(&parts.join("&"));
+    }
+    Ok(key)
+}
+
+fn timestamp14(d: &str) -> String {
+    d.chars().filter(char::is_ascii_digit).take(14).collect()
+}
+
+fn cdx_fields(r: &Record) -> Option<Value> {
+    let kind = r.get("WARC-Type")?;
+    if !["response", "resource", "revisit"].contains(&kind) {
+        return None;
+    }
+    let url = r.get("WARC-Target-URI")?.trim_matches(|c| c == '<' || c == '>');
+    let (mut mime, mut status, mut redirect) = ("-".to_string(), "-".to_string(), "-".to_string());
+    let mut payload: &[u8] = &r.block;
+    if is_http(r) {
+        if let Some((first, h, p)) = split_http(&r.block) {
+            status = first.split(' ').nth(1).unwrap_or("-").to_string();
+            payload = p;
+            let get = |k: &str| h.iter().find(|x| x.0.eq_ignore_ascii_case(k)).map(|x| x.1.clone());
+            mime = get("content-type").map_or("unk".to_string(), |c| c.split(';').next().unwrap_or("").trim().to_lowercase());
+            redirect = get("location").unwrap_or("-".to_string());
+        }
+    } else if kind == "resource" {
+        mime = r.get("content-type").unwrap_or("unk").split(';').next().unwrap_or("").trim().to_string();
+        status = "200".to_string();
+    }
+    if kind == "revisit" {
+        mime = "warc/revisit".to_string();
+    }
+    let digest = r.get("WARC-Payload-Digest").map(|d| d.strip_prefix("sha1:").unwrap_or(d).to_string()).unwrap_or_else(|| sha1_b32(payload)[5..].to_string());
+    Some(json!({ "url": url, "timestamp": timestamp14(r.get("WARC-Date").unwrap_or("")), "mime": mime, "status": status, "digest": digest, "redirect": redirect, "length": r.length, "offset": r.offset, "surt": surt(url).unwrap_or_default() }))
+}
+
+/// CDX index lines for a file, sorted: `format` is `cdx11` (`N b a m s k r M S V g`, with the header line) or `cdxj` (key, time, JSON).
+pub fn warc_cdx(path: &str, format: &str) -> Result<Vec<String>, String> {
+    if format != "cdx11" && format != "cdxj" {
+        return Err(format!("`{}` is not a format: cdx11 or cdxj", format));
+    }
+    let b = read_bytes(path)?;
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut lines = vec![];
+    walk(&b, |r| {
+        if let Some(f) = cdx_fields(&r) {
+            let s = |k: &str| f[k].as_str().unwrap_or("-").to_string();
+            lines.push(if format == "cdx11" {
+                format!("{} {} {} {} {} {} {} - {} {} {}", s("surt"), s("timestamp"), s("url"), s("mime"), s("status"), s("digest"), s("redirect"), f["length"], f["offset"], name)
+            } else {
+                let mut o = Map::new();
+                o.insert("url".into(), f["url"].clone());
+                o.insert("mime".into(), f["mime"].clone());
+                o.insert("status".into(), f["status"].clone());
+                o.insert("digest".into(), f["digest"].clone());
+                o.insert("length".into(), json!(f["length"].to_string()));
+                o.insert("offset".into(), json!(f["offset"].to_string()));
+                o.insert("filename".into(), json!(name));
+                format!("{} {} {}", s("surt"), s("timestamp"), Value::Object(o))
+            });
+        }
+        Ok(true)
+    })?;
+    lines.sort();
+    if format == "cdx11" {
+        lines.insert(0, " CDX N b a m s k r M S V g".to_string());
+    }
+    Ok(lines)
+}
+
+fn gzip(b: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    GzEncoder::new(b, Compression::default()).read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+fn now() -> String {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, secs / 3600, secs % 3600 / 60, secs % 60)
+}
+
+/// A name-based id: the same record always gets the same id, so a file can be made again and compared.
+fn record_id(block: &[u8], date: &str, uri: &str, n: usize) -> String {
+    let mut h = Sha1::new();
+    h.update(block);
+    h.update(date.as_bytes());
+    h.update(uri.as_bytes());
+    h.update(n.to_le_bytes());
+    let d = h.finalize();
+    let x: String = d.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+    format!("<urn:uuid:{}-{}-5{}-a{}-{}>", &x[..8], &x[8..12], &x[13..16], &x[17..20], &x[20..32])
+}
+
+fn http_block(h: &Value) -> Result<Vec<u8>, String> {
+    let status = h.get("status").and_then(Value::as_i64).unwrap_or(200);
+    let reason = h.get("reason").and_then(Value::as_str).unwrap_or(if status == 200 { "OK" } else { "" });
+    let body = h.get("body").and_then(Value::as_str).unwrap_or("");
+    let mut out = match h.get("method").and_then(Value::as_str) {
+        Some(m) => format!("{} {} HTTP/1.1\r\n", m, h.get("path").and_then(Value::as_str).unwrap_or("/")),
+        None => format!("HTTP/1.1 {} {}\r\n", status, reason),
+    };
+    for (k, v) in h.get("headers").and_then(Value::as_object).into_iter().flatten() {
+        let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+        if k.contains(['\r', '\n', ':']) || v.contains(['\r', '\n']) {
+            return Err(format!("the header {} has a line break in it", k));
+        }
+        out.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    out.push_str("\r\n");
+    let mut b = out.into_bytes();
+    b.extend_from_slice(body.as_bytes());
+    Ok(b)
+}
+
+fn encode_record(rec: &Value, n: usize, info_id: Option<&str>) -> Result<(Vec<u8>, String), String> {
+    let kind = rec.get("type").and_then(Value::as_str).unwrap_or("response");
+    if !TYPES.contains(&kind) {
+        return Err(format!("record {}: `{}` is not a WARC type", n, kind));
+    }
+    let uri = rec.get("target_uri").and_then(Value::as_str);
+    if uri.is_none() && kind != "warcinfo" {
+        return Err(format!("record {}: a {} record needs a `target_uri`", n, kind));
+    }
+    let date = rec.get("date").and_then(Value::as_str).map(str::to_string).unwrap_or_else(now);
+    let (block, ctype, http) = if let Some(h) = rec.get("http") {
+        let m = if h.get("method").is_some() { "request" } else { "response" };
+        (http_block(h)?, format!("application/http;msgtype={}", m), true)
+    } else if let Some(f) = rec.get("fields").and_then(Value::as_object) {
+        let t: String = f.iter().map(|(k, v)| format!("{}: {}\r\n", k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect();
+        (t.into_bytes(), "application/warc-fields".to_string(), false)
+    } else {
+        (rec.get("body").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec(), rec.get("content_type").and_then(Value::as_str).unwrap_or("application/octet-stream").to_string(), false)
+    };
+    let id = rec.get("id").and_then(Value::as_str).map(|i| format!("<{}>", i.trim_matches(|c| c == '<' || c == '>'))).unwrap_or_else(|| record_id(&block, &date, uri.unwrap_or(""), n));
+    let mut head = format!("WARC/1.1\r\nWARC-Type: {}\r\nWARC-Record-ID: {}\r\nWARC-Date: {}\r\n", kind, id, date);
+    if let Some(u) = uri {
+        if u.contains(['\r', '\n', ' ']) {
+            return Err(format!("record {}: `{}` is not a URI", n, u));
+        }
+        head.push_str(&format!("WARC-Target-URI: {}\r\n", u));
+    }
+    if let (Some(i), true) = (info_id, kind != "warcinfo") {
+        head.push_str(&format!("WARC-Warcinfo-ID: {}\r\n", i));
+    }
+    if let Some(r) = rec.get("refers_to").and_then(Value::as_str) {
+        head.push_str(&format!("WARC-Refers-To: <{}>\r\n", r.trim_matches(|c| c == '<' || c == '>')));
+    }
+    if let Some(p) = rec.get("profile").and_then(Value::as_str) {
+        head.push_str(&format!("WARC-Profile: {}\r\n", p));
+    }
+    head.push_str(&format!("WARC-Block-Digest: {}\r\n", sha1_b32(&block)));
+    if http {
+        let p = split_http(&block).map_or(&block[..], |x| x.2);
+        head.push_str(&format!("WARC-Payload-Digest: {}\r\n", sha1_b32(p)));
+    }
+    head.push_str(&format!("Content-Type: {}\r\nContent-Length: {}\r\n\r\n", ctype, block.len()));
+    let mut out = head.into_bytes();
+    out.extend_from_slice(&block);
+    out.extend_from_slice(b"\r\n\r\n");
+    Ok((out, id))
+}
+
+/// Writes records to a file: `{ type, target_uri, date, http: { status, headers, body } | body | fields }`, digests and ids made here. `gzip` compresses each record alone, as a `.warc.gz` must, so a reader can jump to one. Gives each record's `{ id, offset, length }`.
+pub fn warc_write(path: &str, records: Vec<serde_json::Value>, gzip_each: bool) -> Result<Vec<Value>, String> {
+    let info = records.iter().find(|r| r.get("type").and_then(Value::as_str) == Some("warcinfo"));
+    let mut info_id = None;
+    let mut out: Vec<u8> = vec![];
+    let mut placed = vec![];
+    if let Some(i) = info {
+        info_id = Some(encode_record(i, 0, None)?.1);
+    }
+    for (n, r) in records.iter().enumerate() {
+        let (bytes, id) = encode_record(r, n, info_id.as_deref())?;
+        let chunk = if gzip_each { gzip(&bytes)? } else { bytes };
+        placed.push(json!({ "id": id.trim_matches(|c| c == '<' || c == '>'), "offset": out.len(), "length": chunk.len() }));
+        out.extend_from_slice(&chunk);
+    }
+    std::fs::write(path, &out).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    Ok(placed)
+}

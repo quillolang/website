@@ -1,0 +1,616 @@
+//! US ACH files in the NACHA format: fixed-width batches built with their entry hash, control totals, trace numbers and block padding, and files read back and checked, each problem naming its line.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+
+const LINE: usize = 94;
+const MAX_AMOUNT: i64 = 9_999_999_999;
+
+fn s(v: &Value, k: &str) -> String {
+    match v.get(k) {
+        Some(Value::String(x)) => x.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn digits(x: &str) -> bool {
+    !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Text field: left-justified, space-filled, cut at the width. Only printable ASCII fits a fixed-width line.
+fn alpha(x: &str, width: usize, what: &str) -> Result<String, String> {
+    if let Some(c) = x.chars().find(|c| !(' '..='~').contains(c)) {
+        return Err(format!("{}: `{}` holds {:?}; a NACHA file is printable ASCII", what, x, c));
+    }
+    let up = x.to_uppercase();
+    let cut: String = up.chars().take(width).collect();
+    Ok(format!("{:<w$}", cut, w = width))
+}
+
+fn num(x: i64, width: usize) -> String {
+    format!("{:0>w$}", x, w = width)
+}
+
+fn digit_field(x: &str, width: usize, what: &str) -> Result<String, String> {
+    if !digits(x) || x.len() != width {
+        return Err(format!("{}: `{}` should be {} digits", what, x, width));
+    }
+    Ok(x.to_string())
+}
+
+fn yymmdd(x: &str, what: &str) -> Result<String, String> {
+    let ok = x.len() == 6 && digits(x) && matches!(x[2..4].parse::<u32>(), Ok(1..=12)) && matches!(x[4..6].parse::<u32>(), Ok(1..=31));
+    if ok { Ok(x.to_string()) } else { Err(format!("{}: `{}` is not a date as YYMMDD", what, x)) }
+}
+
+fn check_digit(first8: &str) -> u32 {
+    let w = [3, 7, 1, 3, 7, 1, 3, 7];
+    let sum: u32 = first8.bytes().zip(w).map(|(b, w)| (b - b'0') as u32 * w).sum();
+    (10 - sum % 10) % 10
+}
+
+/// The check digit that ends a routing number, from its first eight digits (weights 3, 7, 1): `nacha_check_digit("09100001")` is 9.
+pub fn nacha_check_digit(first8: &str) -> Result<i64, String> {
+    if first8.len() != 8 || !digits(first8) {
+        return Err(format!("`{}` should be the first 8 digits of a routing number", first8));
+    }
+    Ok(check_digit(first8) as i64)
+}
+
+/// Whether nine digits are a routing number with the right check digit.
+pub fn nacha_routing_ok(routing: &str) -> bool {
+    routing.len() == 9 && digits(routing) && check_digit(&routing[..8]) == (routing.as_bytes()[8] - b'0') as u32
+}
+
+/// The entry hash of a list of routing numbers: the sum of each one's first eight digits, kept to its last ten digits.
+pub fn nacha_entry_hash(routings: Vec<String>) -> Result<i64, String> {
+    let mut sum = 0i64;
+    for r in &routings {
+        if r.len() < 8 || !digits(r) {
+            return Err(format!("`{}` is not a routing number", r));
+        }
+        sum += r[..8].parse::<i64>().unwrap();
+    }
+    Ok(sum % 10_000_000_000)
+}
+
+/// A trace number: the originating bank's eight digits and a sequence number of seven.
+pub fn nacha_trace(odfi: &str, sequence: i64) -> Result<String, String> {
+    if odfi.len() != 8 || !digits(odfi) {
+        return Err(format!("`{}` should be the 8 digits of the originating bank", odfi));
+    }
+    if !(0..=9_999_999).contains(&sequence) {
+        return Err(format!("sequence {} does not fit seven digits", sequence));
+    }
+    Ok(format!("{}{:07}", odfi, sequence))
+}
+
+fn cents(e: &Value) -> Result<i64, String> {
+    if let Some(n) = e.get("amount_cents").and_then(Value::as_i64) {
+        return Ok(n);
+    }
+    let a = s(e, "amount");
+    let (w, f) = a.split_once('.').unwrap_or((&a, ""));
+    if !digits(w) || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("amount `{}` should be dollars with at most 2 decimals, or give amount_cents", a));
+    }
+    let c = w.parse::<i64>().map_err(|_| format!("amount `{}` is too large", a))?;
+    Ok(c * 100 + format!("{:0<2}", f).parse::<i64>().unwrap())
+}
+
+fn tran_code(e: &Value) -> Result<i64, String> {
+    if let Some(c) = e.get("transaction_code").and_then(Value::as_i64) {
+        return if tran_kind(c).is_some() { Ok(c) } else { Err(format!("transaction code {} is not one of 22 to 39", c)) };
+    }
+    let kind = s(e, "kind");
+    let base = match s(e, "account_type").as_str() {
+        "" | "checking" => 20,
+        "savings" => 30,
+        "gl" => 40,
+        "loan" => 50,
+        o => return Err(format!("account_type `{}` should be checking, savings, gl or loan", o)),
+    };
+    let prenote = e.get("prenote").and_then(Value::as_bool).unwrap_or(false);
+    match kind.as_str() {
+        "credit" => Ok(base + if prenote { 3 } else { 2 }),
+        "debit" if base != 50 => Ok(base + if prenote { 8 } else { 7 }),
+        "debit" => Err("a loan account takes credits only".into()),
+        o => Err(format!("kind `{}` should be credit or debit", o)),
+    }
+}
+
+/// (account, credit or debit, what it is) of a transaction code.
+fn tran_kind(code: i64) -> Option<(&'static str, &'static str, &'static str)> {
+    let account = match code / 10 {
+        2 => "checking",
+        3 => "savings",
+        4 => "gl",
+        5 => "loan",
+        _ => return None,
+    };
+    Some(match code % 10 {
+        1 => (account, "credit", "return"),
+        2 => (account, "credit", "live"),
+        3 => (account, "credit", "prenote"),
+        4 => (account, "credit", "zero dollar"),
+        6 => (account, "debit", "return"),
+        7 => (account, "debit", "live"),
+        8 => (account, "debit", "prenote"),
+        9 => (account, "debit", "zero dollar"),
+        _ => return None,
+    })
+}
+
+fn is_credit(code: i64) -> bool {
+    matches!(code % 10, 1..=4)
+}
+
+fn pad(mut line: String) -> String {
+    while line.len() < LINE {
+        line.push(' ');
+    }
+    line
+}
+
+struct Totals {
+    count: i64,
+    hash: i64,
+    debit: i64,
+    credit: i64,
+}
+
+fn build_batch(b: &Value, number: i64, out: &mut Vec<String>, sequence: &mut i64) -> Result<Totals, String> {
+    let at = format!("batch {}", number);
+    let company = s(b, "company_name");
+    if company.is_empty() {
+        return Err(format!("{}: no company_name", at));
+    }
+    let company_id = s(b, "company_id");
+    if company_id.is_empty() || company_id.len() > 10 {
+        return Err(format!("{}: company_id `{}` should be up to 10 characters", at, company_id));
+    }
+    let sec = { let c = s(b, "sec_code"); if c.is_empty() { "PPD".to_string() } else { c.to_uppercase() } };
+    if !["PPD", "CCD", "CTX", "WEB", "TEL", "ARC", "BOC", "POP", "RCK"].contains(&sec.as_str()) {
+        return Err(format!("{}: SEC code `{}` is not one this builds (IAT has a layout of its own)", at, sec));
+    }
+    let description = s(b, "description");
+    if description.is_empty() {
+        return Err(format!("{}: no description (it shows on the receiver's statement)", at));
+    }
+    let odfi = digit_field(&s(b, "odfi"), 8, &format!("{}: odfi", at))?;
+    let effective = yymmdd(&s(b, "effective_date"), &format!("{}: effective_date", at))?;
+    let entries = b.get("entries").and_then(Value::as_array).filter(|e| !e.is_empty()).ok_or(format!("{}: no entries", at))?;
+
+    let mut lines = vec![];
+    let mut t = Totals { count: 0, hash: 0, debit: 0, credit: 0 };
+    let (mut credits, mut debits) = (0, 0);
+    for (i, e) in entries.iter().enumerate() {
+        let at = format!("batch {} entry {}", number, i + 1);
+        let code = tran_code(e).map_err(|m| format!("{}: {}", at, m))?;
+        let amount = cents(e).map_err(|m| format!("{}: {}", at, m))?;
+        if !(0..=MAX_AMOUNT).contains(&amount) {
+            return Err(format!("{}: {} cents does not fit the ten-digit amount field", at, amount));
+        }
+        let prenote = matches!(code % 10, 3 | 8);
+        if prenote && amount != 0 {
+            return Err(format!("{}: a prenote carries no amount", at));
+        }
+        let routing = s(e, "routing");
+        if !nacha_routing_ok(&routing) {
+            let good = if routing.len() == 9 && digits(&routing) { format!("; its check digit should be {}", check_digit(&routing[..8])) } else { String::new() };
+            return Err(format!("{}: routing number `{}` is not valid{}", at, routing, good));
+        }
+        let account = s(e, "account");
+        if account.is_empty() || account.len() > 17 {
+            return Err(format!("{}: account `{}` should be 1 to 17 characters", at, account));
+        }
+        let name = s(e, "name");
+        if name.is_empty() {
+            return Err(format!("{}: no name", at));
+        }
+        if sec == "TEL" && is_credit(code) {
+            return Err(format!("{}: a TEL batch holds debits only", at));
+        }
+        let addenda: Vec<String> = match e.get("addenda") {
+            Some(Value::String(x)) if !x.is_empty() => vec![x.clone()],
+            Some(Value::Array(a)) => a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect(),
+            _ => vec![],
+        };
+        let most = if sec == "CTX" { 9999 } else if matches!(sec.as_str(), "PPD" | "CCD" | "WEB") { 1 } else { 0 };
+        if addenda.len() > most {
+            return Err(format!("{}: {} addenda, and a {} entry takes at most {}", at, addenda.len(), sec, most));
+        }
+        *sequence += 1;
+        let trace = match e.get("trace").and_then(Value::as_str) {
+            Some(x) => digit_field(x, 15, &format!("{}: trace", at))?,
+            None => nacha_trace(&odfi, *sequence)?,
+        };
+        let id = alpha(&s(e, "id"), 15, &format!("{}: id", at))?;
+        let discretionary = alpha(&s(e, "discretionary"), 2, &format!("{}: discretionary", at))?;
+        lines.push(format!(
+            "6{:02}{}{:<17}{:010}{}{}{}{}{}",
+            code, routing, alpha(&account, 17, &at)?.trim_end(), amount, id, alpha(&name, 22, &format!("{}: name", at))?, discretionary,
+            if addenda.is_empty() { 0 } else { 1 }, trace
+        ));
+        for (n, a) in addenda.iter().enumerate() {
+            lines.push(format!("705{}{:04}{}", alpha(a, 80, &format!("{}: addenda", at))?, n + 1, &trace[8..]));
+        }
+        t.count += 1 + addenda.len() as i64;
+        t.hash += routing[..8].parse::<i64>().unwrap();
+        if is_credit(code) { credits += 1; t.credit += amount } else { debits += 1; t.debit += amount }
+    }
+    t.hash %= 10_000_000_000;
+    if t.debit >= 1_000_000_000_000 || t.credit >= 1_000_000_000_000 {
+        return Err(format!("{}: the total does not fit twelve digits", at));
+    }
+    let class = match (credits > 0, debits > 0) { (true, true) => 200, (true, false) => 220, _ => 225 };
+    let class = b.get("service_class").and_then(Value::as_i64).unwrap_or(class);
+    if ![200, 220, 225].contains(&class) || (class == 220 && debits > 0) || (class == 225 && credits > 0) {
+        return Err(format!("{}: service class {} does not fit {} credits and {} debits", at, class, credits, debits));
+    }
+    let settle = "   ";
+    out.push(format!(
+        "5{}{}{}{:>10}{}{}{}{}{}1{}{:07}",
+        class, alpha(&company, 16, &at)?, alpha(&s(b, "discretionary"), 20, &at)?, company_id, sec, alpha(&description, 10, &at)?,
+        alpha(&s(b, "descriptive_date"), 6, &at)?, effective, settle, odfi, number
+    ));
+    out.append(&mut lines);
+    out.push(pad(format!(
+        "8{}{:06}{:010}{:012}{:012}{:>10}{:<19}{:<6}{}{:07}",
+        class, t.count, t.hash, t.debit, t.credit, company_id, "", "", odfi, number
+    )));
+    Ok(t)
+}
+
+/// A whole ACH file from a map: `immediate_destination` and `immediate_origin` (9 or 10 characters), `destination_name`,
+/// `origin_name`, `file_date` (YYMMDD), `file_time` (HHMM), `file_id_modifier`, `reference`, and `batches`, each with
+/// `company_name`, `company_id`, `sec_code`, `description`, `odfi`, `effective_date` and `entries`, each of those with `kind` (credit or
+/// debit), `account_type`, `routing`, `account`, `amount` (text) or `amount_cents`, `id`, `name`, `addenda`. Lines end with a newline; the file is padded with nines to a multiple of ten.
+pub fn nacha_build(file: serde_json::Value) -> Result<String, String> {
+    let batches = file.get("batches").and_then(Value::as_array).filter(|b| !b.is_empty()).ok_or("no batches")?;
+    let routed = |k: &str| -> Result<String, String> {
+        let x = s(&file, k);
+        if x.len() == 9 && digits(&x) {
+            if !nacha_routing_ok(&x) { return Err(format!("{}: `{}` has a wrong check digit", k, x)); }
+            return Ok(format!(" {}", x));
+        }
+        if x.len() == 10 { Ok(x) } else { Err(format!("{}: `{}` should be 9 digits, or 10 characters", k, x)) }
+    };
+    let (dest, orig) = (routed("immediate_destination")?, {
+        let x = s(&file, "immediate_origin");
+        if x.len() == 9 || x.len() == 10 { format!("{:>10}", x) } else { return Err(format!("immediate_origin: `{}` should be 9 or 10 characters", x)); }
+    });
+    let date = yymmdd(&s(&file, "file_date"), "file_date")?;
+    let time = { let t = s(&file, "file_time"); if t.is_empty() { "0000".to_string() } else { digit_field(&t, 4, "file_time")? } };
+    let modifier = { let m = s(&file, "file_id_modifier"); if m.is_empty() { "A".to_string() } else { m.to_uppercase() } };
+    if modifier.len() != 1 || !modifier.as_bytes()[0].is_ascii_alphanumeric() {
+        return Err(format!("file_id_modifier: `{}` should be one letter or digit", modifier));
+    }
+    let mut lines = vec![format!(
+        "101{}{}{}{}{}094101{}{}{}",
+        dest, orig, date, time, modifier, alpha(&s(&file, "destination_name"), 23, "destination_name")?, alpha(&s(&file, "origin_name"), 23, "origin_name")?, alpha(&s(&file, "reference"), 8, "reference")?
+    )];
+    let mut total = Totals { count: 0, hash: 0, debit: 0, credit: 0 };
+    let mut sequence = 0;
+    for (i, b) in batches.iter().enumerate() {
+        let t = build_batch(b, i as i64 + 1, &mut lines, &mut sequence)?;
+        total.count += t.count;
+        total.hash += t.hash;
+        total.debit += t.debit;
+        total.credit += t.credit;
+    }
+    let blocks = (lines.len() as i64 + 10) / 10;
+    lines.push(pad(format!("9{:06}{:06}{:08}{:010}{:012}{:012}", batches.len(), blocks, total.count, total.hash % 10_000_000_000, total.debit, total.credit)));
+    while lines.len() % 10 != 0 {
+        lines.push("9".repeat(LINE));
+    }
+    for l in &lines {
+        debug_assert_eq!(l.len(), LINE);
+    }
+    Ok(lines.iter().map(|l| format!("{}\n", l)).collect())
+}
+
+fn field(l: &str, from: usize, to: usize) -> &str {
+    &l[from - 1..to]
+}
+
+fn int(x: &str) -> Option<i64> {
+    let t = x.trim();
+    if digits(t) { t.parse().ok() } else { None }
+}
+
+fn return_reason(code: &str) -> &'static str {
+    match code {
+        "R01" => "insufficient funds",
+        "R02" => "account closed",
+        "R03" => "no account, or unable to locate",
+        "R04" => "invalid account number",
+        "R05" => "unauthorized debit to a consumer account, corporate SEC code",
+        "R06" => "returned at the originating bank's request",
+        "R07" => "authorization revoked by the customer",
+        "R08" => "payment stopped",
+        "R09" => "uncollected funds",
+        "R10" => "customer says the debit was not authorized",
+        "R11" => "customer says the entry does not follow the authorization",
+        "R12" => "account sold to another bank",
+        "R13" => "invalid routing number",
+        "R14" => "payee or account holder has died",
+        "R15" => "beneficiary has died",
+        "R16" => "account frozen",
+        "R17" => "file edit failed, or suspicious entry",
+        "R20" => "account cannot take this entry",
+        "R23" => "credit refused by the receiver",
+        "R24" => "duplicate entry",
+        "R29" => "corporate customer says the debit was not authorized",
+        "R31" => "permissible return, agreed by the originating bank",
+        "R33" => "return of an XCK entry",
+        "C01" => "incorrect account number",
+        "C02" => "incorrect routing number",
+        "C03" => "incorrect routing and account numbers",
+        "C05" => "incorrect transaction code",
+        "C06" => "incorrect account number and transaction code",
+        "C07" => "incorrect routing, account and transaction code",
+        "C09" => "incorrect individual id",
+        _ => "unknown code",
+    }
+}
+
+/// What a return reason (R01...) or a notification of change (C01...) means.
+pub fn nacha_reason(code: &str) -> String {
+    return_reason(&code.to_uppercase()).to_string()
+}
+
+fn read(text: &str) -> (Value, Vec<String>) {
+    let mut p: Vec<String> = vec![];
+    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let lines: Vec<&str> = if lines.last() == Some(&"") { lines[..lines.len() - 1].to_vec() } else { lines };
+    let mut out = Map::new();
+    let mut batches: Vec<Value> = vec![];
+    let mut cur: Option<Map<String, Value>> = None; // the open batch
+    let mut entries: Vec<Value> = vec![];
+    let (mut count, mut hash, mut debit, mut credit) = (0i64, 0i64, 0i64, 0i64);
+    let (mut f_count, mut f_hash, mut f_debit, mut f_credit) = (0i64, 0i64, 0i64, 0i64);
+    let mut last_trace = 0i64;
+    let mut pending_addenda = 0; // entries whose indicator says an addenda should follow
+    let mut seen_header = false;
+    let mut control: Option<(usize, String)> = None;
+    let mut padding = 0;
+    if lines.is_empty() {
+        p.push("line 1: the file is empty".into());
+    }
+    if lines.len() % 10 != 0 {
+        p.push(format!("line {}: {} lines is not a multiple of 10; the file should be padded with lines of nines", lines.len(), lines.len()));
+    }
+    for (i, l) in lines.iter().enumerate() {
+        let n = i + 1;
+        if !l.is_ascii() {
+            p.push(format!("line {}: not ASCII", n));
+            continue;
+        }
+        if l.len() != LINE {
+            p.push(format!("line {}: {} characters; a line has {}", n, l.len(), LINE));
+            continue;
+        }
+        if control.is_some() || *l == "9".repeat(LINE) {
+            if *l == "9".repeat(LINE) { padding += 1; continue; }
+            if control.is_some() { p.push(format!("line {}: after the file control only lines of nines may follow", n)); continue; }
+        }
+        if pending_addenda > 0 && !l.starts_with('7') {
+            p.push(format!("line {}: the entry above says it has an addenda, and record type {} follows", n, &l[..1]));
+            pending_addenda = 0;
+        }
+        match &l[..1] {
+            "1" => {
+                if i != 0 { p.push(format!("line {}: a file header belongs on the first line", n)); }
+                seen_header = true;
+                if field(l, 2, 3) != "01" { p.push(format!("line {}: priority code `{}` should be 01", n, field(l, 2, 3))); }
+                if field(l, 35, 37) != "094" { p.push(format!("line {}: record size `{}` should be 094", n, field(l, 35, 37))); }
+                if field(l, 38, 39) != "10" { p.push(format!("line {}: blocking factor `{}` should be 10", n, field(l, 38, 39))); }
+                if field(l, 40, 40) != "1" { p.push(format!("line {}: format code `{}` should be 1", n, field(l, 40, 40))); }
+                let dest = field(l, 4, 13).trim();
+                if dest.len() == 9 && !nacha_routing_ok(dest) { p.push(format!("line {}: immediate destination `{}` has a wrong check digit", n, dest)); }
+                out.insert("immediate_destination".into(), json!(dest));
+                out.insert("immediate_origin".into(), json!(field(l, 14, 23).trim()));
+                out.insert("file_date".into(), json!(field(l, 24, 29)));
+                out.insert("file_time".into(), json!(field(l, 30, 33)));
+                out.insert("file_id_modifier".into(), json!(field(l, 34, 34)));
+                out.insert("destination_name".into(), json!(field(l, 41, 63).trim()));
+                out.insert("origin_name".into(), json!(field(l, 64, 86).trim()));
+                out.insert("reference".into(), json!(field(l, 87, 94).trim()));
+            }
+            "5" => {
+                if !seen_header { p.push(format!("line {}: a batch before the file header", n)); }
+                if cur.is_some() { p.push(format!("line {}: a batch header inside a batch: the one above has no control record", n)); }
+                let mut b = Map::new();
+                let class = int(field(l, 2, 4)).unwrap_or(0);
+                if ![200, 220, 225].contains(&class) { p.push(format!("line {}: service class `{}` should be 200, 220 or 225", n, field(l, 2, 4))); }
+                b.insert("service_class".into(), json!(class));
+                b.insert("company_name".into(), json!(field(l, 5, 20).trim()));
+                b.insert("discretionary".into(), json!(field(l, 21, 40).trim()));
+                b.insert("company_id".into(), json!(field(l, 41, 50).trim()));
+                b.insert("sec_code".into(), json!(field(l, 51, 53)));
+                b.insert("description".into(), json!(field(l, 54, 63).trim()));
+                b.insert("descriptive_date".into(), json!(field(l, 64, 69).trim()));
+                b.insert("effective_date".into(), json!(field(l, 70, 75)));
+                b.insert("odfi".into(), json!(field(l, 80, 87)));
+                b.insert("number".into(), json!(int(field(l, 88, 94)).unwrap_or(0)));
+                b.insert("line".into(), json!(n));
+                let expected = batches.len() as i64 + 1;
+                if int(field(l, 88, 94)) != Some(expected) { p.push(format!("line {}: batch number `{}` should be {}", n, field(l, 88, 94), expected)); }
+                cur = Some(b);
+                entries = vec![];
+                count = 0; hash = 0; debit = 0; credit = 0; last_trace = 0;
+            }
+            "6" => {
+                let Some(b) = cur.as_ref() else {
+                    p.push(format!("line {}: an entry outside a batch", n));
+                    continue;
+                };
+                let code = int(field(l, 2, 3)).unwrap_or(0);
+                let routing = format!("{}{}", field(l, 4, 11), field(l, 12, 12));
+                if !digits(&routing) {
+                    p.push(format!("line {}: routing number `{}` is not digits", n, routing));
+                } else {
+                    if !nacha_routing_ok(&routing) {
+                        p.push(format!("line {}: routing number {} has check digit {}, and should have {}", n, routing, &routing[8..], check_digit(&routing[..8])));
+                    }
+                    hash += routing[..8].parse::<i64>().unwrap_or(0);
+                }
+                let amount = match int(field(l, 30, 39)) {
+                    Some(a) => a,
+                    None => { p.push(format!("line {}: amount `{}` is not digits", n, field(l, 30, 39))); 0 }
+                };
+                let Some((account, kind, what)) = tran_kind(code) else {
+                    p.push(format!("line {}: transaction code `{}` is not one there is", n, field(l, 2, 3)));
+                    continue;
+                };
+                if kind == "credit" { credit += amount } else { debit += amount }
+                let class = b["service_class"].as_i64().unwrap_or(0);
+                if class == 220 && kind == "debit" { p.push(format!("line {}: a debit in a credits-only batch (service class 220)", n)); }
+                if class == 225 && kind == "credit" { p.push(format!("line {}: a credit in a debits-only batch (service class 225)", n)); }
+                let trace = field(l, 80, 94);
+                let seq = int(&trace[8..]).unwrap_or(0);
+                if field(l, 80, 87) != b["odfi"].as_str().unwrap_or("") && !matches!(code % 10, 1 | 6) {
+                    p.push(format!("line {}: trace {} does not start with the batch's bank {}", n, trace, b["odfi"].as_str().unwrap_or("")));
+                }
+                if seq <= last_trace { p.push(format!("line {}: trace {} is not above the one before", n, trace)); }
+                last_trace = seq;
+                let indicator = field(l, 79, 79);
+                if indicator != "0" && indicator != "1" { p.push(format!("line {}: addenda indicator `{}` should be 0 or 1", n, indicator)); }
+                count += 1;
+                if indicator == "1" { pending_addenda = 1; }
+                entries.push(json!({
+                    "line": n, "transaction_code": code, "kind": kind, "account_type": account, "what": what, "routing": routing,
+                    "account": field(l, 13, 29).trim(), "amount_cents": amount, "amount": format!("{}.{:02}", amount / 100, amount % 100),
+                    "id": field(l, 40, 54).trim(), "name": field(l, 55, 76).trim(), "discretionary": field(l, 77, 78).trim(), "trace": trace, "addenda": [],
+                }));
+            }
+            "7" => {
+                pending_addenda = 0;
+                let Some(e) = entries.last_mut() else {
+                    p.push(format!("line {}: an addenda with no entry above it", n));
+                    continue;
+                };
+                if e["addenda"].as_array().map_or(0, |a| a.len()) == 0 && !e["trace"].is_null() && field(lines[e["line"].as_u64().unwrap_or(1) as usize - 1], 79, 79) == "0" {
+                    p.push(format!("line {}: an addenda, and the entry above says it has none", n));
+                }
+                count += 1;
+                let kind = field(l, 2, 3);
+                let addenda = match kind {
+                    "05" => {
+                        let sequence = int(field(l, 84, 87)).unwrap_or(0);
+                        let have = e["addenda"].as_array().map_or(0, |a| a.len()) as i64;
+                        if sequence != have + 1 { p.push(format!("line {}: addenda sequence {} should be {}", n, sequence, have + 1)); }
+                        let trace = e["trace"].as_str().unwrap_or("");
+                        if field(l, 88, 94) != &trace[8..] { p.push(format!("line {}: addenda entry number {} does not match the trace {}", n, field(l, 88, 94), trace)); }
+                        json!({ "type": "05", "text": field(l, 4, 83).trim() })
+                    }
+                    "99" => json!({ "type": "99", "reason": field(l, 4, 6), "means": return_reason(field(l, 4, 6)), "original_trace": field(l, 7, 21), "date_of_death": field(l, 22, 27).trim(), "original_rdfi": field(l, 28, 35), "text": field(l, 36, 79).trim(), "trace": field(l, 80, 94) }),
+                    "98" => json!({ "type": "98", "reason": field(l, 4, 6), "means": return_reason(field(l, 4, 6)), "original_trace": field(l, 7, 21), "original_rdfi": field(l, 28, 35), "corrected": field(l, 36, 64).trim(), "trace": field(l, 80, 94) }),
+                    o => { p.push(format!("line {}: addenda type `{}` is not 05, 98 or 99", n, o)); Value::Null }
+                };
+                if let Some(a) = e["addenda"].as_array_mut() { a.push(addenda); }
+            }
+            "8" => {
+                let Some(mut b) = cur.take() else {
+                    p.push(format!("line {}: a batch control with no batch open", n));
+                    continue;
+                };
+                let hashed = hash % 10_000_000_000;
+                let checks = [
+                    ("entry and addenda count", field(l, 5, 10), count, 6),
+                    ("entry hash", field(l, 11, 20), hashed, 10),
+                    ("total debits", field(l, 21, 32), debit, 12),
+                    ("total credits", field(l, 33, 44), credit, 12),
+                ];
+                for (name, got, want, width) in checks {
+                    if int(got) != Some(want) { p.push(format!("line {}: batch {}, {} `{}` should be {}", n, b["number"], name, got, num(want, width))); }
+                }
+                if field(l, 2, 4) != num(b["service_class"].as_i64().unwrap_or(0), 3) { p.push(format!("line {}: service class differs from the batch header", n)); }
+                if field(l, 45, 54).trim() != b["company_id"].as_str().unwrap_or("") { p.push(format!("line {}: company id differs from the batch header", n)); }
+                if field(l, 80, 87) != b["odfi"].as_str().unwrap_or("") { p.push(format!("line {}: bank differs from the batch header", n)); }
+                if int(field(l, 88, 94)) != b["number"].as_i64() { p.push(format!("line {}: batch number differs from the batch header", n)); }
+                b.insert("entry_count".into(), json!(count));
+                b.insert("entry_hash".into(), json!(hashed));
+                b.insert("total_debit_cents".into(), json!(debit));
+                b.insert("total_credit_cents".into(), json!(credit));
+                b.insert("entries".into(), Value::Array(std::mem::take(&mut entries)));
+                batches.push(Value::Object(b));
+                f_count += count; f_hash += hashed; f_debit += debit; f_credit += credit;
+            }
+            "9" => {
+                if cur.is_some() { p.push(format!("line {}: the file ends inside a batch", n)); cur = None; }
+                control = Some((n, l.to_string()));
+            }
+            o => p.push(format!("line {}: record type `{}` is not 1, 5, 6, 7, 8 or 9", n, o)),
+        }
+    }
+    let blocks = (lines.len() as i64 + 9) / 10;
+    match &control {
+        None => { if !lines.is_empty() { p.push(format!("line {}: the file has no file control record", lines.len())); } }
+        Some((n, l)) => {
+            let checks = [
+                ("batch count", field(l, 2, 7), batches.len() as i64, 6),
+                ("block count", field(l, 8, 13), blocks, 6),
+                ("entry and addenda count", field(l, 14, 21), f_count, 8),
+                ("entry hash", field(l, 22, 31), f_hash % 10_000_000_000, 10),
+                ("total debits", field(l, 32, 43), f_debit, 12),
+                ("total credits", field(l, 44, 55), f_credit, 12),
+            ];
+            for (name, got, want, width) in checks {
+                if int(got) != Some(want) { p.push(format!("line {}: file control, {} `{}` should be {}", n, name, got, num(want, width))); }
+            }
+        }
+    }
+    out.insert("batch_count".into(), json!(batches.len()));
+    out.insert("entry_count".into(), json!(f_count));
+    out.insert("entry_hash".into(), json!(f_hash % 10_000_000_000));
+    out.insert("total_debit_cents".into(), json!(f_debit));
+    out.insert("total_credit_cents".into(), json!(f_credit));
+    out.insert("block_count".into(), json!(blocks));
+    out.insert("padding_lines".into(), json!(padding));
+    out.insert("batches".into(), Value::Array(batches));
+    (Value::Object(out), p)
+}
+
+/// Reads an ACH file into its header, batches and entries, addenda, returns (type 99) and changes (type 98) among them. Any problem is an error naming its line; `nacha_check` lists them all.
+pub fn nacha_parse(text: &str) -> Result<Value, String> {
+    let (v, p) = read(text);
+    match p.into_iter().next() {
+        Some(first) => Err(first),
+        None => Ok(v),
+    }
+}
+
+/// Every problem in an ACH file: `{ ok, problems, batch_count, entry_count, entry_hash, total_debit_cents, total_credit_cents }`, each problem starting `line N:`.
+pub fn nacha_check(text: &str) -> Value {
+    let (v, p) = read(text);
+    json!({
+        "ok": p.is_empty(), "problems": p, "batch_count": v["batch_count"], "entry_count": v["entry_count"], "entry_hash": v["entry_hash"],
+        "total_debit_cents": v["total_debit_cents"], "total_credit_cents": v["total_credit_cents"],
+    })
+}
+
+/// Reads an ACH file from disk as `nacha_parse` does.
+pub fn nacha_read_file(path: &str) -> Result<Value, String> {
+    nacha_parse(&std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?)
+}
+
+/// A flat list of a file's entries, each with its batch's company, SEC code and effective date: `{ company_name, sec_code, effective_date, kind, name, amount_cents, routing, account, trace, line, addenda }`.
+pub fn nacha_entries(text: &str) -> Result<Vec<Value>, String> {
+    let v = nacha_parse(text)?;
+    let mut out = vec![];
+    for b in v["batches"].as_array().into_iter().flatten() {
+        for e in b["entries"].as_array().into_iter().flatten() {
+            out.push(json!({
+                "company_name": b["company_name"], "sec_code": b["sec_code"], "effective_date": b["effective_date"], "kind": e["kind"], "name": e["name"],
+                "amount_cents": e["amount_cents"], "routing": e["routing"], "account": e["account"], "trace": e["trace"], "line": e["line"], "addenda": e["addenda"],
+            }));
+        }
+    }
+    Ok(out)
+}

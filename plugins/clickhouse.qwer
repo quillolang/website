@@ -1,0 +1,283 @@
+//! ClickHouse over its HTTP interface: queries with typed parameters, JSONEachRow inserts with deduplication and async inserts, results typed by the columns ClickHouse reports (64-bit integers back to numbers, decimals kept exact), and errors read from the body, including the ones that arrive after a 200.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::Read;
+use std::time::Duration;
+
+// CLICKHOUSE_API_URL is the server (http://localhost:8123 when not set), CLICKHOUSE_DATABASE the
+// database, CLICKHOUSE_USER and CLICKHOUSE_PASSWORD who signs in.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn base() -> String {
+    env("CLICKHOUSE_API_URL").unwrap_or_else(|| "http://localhost:8123".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// `Code: 60. DB::Exception: Table x does not exist. (UNKNOWN_TABLE) (version 24.3)` as a short sentence.
+fn parse_error(text: &str, header_code: Option<&str>) -> String {
+    let t = text.trim();
+    let start = t.rfind("Code: ").unwrap_or(0);
+    let e = &t[start..];
+    let code = e.strip_prefix("Code: ").and_then(|r| r.split('.').next()).map(str::to_string).or(header_code.map(str::to_string)).unwrap_or_default();
+    let msg = e.split_once("DB::Exception: ").map_or(e, |x| x.1);
+    let msg = msg.split(" (version ").next().unwrap_or(msg);
+    let (msg, name) = match msg.rfind(" (") {
+        Some(i) if msg.ends_with(')') && msg[i + 2..msg.len() - 1].chars().all(|c| c.is_ascii_uppercase() || c == '_') => (&msg[..i], Some(&msg[i + 2..msg.len() - 1])),
+        _ => (msg, None),
+    };
+    match name {
+        Some(n) => format!("ClickHouse error {} {}: {}", code, n, msg.trim()),
+        None => format!("ClickHouse error {}: {}", code, msg.trim()),
+    }
+}
+
+/// An error sent after the 200 went out sits at the end of a body that is no longer JSON.
+fn late_error(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]);
+    text.contains("__exception__") || (tail.contains("DB::Exception: ") && tail.contains("Code: "))
+}
+
+struct Reply {
+    text: String,
+    summary: Value,
+}
+
+fn post(params: &[(String, String)], body: Vec<u8>) -> Result<Reply, String> {
+    let mut q: Vec<String> = vec![];
+    if let Some(d) = env("CLICKHOUSE_DATABASE") {
+        q.push(format!("database={}", enc(&d)));
+    }
+    q.extend(params.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))));
+    let url = format!("{}/?{}", base(), q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).build();
+    let mut req = agent.post(&url).set("Content-Type", "text/plain; charset=utf-8");
+    if let Some(u) = env("CLICKHOUSE_USER") {
+        req = req.set("X-ClickHouse-User", &u);
+    }
+    if let Some(p) = env("CLICKHOUSE_PASSWORD") {
+        req = req.set("X-ClickHouse-Key", &p);
+    }
+    match req.send_bytes(&body) {
+        Ok(r) => {
+            let summary = r.header("X-ClickHouse-Summary").and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!({}));
+            let mut text = String::new();
+            r.into_reader().read_to_string(&mut text).map_err(|e| format!("ClickHouse broke off its answer: {}", e))?;
+            Ok(Reply { text, summary })
+        }
+        Err(ureq::Error::Status(c, r)) => {
+            let code = r.header("X-ClickHouse-Exception-Code").map(str::to_string);
+            let t = r.into_string().unwrap_or_default();
+            if c == 401 || c == 403 || t.contains("AUTHENTICATION_FAILED") {
+                return Err(format!("{} (check CLICKHOUSE_USER and CLICKHOUSE_PASSWORD)", parse_error(&t, code.as_deref())));
+            }
+            Err(parse_error(&t, code.as_deref()))
+        }
+        Err(e) => Err(format!("cannot reach ClickHouse at {}: {}", base(), e)),
+    }
+}
+
+/// A value as a literal inside an Array, Tuple or Map parameter: strings in single quotes.
+fn literal(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+        Value::Null => "NULL".into(),
+        Value::Array(a) => format!("[{}]", a.iter().map(literal).collect::<Vec<_>>().join(",")),
+        Value::Object(m) => format!("{{{}}}", m.iter().map(|(k, x)| format!("'{}':{}", k.replace('\\', "\\\\").replace('\'', "\\'"), literal(x))).collect::<Vec<_>>().join(",")),
+        o => o.to_string(),
+    }
+}
+
+/// A value as `param_<name>` wants it: the "escaped" format, where tab, line break and backslash in a text would otherwise end or change it, and null is `\N`.
+fn param_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n").replace('\r', "\\r"),
+        Value::Null => "\\N".into(),
+        Value::Array(_) | Value::Object(_) => literal(v),
+        o => o.to_string(),
+    }
+}
+
+/// Unwraps the types that do not change a value's form.
+fn inner(t: &str) -> &str {
+    for w in ["Nullable(", "LowCardinality("] {
+        if let Some(r) = t.strip_prefix(w) {
+            return inner(r.strip_suffix(')').unwrap_or(r));
+        }
+    }
+    t
+}
+
+/// The top-level parts of `A, B(C, D), E`.
+fn split_types(t: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut out) = (0i32, 0usize, vec![]);
+    for (i, c) in t.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(t[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(t[start..].trim());
+    out
+}
+
+/// A cell by its column type: Int64 and UInt64 arrive as text (JavaScript's limit), so they come back as numbers when they fit; Decimal and the 128 and 256-bit integers stay text, being exact.
+fn typed(t: &str, v: &Value) -> Value {
+    let t = inner(t);
+    if v.is_null() {
+        return Value::Null;
+    }
+    if let Some(r) = t.strip_prefix("Array(").and_then(|r| r.strip_suffix(')')) {
+        return Value::Array(v.as_array().into_iter().flatten().map(|x| typed(r, x)).collect());
+    }
+    if let Some(r) = t.strip_prefix("Tuple(").and_then(|r| r.strip_suffix(')')) {
+        let parts: Vec<&str> = split_types(r).into_iter().map(|p| p.rsplit_once(' ').filter(|(n, _)| !n.contains('(')).map_or(p, |x| x.1)).collect();
+        return Value::Array(v.as_array().into_iter().flatten().zip(parts).map(|(x, p)| typed(p, x)).collect());
+    }
+    if let Some(r) = t.strip_prefix("Map(").and_then(|r| r.strip_suffix(')')) {
+        let parts = split_types(r);
+        let value_type = parts.get(1).copied().unwrap_or("String");
+        return Value::Object(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), typed(value_type, x))).collect());
+    }
+    if t == "Int64" || t == "UInt64" {
+        if let Some(s) = v.as_str() {
+            if let Ok(n) = s.parse::<i64>() {
+                return json!(n);
+            }
+            if let Ok(n) = s.parse::<u64>() {
+                return json!(n);
+            }
+        }
+    }
+    v.clone()
+}
+
+fn table_of(v: &Value, summary: &Value) -> Value {
+    let meta: Vec<(String, String)> = v["meta"].as_array().into_iter().flatten().map(|m| (m["name"].as_str().unwrap_or("").to_string(), m["type"].as_str().unwrap_or("").to_string())).collect();
+    let rows: Vec<Value> = v["data"].as_array().into_iter().flatten().map(|r| {
+        let mut o = Map::new();
+        for (cell, (name, kind)) in r.as_array().into_iter().flatten().zip(&meta) {
+            o.insert(name.clone(), typed(kind, cell));
+        }
+        Value::Object(o)
+    }).collect();
+    let columns: Vec<Value> = meta.iter().map(|(n, t)| json!({ "name": n, "type": t })).collect();
+    let mut o = json!({ "columns": columns, "rows": rows, "row_count": v["rows"], "statistics": v["statistics"], "summary": summary });
+    if let Some(t) = v.get("rows_before_limit_at_least") {
+        o["rows_before_limit"] = t.clone();
+    }
+    if v.get("totals").is_some() {
+        o["totals"] = v["totals"].clone();
+    }
+    o
+}
+
+fn params_of(params: &Value, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    match params {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for (k, v) in m {
+                if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err(format!("{:?} is not a parameter name", k));
+                }
+                out.push((format!("param_{}", k), param_text(v)));
+            }
+            Ok(())
+        }
+        _ => Err("parameters are a map, or null: { user: \"ada\" } for {user:String} in the query".into()),
+    }
+}
+
+/// A SELECT. Write parameters into the SQL as `{name:Type}` and give their values in `params` (a map, or null), never by joining text. Gives `{ columns: [{ name, type }], rows: [{ column: value }], row_count, statistics, summary }`, each value by its column's type. An error after the 200 (a query that fails midway) is still an error.
+pub fn clickhouse_query(sql: &str, params: serde_json::Value) -> Result<Value, String> {
+    let mut p = vec![("default_format".to_string(), "JSONCompact".to_string()), ("output_format_json_quote_decimals".to_string(), "1".to_string()), ("output_format_json_quote_64bit_integers".to_string(), "1".to_string())];
+    params_of(&params, &mut p)?;
+    let r = post(&p, sql.as_bytes().to_vec())?;
+    let v: Value = serde_json::from_str(&r.text).map_err(|_| {
+        if late_error(&r.text) {
+            return parse_error(&r.text, None);
+        }
+        format!("the query's answer is not JSONCompact (leave FORMAT out of the query): {}", r.text.chars().take(200).collect::<String>())
+    })?;
+    Ok(table_of(&v, &r.summary))
+}
+
+/// The first row of a SELECT, or null.
+pub fn clickhouse_one(sql: &str, params: serde_json::Value) -> Result<Value, String> {
+    let r = clickhouse_query(sql, params)?;
+    Ok(r["rows"].get(0).cloned().unwrap_or(Value::Null))
+}
+
+/// A statement with no rows to give: CREATE, ALTER, DROP, OPTIMIZE, or an INSERT ... SELECT. Waits for the end of the query, so a failure midway is reported. Gives the server's summary, `{ written_rows, read_rows, ... }`.
+pub fn clickhouse_exec(sql: &str, params: serde_json::Value) -> Result<Value, String> {
+    let mut p = vec![("wait_end_of_query".to_string(), "1".to_string())];
+    params_of(&params, &mut p)?;
+    Ok(post(&p, sql.as_bytes().to_vec())?.summary)
+}
+
+fn identifier(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("no table given".into());
+    }
+    Ok(name.split('.').map(|p| format!("`{}`", p.replace('\\', "\\\\").replace('`', "\\`"))).collect::<Vec<_>>().join("."))
+}
+
+/// Rows into `table` (`db.table` also works) as JSONEachRow, one object per line, in one request. `options`: `async` (true: the server batches them, and this waits until they are written), `dedup_token` (a retry of the same batch writes once, on Replicated tables), `skip_unknown` (ignore fields the table lacks). Gives `{ rows, written_rows }`.
+pub fn clickhouse_insert(table: &str, rows: Vec<serde_json::Value>, options: serde_json::Value) -> Result<Value, String> {
+    if rows.is_empty() {
+        return Ok(json!({ "rows": 0, "written_rows": 0 }));
+    }
+    let mut p = vec![("query".to_string(), format!("INSERT INTO {} FORMAT JSONEachRow", identifier(table)?)), ("wait_end_of_query".to_string(), "1".to_string())];
+    if options["async"] == true {
+        p.push(("async_insert".to_string(), "1".to_string()));
+        p.push(("wait_for_async_insert".to_string(), "1".to_string()));
+    }
+    if let Some(t) = options["dedup_token"].as_str() {
+        p.push(("insert_deduplication_token".to_string(), t.to_string()));
+    }
+    if options["skip_unknown"] == true {
+        p.push(("input_format_skip_unknown_fields".to_string(), "1".to_string()));
+    }
+    let mut body = Vec::new();
+    for r in &rows {
+        if !r.is_object() {
+            return Err("each row is a map of column to value".into());
+        }
+        body.extend_from_slice(r.to_string().as_bytes());
+        body.push(b'\n');
+    }
+    let r = post(&p, body)?;
+    let written = r.summary["written_rows"].as_str().and_then(|s| s.parse::<i64>().ok()).or(r.summary["written_rows"].as_i64());
+    Ok(json!({ "rows": rows.len(), "written_rows": written }))
+}
+
+/// True when the server answers on /ping.
+pub fn clickhouse_ping() -> Result<bool, String> {
+    let r = ureq::get(&format!("{}/ping", base())).timeout(Duration::from_secs(5)).call();
+    match r {
+        Ok(a) => Ok(a.into_string().map_err(|e| e.to_string())?.trim() == "Ok."),
+        Err(ureq::Error::Status(..)) => Ok(false),
+        Err(e) => Err(format!("cannot reach ClickHouse at {}: {}", base(), e)),
+    }
+}
+
+/// A table or column name quoted for use in SQL, for the names parameters cannot stand in for (or use the `{name:Identifier}` parameter type).
+pub fn clickhouse_quote_name(name: &str) -> Result<String, String> {
+    identifier(name)
+}

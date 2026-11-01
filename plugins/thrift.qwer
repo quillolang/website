@@ -1,0 +1,757 @@
+//! Apache Thrift without generated code: the binary and compact protocols encoded and decoded from a schema-less value form, TMessage framing strict and old, and a call to a framed-transport server with its result, declared exceptions and TApplicationException read.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
+
+// A struct is a list of fields: [{ id: 1, type: "string", value: "hi" }].
+// Types: bool, byte, i16, i32, i64, double, string, binary (hex), uuid, struct (a list of fields),
+// list and set (with `elem`), map (with `key` and `val`; the value is a list of [key, value]).
+// `elem`, `key` and `val` are a type's name, or a map like { type: "list", elem: "i32" } for one
+// inside another. Decoding gives the same form back, and a string that is not UTF-8 as binary.
+
+const MAX_FRAME: usize = 64 << 20;
+const MAX_DEPTH: usize = 64;
+
+const STOP: u8 = 0;
+const BOOL: u8 = 2;
+const BYTE: u8 = 3;
+const DOUBLE: u8 = 4;
+const I16: u8 = 6;
+const I32: u8 = 8;
+const I64: u8 = 10;
+const STRING: u8 = 11;
+const STRUCT: u8 = 12;
+const MAP: u8 = 13;
+const SET: u8 = 14;
+const LIST: u8 = 15;
+const UUID: u8 = 16;
+
+const CALL: u8 = 1;
+const REPLY: u8 = 2;
+const EXCEPTION: u8 = 3;
+const ONEWAY: u8 = 4;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Proto {
+    Binary,
+    Compact,
+}
+
+fn proto_of(n: &str) -> Result<Proto, String> {
+    match n {
+        "binary" | "" => Ok(Proto::Binary),
+        "compact" => Ok(Proto::Compact),
+        p => Err(format!("`{}` is not a protocol: binary or compact", p)),
+    }
+}
+
+fn type_code(n: &str) -> Result<u8, String> {
+    Ok(match n {
+        "bool" => BOOL,
+        "byte" | "i8" => BYTE,
+        "double" => DOUBLE,
+        "i16" => I16,
+        "i32" => I32,
+        "i64" => I64,
+        "string" | "binary" => STRING,
+        "struct" => STRUCT,
+        "map" => MAP,
+        "set" => SET,
+        "list" => LIST,
+        "uuid" => UUID,
+        t => return Err(format!("`{}` is not a Thrift type", t)),
+    })
+}
+
+fn type_name(c: u8) -> &'static str {
+    match c {
+        BOOL => "bool",
+        BYTE => "byte",
+        DOUBLE => "double",
+        I16 => "i16",
+        I32 => "i32",
+        I64 => "i64",
+        STRING => "string",
+        STRUCT => "struct",
+        MAP => "map",
+        SET => "set",
+        LIST => "list",
+        UUID => "uuid",
+        _ => "unknown",
+    }
+}
+
+// A type given as text or a map: its code, and the map for what is inside.
+fn descriptor(t: &Value) -> Result<(u8, &str, Value), String> {
+    match t {
+        Value::String(s) => Ok((type_code(s)?, s.as_str(), Value::Null)),
+        Value::Object(_) => {
+            let n = t.get("type").and_then(|v| v.as_str()).ok_or("a nested type needs `type`")?;
+            Ok((type_code(n)?, n, t.clone()))
+        }
+        _ => Err(format!("{} is not a type", t)),
+    }
+}
+
+fn compact_type(c: u8) -> Result<u8, String> {
+    Ok(match c {
+        BOOL => 1,
+        BYTE => 3,
+        I16 => 4,
+        I32 => 5,
+        I64 => 6,
+        DOUBLE => 7,
+        STRING => 8,
+        LIST => 9,
+        SET => 10,
+        MAP => 11,
+        STRUCT => 12,
+        UUID => 13,
+        x => return Err(format!("type {} has no compact form", x)),
+    })
+}
+
+fn from_compact(c: u8) -> Result<u8, String> {
+    Ok(match c {
+        1 | 2 => BOOL,
+        3 => BYTE,
+        4 => I16,
+        5 => I32,
+        6 => I64,
+        7 => DOUBLE,
+        8 => STRING,
+        9 => LIST,
+        10 => SET,
+        11 => MAP,
+        12 => STRUCT,
+        13 => UUID,
+        x => return Err(format!("compact type {} is not known", x)),
+    })
+}
+
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8 & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+fn unzig(v: u64) -> i64 {
+    ((v >> 1) as i64) ^ -((v & 1) as i64)
+}
+
+fn int_in(v: &Value, lo: i64, hi: i64, ty: &str) -> Result<i64, String> {
+    let n = v.as_i64().ok_or(format!("{} is not a whole number for {}", v, ty))?;
+    if n < lo || n > hi {
+        return Err(format!("{} is out of range for {}", n, ty));
+    }
+    Ok(n)
+}
+
+fn string_bytes(v: &Value, ty: &str) -> Result<Vec<u8>, String> {
+    let s = v.as_str().ok_or(format!("{} is not text for {}", v, ty))?;
+    if ty == "binary" {
+        hex::decode(s).map_err(|_| "a binary value is hex".to_string())
+    } else {
+        Ok(s.as_bytes().to_vec())
+    }
+}
+
+fn uuid_bytes(v: &Value) -> Result<Vec<u8>, String> {
+    let s = v.as_str().ok_or("a uuid is text")?.replace('-', "");
+    let b = hex::decode(&s).map_err(|_| format!("`{}` is not a uuid", s))?;
+    if b.len() != 16 {
+        return Err(format!("`{}` is not a uuid", s));
+    }
+    Ok(b)
+}
+
+fn write_value(out: &mut Vec<u8>, p: Proto, ty: &Value, v: &Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err("a value nested too deep".into());
+    }
+    let (code, name, inner) = descriptor(ty)?;
+    match code {
+        BOOL => {
+            let b = v.as_bool().ok_or(format!("{} is not a bool", v))?;
+            // Compact keeps a field's bool in its header, so this is for lists: 1 true, 2 false.
+            out.push(if p == Proto::Compact { if b { 1 } else { 2 } } else { b as u8 });
+        }
+        BYTE => out.push(int_in(v, -128, 127, "byte")? as u8),
+        I16 => {
+            let n = int_in(v, -32768, 32767, "i16")?;
+            match p {
+                Proto::Binary => out.extend((n as i16).to_be_bytes()),
+                Proto::Compact => varint(out, zigzag(n)),
+            }
+        }
+        I32 => {
+            let n = int_in(v, i32::MIN as i64, i32::MAX as i64, "i32")?;
+            match p {
+                Proto::Binary => out.extend((n as i32).to_be_bytes()),
+                Proto::Compact => varint(out, zigzag(n)),
+            }
+        }
+        I64 => {
+            let n = v.as_i64().ok_or(format!("{} is not a whole number for i64", v))?;
+            match p {
+                Proto::Binary => out.extend(n.to_be_bytes()),
+                Proto::Compact => varint(out, zigzag(n)),
+            }
+        }
+        DOUBLE => {
+            let x = v.as_f64().ok_or(format!("{} is not a number", v))?;
+            match p {
+                Proto::Binary => out.extend(x.to_be_bytes()),
+                Proto::Compact => out.extend(x.to_le_bytes()), // little-endian here, as the spec says
+            }
+        }
+        STRING => {
+            let b = string_bytes(v, name)?;
+            match p {
+                Proto::Binary => out.extend((b.len() as i32).to_be_bytes()),
+                Proto::Compact => varint(out, b.len() as u64),
+            }
+            out.extend(b);
+        }
+        UUID => out.extend(uuid_bytes(v)?),
+        STRUCT => write_struct(out, p, v, depth + 1)?,
+        LIST | SET => {
+            let elem = inner.get("elem").or(None).cloned().ok_or(format!("a {} needs `elem`", name))?;
+            let (e, _, _) = descriptor(&elem)?;
+            let items = v.as_array().ok_or(format!("a {} is a list", name))?;
+            match p {
+                Proto::Binary => {
+                    out.push(e);
+                    out.extend((items.len() as i32).to_be_bytes());
+                }
+                Proto::Compact => {
+                    let c = compact_type(e)?;
+                    if items.len() < 15 {
+                        out.push((items.len() as u8) << 4 | c);
+                    } else {
+                        out.push(0xf0 | c);
+                        varint(out, items.len() as u64);
+                    }
+                }
+            }
+            for x in items {
+                write_value(out, p, &elem, x, depth + 1)?;
+            }
+        }
+        MAP => {
+            let k = inner.get("key").cloned().ok_or("a map needs `key`")?;
+            let w = inner.get("val").cloned().ok_or("a map needs `val`")?;
+            let (kc, _, _) = descriptor(&k)?;
+            let (vc, _, _) = descriptor(&w)?;
+            let items = v.as_array().ok_or("a map's value is a list of [key, value]")?;
+            match p {
+                Proto::Binary => {
+                    out.push(kc);
+                    out.push(vc);
+                    out.extend((items.len() as i32).to_be_bytes());
+                }
+                Proto::Compact => {
+                    varint(out, items.len() as u64);
+                    if !items.is_empty() {
+                        out.push(compact_type(kc)? << 4 | compact_type(vc)?);
+                    }
+                }
+            }
+            for pair in items {
+                let a = pair.as_array().filter(|a| a.len() == 2).ok_or("a map's value is a list of [key, value]")?;
+                write_value(out, p, &k, &a[0], depth + 1)?;
+                write_value(out, p, &w, &a[1], depth + 1)?;
+            }
+        }
+        _ => return Err(format!("type {} cannot be written", code)),
+    }
+    Ok(())
+}
+
+fn nested(field: &Value) -> Value {
+    // A field's own map carries `elem`, `key` and `val`, so it serves as its descriptor.
+    field.clone()
+}
+
+fn write_struct(out: &mut Vec<u8>, p: Proto, fields: &Value, depth: usize) -> Result<(), String> {
+    let list = fields.as_array().ok_or("a struct is a list of fields")?;
+    let mut last: i64 = 0;
+    for f in list {
+        let id = f.get("id").and_then(|v| v.as_i64()).filter(|x| (-32768..=32767).contains(x)).ok_or(format!("a field needs an `id`: {}", f))?;
+        let v = f.get("value").ok_or(format!("field {} has no `value`", id))?;
+        if v.is_null() {
+            continue; // an unset optional field
+        }
+        let (code, _, _) = descriptor(f.get("type").ok_or(format!("field {} has no `type`", id))?)?;
+        match p {
+            Proto::Binary => {
+                out.push(code);
+                out.extend((id as i16).to_be_bytes());
+                write_value(out, p, &nested(f), v, depth)?;
+            }
+            Proto::Compact => {
+                let c = if code == BOOL { if v.as_bool().ok_or(format!("{} is not a bool", v))? { 1 } else { 2 } } else { compact_type(code)? };
+                let delta = id - last;
+                if delta > 0 && delta <= 15 {
+                    out.push((delta as u8) << 4 | c);
+                } else {
+                    out.push(c);
+                    varint(out, zigzag(id));
+                }
+                last = id;
+                if code != BOOL {
+                    write_value(out, p, &nested(f), v, depth)?;
+                }
+            }
+        }
+    }
+    out.push(STOP);
+    Ok(())
+}
+
+struct In<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> In<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let e = self.i.checked_add(n).filter(|e| *e <= self.b.len()).ok_or(format!("the data ends at byte {}, in the middle of a value", self.i))?;
+        let s = &self.b[self.i..e];
+        self.i = e;
+        Ok(s)
+    }
+    fn byte(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn i16(&mut self) -> Result<i16, String> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+    fn i32(&mut self) -> Result<i32, String> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn varint(&mut self) -> Result<u64, String> {
+        let mut v = 0u64;
+        let mut s = 0;
+        loop {
+            let x = self.byte()?;
+            v |= ((x & 0x7f) as u64) << s;
+            if x & 0x80 == 0 {
+                return Ok(v);
+            }
+            s += 7;
+            if s > 63 {
+                return Err("a varint too long".into());
+            }
+        }
+    }
+    fn size(&mut self, p: Proto) -> Result<usize, String> {
+        let n = match p {
+            Proto::Binary => self.i32()? as i64,
+            Proto::Compact => self.varint()? as i64,
+        };
+        if n < 0 {
+            return Err(format!("a negative size, {}", n));
+        }
+        Ok(n as usize)
+    }
+}
+
+fn descriptor_map(t: u8, inner: Map<String, Value>) -> Value {
+    if inner.is_empty() {
+        json!(type_name(t))
+    } else {
+        let mut m = Map::new();
+        m.insert("type".into(), json!(type_name(t)));
+        m.extend(inner);
+        Value::Object(m)
+    }
+}
+
+fn read_value(r: &mut In, p: Proto, code: u8, bool_header: Option<bool>, depth: usize) -> Result<(Value, Map<String, Value>, &'static str), String> {
+    if depth > MAX_DEPTH {
+        return Err("a value nested too deep".into());
+    }
+    let mut extra = Map::new();
+    let mut name = type_name(code);
+    let v = match code {
+        BOOL => match bool_header {
+            Some(b) => json!(b),
+            None => match p {
+                Proto::Binary => json!(r.byte()? != 0),
+                Proto::Compact => json!(r.byte()? == 1),
+            },
+        },
+        BYTE => json!(r.byte()? as i8),
+        I16 => match p {
+            Proto::Binary => json!(r.i16()?),
+            Proto::Compact => json!(unzig(r.varint()?)),
+        },
+        I32 => match p {
+            Proto::Binary => json!(r.i32()?),
+            Proto::Compact => json!(unzig(r.varint()?)),
+        },
+        I64 => match p {
+            Proto::Binary => {
+                let b = r.take(8)?;
+                json!(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            }
+            Proto::Compact => json!(unzig(r.varint()?)),
+        },
+        DOUBLE => {
+            let b: [u8; 8] = r.take(8)?.try_into().map_err(|_| "cut off")?;
+            json!(if p == Proto::Binary { f64::from_be_bytes(b) } else { f64::from_le_bytes(b) })
+        }
+        STRING => {
+            let n = r.size(p)?;
+            let b = r.take(n)?;
+            match std::str::from_utf8(b) {
+                Ok(t) => json!(t),
+                Err(_) => {
+                    name = "binary";
+                    json!(hex::encode(b))
+                }
+            }
+        }
+        UUID => {
+            let b = r.take(16)?;
+            let h = hex::encode(b);
+            json!(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+        }
+        STRUCT => read_struct(r, p, depth + 1)?,
+        LIST | SET => {
+            let (e, n) = match p {
+                Proto::Binary => {
+                    let e = r.byte()?;
+                    (e, r.size(p)?)
+                }
+                Proto::Compact => {
+                    let h = r.byte()?;
+                    let n = if h >> 4 == 15 { r.varint()? as usize } else { (h >> 4) as usize };
+                    (from_compact(h & 15)?, n)
+                }
+            };
+            // Each element takes at least a byte, so a size past the data is a lie, not a big list.
+            if n > r.b.len() - r.i {
+                return Err(format!("a list says {} items; {} bytes are left", n, r.b.len() - r.i));
+            }
+            let mut items = vec![];
+            let mut einner = Map::new();
+            for _ in 0..n {
+                let (x, m, _) = read_value(r, p, e, None, depth + 1)?;
+                einner = m;
+                items.push(x);
+            }
+            extra.insert("elem".into(), descriptor_map(e, einner));
+            json!(items)
+        }
+        MAP => {
+            let (k, w, n) = match p {
+                Proto::Binary => {
+                    let (a, b) = (r.byte()?, r.byte()?);
+                    (a, b, r.size(p)?)
+                }
+                Proto::Compact => {
+                    let n = r.varint()? as usize;
+                    if n == 0 {
+                        (STRING, STRING, 0)
+                    } else {
+                        let h = r.byte()?;
+                        (from_compact(h >> 4)?, from_compact(h & 15)?, n)
+                    }
+                }
+            };
+            if n > r.b.len() - r.i {
+                return Err(format!("a map says {} items; {} bytes are left", n, r.b.len() - r.i));
+            }
+            let mut items = vec![];
+            let (mut ki, mut vi) = (Map::new(), Map::new());
+            for _ in 0..n {
+                let (a, m1, _) = read_value(r, p, k, None, depth + 1)?;
+                let (b, m2, _) = read_value(r, p, w, None, depth + 1)?;
+                ki = m1;
+                vi = m2;
+                items.push(json!([a, b]));
+            }
+            extra.insert("key".into(), descriptor_map(k, ki));
+            extra.insert("val".into(), descriptor_map(w, vi));
+            json!(items)
+        }
+        x => return Err(format!("wire type {} is not known", x)),
+    };
+    Ok((v, extra, name))
+}
+
+fn read_struct(r: &mut In, p: Proto, depth: usize) -> Result<Value, String> {
+    let mut fields = vec![];
+    let mut last: i64 = 0;
+    loop {
+        let h = r.byte()?;
+        if h == STOP {
+            return Ok(json!(fields));
+        }
+        let (code, id, b) = match p {
+            Proto::Binary => (h, r.i16()? as i64, None),
+            Proto::Compact => {
+                let delta = (h >> 4) as i64;
+                let c = h & 15;
+                let id = if delta == 0 { unzig(r.varint()?) } else { last + delta };
+                last = id;
+                let b = match c {
+                    1 => Some(true),
+                    2 => Some(false),
+                    _ => None,
+                };
+                (from_compact(c)?, id, b)
+            }
+        };
+        let (v, extra, name) = read_value(r, p, code, b, depth)?;
+        let mut f = Map::new();
+        f.insert("id".into(), json!(id));
+        f.insert("type".into(), json!(name));
+        f.extend(extra);
+        f.insert("value".into(), v);
+        fields.push(Value::Object(f));
+    }
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => hex::decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex".to_string()),
+        _ => Err("give bytes as hex or a list of numbers".into()),
+    }
+}
+
+/// Encodes a struct, a list of `{ id, type, value }` fields, as hex in "binary" or "compact". A field whose `value` is null is left out, as an unset optional is.
+pub fn thrift_encode(fields: serde_json::Value, protocol: &str) -> Result<String, String> {
+    let mut out = vec![];
+    write_struct(&mut out, proto_of(protocol)?, &fields, 0)?;
+    Ok(hex::encode(out))
+}
+
+/// Decodes a struct from hex or bytes into the value form `thrift_encode` takes, with no schema: types come from the wire. Field names are not on the wire, so `thrift_fields` gives them.
+pub fn thrift_decode(data: serde_json::Value, protocol: &str) -> Result<Value, String> {
+    let b = bytes_of(&data)?;
+    let mut r = In { b: &b, i: 0 };
+    read_struct(&mut r, proto_of(protocol)?, 0)
+}
+
+/// A decoded struct as a plain map, with `names` turning ids into names: `thrift_fields(s, { "1": "name" })`; a field with no name is `field_N`.
+pub fn thrift_fields(fields: serde_json::Value, names: serde_json::Value) -> Result<Value, String> {
+    fn plain(v: &Value, f: &Value, names: &Value) -> Value {
+        let t = f.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if t == "struct" {
+            return flat(v, &json!({}));
+        }
+        if t == "list" || t == "set" {
+            let elem = f.get("elem").cloned().unwrap_or(Value::Null);
+            let desc = if elem.is_object() { elem } else { json!({ "type": elem }) };
+            return json!(v.as_array().map(|a| a.iter().map(|x| plain(x, &desc, names)).collect::<Vec<_>>()));
+        }
+        v.clone()
+    }
+    fn flat(list: &Value, names: &Value) -> Value {
+        let mut m = Map::new();
+        for f in list.as_array().into_iter().flatten() {
+            let id = f["id"].to_string();
+            let k = names.get(&id).and_then(|v| v.as_str()).map(String::from).unwrap_or(format!("field_{}", id));
+            m.insert(k, plain(&f["value"], f, names));
+        }
+        Value::Object(m)
+    }
+    if !fields.is_array() {
+        return Err("a struct is a list of fields".into());
+    }
+    Ok(flat(&fields, &names))
+}
+
+fn message_bytes(p: Proto, name: &str, kind: u8, seq: i32, body: &Value) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    match p {
+        Proto::Binary => {
+            out.extend((0x8001_0000u32 | kind as u32).to_be_bytes());
+            out.extend((name.len() as i32).to_be_bytes());
+            out.extend(name.as_bytes());
+            out.extend(seq.to_be_bytes());
+        }
+        Proto::Compact => {
+            out.push(0x82);
+            out.push(kind << 5 | 1);
+            varint(&mut out, seq as u32 as u64);
+            varint(&mut out, name.len() as u64);
+            out.extend(name.as_bytes());
+        }
+    }
+    write_struct(&mut out, p, body, 0)?;
+    Ok(out)
+}
+
+fn read_message(b: &[u8]) -> Result<(Proto, String, u8, i32, Value), String> {
+    let first = *b.first().ok_or("an empty message")?;
+    let mut r = In { b, i: 0 };
+    let (p, name, kind, seq) = if first == 0x82 {
+        r.byte()?;
+        let h = r.byte()?;
+        if h & 0x1f != 1 {
+            return Err(format!("compact protocol version {} is not 1", h & 0x1f));
+        }
+        let seq = r.varint()? as u32 as i32;
+        let n = r.varint()? as usize;
+        let name = String::from_utf8_lossy(r.take(n)?).to_string();
+        (Proto::Compact, name, h >> 5, seq)
+    } else if first == 0x80 {
+        let v = r.i32()? as u32;
+        if v & 0xffff_0000 != 0x8001_0000 {
+            return Err(format!("binary protocol version 0x{:x} is not 1", v >> 16));
+        }
+        let n = r.i32()?;
+        if n < 0 {
+            return Err("a negative name length".into());
+        }
+        let name = String::from_utf8_lossy(r.take(n as usize)?).to_string();
+        (Proto::Binary, name, (v & 0xff) as u8, r.i32()?)
+    } else {
+        // The old form: no version, the name's length first.
+        let n = r.i32()?;
+        if n < 0 || n as usize > b.len() {
+            return Err("not a Thrift message".into());
+        }
+        let name = String::from_utf8_lossy(r.take(n as usize)?).to_string();
+        let k = r.byte()?;
+        (Proto::Binary, name, k, r.i32()?)
+    };
+    if !(CALL..=ONEWAY).contains(&kind) {
+        return Err(format!("message type {} is not known", kind));
+    }
+    let body = read_struct(&mut r, p, 0)?;
+    Ok((p, name, kind, seq, body))
+}
+
+const KINDS: [&str; 5] = ["", "call", "reply", "exception", "oneway"];
+
+fn kind_code(k: &str) -> Result<u8, String> {
+    KINDS.iter().position(|x| *x == k && !x.is_empty()).map(|i| i as u8).ok_or(format!("`{}` is not a message type: call, reply, exception or oneway", k))
+}
+
+/// A whole message as hex: `{ name, type: "call", seq, body }`, with `body` a struct.
+pub fn thrift_message(message: serde_json::Value, protocol: &str) -> Result<String, String> {
+    let name = message.get("name").and_then(|v| v.as_str()).ok_or("a message needs `name`")?;
+    let kind = kind_code(message.get("type").and_then(|v| v.as_str()).unwrap_or("call"))?;
+    let seq = message.get("seq").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let empty = json!([]);
+    Ok(hex::encode(message_bytes(proto_of(protocol)?, name, kind, seq, message.get("body").unwrap_or(&empty))?))
+}
+
+/// Reads a message from hex or bytes: `{ protocol, name, type, seq, body }`. The protocol is told by the first byte, the old unversioned binary form included.
+pub fn thrift_read_message(data: serde_json::Value) -> Result<Value, String> {
+    let b = bytes_of(&data)?;
+    let (p, name, kind, seq, body) = read_message(&b)?;
+    Ok(json!({ "protocol": if p == Proto::Binary { "binary" } else { "compact" }, "name": name, "type": KINDS[kind as usize], "seq": seq, "body": body }))
+}
+
+fn app_exception_type(t: i64) -> &'static str {
+    match t {
+        1 => "UNKNOWN_METHOD",
+        2 => "INVALID_MESSAGE_TYPE",
+        3 => "WRONG_METHOD_NAME",
+        4 => "BAD_SEQUENCE_ID",
+        5 => "MISSING_RESULT",
+        6 => "INTERNAL_ERROR",
+        7 => "PROTOCOL_ERROR",
+        8 => "INVALID_TRANSFORM",
+        9 => "INVALID_PROTOCOL",
+        10 => "UNSUPPORTED_CLIENT_TYPE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn field<'a>(s: &'a Value, id: i64) -> Option<&'a Value> {
+    s.as_array()?.iter().find(|f| f["id"] == id)
+}
+
+static SEQ: AtomicI32 = AtomicI32::new(1);
+
+/// Calls a method on a server: `host` is "host:port", `args` a struct of its arguments. Options: `protocol` (binary, compact), `framed` (true; false for a plain buffered transport, one call a connection), `oneway`, `timeout_ms`. Answers `{ value, type, fields }`: `value` is the result's field 0, with its wire `type`; a declared exception is `{ exception: { id, fields } }`; a TApplicationException is an error by name.
+pub fn thrift_call(host: &str, method: &str, args: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let p = proto_of(options.get("protocol").and_then(|v| v.as_str()).unwrap_or("binary"))?;
+    let framed = options.get("framed").and_then(|v| v.as_bool()).unwrap_or(true);
+    let oneway = options.get("oneway").and_then(|v| v.as_bool()).unwrap_or(false);
+    let timeout = Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let body = message_bytes(p, method, if oneway { ONEWAY } else { CALL }, seq, &args)?;
+    let addr = host.to_socket_addrs().map_err(|e| format!("{}: {}", host, e))?.next().ok_or(format!("{}: no address", host))?;
+    let mut s = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("cannot reach {}: {}", host, e))?;
+    s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(timeout)).ok();
+    s.set_write_timeout(Some(timeout)).ok();
+    let mut out = vec![];
+    if framed {
+        out.extend((body.len() as u32).to_be_bytes());
+    }
+    out.extend(&body);
+    s.write_all(&out).map_err(|e| format!("cannot send to {}: {}", host, e))?;
+    if oneway {
+        return Ok(json!({ "sent": true }));
+    }
+    let what = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!("{} did not answer in {} ms", host, timeout.as_millis()),
+        std::io::ErrorKind::UnexpectedEof => format!("{} closed the connection: is it framed, and does it speak this protocol?", host),
+        _ => format!("{}: {}", host, e),
+    };
+    let reply = if framed {
+        let mut h = [0u8; 4];
+        s.read_exact(&mut h).map_err(what)?;
+        let n = u32::from_be_bytes(h) as usize;
+        if n > MAX_FRAME {
+            return Err(format!("a frame of {} bytes: not framed Thrift, or too big", n));
+        }
+        let mut b = vec![0u8; n];
+        s.read_exact(&mut b).map_err(what)?;
+        b
+    } else {
+        let mut b = vec![];
+        s.take(MAX_FRAME as u64).read_to_end(&mut b).map_err(what)?;
+        b
+    };
+    let (_, name, kind, rseq, res) = read_message(&reply)?;
+    if rseq != seq {
+        return Err(format!("the answer is to call {}, not {}", rseq, seq));
+    }
+    if kind == EXCEPTION {
+        let msg = field(&res, 1).and_then(|f| f["value"].as_str()).unwrap_or("").to_string();
+        let t = field(&res, 2).and_then(|f| f["value"].as_i64()).unwrap_or(0);
+        return Err(format!("{}: {}", app_exception_type(t), msg));
+    }
+    if kind != REPLY {
+        return Err(format!("a message of type {} came back", kind));
+    }
+    if name != method {
+        return Err(format!("the answer is to `{}`, not `{}`", name, method));
+    }
+    // Field 0 is the result; any other, a declared exception.
+    let list = res.as_array().cloned().unwrap_or_default();
+    if let Some(f) = field(&res, 0) {
+        return Ok(json!({ "value": f["value"], "type": f["type"], "fields": list }));
+    }
+    if let Some(f) = list.first() {
+        return Ok(json!({ "exception": { "id": f["id"], "fields": f["value"] } }));
+    }
+    Ok(json!({ "value": Value::Null, "type": "void", "fields": [] }))
+}

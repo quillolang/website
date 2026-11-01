@@ -1,0 +1,307 @@
+//! Hetzner Cloud's API: servers made, powered and removed, volumes made, attached and resized, firewalls and their rules, every action waited on including those a call starts next, pages followed, and rate-limit headers read and waited out.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static RATE: Mutex<Value> = Mutex::new(Value::Null);
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// One call. 429 waits for RateLimit-Reset (at most option max_wait_s, 10), `locked` (a resource busy with another action) is tried again, and 5xx on a GET. Errors are `Hetzner 404 not_found: ...`, with field names from `details`.
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let token = std::env::var("HETZNER_API_TOKEN").ok().filter(|v| !v.is_empty()).ok_or("no token: set HETZNER_API_TOKEN")?;
+    let base = std::env::var("HETZNER_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or("https://api.hetzner.cloud/v1".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let most = o.get("max_wait_s").and_then(|v| v.as_u64()).unwrap_or(10);
+    let mut tries = 0u64;
+    loop {
+        tries += 1;
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token));
+        let res = match body {
+            Some(b) => r.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => r.call(),
+        };
+        let resp = match res {
+            Ok(x) => x,
+            Err(ureq::Error::Status(_, x)) => x,
+            Err(e) => return Err(format!("cannot reach Hetzner: {}", e)),
+        };
+        let status = resp.status();
+        let num = |n: &str| resp.header(n).and_then(|h| h.trim().parse::<i64>().ok());
+        let (limit, left, reset) = (num("ratelimit-limit"), num("ratelimit-remaining"), num("ratelimit-reset"));
+        if limit.is_some() {
+            if let Ok(mut g) = RATE.lock() {
+                *g = json!({ "limit": limit, "remaining": left, "reset": reset });
+            }
+        }
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        if status < 300 {
+            if text.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&text).map_err(|e| format!("Hetzner: not JSON: {}", e));
+        }
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let e = &v["error"];
+        let code = e["code"].as_str().unwrap_or("error");
+        if tries < 6 {
+            let wait = if status == 429 {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                Some(reset.map(|r| (r - now).max(1) as u64).unwrap_or(1))
+            } else if code == "locked" || (status >= 500 && method == "GET") {
+                Some(tries)
+            } else {
+                None
+            };
+            if let Some(w) = wait.filter(|w| *w <= most) {
+                std::thread::sleep(Duration::from_secs(w));
+                continue;
+            }
+        }
+        let fields: Vec<String> = e.pointer("/details/fields").and_then(|f| f.as_array()).into_iter().flatten().map(|f| format!("{}: {}", f["name"].as_str().unwrap_or("?"), f["messages"].as_array().map(|m| m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default())).collect();
+        let more = if fields.is_empty() { String::new() } else { format!(" ({})", fields.join("; ")) };
+        return Err(format!("Hetzner {} {}: {}{}", status, code, e["message"].as_str().map(str::to_string).unwrap_or_else(|| text.chars().take(160).collect()), more));
+    }
+}
+
+/// What the last answer said of the rate limit: { limit, remaining, reset }.
+pub fn hetzner_rate() -> serde_json::Value {
+    RATE.lock().map(|g| g.clone()).unwrap_or(Value::Null)
+}
+
+/// Any call: `method`, `path` like /datacenters, `body` or null. Gives the JSON answer.
+pub fn hetzner_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+/// Every item of a list under `key`, by `meta.pagination.next_page`.
+pub fn hetzner_all(path: &str, key: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let per = options.get("per_page").and_then(|v| v.as_u64()).unwrap_or(50);
+    let sep = if path.contains('?') { "&" } else { "?" };
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let v = call("GET", &format!("{}{}page={}&per_page={}", path, sep, page, per), None, &options)?;
+        out.extend(v[key].as_array().cloned().unwrap_or_default());
+        match v.pointer("/meta/pagination/next_page").and_then(|n| n.as_u64()) {
+            Some(n) => page = n,
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Waits for an action: a `success` gives it, an `error` is an error value with the action's own code and message. Options: wait_ms (5 min), every_ms (1 s).
+pub fn hetzner_action_wait(id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let limit = Duration::from_millis(options.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(300_000));
+    let every = Duration::from_millis(options.get("every_ms").and_then(|v| v.as_u64()).unwrap_or(1_000));
+    let start = Instant::now();
+    loop {
+        let a = call("GET", &format!("/actions/{}", id), None, &options)?["action"].clone();
+        match a["status"].as_str() {
+            Some("success") => return Ok(a),
+            Some("error") => return Err(format!("action {} ({}) failed: {}: {}", id, a["command"].as_str().unwrap_or("?"), a["error"]["code"].as_str().unwrap_or("?"), a["error"]["message"].as_str().unwrap_or("?"))),
+            _ => {}
+        }
+        if start.elapsed() > limit {
+            return Err(format!("action {} is still at {}% after {} ms", id, a["progress"], limit.as_millis()));
+        }
+        std::thread::sleep(every);
+    }
+}
+
+fn wait_all(r: &Value, o: &Value) -> Result<i64, String> {
+    let mut n = 0;
+    let singles = r.get("action").into_iter();
+    let lists = ["actions", "next_actions"].into_iter().flat_map(|k| r.get(k).and_then(|l| l.as_array()).into_iter().flatten());
+    for a in singles.chain(lists) {
+        if a.is_object() {
+            hetzner_action_wait(a["id"].as_i64().unwrap_or(0), o.clone())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn wants_wait(o: &Value) -> bool {
+    o.get("wait") == Some(&Value::Bool(true))
+}
+
+fn filters(o: &Value, keys: &[&str]) -> String {
+    let q: Vec<String> = keys.iter().filter_map(|k| o.get(*k).and_then(|v| v.as_str()).map(|v| format!("{}={}", k, enc(v)))).collect();
+    if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
+}
+
+/// All servers. Options: name, label_selector (like env=prod), status.
+pub fn hetzner_servers(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    hetzner_all(&format!("/servers{}", filters(&options, &["name", "label_selector", "status"])), "servers", options)
+}
+
+/// One server.
+pub fn hetzner_server(id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("/servers/{}", id), None, &options)?["server"].clone())
+}
+
+/// Makes a server: `spec` is { name, server_type, image, location, ssh_keys, labels, user_data, ... }. Gives { server, root_password, actions }: with the option wait, after its action and those it starts next, and with the server read again. Password is null when ssh_keys were given.
+pub fn hetzner_server_create(spec: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["name", "server_type", "image"] {
+        if spec.get(k).is_none() {
+            return Err(format!("the server needs `{}`", k));
+        }
+    }
+    let r = call("POST", "/servers", Some(&spec), &options)?;
+    if wants_wait(&options) {
+        let n = wait_all(&r, &options)?;
+        let s = hetzner_server(r["server"]["id"].as_i64().unwrap_or(0), options)?;
+        return Ok(json!({ "server": s, "root_password": r["root_password"], "actions": n }));
+    }
+    Ok(json!({ "server": r["server"], "root_password": r["root_password"], "actions": 0 }))
+}
+
+/// Runs a server action: poweron, poweroff, shutdown, reboot, reset, rebuild, change_type..., `args` being its fields or null. With the option wait, waits for it. Gives the action.
+pub fn hetzner_server_action(id: i64, action: &str, args: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let body = if args.is_object() { args } else { json!({}) };
+    let r = call("POST", &format!("/servers/{}/actions/{}", id, action), Some(&body), &options)?;
+    if wants_wait(&options) {
+        return hetzner_action_wait(r["action"]["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(r["action"].clone())
+}
+
+/// Removes a server. With the option wait, waits until it has gone.
+pub fn hetzner_server_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    let r = call("DELETE", &format!("/servers/{}", id), None, &options)?;
+    if wants_wait(&options) {
+        wait_all(&r, &options)?;
+    }
+    Ok(true)
+}
+
+/// All volumes. Options: name, label_selector, status.
+pub fn hetzner_volumes(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    hetzner_all(&format!("/volumes{}", filters(&options, &["name", "label_selector", "status"])), "volumes", options)
+}
+
+/// Makes a volume: { name, size (GB, 10 at least), location or server, format, automount, labels }. With the option wait, waits for it. Gives the volume.
+pub fn hetzner_volume_create(spec: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if spec.get("size").and_then(|s| s.as_i64()).is_none_or(|s| s < 10) {
+        return Err("a Hetzner volume is 10 GB or more".into());
+    }
+    if spec.get("location").is_none() && spec.get("server").is_none() {
+        return Err("a volume needs `location` or `server`".into());
+    }
+    let r = call("POST", "/volumes", Some(&spec), &options)?;
+    if wants_wait(&options) {
+        wait_all(&r, &options)?;
+    }
+    Ok(r["volume"].clone())
+}
+
+/// Attaches a volume to a server. Option automount; with the option wait, waits. Gives the action.
+pub fn hetzner_volume_attach(id: i64, server: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "server": server });
+    if let Some(a) = options.get("automount") {
+        b["automount"] = a.clone();
+    }
+    let r = call("POST", &format!("/volumes/{}/actions/attach", id), Some(&b), &options)?;
+    if wants_wait(&options) {
+        return hetzner_action_wait(r["action"]["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(r["action"].clone())
+}
+
+/// Detaches a volume.
+pub fn hetzner_volume_detach(id: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = call("POST", &format!("/volumes/{}/actions/detach", id), Some(&json!({})), &options)?;
+    if wants_wait(&options) {
+        return hetzner_action_wait(r["action"]["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(r["action"].clone())
+}
+
+/// Grows a volume to `size` GB; it cannot shrink.
+pub fn hetzner_volume_resize(id: i64, size: i64, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = call("POST", &format!("/volumes/{}/actions/resize", id), Some(&json!({ "size": size })), &options)?;
+    if wants_wait(&options) {
+        return hetzner_action_wait(r["action"]["id"].as_i64().unwrap_or(0), options);
+    }
+    Ok(r["action"].clone())
+}
+
+/// Removes a detached volume.
+pub fn hetzner_volume_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/volumes/{}", id), None, &options)?;
+    Ok(true)
+}
+
+/// All firewalls. Options: name, label_selector.
+pub fn hetzner_firewalls(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    hetzner_all(&format!("/firewalls{}", filters(&options, &["name", "label_selector"])), "firewalls", options)
+}
+
+fn check_rules(rules: &Value) -> Result<(), String> {
+    for r in rules.as_array().ok_or("rules is a list")? {
+        let dir = r["direction"].as_str().unwrap_or("");
+        let proto = r["protocol"].as_str().unwrap_or("");
+        if dir != "in" && dir != "out" {
+            return Err(format!("a rule's direction is in or out, not `{}`", dir));
+        }
+        if !["tcp", "udp", "icmp", "esp", "gre"].contains(&proto) {
+            return Err(format!("`{}` is not a protocol Hetzner firewalls know", proto));
+        }
+        if matches!(proto, "tcp" | "udp") && r.get("port").is_none() {
+            return Err(format!("a {} rule needs `port`", proto));
+        }
+        let ips = if dir == "in" { "source_ips" } else { "destination_ips" };
+        if r[ips].as_array().is_none_or(|l| l.is_empty()) {
+            return Err(format!("an `{}` rule needs `{}`", dir, ips));
+        }
+    }
+    Ok(())
+}
+
+/// Makes a firewall: { name, rules: [{ direction, protocol, port, source_ips or destination_ips, description }], apply_to, labels }. Rules are checked here first. With the option wait, waits. Gives the firewall.
+pub fn hetzner_firewall_create(spec: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(r) = spec.get("rules") {
+        check_rules(r)?;
+    }
+    let r = call("POST", "/firewalls", Some(&spec), &options)?;
+    if wants_wait(&options) {
+        wait_all(&r, &options)?;
+    }
+    Ok(r["firewall"].clone())
+}
+
+/// Replaces a firewall's rules, all at once. With the option wait, waits.
+pub fn hetzner_firewall_set_rules(id: i64, rules: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    check_rules(&rules)?;
+    let r = call("POST", &format!("/firewalls/{}/actions/set_rules", id), Some(&json!({ "rules": rules })), &options)?;
+    if wants_wait(&options) {
+        return wait_all(&r, &options);
+    }
+    Ok(r["actions"].as_array().map_or(0, |a| a.len() as i64))
+}
+
+/// Applies a firewall to `targets`: server ids, or { type: "label_selector", label_selector: { selector } } maps.
+pub fn hetzner_firewall_apply(id: i64, targets: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    let list: Vec<Value> = targets.as_array().ok_or("targets is a list")?.iter().map(|t| if t.is_i64() { json!({ "type": "server", "server": { "id": t } }) } else { t.clone() }).collect();
+    let r = call("POST", &format!("/firewalls/{}/actions/apply_to_resources", id), Some(&json!({ "apply_to": list })), &options)?;
+    if wants_wait(&options) {
+        return wait_all(&r, &options);
+    }
+    Ok(r["actions"].as_array().map_or(0, |a| a.len() as i64))
+}
+
+/// Removes a firewall no longer applied.
+pub fn hetzner_firewall_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/firewalls/{}", id), None, &options)?;
+    Ok(true)
+}

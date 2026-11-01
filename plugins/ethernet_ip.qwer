@@ -1,0 +1,656 @@
+//! EtherNet/IP and CIP for Allen-Bradley PLCs (ControlLogix, CompactLogix, Micro800): sessions registered, tags read and written by name with CIP types, arrays and UDT members, large reads in fragments, several tags in one packet, unconnected send through the backplane or a Forward Open connection, ListIdentity, and CIP status codes turned into errors by name.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+const REGISTER: u16 = 0x0065;
+const UNREGISTER: u16 = 0x0066;
+const LIST_IDENTITY: u16 = 0x0063;
+const SEND_RR: u16 = 0x006f;
+const SEND_UNIT: u16 = 0x0070;
+
+const READ_TAG: u8 = 0x4c;
+const WRITE_TAG: u8 = 0x4d;
+const READ_FRAGMENT: u8 = 0x52;
+const UNCONNECTED_SEND: u8 = 0x52;
+const FORWARD_OPEN: u8 = 0x54;
+const FORWARD_CLOSE: u8 = 0x4e;
+const MULTI_SERVICE: u8 = 0x0a;
+
+const TYPES: [(u16, &str, usize); 12] = [
+    (0xc1, "BOOL", 1), (0xc2, "SINT", 1), (0xc3, "INT", 2), (0xc4, "DINT", 4), (0xc5, "LINT", 8), (0xc6, "USINT", 1),
+    (0xc7, "UINT", 2), (0xc8, "UDINT", 4), (0xc9, "ULINT", 8), (0xca, "REAL", 4), (0xcb, "LREAL", 8), (0xd3, "DWORD", 4),
+];
+const LOGIX_STRING: u16 = 0x0fce; // Logix's STRING structure: a DINT length and 82 SINTs
+
+fn cip_status(s: u8) -> String {
+    match s {
+        0x01 => "connection failure".into(),
+        0x02 => "resource unavailable".into(),
+        0x03 => "invalid parameter value".into(),
+        0x04 => "path segment error: no such tag, or the path is malformed".into(),
+        0x05 => "path destination unknown: no such tag or instance".into(),
+        0x06 => "partial transfer".into(),
+        0x07 => "connection lost".into(),
+        0x08 => "service not supported".into(),
+        0x09 => "invalid attribute value".into(),
+        0x0c => "object state conflict".into(),
+        0x0f => "privilege violation".into(),
+        0x10 => "device state conflict: the controller may be in the wrong mode".into(),
+        0x11 => "reply data too large".into(),
+        0x13 => "not enough data".into(),
+        0x15 => "too much data".into(),
+        0x1e => "embedded service error".into(),
+        0x1f => "vendor specific error".into(),
+        0x20 => "invalid parameter".into(),
+        0x26 => "path size invalid".into(),
+        0xff => "general error".into(),
+        x => format!("status 0x{:02x}", x),
+    }
+}
+
+fn extended(code: u16) -> Option<&'static str> {
+    match code {
+        0x2104 => Some("offset out of range"),
+        0x2105 => Some("the index or size is beyond the tag's end"),
+        0x2107 => Some("the type given does not match the tag's type"),
+        0x0100 => Some("connection in use or duplicate Forward Open"),
+        0x0204 => Some("connection timed out"),
+        0x0312 => Some("link address not valid: check the slot"),
+        _ => None,
+    }
+}
+
+fn encap_status(s: u32) -> String {
+    match s {
+        0x01 => "invalid or unsupported command".into(),
+        0x02 => "insufficient memory on the target".into(),
+        0x03 => "poorly formed encapsulation data".into(),
+        0x64 => "invalid session handle".into(),
+        0x65 => "invalid length".into(),
+        0x69 => "unsupported protocol revision".into(),
+        x => format!("status 0x{:x}", x),
+    }
+}
+
+struct Plc {
+    s: TcpStream,
+    session: u32,
+    route: Vec<u8>,
+    connection: Option<u32>, // O->T connection id
+    t_o: u32,
+    serial: u16,
+    seq: u16,
+    context: u64,
+}
+
+fn plcs() -> &'static Mutex<HashMap<String, Plc>> {
+    static P: OnceLock<Mutex<HashMap<String, Plc>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn header(cmd: u16, len: usize, session: u32, context: u64) -> Vec<u8> {
+    let mut h = cmd.to_le_bytes().to_vec();
+    h.extend((len as u16).to_le_bytes());
+    h.extend(session.to_le_bytes());
+    h.extend(0u32.to_le_bytes());
+    h.extend(context.to_le_bytes());
+    h.extend(0u32.to_le_bytes());
+    h
+}
+
+fn read_reply(s: &mut TcpStream) -> Result<(u16, u32, u32, Vec<u8>), String> {
+    let mut h = [0u8; 24];
+    s.read_exact(&mut h).map_err(|e| format!("no answer from the PLC: {}", e))?;
+    let len = u16::from_le_bytes([h[2], h[3]]) as usize;
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).map_err(|e| format!("the PLC's answer was cut off: {}", e))?;
+    Ok((u16::from_le_bytes([h[0], h[1]]), u32::from_le_bytes([h[4], h[5], h[6], h[7]]), u32::from_le_bytes([h[8], h[9], h[10], h[11]]), body))
+}
+
+fn addr(host: &str) -> Result<SocketAddr, String> {
+    let t = if host.contains(':') { host.to_string() } else { format!("{}:44818", host) };
+    t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.next().ok_or(format!("{}: no address", t))
+}
+
+fn open_socket(host: &str, o: &Value) -> Result<TcpStream, String> {
+    let a = addr(host)?;
+    let timeout = Duration::from_millis(o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000));
+    let s = TcpStream::connect_timeout(&a, timeout).map_err(|e| format!("cannot reach the PLC at {}: {}", a, e))?;
+    s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(timeout)).ok();
+    s.set_write_timeout(Some(timeout)).ok();
+    Ok(s)
+}
+
+impl Plc {
+    fn exchange(&mut self, cmd: u16, body: &[u8]) -> Result<Vec<u8>, String> {
+        self.context = self.context.wrapping_add(1);
+        let mut p = header(cmd, body.len(), self.session, self.context);
+        p.extend(body);
+        self.s.write_all(&p).map_err(|e| format!("cannot send to the PLC: {}", e))?;
+        let (_, _, status, reply) = read_reply(&mut self.s)?;
+        if status != 0 {
+            return Err(format!("EtherNet/IP: {}", encap_status(status)));
+        }
+        Ok(reply)
+    }
+
+    // A CIP request to the PLC's Message Router; answers the reply, its head checked.
+    fn cip(&mut self, request: &[u8]) -> Result<Reply, String> {
+        if let Some(id) = self.connection {
+            self.seq = self.seq.wrapping_add(1);
+            let mut data = self.seq.to_le_bytes().to_vec();
+            data.extend(request);
+            let mut b = vec![0u8; 4]; // interface handle
+            b.extend(0u16.to_le_bytes()); // timeout
+            b.extend(2u16.to_le_bytes());
+            b.extend(0x00a1u16.to_le_bytes());
+            b.extend(4u16.to_le_bytes());
+            b.extend(id.to_le_bytes());
+            b.extend(0x00b1u16.to_le_bytes());
+            b.extend((data.len() as u16).to_le_bytes());
+            b.extend(data);
+            let r = self.exchange(SEND_UNIT, &b)?;
+            let d = cpf_data(&r, 0x00b1)?;
+            if d.len() < 2 {
+                return Err("a connected reply is cut off".into());
+            }
+            return parse_reply(&d[2..]);
+        }
+        // Routed through the backplane with Unconnected Send, or straight to a controller.
+        let wrapped = if self.route.is_empty() { request.to_vec() } else { unconnected(request, &self.route) };
+        self.direct(&wrapped)
+    }
+
+    // To the device on this socket itself: its Connection Manager takes Forward Open.
+    fn direct(&mut self, request: &[u8]) -> Result<Reply, String> {
+        let r = self.exchange(SEND_RR, &rr_body(request))?;
+        parse_reply(cpf_data(&r, 0x00b2)?)
+    }
+}
+
+fn rr_body(cip: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 4];
+    b.extend(5u16.to_le_bytes()); // timeout
+    b.extend(2u16.to_le_bytes()); // two items
+    b.extend([0, 0, 0, 0]); // null address
+    b.extend(0x00b2u16.to_le_bytes());
+    b.extend((cip.len() as u16).to_le_bytes());
+    b.extend(cip);
+    b
+}
+
+fn cpf_data(r: &[u8], want: u16) -> Result<&[u8], String> {
+    if r.len() < 8 {
+        return Err("an EtherNet/IP reply is cut off".into());
+    }
+    let count = u16::from_le_bytes([r[6], r[7]]);
+    let mut i = 8;
+    for _ in 0..count {
+        let h = r.get(i..i + 4).ok_or("a CPF item is cut off")?;
+        let (ty, len) = (u16::from_le_bytes([h[0], h[1]]), u16::from_le_bytes([h[2], h[3]]) as usize);
+        i += 4;
+        let d = r.get(i..i + len).ok_or("a CPF item is cut off")?;
+        i += len;
+        if ty == want {
+            return Ok(d);
+        }
+    }
+    Err(format!("the reply has no item 0x{:04x}", want))
+}
+
+fn connection_manager_path() -> [u8; 4] {
+    [0x20, 0x06, 0x24, 0x01]
+}
+
+fn unconnected(request: &[u8], route: &[u8]) -> Vec<u8> {
+    let mut b = vec![UNCONNECTED_SEND, 2];
+    b.extend(connection_manager_path());
+    b.push(0x0a); // tick
+    b.push(0x0e); // ticks
+    b.extend((request.len() as u16).to_le_bytes());
+    b.extend(request);
+    if request.len() % 2 == 1 {
+        b.push(0);
+    }
+    b.push((route.len() / 2) as u8);
+    b.push(0);
+    b.extend(route);
+    b
+}
+
+struct Reply {
+    service: u8,
+    status: u8,
+    ext: Vec<u16>,
+    data: Vec<u8>,
+}
+
+fn parse_reply(d: &[u8]) -> Result<Reply, String> {
+    if d.len() < 4 {
+        return Err("a CIP reply is cut off".into());
+    }
+    let ext_words = d[3] as usize;
+    let ext: Vec<u16> = d.get(4..4 + ext_words * 2).ok_or("a CIP reply is cut off")?.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Ok(Reply { service: d[0], status: d[2], ext, data: d[4 + ext_words * 2..].to_vec() })
+}
+
+fn failure(what: &str, r: &Reply) -> String {
+    let mut m = format!("{}: {}", what, cip_status(r.status));
+    if let Some(e) = r.ext.first() {
+        match extended(*e) {
+            Some(t) => m.push_str(&format!(" ({})", t)),
+            None => m.push_str(&format!(" (extended 0x{:04x})", e)),
+        }
+    }
+    m
+}
+
+fn tag_path(tag: &str) -> Result<Vec<u8>, String> {
+    if tag.is_empty() {
+        return Err("a tag needs a name".into());
+    }
+    let mut p = vec![];
+    for piece in tag.split('.') {
+        let (name, index) = match piece.split_once('[') {
+            Some((n, rest)) => {
+                let inner = rest.strip_suffix(']').ok_or(format!("`{}`: an index needs its `]`", tag))?;
+                let ix: Vec<u32> = inner.split(',').map(|x| x.trim().parse().map_err(|_| format!("`{}`: `{}` is not an index", tag, x))).collect::<Result<_, _>>()?;
+                (n, ix)
+            }
+            None => (piece, vec![]),
+        };
+        if name.is_empty() {
+            return Err(format!("`{}` is not a tag name", tag));
+        }
+        if name.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(format!("`{}`: a bit of a DINT cannot be addressed; read the DINT and test the bit", tag));
+        }
+        if !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b':') {
+            return Err(format!("`{}` is not a tag name", tag));
+        }
+        if name.len() > 255 {
+            return Err("a tag name is too long".into());
+        }
+        p.push(0x91);
+        p.push(name.len() as u8);
+        p.extend(name.as_bytes());
+        if name.len() % 2 == 1 {
+            p.push(0);
+        }
+        for i in index {
+            if i < 256 {
+                p.extend([0x28, i as u8]);
+            } else if i < 65536 {
+                p.extend([0x29, 0]);
+                p.extend((i as u16).to_le_bytes());
+            } else {
+                p.extend([0x2a, 0]);
+                p.extend(i.to_le_bytes());
+            }
+        }
+    }
+    Ok(p)
+}
+
+/// A tag's CIP path as hex, for looking at: "Motor[3].Speed" with its symbolic and member segments.
+pub fn eip_tag_path(tag: &str) -> Result<String, String> {
+    Ok(hex::encode(tag_path(tag)?))
+}
+
+fn request(service: u8, path: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut r = vec![service, (path.len() / 2) as u8];
+    r.extend(path);
+    r.extend(data);
+    r
+}
+
+fn type_name(t: u16) -> String {
+    TYPES.iter().find(|x| x.0 == t).map(|x| x.1.to_string()).unwrap_or(format!("0x{:04x}", t))
+}
+
+fn decode_one(t: u16, d: &[u8]) -> Value {
+    match t {
+        0xc1 => json!(d[0] != 0),
+        0xc2 => json!(d[0] as i8),
+        0xc3 => json!(i16::from_le_bytes([d[0], d[1]])),
+        0xc4 => json!(i32::from_le_bytes([d[0], d[1], d[2], d[3]])),
+        0xc5 => json!(i64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])),
+        0xc6 => json!(d[0]),
+        0xc7 => json!(u16::from_le_bytes([d[0], d[1]])),
+        0xc8 | 0xd3 => json!(u32::from_le_bytes([d[0], d[1], d[2], d[3]])),
+        0xc9 => json!(u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])),
+        0xca => {
+            let x = f32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64;
+            json!((x * 1e6).round() / 1e6)
+        }
+        0xcb => json!(f64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])),
+        _ => json!(hex::encode(d)),
+    }
+}
+
+// What a read gives: the type, then the data. A structure's type is 0x02A0 and its handle.
+fn decoded(data: &[u8]) -> Result<Value, String> {
+    if data.len() < 2 {
+        return Err("a read answer with no type".into());
+    }
+    let mut t = u16::from_le_bytes([data[0], data[1]]);
+    let mut d = &data[2..];
+    let mut structure = false;
+    if t == 0x02a0 {
+        if data.len() < 4 {
+            return Err("a structure's handle is cut off".into());
+        }
+        t = u16::from_le_bytes([data[2], data[3]]);
+        d = &data[4..];
+        structure = true;
+    }
+    if structure {
+        if t == LOGIX_STRING && d.len() >= 4 {
+            let mut out = vec![];
+            for c in d.chunks(88) {
+                if c.len() < 4 {
+                    break;
+                }
+                let n = (i32::from_le_bytes([c[0], c[1], c[2], c[3]]).max(0) as usize).min(c.len() - 4);
+                out.push(json!(String::from_utf8_lossy(&c[4..4 + n])));
+            }
+            let value = if out.len() == 1 { out.remove(0) } else { json!(out) };
+            return Ok(json!({ "type": "STRING", "value": value }));
+        }
+        return Ok(json!({ "type": format!("structure 0x{:04x}", t), "value": hex::encode(d), "bytes": d.len() }));
+    }
+    let size = TYPES.iter().find(|x| x.0 == t).map(|x| x.2).ok_or(format!("type 0x{:04x} is not one this reads", t))?;
+    if d.len() % size != 0 {
+        return Err(format!("{} bytes of {} do not divide evenly", d.len(), type_name(t)));
+    }
+    let list: Vec<Value> = d.chunks(size).map(|c| decode_one(t, c)).collect();
+    let value = if list.len() == 1 { list[0].clone() } else { json!(list) };
+    Ok(json!({ "type": type_name(t), "value": value }))
+}
+
+fn encode_one(t: u16, v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+    let name = type_name(t);
+    let int = |lo: i128, hi: i128| -> Result<i128, String> {
+        let x: i128 = v.as_i64().map(|x| x as i128).or(v.as_u64().map(|x| x as i128)).ok_or(format!("{} is not a whole number for {}", v, name))?;
+        if x < lo || x > hi {
+            return Err(format!("{} is out of range for {}", x, name));
+        }
+        Ok(x)
+    };
+    match t {
+        0xc1 => out.push(if v.as_bool().ok_or(format!("{} is not true or false", v))? { 0xff } else { 0 }),
+        0xc2 => out.push(int(-128, 127)? as i8 as u8),
+        0xc3 => out.extend((int(-32768, 32767)? as i16).to_le_bytes()),
+        0xc4 => out.extend((int(i32::MIN as i128, i32::MAX as i128)? as i32).to_le_bytes()),
+        0xc5 => out.extend((int(i64::MIN as i128, i64::MAX as i128)? as i64).to_le_bytes()),
+        0xc6 => out.push(int(0, 255)? as u8),
+        0xc7 => out.extend((int(0, 65535)? as u16).to_le_bytes()),
+        0xc8 | 0xd3 => out.extend((int(0, u32::MAX as i128)? as u32).to_le_bytes()),
+        0xc9 => out.extend((int(0, u64::MAX as i128)? as u64).to_le_bytes()),
+        0xca => out.extend((v.as_f64().ok_or(format!("{} is not a number", v))? as f32).to_le_bytes()),
+        0xcb => out.extend(v.as_f64().ok_or(format!("{} is not a number", v))?.to_le_bytes()),
+        _ => return Err(format!("{} cannot be written", name)),
+    }
+    Ok(())
+}
+
+fn with_plc<T>(name: &str, f: impl FnOnce(&mut Plc) -> Result<T, String>) -> Result<T, String> {
+    let mut g = plcs().lock().map_err(|_| "lock")?;
+    let p = g.get_mut(name).ok_or(format!("no PLC `{}`: call eip_connect first", name))?;
+    f(p)
+}
+
+fn forward_open(p: &mut Plc, route: &[u8]) -> Result<(), String> {
+    let mut id = [0u8; 8];
+    getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
+    p.serial = u16::from_le_bytes([id[0], id[1]]);
+    let t_o = u32::from_le_bytes([id[2], id[3], id[4], id[5]]);
+    let mut d = vec![0x0a, 0x0e];
+    d.extend(0u32.to_le_bytes()); // O->T id, the target picks
+    d.extend(t_o.to_le_bytes());
+    d.extend(p.serial.to_le_bytes());
+    d.extend(0x1337u16.to_le_bytes()); // vendor
+    d.extend(0x51756c6cu32.to_le_bytes()); // originator serial
+    d.extend([3, 0, 0, 0]); // timeout multiplier
+    d.extend(2_000_000u32.to_le_bytes()); // O->T RPI
+    d.extend(0x43f4u16.to_le_bytes()); // point to point, low priority, variable, 500 bytes
+    d.extend(2_000_000u32.to_le_bytes()); // T->O RPI
+    d.extend(0x43f4u16.to_le_bytes());
+    d.push(0xa3); // server, class 3, application trigger
+    let mut path = route.to_vec();
+    path.extend([0x20, 0x02, 0x24, 0x01]); // Message Router
+    d.push((path.len() / 2) as u8);
+    d.extend(path);
+    let r = p.direct(&request(FORWARD_OPEN, &connection_manager_path(), &d))?;
+    if r.status != 0 {
+        return Err(failure("Forward Open refused", &r));
+    }
+    if r.data.len() < 8 {
+        return Err("a Forward Open reply is cut off".into());
+    }
+    p.connection = Some(u32::from_le_bytes([r.data[0], r.data[1], r.data[2], r.data[3]]));
+    p.t_o = u32::from_le_bytes([r.data[4], r.data[5], r.data[6], r.data[7]]);
+    Ok(())
+}
+
+/// Opens a session with a PLC ("host" on port 44818, or "host:port"): RegisterSession, kept under `name`. Options: `slot` (0; the controller's slot in a chassis, reached by Unconnected Send), `route: false` for a Micro800 or anything with no backplane, `connected: true` for a Forward Open connection, `timeout_ms`.
+pub fn eip_connect(name: &str, host: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut s = open_socket(host, &options)?;
+    let mut p = header(REGISTER, 4, 0, 1);
+    p.extend([1, 0, 0, 0]);
+    s.write_all(&p).map_err(|e| e.to_string())?;
+    let (_, session, status, _) = read_reply(&mut s)?;
+    if status != 0 {
+        return Err(format!("RegisterSession refused: {}", encap_status(status)));
+    }
+    let slot = options.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
+    if slot > 255 {
+        return Err("a slot is 0 to 255".into());
+    }
+    let route = if options.get("route").and_then(|v| v.as_bool()) == Some(false) { vec![] } else { vec![1, slot as u8] };
+    let mut plc = Plc { s, session, route: route.clone(), connection: None, t_o: 0, serial: 0, seq: 0, context: 1 };
+    let connected = options.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+    if connected {
+        forward_open(&mut plc, &route)?;
+    }
+    let out = json!({ "session": session, "connected": connected, "connection": plc.connection });
+    if let Some(mut old) = plcs().lock().map_err(|_| "lock")?.insert(name.to_string(), plc) {
+        let _ = old.s.write_all(&header(UNREGISTER, 0, old.session, 0));
+    }
+    Ok(out)
+}
+
+/// Reads a tag by name, a program's too ("Program:Main.Speed", "Recipe[2].Temp"): `{ type, value }`, with `count` in `options` for that many array elements from the one named. A read that does not fit one packet goes on in fragments.
+pub fn eip_read(name: &str, tag: &str, options: serde_json::Value) -> Result<Value, String> {
+    let count = options.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+    if !(1..=65535).contains(&count) {
+        return Err("count is 1 to 65535".into());
+    }
+    let path = tag_path(tag)?;
+    with_plc(name, |p| {
+        let r = p.cip(&request(READ_TAG, &path, &(count as u16).to_le_bytes()))?;
+        if r.status != 0 && r.status != 0x06 {
+            return Err(failure(&format!("cannot read {}", tag), &r));
+        }
+        let mut data = r.data;
+        let head = if data.len() >= 2 && u16::from_le_bytes([data[0], data[1]]) == 0x02a0 { 4 } else { 2 };
+        let mut more = r.status == 0x06;
+        let mut got = data.len().saturating_sub(head);
+        while more {
+            let mut b = (count as u16).to_le_bytes().to_vec();
+            b.extend((got as u32).to_le_bytes());
+            let r = p.cip(&request(READ_FRAGMENT, &path, &b))?;
+            if r.status != 0 && r.status != 0x06 {
+                return Err(failure(&format!("cannot read {} past byte {}", tag, got), &r));
+            }
+            if r.data.len() <= head {
+                return Err("a fragment with no data".into());
+            }
+            data.extend(&r.data[head..]);
+            got += r.data.len() - head;
+            more = r.status == 0x06;
+        }
+        decoded(&data)
+    })
+}
+
+/// Reads several tags in one Multiple Service Packet: answers a list of `{ tag, type, value }`, or `{ tag, error }` for the ones the PLC refused.
+pub fn eip_read_many(name: &str, tags: Vec<String>) -> Result<Vec<Value>, String> {
+    if tags.is_empty() {
+        return Ok(vec![]);
+    }
+    let reqs: Vec<Vec<u8>> = tags.iter().map(|t| Ok(request(READ_TAG, &tag_path(t)?, &1u16.to_le_bytes()))).collect::<Result<_, String>>()?;
+    let mut body = (reqs.len() as u16).to_le_bytes().to_vec();
+    let mut at = 2 + 2 * reqs.len();
+    for r in &reqs {
+        body.extend((at as u16).to_le_bytes());
+        at += r.len();
+    }
+    for r in &reqs {
+        body.extend(r);
+    }
+    with_plc(name, |p| {
+        let r = p.cip(&request(MULTI_SERVICE, &[0x20, 0x02, 0x24, 0x01], &body))?;
+        if r.status != 0 && r.status != 0x1e {
+            return Err(failure("the multiple service packet was refused", &r));
+        }
+        let d = &r.data;
+        if d.len() < 2 {
+            return Err("a multiple service reply is cut off".into());
+        }
+        let n = u16::from_le_bytes([d[0], d[1]]) as usize;
+        let mut out = vec![];
+        for i in 0..n {
+            let o = d.get(2 + 2 * i..4 + 2 * i).ok_or("a multiple service reply is cut off")?;
+            let start = u16::from_le_bytes([o[0], o[1]]) as usize;
+            let end = if i + 1 < n {
+                let e = d.get(4 + 2 * i..6 + 2 * i).ok_or("a multiple service reply is cut off")?;
+                u16::from_le_bytes([e[0], e[1]]) as usize
+            } else {
+                d.len()
+            };
+            let one = parse_reply(d.get(start..end).ok_or("a multiple service reply is cut off")?)?;
+            let tag = tags.get(i).cloned().unwrap_or_default();
+            if one.status != 0 {
+                out.push(json!({ "tag": tag, "error": failure("refused", &one) }));
+            } else {
+                let mut m = decoded(&one.data)?;
+                m["tag"] = json!(tag);
+                out.push(m);
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Writes a tag: `type` in `options` says its CIP type (BOOL, SINT, INT, DINT, LINT, USINT, UINT, UDINT, ULINT, REAL, LREAL, STRING); left out, the tag is read first to learn it. A list writes that many array elements. Answers true.
+pub fn eip_write(name: &str, tag: &str, value: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    let path = tag_path(tag)?;
+    let given = options.get("type").and_then(|v| v.as_str()).map(|s| s.to_uppercase());
+    let ty = match given {
+        Some(t) => t,
+        None => eip_read(name, tag, json!({}))?["type"].as_str().unwrap_or("").to_string(),
+    };
+    let list: Vec<Value> = match &value {
+        Value::Array(a) => a.clone(),
+        v => vec![v.clone()],
+    };
+    let mut data;
+    if ty == "STRING" {
+        let s = value.as_str().ok_or("a STRING tag takes text")?;
+        if s.len() > 82 {
+            return Err(format!("a STRING tag holds 82 characters; this is {}", s.len()));
+        }
+        data = 0x02a0u16.to_le_bytes().to_vec();
+        data.extend(LOGIX_STRING.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend((s.len() as i32).to_le_bytes());
+        let mut c = s.as_bytes().to_vec();
+        c.resize(84, 0); // 82 characters and the padding to a whole DINT
+        data.extend(c);
+    } else {
+        let t = TYPES.iter().find(|x| x.1 == ty).ok_or(format!("`{}` is not a CIP type this writes", ty))?;
+        data = t.0.to_le_bytes().to_vec();
+        data.extend((list.len() as u16).to_le_bytes());
+        for v in &list {
+            encode_one(t.0, v, &mut data)?;
+        }
+    }
+    with_plc(name, |p| {
+        let r = p.cip(&request(WRITE_TAG, &path, &data))?;
+        if r.status != 0 {
+            return Err(failure(&format!("cannot write {}", tag), &r));
+        }
+        Ok(true)
+    })
+}
+
+/// Reads an attribute with Get Attribute Single, for objects that are not tags: `eip_get_attribute("plc", 1, 1, 7)` is the Identity object's product name. Answers hex.
+pub fn eip_get_attribute(name: &str, class: i64, instance: i64, attribute: i64) -> Result<String, String> {
+    let path = [0x20, class as u8, 0x24, instance as u8, 0x30, attribute as u8];
+    with_plc(name, |p| {
+        let r = p.cip(&request(0x0e, &path, &[]))?;
+        if r.status != 0 {
+            return Err(failure("Get Attribute Single", &r));
+        }
+        Ok(hex::encode(r.data))
+    })
+}
+
+/// Closes a PLC's connection and session; true when there was one.
+pub fn eip_close(name: &str) -> Result<bool, String> {
+    let Some(mut p) = plcs().lock().map_err(|_| "lock")?.remove(name) else { return Ok(false) };
+    if p.connection.take().is_some() {
+        let mut d = vec![0x0a, 0x0e];
+        d.extend(p.serial.to_le_bytes());
+        d.extend(0x1337u16.to_le_bytes());
+        d.extend(0x51756c6cu32.to_le_bytes());
+        let mut path = p.route.clone();
+        path.extend([0x20, 0x02, 0x24, 0x01]);
+        d.push((path.len() / 2) as u8);
+        d.push(0);
+        d.extend(path);
+        let _ = p.direct(&request(FORWARD_CLOSE, &connection_manager_path(), &d));
+    }
+    let _ = p.s.write_all(&header(UNREGISTER, 0, p.session, 0));
+    Ok(true)
+}
+
+/// Asks a device who it is with ListIdentity, no session needed: vendor, device type, product code, revision, status, serial and product name.
+pub fn eip_list_identity(host: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut s = open_socket(host, &options)?;
+    s.write_all(&header(LIST_IDENTITY, 0, 0, 0)).map_err(|e| e.to_string())?;
+    let (_, _, status, r) = read_reply(&mut s)?;
+    if status != 0 {
+        return Err(format!("ListIdentity: {}", encap_status(status)));
+    }
+    if r.len() < 6 || u16::from_le_bytes([r[0], r[1]]) == 0 {
+        return Err("the device gave no identity".into());
+    }
+    let d = r.get(6..).ok_or("cut off")?;
+    if d.len() < 35 {
+        return Err("an identity item is cut off".into());
+    }
+    let le16 = |at: usize| u16::from_le_bytes([d[at], d[at + 1]]);
+    let n = d[32] as usize;
+    let name = d.get(33..33 + n).ok_or("a product name is cut off")?;
+    let ip = format!("{}.{}.{}.{}", d[6], d[7], d[8], d[9]);
+    Ok(json!({
+        "protocol": le16(0), "ip": ip, "port": u16::from_be_bytes([d[4], d[5]]),
+        "vendor": le16(18), "device_type": le16(20), "product_code": le16(22), "revision": format!("{}.{}", d[24], d[25]),
+        "status": le16(26), "serial": format!("{:08x}", u32::from_le_bytes([d[28], d[29], d[30], d[31]])),
+        "product": String::from_utf8_lossy(name), "state": d.get(33 + n),
+    }))
+}

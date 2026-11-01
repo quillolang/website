@@ -1,0 +1,232 @@
+//! Trello's REST API without an SDK: boards, lists and cards, comments, moves and positions, key and token sent in a header, card ids taken from their short links, a board's actions walked backward through `before`, Trello's plain-text errors and JSON 429s read, webhooks made, and their signature checked with the callback URL it covers.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha1 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+// TRELLO_API_KEY and TRELLO_TOKEN are the key and token; TRELLO_API_URL the API
+// (https://api.trello.com/1 when not set). TRELLO_API_SECRET is the secret webhooks are signed with.
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("TRELLO_API_URL").unwrap_or_else(|| "https://api.trello.com/1".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn query(params: &Value) -> String {
+    params.as_object().map_or(String::new(), |m| {
+        let parts: Vec<String> = m.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))).collect();
+        parts.join("&")
+    })
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    // Mostly plain text; some errors are JSON.
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let what = v["message"].as_str().map(|m| match v["error"].as_str() { Some(e) => format!("{}: {}", e, m), None => m.to_string() }).unwrap_or_else(|| text.trim().chars().take(300).collect());
+    let hint = if status == 401 && what.contains("invalid") { " (check TRELLO_API_KEY and TRELLO_TOKEN)" } else if status == 401 { " (the token cannot reach this)" } else { "" };
+    format!("Trello {}: {}{}", status, what, hint)
+}
+
+fn call(method: &str, path: &str, params: &Value) -> Result<Value, String> {
+    let key = setting("TRELLO_API_KEY").ok_or("TRELLO_API_KEY is not set")?;
+    let tok = setting("TRELLO_TOKEN").ok_or("TRELLO_TOKEN is not set")?;
+    let q = query(params);
+    let url = if q.is_empty() { format!("{}{}", api(), path) } else { format!("{}{}?{}", api(), path, q) };
+    let auth = format!("OAuth oauth_consumer_key=\"{}\", oauth_token=\"{}\"", key, tok);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..5u32 {
+        match agent.request(method, &url).set("Authorization", &auth).set("Accept", "application/json").call() {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Trello's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            // 300 requests per 10 s a key, 100 a token; a refused request is not counted as done.
+            Err(ureq::Error::Status(429, r)) if attempt < 4 => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(1000u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(15_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Trello at {}: {}", api(), e)),
+        }
+    }
+    Err("Trello stayed over its limit through five tries".into())
+}
+
+/// Any other call: `method`, `path` like "/labels/abc", `params` a map for the query (Trello takes its fields there, even on POST and PUT).
+pub fn trello_call(method: &str, path: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, &params)
+}
+
+/// The id Trello wants from a card or board address: takes "https://trello.com/c/abc123/12-title", "abc123" or a full id, and gives the short link or id.
+pub fn trello_id(link: &str) -> Result<String, String> {
+    let t = link.trim().trim_end_matches('/');
+    let id = if let Some((_, rest)) = t.split_once("trello.com/") {
+        let mut parts = rest.split('/');
+        match (parts.next(), parts.next()) {
+            (Some("c" | "b"), Some(id)) if !id.is_empty() => id.to_string(),
+            _ => return Err(format!("`{}` is not the address of a card or a board", link)),
+        }
+    } else {
+        t.to_string()
+    };
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("`{}` is not a Trello id", link));
+    }
+    Ok(id)
+}
+
+/// The boards of the token's member.
+pub fn trello_boards() -> Result<serde_json::Value, String> {
+    call("GET", "/members/me/boards", &json!({ "fields": "name,url,closed", "filter": "open" }))
+}
+
+/// One board by id or address.
+pub fn trello_board(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/boards/{}", trello_id(id)?), &json!({ "fields": "name,desc,url,closed" }))
+}
+
+/// A board's open lists, in order.
+pub fn trello_lists(board: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/boards/{}/lists", trello_id(board)?), &json!({ "filter": "open" }))
+}
+
+/// Makes a list on a board; `pos` is "top", "bottom" or a number.
+pub fn trello_list_create(board_id: &str, name: &str, pos: &str) -> Result<serde_json::Value, String> {
+    call("POST", "/lists", &json!({ "idBoard": board_id, "name": name, "pos": if pos.is_empty() { "bottom" } else { pos } }))
+}
+
+/// The list named `name` on a board, or null: Trello has no lookup by name.
+pub fn trello_list_named(board: &str, name: &str) -> Result<serde_json::Value, String> {
+    Ok(trello_lists(board)?.as_array().and_then(|l| l.iter().find(|x| x["name"].as_str() == Some(name)).cloned()).unwrap_or(Value::Null))
+}
+
+/// The cards of a board, of the open ones.
+pub fn trello_board_cards(board: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/boards/{}/cards", trello_id(board)?), &json!({ "filter": "open" }))
+}
+
+/// The cards of a list.
+pub fn trello_list_cards(list_id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/lists/{}/cards", trello_id(list_id)?), &Value::Null)
+}
+
+/// Makes a card on a list: `fields` adds `desc`, `due` (RFC 3339), `pos`, `idLabels`, `idMembers`.
+pub fn trello_card_create(list_id: &str, name: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut p = if fields.is_object() { fields } else { json!({}) };
+    p["idList"] = json!(list_id);
+    p["name"] = json!(name);
+    if let Some(a) = p["idMembers"].as_array() {
+        let joined = a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",");
+        p["idMembers"] = json!(joined);
+    }
+    call("POST", "/cards", &p)
+}
+
+/// One card by id or address.
+pub fn trello_card(id: &str) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/cards/{}", trello_id(id)?), &Value::Null)
+}
+
+/// Changes a card: `fields` as Trello names them (`name`, `desc`, `due`, `dueComplete`, `closed`, `idList`, `pos`).
+pub fn trello_card_update(id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PUT", &format!("/cards/{}", trello_id(id)?), &fields)
+}
+
+/// Moves a card to a list, to the top, the bottom or a number; "" keeps Trello's choice.
+pub fn trello_card_move(id: &str, list_id: &str, pos: &str) -> Result<serde_json::Value, String> {
+    let mut p = json!({ "idList": list_id });
+    if !pos.is_empty() {
+        p["pos"] = json!(pos);
+    }
+    call("PUT", &format!("/cards/{}", trello_id(id)?), &p)
+}
+
+/// Writes a comment on a card (at most 16384 characters).
+pub fn trello_comment(card: &str, text: &str) -> Result<serde_json::Value, String> {
+    if text.is_empty() || text.chars().count() > 16384 {
+        return Err("a comment is 1 to 16384 characters".into());
+    }
+    call("POST", &format!("/cards/{}/actions/comments", trello_id(card)?), &json!({ "text": text }))
+}
+
+/// Deletes a card for good. To keep it, set `closed: true` by trello_card_update.
+pub fn trello_card_delete(id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/cards/{}", trello_id(id)?), &Value::Null)?;
+    Ok(true)
+}
+
+/// A board's actions, newest first, walking back through `before` past Trello's 1000 a request. `filter` is like "commentCard,updateCard" or ""; `max_items` caps them (0: all).
+pub fn trello_actions(board: &str, filter: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    let path = format!("/boards/{}/actions", trello_id(board)?);
+    let mut out: Vec<Value> = vec![];
+    let mut before: Option<String> = None;
+    loop {
+        let mut p = json!({ "limit": 1000 });
+        if !filter.is_empty() {
+            p["filter"] = json!(filter);
+        }
+        if let Some(b) = &before {
+            p["before"] = json!(b);
+        }
+        let page = call("GET", &path, &p)?;
+        let items = page.as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        before = items.last().and_then(|a| a["id"].as_str()).map(str::to_string);
+        out.extend(items);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < 1000 {
+            return Ok(out);
+        }
+    }
+}
+
+/// Makes a webhook on a model (a board's or card's id). Trello sends a HEAD to `callback_url` first, and refuses it unless that answers 200.
+pub fn trello_webhook_create(callback_url: &str, model_id: &str, description: &str) -> Result<serde_json::Value, String> {
+    call("POST", "/webhooks", &json!({ "callbackURL": callback_url, "idModel": model_id, "description": description }))
+}
+
+/// Deletes a webhook.
+pub fn trello_webhook_delete(id: &str) -> Result<bool, String> {
+    call("DELETE", &format!("/webhooks/{}", enc(id)), &Value::Null)?;
+    Ok(true)
+}
+
+fn sign(body: &str, callback_url: &str, secret: &str) -> Hmac<sha1::Sha1> {
+    let mut m = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    m.update(callback_url.as_bytes());
+    m
+}
+
+/// Checks a webhook: `signature` the x-trello-webhook header, the base64 HMAC-SHA1 of the raw body followed by `callback_url`, exactly as given when the webhook was made, by your app's secret (from TRELLO_API_SECRET). Gives { action, model }.
+pub fn trello_webhook(body: &str, signature: &str, callback_url: &str) -> Result<serde_json::Value, String> {
+    let secret = setting("TRELLO_API_SECRET").ok_or("TRELLO_API_SECRET is not set")?;
+    if signature.is_empty() {
+        return Err("no x-trello-webhook header: this did not come from Trello".into());
+    }
+    let raw = STANDARD.decode(signature).map_err(|_| "the x-trello-webhook header is not base64".to_string())?;
+    if sign(body, callback_url, &secret).verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match: a wrong secret, a callback URL not exactly as registered, or a changed body".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "action": v["action"], "model": v["model"] }))
+}

@@ -1,0 +1,227 @@
+//! DMARC aggregate reports: the XML that mailbox providers send read into records, gzip and zip attachments opened (by bytes or path, with a limit on what they unpack to), and summaries by source and alignment showing who sends as your domain and what fails.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! roxmltree = "0.20"
+//! flate2 = "1"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use flate2::read::{DeflateDecoder, GzDecoder};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::io::Read;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+// A report of a large provider is a few MB of XML: this stops a small file unpacking to gigabytes.
+const MOST: u64 = 64 << 20;
+
+fn iso(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn kid<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    n.children().find(|c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn kids<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &'a str) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> + 'a where 'i: 'a {
+    n.children().filter(move |c| c.is_element() && c.tag_name().name() == name)
+}
+
+fn txt(n: Option<roxmltree::Node>, name: &str) -> Value {
+    n.and_then(|x| kid(x, name)).and_then(|c| c.text()).map(str::trim).filter(|t| !t.is_empty()).map_or(Value::Null, |t| json!(t))
+}
+
+/// Relaxed alignment: the same organizational domain, here judged by one being the other or under it, as no public suffix list is at hand. Strict: the same name.
+fn aligned(from: &str, other: &str, strict: bool) -> bool {
+    let (a, b) = (from.to_ascii_lowercase(), other.to_ascii_lowercase());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if strict {
+        return a == b;
+    }
+    a == b || a.ends_with(&format!(".{}", b)) || b.ends_with(&format!(".{}", a))
+}
+
+/// Reads a report's XML: { org, email, report_id, begin, end, domain, policy, records, messages }. A record is { source_ip, count, disposition, dkim, spf, passed, header_from, envelope_from, reasons, auth: { dkim: [...], spf: [...] }, dkim_aligned, spf_aligned }: `dkim` and `spf` are the provider's own DMARC verdicts, `passed` is either of them passing. An XML document with a DTD is refused.
+pub fn dmarc_report_parse(xml: &str) -> Result<serde_json::Value, String> {
+    let doc = roxmltree::Document::parse(xml.trim_start_matches('\u{feff}')).map_err(|e| format!("not an XML report: {}", e))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "feedback" {
+        return Err(format!("this is not a DMARC report: its root is <{}>, not <feedback>", root.tag_name().name()));
+    }
+    let meta = kid(root, "report_metadata").ok_or("the report has no report_metadata")?;
+    let pol = kid(root, "policy_published").ok_or("the report has no policy_published")?;
+    let range = kid(meta, "date_range");
+    let num = |n: Option<roxmltree::Node>, k: &str| txt(n, k).as_str().and_then(|t| t.parse::<i64>().ok());
+    let (begin, end) = (num(range, "begin"), num(range, "end"));
+    let adkim = txt(Some(pol), "adkim").as_str().unwrap_or("r").to_string();
+    let aspf = txt(Some(pol), "aspf").as_str().unwrap_or("r").to_string();
+    let mut records = vec![];
+    let mut total = 0;
+    for r in kids(root, "record") {
+        let row = kid(r, "row").ok_or("a record has no row")?;
+        let ev = kid(row, "policy_evaluated");
+        let ids = kid(r, "identifiers");
+        let auth = kid(r, "auth_results");
+        let count = num(Some(row), "count").unwrap_or(0);
+        total += count;
+        let dkim: Vec<Value> = auth.into_iter().flat_map(|a| kids(a, "dkim")).map(|d| json!({ "domain": txt(Some(d), "domain"), "selector": txt(Some(d), "selector"), "result": txt(Some(d), "result"), "human": txt(Some(d), "human_result") })).collect();
+        let spf: Vec<Value> = auth.into_iter().flat_map(|a| kids(a, "spf")).map(|d| json!({ "domain": txt(Some(d), "domain"), "scope": txt(Some(d), "scope"), "result": txt(Some(d), "result") })).collect();
+        let from = txt(ids, "header_from").as_str().unwrap_or("").to_string();
+        let good = |l: &[Value], strict: bool| l.iter().any(|x| x["result"] == "pass" && aligned(&from, x["domain"].as_str().unwrap_or(""), strict));
+        let reasons: Vec<Value> = ev.into_iter().flat_map(|e| kids(e, "reason")).map(|x| json!({ "type": txt(Some(x), "type"), "comment": txt(Some(x), "comment") })).collect();
+        let (d, s) = (txt(ev, "dkim"), txt(ev, "spf"));
+        records.push(json!({
+            "source_ip": txt(Some(row), "source_ip"), "count": count, "disposition": txt(ev, "disposition"), "dkim": d, "spf": s,
+            "passed": d == "pass" || s == "pass", "header_from": from, "envelope_from": txt(ids, "envelope_from"), "envelope_to": txt(ids, "envelope_to"),
+            "reasons": reasons, "auth": { "dkim": dkim.clone(), "spf": spf.clone() },
+            "dkim_aligned": good(&dkim, adkim == "s"), "spf_aligned": good(&spf, aspf == "s"),
+        }));
+    }
+    Ok(json!({
+        "org": txt(Some(meta), "org_name"), "email": txt(Some(meta), "email"), "contact": txt(Some(meta), "extra_contact_info"), "report_id": txt(Some(meta), "report_id"),
+        "begin": begin.map(iso), "end": end.map(iso), "errors": kids(meta, "error").filter_map(|e| e.text()).collect::<Vec<_>>(),
+        "domain": txt(Some(pol), "domain"),
+        "policy": { "p": txt(Some(pol), "p"), "sp": txt(Some(pol), "sp"), "pct": num(Some(pol), "pct"), "adkim": adkim, "aspf": aspf, "fo": txt(Some(pol), "fo") },
+        "records": records, "messages": total,
+    }))
+}
+
+fn inflate(data: &[u8]) -> Result<String, String> {
+    let mut out = String::new();
+    let got = DeflateDecoder::new(data).take(MOST + 1).read_to_string(&mut out).map_err(|e| format!("the zip entry cannot be unpacked: {}", e))?;
+    if got as u64 > MOST {
+        return Err("the report unpacks to over 64 MB: refused".into());
+    }
+    Ok(out)
+}
+
+/// The first .xml file in a zip, read by the central directory, stored or deflated.
+fn unzip(data: &[u8]) -> Result<String, String> {
+    let u16le = |a: usize| data.get(a..a + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32le = |a: usize| data.get(a..a + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let tail = data.len().saturating_sub(65557);
+    let eocd = (tail..data.len().saturating_sub(21)).rev().find(|&i| data[i..].starts_with(b"PK\x05\x06")).ok_or("a zip with no end record")?;
+    let n = u16le(eocd + 10).ok_or("a cut-off zip")?;
+    let mut at = u32le(eocd + 16).ok_or("a cut-off zip")?;
+    for _ in 0..n {
+        if !data.get(at..).is_some_and(|d| d.starts_with(b"PK\x01\x02")) {
+            return Err("a broken zip directory".into());
+        }
+        let flags = u16le(at + 8).ok_or("a cut-off zip")?;
+        let method = u16le(at + 10).ok_or("a cut-off zip")?;
+        let size = u32le(at + 20).ok_or("a cut-off zip")?;
+        let (nl, el, cl) = (u16le(at + 28).ok_or("a cut-off zip")?, u16le(at + 30).ok_or("a cut-off zip")?, u16le(at + 32).ok_or("a cut-off zip")?);
+        let local = u32le(at + 42).ok_or("a cut-off zip")?;
+        let name = String::from_utf8_lossy(data.get(at + 46..at + 46 + nl).ok_or("a cut-off zip")?).to_string();
+        at += 46 + nl + el + cl;
+        if !name.to_ascii_lowercase().ends_with(".xml") {
+            continue;
+        }
+        if flags & 1 != 0 {
+            return Err(format!("{} is encrypted", name));
+        }
+        let (lnl, lel) = (u16le(local + 26).ok_or("a cut-off zip")?, u16le(local + 28).ok_or("a cut-off zip")?);
+        let start = local + 30 + lnl + lel;
+        let body = data.get(start..start + size).ok_or("a cut-off zip")?;
+        return match method {
+            0 => String::from_utf8(body.to_vec()).map_err(|_| "the report is not UTF-8".to_string()),
+            8 => inflate(body),
+            m => Err(format!("zip method {} is not one reports use", m)),
+        };
+    }
+    Err("the zip holds no .xml file".into())
+}
+
+fn gunzip(data: &[u8]) -> Result<String, String> {
+    let mut out = String::new();
+    let got = GzDecoder::new(data).take(MOST + 1).read_to_string(&mut out).map_err(|e| format!("the gzip cannot be unpacked: {}", e))?;
+    if got as u64 > MOST {
+        return Err("the report unpacks to over 64 MB: refused".into());
+    }
+    Ok(out)
+}
+
+fn open(data: &[u8]) -> Result<String, String> {
+    if data.starts_with(&[0x1f, 0x8b]) {
+        gunzip(data)
+    } else if data.starts_with(b"PK") {
+        unzip(data)
+    } else {
+        String::from_utf8(data.to_vec()).map_err(|_| "this is neither XML, gzip nor zip".to_string())
+    }
+}
+
+/// Reads a report from an attachment's base64: gzip, zip or plain XML, told by its first bytes.
+pub fn dmarc_report_open(data_base64: &str) -> Result<serde_json::Value, String> {
+    let clean: String = data_base64.chars().filter(|c| !c.is_whitespace()).collect();
+    let data = B64.decode(clean).map_err(|_| "the attachment is not base64".to_string())?;
+    dmarc_report_parse(&open(&data)?)
+}
+
+/// Reads a report from a file: .xml, .xml.gz, .gz or .zip.
+pub fn dmarc_report_file(path: &str) -> Result<serde_json::Value, String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    dmarc_report_parse(&open(&data)?)
+}
+
+fn summarize(reports: &[Value]) -> Value {
+    let (mut total, mut pass, mut fail) = (0i64, 0i64, 0i64);
+    let (mut both, mut dkim_only, mut spf_only, mut neither) = (0i64, 0i64, 0i64, 0i64);
+    let mut sources: BTreeMap<String, (i64, i64, i64, BTreeMap<String, i64>, BTreeMap<String, i64>)> = BTreeMap::new();
+    let mut orgs: BTreeMap<String, i64> = BTreeMap::new();
+    let mut dispositions: BTreeMap<String, i64> = BTreeMap::new();
+    for rep in reports {
+        *orgs.entry(rep["org"].as_str().unwrap_or("?").to_string()).or_default() += rep["messages"].as_i64().unwrap_or(0);
+        for r in rep["records"].as_array().into_iter().flatten() {
+            let n = r["count"].as_i64().unwrap_or(0);
+            let ok = r["passed"] == true;
+            total += n;
+            if ok { pass += n } else { fail += n }
+            match (r["dkim_aligned"] == true, r["spf_aligned"] == true) {
+                (true, true) => both += n,
+                (true, false) => dkim_only += n,
+                (false, true) => spf_only += n,
+                _ => neither += n,
+            }
+            let d = r["disposition"].as_str().unwrap_or("none").to_string();
+            *dispositions.entry(d.clone()).or_default() += n;
+            let e = sources.entry(r["source_ip"].as_str().unwrap_or("?").to_string()).or_default();
+            e.0 += n;
+            if ok { e.1 += n } else { e.2 += n }
+            *e.3.entry(d).or_default() += n;
+            *e.4.entry(r["header_from"].as_str().unwrap_or("?").to_string()).or_default() += n;
+        }
+    }
+    let mut list: Vec<Value> = sources.into_iter().map(|(ip, (count, p, f, d, from))| json!({ "source_ip": ip, "count": count, "pass": p, "fail": f, "dispositions": d, "header_from": from })).collect();
+    list.sort_by_key(|s| -s["count"].as_i64().unwrap_or(0));
+    let failing: Vec<Value> = list.iter().filter(|s| s["fail"].as_i64().unwrap_or(0) > 0).cloned().collect();
+    let rate = if total > 0 { (pass as f64 / total as f64 * 10000.0).round() / 100.0 } else { 0.0 };
+    let mut align = Map::new();
+    for (k, v) in [("both", both), ("dkim_only", dkim_only), ("spf_only", spf_only), ("neither", neither)] {
+        align.insert(k.into(), json!(v));
+    }
+    json!({ "reports": reports.len(), "messages": total, "pass": pass, "fail": fail, "pass_rate": rate, "alignment": align, "dispositions": dispositions, "by_org": orgs, "by_source": list, "failing_sources": failing })
+}
+
+/// Totals for one report: { messages, pass, fail, pass_rate (percent), alignment: { both, dkim_only, spf_only, neither }, dispositions, by_org, by_source: [{ source_ip, count, pass, fail, dispositions, header_from }], failing_sources }, sources biggest first.
+pub fn dmarc_report_summary(report: serde_json::Value) -> serde_json::Value {
+    summarize(&[report])
+}
+
+/// The same totals over many reports, from several providers or days.
+pub fn dmarc_report_merge(reports: Vec<serde_json::Value>) -> serde_json::Value {
+    summarize(&reports)
+}

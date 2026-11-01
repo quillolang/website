@@ -1,0 +1,277 @@
+//! Shopify's Admin GraphQL API: queries paced by their cost and the bucket Shopify reports, user errors turned into errors, lists walked by cursor, ids made and read, and webhook and OAuth HMACs checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const API_VERSION: &str = "2025-10";
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+/// Whether `shop` is a real shop domain, like my-shop.myshopify.com: check this before sending anything to a shop named in a request.
+pub fn shopify_shop_ok(shop: &str) -> bool {
+    let Some(name) = shop.strip_suffix(".myshopify.com") else { return false };
+    !name.is_empty() && name.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn base_of(o: &Value) -> Result<String, String> {
+    if let Some(u) = opt(o, "base_url", "SHOPIFY_API_URL") {
+        return Ok(u.trim_end_matches('/').to_string());
+    }
+    let shop = opt(o, "shop", "SHOPIFY_SHOP").ok_or("no shop: set SHOPIFY_SHOP (like my-shop.myshopify.com), or give the option shop")?;
+    if !shopify_shop_ok(&shop) {
+        return Err(format!("{:?} is not a shop domain", shop));
+    }
+    Ok(format!("https://{}", shop))
+}
+
+// What Shopify last said of each shop's bucket: { available, restore rate, when }.
+fn buckets() -> &'static Mutex<HashMap<String, (f64, f64, Instant)>> {
+    static B: OnceLock<Mutex<HashMap<String, (f64, f64, Instant)>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wait_for(key: &str, need: f64) {
+    let wait = {
+        let Ok(map) = buckets().lock() else { return };
+        match map.get(key) {
+            Some((avail, rate, when)) if *rate > 0.0 => {
+                let now = avail + rate * when.elapsed().as_secs_f64();
+                if now < need { (need - now) / rate } else { 0.0 }
+            }
+            _ => 0.0,
+        }
+    };
+    if wait > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(wait.min(30.0)));
+    }
+}
+
+fn gql_errors(v: &Value) -> Vec<String> {
+    v.as_array().map(|l| l.iter().map(|e| {
+        let at = e["path"].as_array().map(|p| p.iter().map(|x| x.as_str().map(str::to_string).unwrap_or(x.to_string())).collect::<Vec<_>>().join(".")).filter(|p| !p.is_empty());
+        format!("{}{}", e["message"].as_str().unwrap_or("error"), at.map(|p| format!(" (at {})", p)).unwrap_or_default())
+    }).collect()).unwrap_or_default()
+}
+
+/// Runs a query or mutation. Options: shop (else SHOPIFY_SHOP), token (else SHOPIFY_ACCESS_TOKEN), version (else SHOPIFY_API_VERSION), base_url (else SHOPIFY_API_URL), cost (points to leave room for before sending; 100 by default after the first call). A THROTTLED answer is waited out by what the bucket says. Gives { data, cost: { requested, actual, available, maximum, restore_rate } }; GraphQL errors are error values.
+pub fn shopify_graphql(query: &str, variables: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let base = base_of(&options)?;
+    let token = opt(&options, "token", "SHOPIFY_ACCESS_TOKEN").ok_or("no token: set SHOPIFY_ACCESS_TOKEN, or give the option token")?;
+    let version = opt(&options, "version", "SHOPIFY_API_VERSION").unwrap_or_else(|| API_VERSION.into());
+    let url = format!("{}/admin/api/{}/graphql.json", base, version);
+    let mut body = json!({ "query": query });
+    if !variables.is_null() {
+        body["variables"] = variables;
+    }
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let need = options.get("cost").and_then(|c| c.as_f64()).unwrap_or(100.0);
+    let mut tries = 0;
+    loop {
+        wait_for(&base, need);
+        let res = agent.post(&url).set("X-Shopify-Access-Token", &token).set("Content-Type", "application/json").set("User-Agent", "quillo-shopify/1.0").send_string(&body.to_string());
+        let text = match res {
+            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+            Err(ureq::Error::Status(429, r)) if tries < 3 => {
+                let wait = r.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok()).unwrap_or(2.0);
+                std::thread::sleep(Duration::from_secs_f64(wait.min(30.0)));
+                tries += 1;
+                continue;
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let msg = v["errors"].as_str().map(str::to_string).unwrap_or(t.trim().chars().take(300).collect());
+                let hint = match code {
+                    401 => " (check SHOPIFY_ACCESS_TOKEN)",
+                    403 => " (the app lacks this scope)",
+                    404 => " (check the shop and the API version)",
+                    _ => "",
+                };
+                return Err(format!("Shopify {}: {}{}", code, msg, hint));
+            }
+            Err(e) => return Err(format!("cannot reach Shopify at {}: {}", base, e)),
+        };
+        let v: Value = serde_json::from_str(&text).map_err(|_| format!("Shopify's answer is not JSON: {:?}", text.chars().take(200).collect::<String>()))?;
+        let cost = &v["extensions"]["cost"];
+        let t = &cost["throttleStatus"];
+        let (avail, rate) = (t["currentlyAvailable"].as_f64().unwrap_or(0.0), t["restoreRate"].as_f64().unwrap_or(0.0));
+        if rate > 0.0 {
+            if let Ok(mut b) = buckets().lock() {
+                b.insert(base.clone(), (avail, rate, Instant::now()));
+            }
+        }
+        let throttled = v["errors"].as_array().map(|l| l.iter().any(|e| e.pointer("/extensions/code").and_then(|c| c.as_str()) == Some("THROTTLED"))).unwrap_or(false);
+        if throttled {
+            if tries >= 5 {
+                return Err("Shopify kept throttling this query: ask for less in one go".into());
+            }
+            tries += 1;
+            let requested = cost["requestedQueryCost"].as_f64().unwrap_or(need);
+            wait_for(&base, requested);
+            // Without a bucket to read, wait a moment anyway.
+            if rate <= 0.0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            continue;
+        }
+        if let Some(e) = v.get("errors") {
+            return Err(format!("Shopify: {}", gql_errors(e).join("; ")));
+        }
+        return Ok(json!({
+            "data": v["data"],
+            "cost": { "requested": cost["requestedQueryCost"], "actual": cost["actualQueryCost"], "available": t["currentlyAvailable"], "maximum": t["maximumAvailable"], "restore_rate": t["restoreRate"] },
+        }));
+    }
+}
+
+/// Runs a mutation and looks in its result (the first field of `data`, or `field`) for `userErrors`, which Shopify answers with a 200: any there is an error value naming the fields. Gives that field's value.
+pub fn shopify_mutate(mutation: &str, variables: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = shopify_graphql(mutation, variables, options)?;
+    let (name, value) = r["data"].as_object().and_then(|m| m.iter().next()).map(|(k, v)| (k.clone(), v.clone())).ok_or("the mutation gave no data")?;
+    let errs = value["userErrors"].as_array().cloned().unwrap_or_default();
+    if !errs.is_empty() {
+        let list: Vec<String> = errs.iter().map(|e| {
+            let f = e["field"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(".")).unwrap_or_default();
+            if f.is_empty() { e["message"].as_str().unwrap_or("error").to_string() } else { format!("{}: {}", f, e["message"].as_str().unwrap_or("error")) }
+        }).collect();
+        return Err(format!("Shopify refused {}: {}", name, list.join("; ")));
+    }
+    Ok(value)
+}
+
+/// Every node of a connection, page by page: the `query` takes a `$cursor: String` variable and asks for `pageInfo { hasNextPage endCursor }`; `path` is where the connection sits under data, like "products" or "order.lineItems". Options add max_items.
+pub fn shopify_all(query: &str, variables: serde_json::Value, path: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut vars = if variables.is_object() { variables } else { json!({}) };
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut out = vec![];
+    loop {
+        let r = shopify_graphql(query, vars.clone(), options.clone())?;
+        let mut at = &r["data"];
+        for part in path.split('.') {
+            at = &at[part];
+        }
+        if at.is_null() {
+            return Err(format!("no connection at data.{}", path));
+        }
+        let nodes = at["nodes"].as_array().cloned().or_else(|| at["edges"].as_array().map(|l| l.iter().map(|e| e["node"].clone()).collect()));
+        out.extend(nodes.ok_or(format!("data.{} has neither nodes nor edges", path))?);
+        let pi = &at["pageInfo"];
+        if pi.is_null() {
+            return Err("the query must ask for pageInfo { hasNextPage endCursor }".into());
+        }
+        if pi["hasNextPage"] != true || out.len() >= max {
+            break;
+        }
+        vars["cursor"] = pi["endCursor"].clone();
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// A global id from a type and a number: `shopify_gid("Product", 123)` is gid://shopify/Product/123.
+pub fn shopify_gid(kind: &str, id: i64) -> String {
+    format!("gid://shopify/{}/{}", kind, id)
+}
+
+/// The number at the end of a global id; `gid://shopify/Order/5?x=1` gives 5.
+pub fn shopify_id(gid: &str) -> Result<i64, String> {
+    gid.split('?').next().unwrap_or("").rsplit('/').next().and_then(|n| n.parse().ok()).ok_or(format!("{:?} is not a global id", gid))
+}
+
+fn hmac_of(secret: &str, text: &[u8]) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(text);
+    m.finalize().into_bytes().to_vec()
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn secret_of(s: &str) -> Result<String, String> {
+    if !s.is_empty() {
+        return Ok(s.to_string());
+    }
+    std::env::var("SHOPIFY_CLIENT_SECRET").ok().filter(|v| !v.is_empty()).ok_or("no secret: set SHOPIFY_CLIENT_SECRET".to_string())
+}
+
+/// Whether a webhook is really Shopify's: the raw `body`, its X-Shopify-Hmac-Sha256 header (base64) and the app's client secret ("" for SHOPIFY_CLIENT_SECRET), compared in constant time.
+pub fn shopify_webhook_ok(body: &str, hmac_header: &str, secret: &str) -> Result<bool, String> {
+    let key = secret_of(secret)?;
+    let Ok(got) = base64::engine::general_purpose::STANDARD.decode(hmac_header.trim()) else { return Ok(false) };
+    Ok(same(&got, &hmac_of(&key, body.as_bytes())))
+}
+
+/// A webhook checked and read: `headers` are the request's. Gives { topic, shop, webhook_id, api_version, triggered_at, payload }; deliveries can repeat, so keep webhook_id. An error when the HMAC is wrong.
+pub fn shopify_webhook(headers: std::collections::HashMap<String, serde_json::Value>, body: &str, secret: &str) -> Result<serde_json::Value, String> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.as_str()).map(str::to_string);
+    let sig = h("x-shopify-hmac-sha256").ok_or("no X-Shopify-Hmac-Sha256 header: this did not come from Shopify")?;
+    if !shopify_webhook_ok(body, &sig, secret)? {
+        return Err("the webhook's HMAC does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    let p: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    Ok(json!({ "topic": h("x-shopify-topic"), "shop": h("x-shopify-shop-domain"), "webhook_id": h("x-shopify-webhook-id"), "api_version": h("x-shopify-api-version"), "triggered_at": h("x-shopify-triggered-at"), "payload": p }))
+}
+
+// Query values escape % and &, and keys = too, before they are signed.
+fn oauth_message(q: &HashMap<String, Value>) -> String {
+    let mut parts: Vec<String> = q.iter().filter(|(k, _)| *k != "hmac" && *k != "signature").map(|(k, v)| {
+        let val = v.as_str().map(str::to_string).unwrap_or(v.to_string());
+        format!("{}={}", k.replace('%', "%25").replace('&', "%26").replace('=', "%3D"), val.replace('%', "%25").replace('&', "%26"))
+    }).collect();
+    parts.sort();
+    parts.join("&")
+}
+
+/// Checks the query of an OAuth callback or an app load: every parameter but `hmac`, sorted and joined, signed with the client secret ("" for SHOPIFY_CLIENT_SECRET), and `shop` a real shop domain. Compare `state` with the one you sent, too.
+pub fn shopify_oauth_ok(query: std::collections::HashMap<String, serde_json::Value>, secret: &str) -> Result<bool, String> {
+    let key = secret_of(secret)?;
+    let got = query.get("hmac").and_then(|h| h.as_str()).ok_or("the query has no hmac")?;
+    let Ok(bytes) = hex::decode(got) else { return Ok(false) };
+    if !query.get("shop").and_then(|s| s.as_str()).map(shopify_shop_ok).unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(same(&bytes, &hmac_of(&key, oauth_message(&query).as_bytes())))
+}
+
+/// Where to send a merchant to install the app: the shop, its client id, the scopes (a list), the redirect URL and a `state` you keep to compare.
+pub fn shopify_oauth_url(shop: &str, client_id: &str, scopes: Vec<String>, redirect_uri: &str, state: &str) -> Result<String, String> {
+    if !shopify_shop_ok(shop) {
+        return Err(format!("{:?} is not a shop domain", shop));
+    }
+    Ok(format!("https://{}/admin/oauth/authorize?client_id={}&scope={}&redirect_uri={}&state={}", shop, enc(client_id), enc(&scopes.join(",")), enc(redirect_uri), enc(state)))
+}
+
+/// Swaps the `code` of an OAuth callback for an access token. Gives { access_token, scope }.
+pub fn shopify_oauth_token(shop: &str, code: &str, client_id: &str, secret: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut o = options;
+    o["shop"] = json!(shop);
+    let base = base_of(&o)?;
+    let body = json!({ "client_id": client_id, "client_secret": secret_of(secret)?, "code": code });
+    let res = ureq::post(&format!("{}/admin/oauth/access_token", base)).timeout(Duration::from_secs(30)).set("Content-Type", "application/json").send_string(&body.to_string());
+    match res {
+        Ok(r) => serde_json::from_str(&r.into_string().map_err(|e| e.to_string())?).map_err(|e| format!("Shopify's answer is not JSON: {}", e)),
+        Err(ureq::Error::Status(c, r)) => Err(format!("Shopify {}: {}", c, r.into_string().unwrap_or_default().trim().chars().take(300).collect::<String>())),
+        Err(e) => Err(format!("cannot reach Shopify at {}: {}", base, e)),
+    }
+}

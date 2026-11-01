@@ -1,0 +1,789 @@
+//! Boolean satisfiability by a conflict-driven clause-learning solver written here: DIMACS read and written, clauses as lists or named variables, models and an unsatisfiable answer with a small core, all models counted, and cardinality constraints encoded.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+const MAX_VARS: usize = 2_000_000;
+
+// A literal is 2·var + sign, sign 1 for negated: the classic layout, so `l ^ 1` is its negation.
+type Lit = u32;
+
+fn lit(x: i64) -> Lit {
+    let v = x.unsigned_abs() as u32 - 1;
+    v * 2 + (x < 0) as u32
+}
+
+fn ext(l: Lit) -> i64 {
+    let v = (l / 2 + 1) as i64;
+    if l & 1 == 1 { -v } else { v }
+}
+
+// A binary heap of variables by activity, knowing where each one is, so a bump can move it up.
+struct Order {
+    heap: Vec<u32>,
+    at: Vec<i32>,
+}
+
+impl Order {
+    fn new(vars: usize) -> Order {
+        Order { heap: (0..vars as u32).collect(), at: (0..vars as i32).collect() }
+    }
+    fn up(&mut self, mut i: usize, act: &[f64]) {
+        let v = self.heap[i];
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if act[self.heap[p] as usize] >= act[v as usize] {
+                break;
+            }
+            self.heap[i] = self.heap[p];
+            self.at[self.heap[i] as usize] = i as i32;
+            i = p;
+        }
+        self.heap[i] = v;
+        self.at[v as usize] = i as i32;
+    }
+    fn down(&mut self, mut i: usize, act: &[f64]) {
+        let v = self.heap[i];
+        loop {
+            let mut c = 2 * i + 1;
+            if c >= self.heap.len() {
+                break;
+            }
+            if c + 1 < self.heap.len() && act[self.heap[c + 1] as usize] > act[self.heap[c] as usize] {
+                c += 1;
+            }
+            if act[self.heap[c] as usize] <= act[v as usize] {
+                break;
+            }
+            self.heap[i] = self.heap[c];
+            self.at[self.heap[i] as usize] = i as i32;
+            i = c;
+        }
+        self.heap[i] = v;
+        self.at[v as usize] = i as i32;
+    }
+    fn insert(&mut self, v: u32, act: &[f64]) {
+        if self.at[v as usize] < 0 {
+            self.heap.push(v);
+            self.at[v as usize] = self.heap.len() as i32 - 1;
+            self.up(self.heap.len() - 1, act);
+        }
+    }
+    fn pop(&mut self, act: &[f64]) -> Option<u32> {
+        let top = *self.heap.first()?;
+        let last = self.heap.pop()?;
+        self.at[top as usize] = -1;
+        if !self.heap.is_empty() {
+            self.heap[0] = last;
+            self.at[last as usize] = 0;
+            self.down(0, act);
+        }
+        Some(top)
+    }
+    fn raised(&mut self, v: u32, act: &[f64]) {
+        let i = self.at[v as usize];
+        if i >= 0 {
+            self.up(i as usize, act);
+        }
+    }
+}
+
+struct Solver {
+    clauses: Vec<Vec<Lit>>,
+    watches: Vec<Vec<usize>>,
+    value: Vec<i8>, // By literal: 1 true, -1 false, 0 unset.
+    level: Vec<u32>,
+    reason: Vec<usize>,
+    trail: Vec<Lit>,
+    limits: Vec<usize>,
+    head: usize,
+    activity: Vec<f64>,
+    bump: f64,
+    order: Order,
+    phase: Vec<bool>,
+    learnt: Vec<(usize, u32)>, // Learnt clauses by id, with how many levels they spanned.
+    limit: usize,
+    conflicts: u64,
+    decisions: u64,
+    propagations: u64,
+    empty: bool,
+}
+
+const NONE: usize = usize::MAX;
+
+enum Answer {
+    Sat(Vec<bool>),
+    Unsat,
+    Unknown,
+}
+
+impl Solver {
+    fn new(vars: usize) -> Solver {
+        let mut s = Solver {
+            clauses: vec![],
+            watches: vec![vec![]; vars * 2],
+            value: vec![0; vars * 2],
+            level: vec![0; vars],
+            reason: vec![NONE; vars],
+            trail: vec![],
+            limits: vec![],
+            head: 0,
+            activity: vec![0.0; vars],
+            bump: 1.0,
+            order: Order::new(vars),
+            phase: vec![false; vars],
+            learnt: vec![],
+            limit: 4000,
+            conflicts: 0,
+            decisions: 0,
+            propagations: 0,
+            empty: false,
+        };
+        s.head = 0;
+        s
+    }
+
+    fn assign(&mut self, l: Lit, why: usize) {
+        self.value[l as usize] = 1;
+        self.value[(l ^ 1) as usize] = -1;
+        let v = (l / 2) as usize;
+        self.level[v] = self.limits.len() as u32;
+        self.reason[v] = why;
+        self.phase[v] = l & 1 == 0;
+        self.trail.push(l);
+    }
+
+    fn add(&mut self, input: &[i64]) {
+        let mut c: Vec<Lit> = input.iter().map(|x| lit(*x)).collect();
+        c.sort();
+        c.dedup();
+        if c.windows(2).any(|w| w[0] ^ 1 == w[1]) {
+            return; // True whatever is chosen.
+        }
+        c.retain(|l| self.value[*l as usize] != -1 || self.level[(*l / 2) as usize] != 0);
+        if c.iter().any(|l| self.value[*l as usize] == 1) {
+            return;
+        }
+        match c.len() {
+            0 => self.empty = true,
+            1 => {
+                self.assign(c[0], NONE);
+                if self.propagate() != NONE {
+                    self.empty = true;
+                }
+            }
+            _ => {
+                let id = self.clauses.len();
+                self.watches[c[0] as usize].push(id);
+                self.watches[c[1] as usize].push(id);
+                self.clauses.push(c);
+            }
+        }
+    }
+
+    // Unit propagation by two watched literals; a clause's watches are its first two.
+    fn propagate(&mut self) -> usize {
+        while self.head < self.trail.len() {
+            let p = self.trail[self.head];
+            self.head += 1;
+            self.propagations += 1;
+            let false_lit = p ^ 1;
+            let mut list = std::mem::take(&mut self.watches[false_lit as usize]);
+            let mut keep = 0;
+            let mut i = 0;
+            while i < list.len() {
+                let id = list[i];
+                i += 1;
+                let c = &mut self.clauses[id];
+                if c.is_empty() {
+                    continue; // Deleted: its watch goes with it.
+                }
+                if c[0] == false_lit {
+                    c.swap(0, 1);
+                }
+                let first = c[0];
+                if self.value[first as usize] == 1 {
+                    list[keep] = id;
+                    keep += 1;
+                    continue;
+                }
+                let mut moved = false;
+                for k in 2..c.len() {
+                    if self.value[c[k] as usize] != -1 {
+                        c.swap(1, k);
+                        self.watches[c[1] as usize].push(id);
+                        moved = true;
+                        break;
+                    }
+                }
+                if moved {
+                    continue;
+                }
+                list[keep] = id;
+                keep += 1;
+                if self.value[first as usize] == -1 {
+                    while i < list.len() {
+                        list[keep] = list[i];
+                        keep += 1;
+                        i += 1;
+                    }
+                    list.truncate(keep);
+                    self.watches[false_lit as usize] = list;
+                    self.head = self.trail.len();
+                    return id;
+                }
+                self.assign(first, id);
+            }
+            list.truncate(keep);
+            self.watches[false_lit as usize] = list;
+        }
+        NONE
+    }
+
+    fn bump_var(&mut self, v: usize) {
+        self.activity[v] += self.bump;
+        if self.activity[v] > 1e100 {
+            for a in self.activity.iter_mut() {
+                *a *= 1e-100;
+            }
+            self.bump *= 1e-100;
+        }
+        self.order.raised(v as u32, &self.activity);
+    }
+
+    // First-UIP learning: walks back along the trail until one literal of the current level is left.
+    fn analyze(&mut self, mut confl: usize, seen: &mut [bool]) -> (Vec<Lit>, usize) {
+        let mut learnt: Vec<Lit> = vec![0];
+        let mut count = 0;
+        let mut at = self.trail.len();
+        let cur = self.limits.len() as u32;
+        let mut p: Option<Lit> = None;
+        loop {
+            for k in (if p.is_some() { 1 } else { 0 })..self.clauses[confl].len() {
+                let l = self.clauses[confl][k];
+                let v = (l / 2) as usize;
+                if !seen[v] && self.level[v] > 0 {
+                    seen[v] = true;
+                    self.bump_var(v);
+                    if self.level[v] >= cur {
+                        count += 1;
+                    } else {
+                        learnt.push(l);
+                    }
+                }
+            }
+            loop {
+                at -= 1;
+                if seen[(self.trail[at] / 2) as usize] {
+                    break;
+                }
+            }
+            let q = self.trail[at];
+            let v = (q / 2) as usize;
+            seen[v] = false;
+            count -= 1;
+            p = Some(q);
+            if count == 0 {
+                learnt[0] = q ^ 1;
+                break;
+            }
+            // A reason's asserted literal stays first in its clause, so `skip(1)` passes over it.
+            confl = self.reason[v];
+        }
+        // A literal implied by the others of the clause adds nothing.
+        let others: Vec<Lit> = learnt[1..].to_vec();
+        let mut k = 1;
+        for l in others {
+            let v = (l / 2) as usize;
+            let r = self.reason[v];
+            let implied = r != NONE && self.clauses[r].iter().skip(1).all(|x| seen[(*x / 2) as usize] || self.level[(*x / 2) as usize] == 0);
+            if !implied {
+                learnt[k] = l;
+                k += 1;
+            } else {
+                seen[v] = false;
+            }
+        }
+        learnt.truncate(k);
+        let mut back = 0;
+        if learnt.len() > 1 {
+            let mut top = 1;
+            for i in 2..learnt.len() {
+                if self.level[(learnt[i] / 2) as usize] > self.level[(learnt[top] / 2) as usize] {
+                    top = i;
+                }
+            }
+            learnt.swap(1, top);
+            back = self.level[(learnt[1] / 2) as usize] as usize;
+        }
+        for l in &learnt {
+            seen[(*l / 2) as usize] = false;
+        }
+        (learnt, back)
+    }
+
+    // Half of the learnt clauses go, the ones spanning most levels, unless one is a reason now.
+    fn reduce(&mut self) {
+        self.learnt.sort_by_key(|x| x.1);
+        let mut keep = Vec::with_capacity(self.learnt.len() / 2 + 1);
+        let half = self.learnt.len() / 2;
+        for (i, (id, span)) in self.learnt.clone().into_iter().enumerate() {
+            let first = self.clauses[id][0];
+            let in_use = self.value[first as usize] == 1 && self.reason[(first / 2) as usize] == id;
+            if i < half || span <= 2 || in_use {
+                keep.push((id, span));
+            } else {
+                self.clauses[id] = Vec::new();
+            }
+        }
+        self.learnt = keep;
+        self.limit += 500;
+    }
+
+    fn cancel(&mut self, level: usize) {
+        if self.limits.len() <= level {
+            return;
+        }
+        let keep = self.limits[level];
+        for i in (keep..self.trail.len()).rev() {
+            let l = self.trail[i];
+            self.value[l as usize] = 0;
+            self.value[(l ^ 1) as usize] = 0;
+            self.order.insert(l / 2, &self.activity);
+        }
+        self.trail.truncate(keep);
+        self.limits.truncate(level);
+        self.head = keep;
+    }
+
+    fn decide(&mut self) -> Option<Lit> {
+        while let Some(v) = self.order.pop(&self.activity) {
+            let l = v * 2;
+            if self.value[l as usize] == 0 {
+                return Some(if self.phase[v as usize] { l } else { l + 1 });
+            }
+        }
+        None
+    }
+
+    fn solve(&mut self, assumptions: &[Lit], max_conflicts: u64) -> Answer {
+        if self.empty || self.propagate() != NONE {
+            self.empty = true;
+            return Answer::Unsat;
+        }
+        let vars = self.level.len();
+        let mut seen = vec![false; vars];
+        let mut restart = 0u32;
+        let mut budget = 100 * luby(restart);
+        let mut since = 0u64;
+        loop {
+            let confl = self.propagate();
+            if confl != NONE {
+                self.conflicts += 1;
+                since += 1;
+                if self.limits.is_empty() {
+                    self.empty = true;
+                    return Answer::Unsat;
+                }
+                if self.conflicts >= max_conflicts {
+                    self.cancel(0);
+                    return Answer::Unknown;
+                }
+                let (learnt, back) = self.analyze(confl, &mut seen);
+                self.cancel(back);
+                self.bump /= 0.95;
+                if learnt.len() == 1 {
+                    self.assign(learnt[0], NONE);
+                } else {
+                    let id = self.clauses.len();
+                    self.watches[learnt[0] as usize].push(id);
+                    self.watches[learnt[1] as usize].push(id);
+                    let first = learnt[0];
+                    let mut lv: Vec<u32> = learnt.iter().map(|l| self.level[(*l / 2) as usize]).collect();
+                    lv.sort();
+                    lv.dedup();
+                    self.learnt.push((id, lv.len() as u32));
+                    self.clauses.push(learnt);
+                    self.assign(first, id);
+                    if self.learnt.len() >= self.limit {
+                        self.reduce();
+                    }
+                }
+                continue;
+            }
+            if since >= budget {
+                since = 0;
+                restart += 1;
+                budget = 100 * luby(restart);
+                self.cancel(0);
+                continue;
+            }
+            // Assumptions are the first decisions.
+            let lvl = self.limits.len();
+            if lvl < assumptions.len() {
+                let a = assumptions[lvl];
+                match self.value[a as usize] {
+                    1 => self.limits.push(self.trail.len()),
+                    -1 => {
+                        self.cancel(0);
+                        return Answer::Unsat;
+                    }
+                    _ => {
+                        self.limits.push(self.trail.len());
+                        self.assign(a, NONE);
+                    }
+                }
+                continue;
+            }
+            match self.decide() {
+                Some(l) => {
+                    self.decisions += 1;
+                    self.limits.push(self.trail.len());
+                    self.assign(l, NONE);
+                }
+                None => {
+                    let model = (0..vars).map(|v| self.value[v * 2] == 1).collect();
+                    self.cancel(0);
+                    return Answer::Sat(model);
+                }
+            }
+        }
+    }
+}
+
+fn luby(mut x: u32) -> u64 {
+    let (mut size, mut seq) = (1u64, 0u32);
+    while size < x as u64 + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    while size - 1 != x as u64 {
+        size = (size - 1) >> 1;
+        seq -= 1;
+        x %= size as u32;
+    }
+    1u64 << seq
+}
+
+fn clause_list(v: &Value) -> Result<(Vec<Vec<i64>>, usize), String> {
+    let list = v.as_array().ok_or("give the clauses as a list of lists of nonzero ints")?;
+    let mut out = vec![];
+    let mut vars = 0;
+    for (i, c) in list.iter().enumerate() {
+        let items = c.as_array().ok_or(format!("clause {} is not a list", i + 1))?;
+        let mut one = vec![];
+        for l in items {
+            let x = l.as_i64().ok_or(format!("clause {}: `{}` is not an int", i + 1, l))?;
+            if x == 0 {
+                return Err(format!("clause {}: 0 is no literal; variables count from 1", i + 1));
+            }
+            vars = vars.max(x.unsigned_abs() as usize);
+            one.push(x);
+        }
+        out.push(one);
+    }
+    if vars > MAX_VARS {
+        return Err(format!("{} variables is more than this solver takes", vars));
+    }
+    Ok((out, vars))
+}
+
+fn solve_list(clauses: &[Vec<i64>], vars: usize, assumptions: &[i64], max_conflicts: u64) -> (Answer, Value) {
+    let mut s = Solver::new(vars);
+    for c in clauses {
+        s.add(c);
+    }
+    let a: Vec<Lit> = assumptions.iter().map(|x| lit(*x)).collect();
+    let answer = s.solve(&a, max_conflicts);
+    let stats = json!({ "variables": vars, "clauses": clauses.len(), "conflicts": s.conflicts, "decisions": s.decisions, "propagations": s.propagations });
+    (answer, stats)
+}
+
+fn budget(options: &Value) -> u64 {
+    options.get("max_conflicts").and_then(|v| v.as_u64()).unwrap_or(5_000_000)
+}
+
+/// Clauses solved. Each clause is a list of ints, -3 meaning "not variable 3": `sat_solve([[1, 2], [-1]], {})`. Gives { sat: true, model, stats } with the model as signed ints, { sat: false, stats }, or { sat: null, stats } when `max_conflicts` ran out. `options`: { assumptions, variables, max_conflicts }.
+pub fn sat_solve(clauses: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (list, mut vars) = clause_list(&clauses)?;
+    vars = vars.max(options.get("variables").and_then(|v| v.as_u64()).unwrap_or(0) as usize);
+    let assumptions: Vec<i64> = options.get("assumptions").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
+    for a in &assumptions {
+        vars = vars.max(a.unsigned_abs() as usize);
+        if *a == 0 {
+            return Err("0 is no literal".into());
+        }
+    }
+    let (a, stats) = solve_list(&list, vars, &assumptions, budget(&options));
+    Ok(match a {
+        Answer::Sat(m) => json!({ "sat": true, "model": m.iter().enumerate().map(|(i, b)| if *b { i as i64 + 1 } else { -(i as i64 + 1) }).collect::<Vec<_>>(), "stats": stats }),
+        Answer::Unsat => json!({ "sat": false, "stats": stats }),
+        Answer::Unknown => json!({ "sat": null, "stats": stats }),
+    })
+}
+
+fn named(clauses: &Value) -> Result<(Vec<Vec<i64>>, Vec<String>), String> {
+    let list = clauses.as_array().ok_or("give the clauses as a list of lists of names")?;
+    let mut ids: HashMap<String, i64> = HashMap::new();
+    let mut names = vec![];
+    let mut out = vec![];
+    for (i, c) in list.iter().enumerate() {
+        let items = c.as_array().ok_or(format!("clause {} is not a list", i + 1))?;
+        let mut one = vec![];
+        for l in items {
+            let t = l.as_str().ok_or(format!("clause {}: `{}` is not text", i + 1, l))?;
+            let (neg, name) = match t.strip_prefix('-').or(t.strip_prefix('!')).or(t.strip_prefix('¬')) {
+                Some(r) => (true, r),
+                None => (false, t),
+            };
+            if name.is_empty() {
+                return Err(format!("clause {}: an empty name", i + 1));
+            }
+            let id = *ids.entry(name.to_string()).or_insert_with(|| {
+                names.push(name.to_string());
+                names.len() as i64
+            });
+            one.push(if neg { -id } else { id });
+        }
+        out.push(one);
+    }
+    Ok((out, names))
+}
+
+/// Clauses over names: `sat_solve_named([["rain", "sprinkler"], ["-rain"]], {})`. A leading `-` or `!` is "not". Gives { sat, model } with the model a map of name to true or false.
+pub fn sat_solve_named(clauses: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let (list, names) = named(&clauses)?;
+    let (a, stats) = solve_list(&list, names.len(), &[], budget(&options));
+    Ok(match a {
+        Answer::Sat(m) => {
+            let map: Map<String, Value> = names.iter().zip(&m).map(|(n, b)| (n.clone(), json!(b))).collect();
+            json!({ "sat": true, "model": map, "stats": stats })
+        }
+        Answer::Unsat => json!({ "sat": false, "stats": stats }),
+        Answer::Unknown => json!({ "sat": null, "stats": stats }),
+    })
+}
+
+/// Every model, up to `limit`: { models, count, complete }. `complete` false means there may be more. Only the `over` variables are told apart, so helpers from a cardinality encoding do not multiply answers; [] means all.
+pub fn sat_all_models(clauses: serde_json::Value, over: Vec<i64>, limit: i64) -> Result<Value, String> {
+    let (mut list, mut vars) = clause_list(&clauses)?;
+    if limit < 1 {
+        return Err("limit is at least 1".into());
+    }
+    for v in &over {
+        if *v <= 0 {
+            return Err("`over` lists variables, as positive ints".into());
+        }
+        vars = vars.max(*v as usize);
+    }
+    let shown: Vec<i64> = if over.is_empty() { (1..=vars as i64).collect() } else { over };
+    let mut s = Solver::new(vars);
+    for c in &list {
+        s.add(c);
+    }
+    let mut models = vec![];
+    let mut complete = false;
+    while (models.len() as i64) < limit {
+        match s.solve(&[], u64::MAX) {
+            Answer::Sat(m) => {
+                let row: Vec<i64> = shown.iter().map(|v| if m[*v as usize - 1] { *v } else { -*v }).collect();
+                let block: Vec<i64> = row.iter().map(|x| -*x).collect();
+                models.push(row);
+                list.push(block.clone());
+                s.add(&block);
+            }
+            _ => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    if !complete {
+        complete = matches!(s.solve(&[], u64::MAX), Answer::Unsat);
+    }
+    Ok(json!({ "count": models.len(), "complete": complete, "models": models }))
+}
+
+/// A small unsatisfiable core: a list of clause positions (from 0) that are already unsatisfiable together, with no clause to spare, found by deleting each in turn. An error value if the clauses are satisfiable.
+pub fn sat_core(clauses: serde_json::Value) -> Result<Value, String> {
+    let (list, vars) = clause_list(&clauses)?;
+    if !matches!(solve_list(&list, vars, &[], u64::MAX).0, Answer::Unsat) {
+        return Err("those clauses are satisfiable, so they have no core".into());
+    }
+    let mut keep: Vec<usize> = (0..list.len()).collect();
+    let mut i = 0;
+    while i < keep.len() {
+        let trial: Vec<Vec<i64>> = keep.iter().enumerate().filter(|(k, _)| *k != i).map(|(_, x)| list[*x].clone()).collect();
+        if matches!(solve_list(&trial, vars, &[], u64::MAX).0, Answer::Unsat) {
+            keep.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(json!({ "core": keep, "clauses": keep.iter().map(|x| list[*x].clone()).collect::<Vec<_>>() }))
+}
+
+/// Whether a model satisfies clauses: { ok, unsatisfied }, the positions of clauses it breaks. For checking an answer from elsewhere.
+pub fn sat_check(clauses: serde_json::Value, model: Vec<i64>) -> Result<Value, String> {
+    let (list, _) = clause_list(&clauses)?;
+    let set: std::collections::HashSet<i64> = model.into_iter().collect();
+    let bad: Vec<usize> = list.iter().enumerate().filter(|(_, c)| !c.iter().any(|l| set.contains(l))).map(|(i, _)| i).collect();
+    Ok(json!({ "ok": bad.is_empty(), "unsatisfied": bad }))
+}
+
+/// DIMACS CNF read: { variables, clauses, comments }. A clause may run over lines, and the `p cnf` header's counts are checked. A SATLIB `%` trailer ends the file.
+pub fn sat_parse_dimacs(text: &str) -> Result<Value, String> {
+    let (mut vars, mut declared, mut seen_p) = (0i64, 0usize, false);
+    let mut clauses: Vec<Vec<i64>> = vec![];
+    let mut cur = vec![];
+    let mut comments = vec![];
+    'lines: for (i, raw) in text.lines().enumerate() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t == "c" || t.starts_with("c ") {
+            comments.push(t[1..].trim().to_string());
+            continue;
+        }
+        if t.starts_with('%') {
+            break;
+        }
+        if t.starts_with("p ") || t.starts_with("p\t") {
+            let f: Vec<&str> = t.split_whitespace().collect();
+            if f.len() != 4 || f[1] != "cnf" {
+                return Err(format!("line {}: the problem line is `p cnf <variables> <clauses>`", i + 1));
+            }
+            vars = f[2].parse().map_err(|_| format!("line {}: `{}` is not a count", i + 1, f[2]))?;
+            declared = f[3].parse().map_err(|_| format!("line {}: `{}` is not a count", i + 1, f[3]))?;
+            seen_p = true;
+            continue;
+        }
+        if !seen_p {
+            return Err(format!("line {}: a clause before the `p cnf` line", i + 1));
+        }
+        for tok in t.split_whitespace() {
+            let x: i64 = tok.parse().map_err(|_| format!("line {}: `{}` is not a literal", i + 1, tok))?;
+            if x == 0 {
+                clauses.push(std::mem::take(&mut cur));
+                if clauses.len() > declared + 1_000_000 {
+                    break 'lines;
+                }
+            } else if x.abs() > vars {
+                return Err(format!("line {}: variable {} is past the {} declared", i + 1, x.abs(), vars));
+            } else {
+                cur.push(x);
+            }
+        }
+    }
+    if !seen_p {
+        return Err("no `p cnf` line".into());
+    }
+    if !cur.is_empty() {
+        clauses.push(cur);
+    }
+    if clauses.len() != declared {
+        return Err(format!("the header says {} clauses and there are {}", declared, clauses.len()));
+    }
+    Ok(json!({ "variables": vars, "clauses": clauses, "comments": comments }))
+}
+
+/// Clauses as DIMACS CNF text, with the variable count worked out unless `variables` is larger.
+pub fn sat_to_dimacs(clauses: serde_json::Value, variables: i64, comment: &str) -> Result<String, String> {
+    let (list, vars) = clause_list(&clauses)?;
+    let mut o = String::new();
+    for l in comment.lines() {
+        o.push_str(&format!("c {}\n", l));
+    }
+    o.push_str(&format!("p cnf {} {}\n", vars.max(variables.max(0) as usize), list.len()));
+    for c in &list {
+        for l in c {
+            o.push_str(&format!("{} ", l));
+        }
+        o.push_str("0\n");
+    }
+    Ok(o)
+}
+
+// Sinz's sequential counter: s(i, j) says at least j of the first i are true.
+fn at_most(lits: &[i64], k: usize, next: &mut i64) -> Vec<Vec<i64>> {
+    let n = lits.len();
+    let mut out = vec![];
+    if k >= n {
+        return out;
+    }
+    if k == 0 {
+        return lits.iter().map(|l| vec![-*l]).collect();
+    }
+    let s: Vec<Vec<i64>> = (0..n - 1).map(|_| (0..k).map(|_| { let v = *next; *next += 1; v }).collect()).collect();
+    out.push(vec![-lits[0], s[0][0]]);
+    for j in 1..k {
+        out.push(vec![-s[0][j]]);
+    }
+    for i in 1..n - 1 {
+        out.push(vec![-lits[i], s[i][0]]);
+        out.push(vec![-s[i - 1][0], s[i][0]]);
+        for j in 1..k {
+            out.push(vec![-lits[i], -s[i - 1][j - 1], s[i][j]]);
+            out.push(vec![-s[i - 1][j], s[i][j]]);
+        }
+        out.push(vec![-lits[i], -s[i - 1][k - 1]]);
+    }
+    out.push(vec![-lits[n - 1], -s[n - 2][k - 1]]);
+    out
+}
+
+/// Clauses saying how many of some literals hold: `kind` is at_most, at_least or exactly. New helper variables start at `next_var`: pass one more than your largest. Gives { clauses, next_var }. Pairs of "not both" are written for at_most 1 of up to six, the sequential counter above that.
+pub fn sat_cardinality(kind: &str, literals: Vec<i64>, k: i64, next_var: i64) -> Result<Value, String> {
+    if k < 0 {
+        return Err("k cannot be negative".into());
+    }
+    if literals.iter().any(|l| *l == 0) {
+        return Err("0 is no literal".into());
+    }
+    let top = literals.iter().map(|l| l.abs()).max().unwrap_or(0);
+    if next_var <= top {
+        return Err(format!("next_var must be above the largest variable used, {}", top));
+    }
+    let n = literals.len() as i64;
+    let mut next = next_var;
+    let neg: Vec<i64> = literals.iter().map(|l| -*l).collect();
+    let most = |lits: &[i64], k: i64, next: &mut i64| -> Vec<Vec<i64>> {
+        if k == 1 && lits.len() <= 6 {
+            let mut o = vec![];
+            for i in 0..lits.len() {
+                for j in i + 1..lits.len() {
+                    o.push(vec![-lits[i], -lits[j]]);
+                }
+            }
+            o
+        } else {
+            at_most(lits, k as usize, next)
+        }
+    };
+    let least = |next: &mut i64| -> Result<Vec<Vec<i64>>, String> {
+        if k > n {
+            return Err(format!("at least {} of {} cannot hold", k, n));
+        }
+        if k == 1 {
+            return Ok(vec![literals.clone()]);
+        }
+        // At least k of n is at most n - k of their negations.
+        Ok(at_most(&neg, (n - k) as usize, next))
+    };
+    let clauses = match kind {
+        "at_most" => most(&literals, k, &mut next),
+        "at_least" => least(&mut next)?,
+        "exactly" => {
+            let mut c = most(&literals, k, &mut next);
+            c.extend(least(&mut next)?);
+            c
+        }
+        o => return Err(format!("no constraint `{}`; there are at_most, at_least and exactly", o)),
+    };
+    Ok(json!({ "clauses": clauses, "next_var": next }))
+}

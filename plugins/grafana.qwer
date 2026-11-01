@@ -1,0 +1,392 @@
+//! Grafana's HTTP API: dashboards saved, read, searched and removed, folders, annotations, data-source queries with their frames flattened into rows, alert rules through provisioning, and service accounts with their tokens, with Grafana's error bodies and version conflicts turned into clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn base() -> String {
+    std::env::var("GRAFANA_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or("http://localhost:3000".into()).trim_end_matches('/').to_string()
+}
+
+fn call_with(method: &str, path: &str, body: Option<&Value>, o: &Value, extra: &[(&str, &str)]) -> Result<Value, String> {
+    let token = std::env::var("GRAFANA_TOKEN").ok().filter(|v| !v.is_empty()).ok_or("no token: set GRAFANA_TOKEN to a service account's token")?;
+    let url = format!("{}{}", base(), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0u64;
+    loop {
+        tries += 1;
+        let mut r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("Accept", "application/json");
+        if let Some(org) = o.get("org_id").and_then(|v| v.as_i64()) {
+            r = r.set("X-Grafana-Org-Id", &org.to_string());
+        }
+        for (k, v) in extra {
+            r = r.set(k, v);
+        }
+        let res = match body {
+            Some(b) => r.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => r.call(),
+        };
+        let resp = match res {
+            Ok(x) => x,
+            Err(ureq::Error::Status(_, x)) => x,
+            Err(e) => return Err(format!("cannot reach Grafana at {}: {}", base(), e)),
+        };
+        let status = resp.status();
+        let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        if status < 300 {
+            if text.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&text).map_err(|e| format!("Grafana: not JSON: {}", e));
+        }
+        if (status == 429 || (status >= 500 && method == "GET")) && tries < 4 {
+            std::thread::sleep(Duration::from_secs(wait.unwrap_or(tries).min(30)));
+            continue;
+        }
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        // A failed data-source query is a 4xx with its reason inside `results`.
+        if let Some((id, e)) = v["results"].as_object().and_then(|m| m.iter().find_map(|(id, r)| r["error"].as_str().map(|e| (id.clone(), e.to_string())))) {
+            return Err(format!("query {}: {}", id, e));
+        }
+        let msg = v["message"].as_str().or(v["error"].as_str()).map(str::to_string).unwrap_or_else(|| text.chars().take(200).collect());
+        let hint = match status {
+            401 => " (the token is wrong or expired)",
+            403 => " (the token's role does not allow this)",
+            _ => "",
+        };
+        let what = v["status"].as_str().map(|s| format!(" {}", s)).unwrap_or_default();
+        return Err(format!("Grafana {}{}: {}{}", status, what, msg, hint));
+    }
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    call_with(method, path, body, o, &[])
+}
+
+fn query(pairs: &[(&str, Option<String>)]) -> String {
+    let q: Vec<String> = pairs.iter().filter_map(|(k, v)| v.as_ref().map(|v| format!("{}={}", k, enc(v)))).collect();
+    if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
+}
+
+fn text(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Is the server up: { database, version, commit }. Needs no special role.
+pub fn grafana_health(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", "/api/health", None, &options)
+}
+
+/// Any call: `method`, `path` like /api/org, `body` or null.
+pub fn grafana_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+// ---- Dashboards ----
+
+/// Saves a dashboard: a dashboard's JSON, with `uid` to keep or none for a new one. Options: folder_uid, overwrite, message. A stale `version` is an error unless overwrite is set. Gives { id, uid, url, status, version, slug }.
+pub fn grafana_dashboard_save(dashboard: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if dashboard.get("title").is_none() {
+        return Err("a dashboard needs a `title`".into());
+    }
+    let mut b = json!({ "dashboard": dashboard, "overwrite": options.get("overwrite") == Some(&Value::Bool(true)) });
+    if let Some(f) = text(&options, "folder_uid") {
+        b["folderUid"] = json!(f);
+    }
+    if let Some(m) = text(&options, "message") {
+        b["message"] = json!(m);
+    }
+    call("POST", "/api/dashboards/db", Some(&b), &options)
+}
+
+/// A dashboard by uid: { dashboard, meta }.
+pub fn grafana_dashboard_get(uid: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/api/dashboards/uid/{}", enc(uid)), None, &options)
+}
+
+/// Removes a dashboard.
+pub fn grafana_dashboard_delete(uid: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/api/dashboards/uid/{}", enc(uid)), None, &options)?;
+    Ok(true)
+}
+
+/// Finds dashboards and folders, all pages: options query, tag, type (dash-db or dash-folder), folder_uids (comma-separated), starred.
+pub fn grafana_search(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let limit = options.get("page_size").and_then(|v| v.as_u64()).unwrap_or(1000);
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let q = query(&[("query", text(&options, "query")), ("tag", text(&options, "tag")), ("type", text(&options, "type")), ("folderUIDs", text(&options, "folder_uids")), ("limit", Some(limit.to_string())), ("page", Some(page.to_string()))]);
+        let v = call("GET", &format!("/api/search{}", q), None, &options)?;
+        let got = v.as_array().cloned().unwrap_or_default();
+        let n = got.len() as u64;
+        out.extend(got);
+        if n < limit {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+// ---- Folders ----
+
+/// Folders at the top, or under the option parent_uid, all pages.
+pub fn grafana_folders(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let limit = 1000;
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let q = query(&[("parentUid", text(&options, "parent_uid")), ("limit", Some(limit.to_string())), ("page", Some(page.to_string()))]);
+        let got = call("GET", &format!("/api/folders{}", q), None, &options)?.as_array().cloned().unwrap_or_default();
+        let n = got.len();
+        out.extend(got);
+        if n < limit {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+/// Makes a folder. Options: uid, parent_uid. Gives { id, uid, title, url, version }.
+pub fn grafana_folder_create(title: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "title": title });
+    if let Some(u) = text(&options, "uid") {
+        b["uid"] = json!(u);
+    }
+    if let Some(u) = text(&options, "parent_uid") {
+        b["parentUid"] = json!(u);
+    }
+    call("POST", "/api/folders", Some(&b), &options)
+}
+
+/// Removes a folder and the dashboards in it. Grafana refuses a folder holding alert rules unless the option force_rules is true.
+pub fn grafana_folder_delete(uid: &str, options: serde_json::Value) -> Result<bool, String> {
+    let q = if options.get("force_rules") == Some(&Value::Bool(true)) { "?forceDeleteRules=true" } else { "" };
+    call("DELETE", &format!("/api/folders/{}{}", enc(uid), q), None, &options)?;
+    Ok(true)
+}
+
+// ---- Annotations ----
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Marks something on the graphs: { text, tags, time (ms, now if left out), time_end for a region, dashboard_uid, panel_id }. Gives the annotation's id.
+pub fn grafana_annotation_add(note: serde_json::Value, options: serde_json::Value) -> Result<i64, String> {
+    let body_text = text(&note, "text").ok_or("an annotation needs `text`")?;
+    let mut b = json!({ "text": body_text, "time": note.get("time").and_then(|t| t.as_i64()).unwrap_or_else(now_ms) });
+    if let Some(t) = note.get("tags") {
+        b["tags"] = t.clone();
+    }
+    if let Some(t) = note.get("time_end").and_then(|t| t.as_i64()) {
+        b["timeEnd"] = json!(t);
+    }
+    if let Some(d) = text(&note, "dashboard_uid") {
+        b["dashboardUID"] = json!(d);
+    }
+    if let Some(p) = note.get("panel_id").and_then(|t| t.as_i64()) {
+        b["panelId"] = json!(p);
+    }
+    let r = call("POST", "/api/annotations", Some(&b), &options)?;
+    Ok(r["id"].as_i64().unwrap_or(0))
+}
+
+/// Annotations: options from and to (ms), tags (a list: all must match), limit, dashboard_uid.
+pub fn grafana_annotations(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut q = vec![];
+    for (k, f) in [("from", "from"), ("to", "to"), ("limit", "limit"), ("dashboard_uid", "dashboardUID")] {
+        if let Some(v) = text(&options, k) {
+            q.push(format!("{}={}", f, enc(&v)));
+        }
+    }
+    for t in options.get("tags").and_then(|t| t.as_array()).into_iter().flatten().filter_map(|t| t.as_str()) {
+        q.push(format!("tags={}", enc(t)));
+    }
+    let v = call("GET", &format!("/api/annotations{}{}", if q.is_empty() { "" } else { "?" }, q.join("&")), None, &options)?;
+    Ok(v.as_array().cloned().unwrap_or_default())
+}
+
+/// Removes an annotation.
+pub fn grafana_annotation_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/api/annotations/{}", id), None, &options)?;
+    Ok(true)
+}
+
+// ---- Data sources ----
+
+/// The data sources: { uid, name, type, url, isDefault, ... }.
+pub fn grafana_datasources(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    Ok(call("GET", "/api/datasources", None, &options)?.as_array().cloned().unwrap_or_default())
+}
+
+/// A frame's columns turned round: [{ field: value }], one map per row.
+fn frame_rows(f: &Value) -> Vec<Value> {
+    let fields = f.pointer("/schema/fields").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let cols = f.pointer("/data/values").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let n = cols.iter().filter_map(|c| c.as_array()).map(|c| c.len()).max().unwrap_or(0);
+    (0..n).map(|i| {
+        let mut row = Map::new();
+        for (j, field) in fields.iter().enumerate() {
+            let name = field["config"]["displayNameFromDS"].as_str().or(field["name"].as_str()).unwrap_or("value");
+            row.insert(name.to_string(), cols.get(j).and_then(|c| c.get(i)).cloned().unwrap_or(Value::Null));
+        }
+        Value::Object(row)
+    }).collect()
+}
+
+/// Runs queries through a data source: `queries` is one query or a list, each as that data source wants it ({ expr } for Prometheus, { rawSql, format } for SQL...), `refId` filled in. Options: from and to (like now-1h, or ms), max_data_points, interval_ms. Gives { A: [{ name, labels, rows }], B: ... }, one entry per frame; a query's own failure is an error value naming it.
+pub fn grafana_ds_query(datasource_uid: &str, queries: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = if queries.is_array() { queries.as_array().cloned().unwrap_or_default() } else { vec![queries] };
+    if list.is_empty() {
+        return Err("no queries".into());
+    }
+    let mut sent = vec![];
+    for (i, q) in list.into_iter().enumerate() {
+        let mut q = q;
+        if !q.is_object() {
+            return Err("a query is a map".into());
+        }
+        if q.get("refId").is_none() {
+            q["refId"] = json!(((b'A' + (i % 26) as u8) as char).to_string());
+        }
+        q["datasource"] = json!({ "uid": datasource_uid });
+        q["maxDataPoints"] = options.get("max_data_points").cloned().unwrap_or(json!(1000));
+        q["intervalMs"] = options.get("interval_ms").cloned().unwrap_or(json!(1000));
+        sent.push(q);
+    }
+    let time = |k: &str, d: &str| text(&options, k).unwrap_or_else(|| d.to_string());
+    let b = json!({ "queries": sent, "from": time("from", "now-1h"), "to": time("to", "now") });
+    let r = call("POST", "/api/ds/query", Some(&b), &options)?;
+    let mut out = Map::new();
+    for (id, res) in r["results"].as_object().into_iter().flatten() {
+        if let Some(e) = res["error"].as_str().filter(|e| !e.is_empty()) {
+            return Err(format!("query {}: {}", id, e));
+        }
+        let frames: Vec<Value> = res["frames"].as_array().into_iter().flatten().map(|f| {
+            let labels = f.pointer("/schema/fields").and_then(|x| x.as_array()).and_then(|l| l.iter().find_map(|c| c.get("labels").cloned())).unwrap_or(Value::Null);
+            json!({ "name": f["schema"]["name"], "labels": labels, "rows": frame_rows(f) })
+        }).collect();
+        out.insert(id.clone(), json!(frames));
+    }
+    Ok(Value::Object(out))
+}
+
+// ---- Alert rules ----
+
+/// All alert rules, by the provisioning API.
+pub fn grafana_alert_rules(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    Ok(call("GET", "/api/v1/provisioning/alert-rules", None, &options)?.as_array().cloned().unwrap_or_default())
+}
+
+/// One alert rule.
+pub fn grafana_alert_rule(uid: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/api/v1/provisioning/alert-rules/{}", enc(uid)), None, &options)
+}
+
+fn check_rule(r: &Value) -> Result<(), String> {
+    for k in ["title", "ruleGroup", "folderUID", "condition", "data"] {
+        if r.get(k).is_none() {
+            return Err(format!("an alert rule needs `{}`", k));
+        }
+    }
+    let cond = r["condition"].as_str().unwrap_or("");
+    if !r["data"].as_array().is_some_and(|d| d.iter().any(|q| q["refId"] == cond)) {
+        return Err(format!("the rule's condition `{}` is no query's refId in `data`", cond));
+    }
+    Ok(())
+}
+
+fn provenance(o: &Value) -> Vec<(&'static str, &'static str)> {
+    if o.get("editable") == Some(&Value::Bool(true)) { vec![("X-Disable-Provenance", "true")] } else { vec![] }
+}
+
+/// Makes an alert rule: { title, ruleGroup, folderUID, condition, data, for, noDataState, execErrState, annotations, labels }. The defaults for noDataState and execErrState are filled in. Option editable: true leaves it changeable in the UI. Gives the rule with its uid.
+pub fn grafana_alert_rule_create(rule: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_rule(&rule)?;
+    let mut r = rule;
+    for (k, d) in [("noDataState", "NoData"), ("execErrState", "Error"), ("for", "5m")] {
+        if r.get(k).is_none() {
+            r[k] = json!(d);
+        }
+    }
+    call_with("POST", "/api/v1/provisioning/alert-rules", Some(&r), &options, &provenance(&options))
+}
+
+/// Replaces an alert rule by uid.
+pub fn grafana_alert_rule_update(uid: &str, rule: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_rule(&rule)?;
+    call_with("PUT", &format!("/api/v1/provisioning/alert-rules/{}", enc(uid)), Some(&rule), &options, &provenance(&options))
+}
+
+/// Removes an alert rule.
+pub fn grafana_alert_rule_delete(uid: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/api/v1/provisioning/alert-rules/{}", enc(uid)), None, &options)?;
+    Ok(true)
+}
+
+// ---- Service accounts ----
+
+/// Service accounts, all pages. Option query.
+pub fn grafana_service_accounts(options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let q = query(&[("query", text(&options, "query")), ("perpage", Some("100".into())), ("page", Some(page.to_string()))]);
+        let v = call("GET", &format!("/api/serviceaccounts/search{}", q), None, &options)?;
+        let list = v["serviceAccounts"].as_array().cloned().unwrap_or_default();
+        let n = list.len();
+        out.extend(list);
+        if n < 100 || out.len() as i64 >= v["totalCount"].as_i64().unwrap_or(0) {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+/// Makes a service account: `role` is Viewer, Editor, Admin or None. Gives it with its id.
+pub fn grafana_service_account_create(name: &str, role: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !["Viewer", "Editor", "Admin", "None"].contains(&role) {
+        return Err(format!("`{}` is not a role: Viewer, Editor, Admin or None", role));
+    }
+    call("POST", "/api/serviceaccounts", Some(&json!({ "name": name, "role": role })), &options)
+}
+
+/// Removes a service account and its tokens.
+pub fn grafana_service_account_delete(id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/api/serviceaccounts/{}", id), None, &options)?;
+    Ok(true)
+}
+
+/// Makes a token for a service account. Option seconds_to_live (never expires without it). Gives { id, name, key }: the key is shown this once.
+pub fn grafana_token_create(account: i64, name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "name": name });
+    if let Some(s) = options.get("seconds_to_live").and_then(|v| v.as_i64()) {
+        b["secondsToLive"] = json!(s);
+    }
+    call("POST", &format!("/api/serviceaccounts/{}/tokens", account), Some(&b), &options)
+}
+
+/// A service account's tokens, without their keys: { id, name, created, expiration, secondsUntilExpiration, hasExpired }.
+pub fn grafana_tokens(account: i64, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    Ok(call("GET", &format!("/api/serviceaccounts/{}/tokens", account), None, &options)?.as_array().cloned().unwrap_or_default())
+}
+
+/// Revokes a token.
+pub fn grafana_token_delete(account: i64, token_id: i64, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/api/serviceaccounts/{}/tokens/{}", account, token_id), None, &options)?;
+    Ok(true)
+}

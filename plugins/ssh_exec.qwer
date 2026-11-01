@@ -1,0 +1,313 @@
+//! Runs commands over SSH from a program, on the pure-Rust russh with ring: sign-in by key or password, the server's host key pinned before anything is sent, exit status and signal, stdout and stderr kept apart, input on stdin, timeouts that end the command, output limits, one command on many hosts, and arguments quoted for the remote shell.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! russh = { version = "=0.65.0", default-features = false, features = ["ring", "rsa"] }
+//! tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use russh::client;
+use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::{ChannelMsg, Sig};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// SSH_EXEC_HOST is the default host, host or host:port. SSH_EXEC_USER signs in, with SSH_EXEC_KEY_FILE
+// (a private key's path) or SSH_EXEC_KEY (its text), SSH_EXEC_KEY_PASSPHRASE if it has one, or
+// SSH_EXEC_PASSWORD. SSH_EXEC_HOST_KEY pins the servers this program will talk to: fingerprints
+// (SHA256:...) or public key lines, comma separated. With none set nothing connects: the error says
+// the key the server offered, which `ssh-keygen -lf` on the server will confirm.
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a tokio runtime"))
+}
+
+fn fingerprint_of(key: &PublicKey) -> String {
+    key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+/// The pins as fingerprints: a public key line is hashed here.
+fn pins() -> Result<Vec<String>, String> {
+    let mut out = vec![];
+    for p in env("SSH_EXEC_HOST_KEY").unwrap_or_default().split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if p.starts_with("SHA256:") {
+            out.push(p.trim_end_matches('=').to_string());
+        } else {
+            let k = PublicKey::from_openssh(p).map_err(|e| format!("SSH_EXEC_HOST_KEY: {:?} is neither a fingerprint nor a public key: {}", p, e))?;
+            out.push(fingerprint_of(&k));
+        }
+    }
+    Ok(out)
+}
+
+struct Pin {
+    allowed: Option<Vec<String>>,
+    seen: Arc<Mutex<Option<String>>>,
+}
+
+impl client::Handler for Pin {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, key: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        let f = match key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => fingerprint_of(key),
+            russh::keys::PublicKeyOrCertificate::Certificate(c) => c.public_key().fingerprint(HashAlg::Sha256).to_string(),
+        };
+        let ok = self.allowed.as_ref().map_or(true, |a| a.contains(&f));
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        Ok(ok)
+    }
+}
+
+fn split_host(host: &str) -> Result<(String, u16), String> {
+    let h = if host.is_empty() { env("SSH_EXEC_HOST").ok_or("no host given, and SSH_EXEC_HOST is not set")? } else { host.to_string() };
+    if let Some(r) = h.strip_prefix('[') {
+        let (name, rest) = r.split_once(']').ok_or(format!("{}: a [ without its ]", h))?;
+        let port = rest.strip_prefix(':').map_or(Ok(22), |p| p.parse()).map_err(|_| format!("{}: a bad port", h))?;
+        return Ok((name.to_string(), port));
+    }
+    match h.rsplit_once(':') {
+        Some((n, p)) if !n.contains(':') => Ok((n.to_string(), p.parse().map_err(|_| format!("{}: a bad port", h))?)),
+        _ => Ok((h, 22)),
+    }
+}
+
+fn config() -> Arc<client::Config> {
+    Arc::new(client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() })
+}
+
+async fn dial(name: &str, port: u16, allowed: Option<Vec<String>>, limit: Duration) -> Result<(client::Handle<Pin>, Arc<Mutex<Option<String>>>), String> {
+    let seen = Arc::new(Mutex::new(None));
+    let handler = Pin { allowed, seen: seen.clone() };
+    match tokio::time::timeout(limit, client::connect(config(), (name, port), handler)).await {
+        Err(_) => Err(format!("{}:{} did not answer within {} ms", name, port, limit.as_millis())),
+        Ok(Err(russh::Error::UnknownKey)) => {
+            let f = seen.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+            Err(format!("the host key of {}:{} is {}, which SSH_EXEC_HOST_KEY does not hold: refused. Check it on the server before adding it", name, port, f))
+        }
+        Ok(Err(e)) => Err(format!("cannot reach {}:{}: {}", name, port, e)),
+        Ok(Ok(h)) => Ok((h, seen)),
+    }
+}
+
+async fn sign_in(h: &mut client::Handle<Pin>, user: &str) -> Result<(), String> {
+    let text = match (env("SSH_EXEC_KEY"), env("SSH_EXEC_KEY_FILE")) {
+        (Some(t), _) => Some(t),
+        (None, Some(p)) => Some(std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?),
+        _ => None,
+    };
+    let mut tried = vec![];
+    if let Some(t) = text {
+        let key = decode_secret_key(&t, env("SSH_EXEC_KEY_PASSPHRASE").as_deref()).map_err(|e| format!("the private key: {}", e))?;
+        let hash = h.best_supported_rsa_hash().await.map_err(|e| e.to_string())?.flatten();
+        let r = h.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(|e| format!("the sign-in broke off: {}", e))?;
+        if r.success() {
+            return Ok(());
+        }
+        tried.push("key");
+    }
+    if let Some(p) = env("SSH_EXEC_PASSWORD") {
+        let r = h.authenticate_password(user, p.clone()).await.map_err(|e| format!("the sign-in broke off: {}", e))?;
+        if r.success() {
+            return Ok(());
+        }
+        // Many servers take passwords only through keyboard-interactive.
+        let mut step = h.authenticate_keyboard_interactive_start(user, None).await.map_err(|e| e.to_string())?;
+        for _ in 0..4 {
+            match step {
+                client::KeyboardInteractiveAuthResponse::Success => return Ok(()),
+                client::KeyboardInteractiveAuthResponse::Failure { .. } => break,
+                client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                    let answers = prompts.iter().map(|_| p.clone()).collect();
+                    step = h.authenticate_keyboard_interactive_respond(answers).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        tried.push("password");
+    }
+    if tried.is_empty() {
+        return Err("set SSH_EXEC_KEY_FILE, SSH_EXEC_KEY or SSH_EXEC_PASSWORD".into());
+    }
+    Err(format!("the server refused {} by {}: check that the key is in authorized_keys, and the user's name", user, tried.join(" and ")))
+}
+
+type Shared = Arc<client::Handle<Pin>>;
+
+fn pool() -> &'static Mutex<HashMap<String, Shared>> {
+    static P: OnceLock<Mutex<HashMap<String, Shared>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A signed-in connection to a host, one kept for each.
+async fn connection(host: &str, limit: Duration, fresh: bool) -> Result<Shared, String> {
+    let (name, port) = split_host(host)?;
+    let user = env("SSH_EXEC_USER").ok_or("SSH_EXEC_USER is not set")?;
+    let key = format!("{}@{}:{}", user, name, port);
+    if !fresh {
+        if let Some(h) = pool().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if !h.is_closed() {
+                return Ok(h.clone());
+            }
+        }
+    }
+    let allowed = pins()?;
+    let (mut h, _) = dial(&name, port, Some(allowed), limit).await?;
+    sign_in(&mut h, &user).await?;
+    let h = Arc::new(h);
+    pool().lock().unwrap_or_else(|e| e.into_inner()).insert(key, h.clone());
+    Ok(h)
+}
+
+struct Job {
+    command: String,
+    stdin: Option<String>,
+    limit: usize,
+    timeout: Duration,
+}
+
+fn job(command: &str, options: &Value) -> Job {
+    Job {
+        command: command.to_string(),
+        stdin: options["stdin"].as_str().map(str::to_string),
+        limit: options["max_output"].as_i64().unwrap_or(10 * 1024 * 1024).max(0) as usize,
+        timeout: Duration::from_millis(options["timeout_ms"].as_i64().unwrap_or(60_000).clamp(10, 86_400_000) as u64),
+    }
+}
+
+/// Reads a command's streams to the end. EOF does not end it: the exit status can come after, so this waits for the channel's close.
+async fn exec_on(h: &Shared, j: &Job) -> Result<Value, russh::Error> {
+    let start = Instant::now();
+    let mut ch = h.channel_open_session().await?;
+    ch.exec(true, j.command.as_bytes().to_vec()).await?;
+    if let Some(s) = &j.stdin {
+        ch.data(s.as_bytes()).await?;
+    }
+    ch.eof().await?;
+    let (mut out, mut err, mut truncated): (Vec<u8>, Vec<u8>, bool) = (vec![], vec![], false);
+    let (mut exit, mut signal, mut timed_out, mut refused): (Option<u32>, Option<String>, bool, bool) = (None, None, false, false);
+    let deadline = tokio::time::Instant::now() + j.timeout;
+    let keep = |to: &mut Vec<u8>, data: &[u8], cut: &mut bool| {
+        let room = j.limit.saturating_sub(to.len());
+        if data.len() > room {
+            *cut = true;
+        }
+        to.extend_from_slice(&data[..data.len().min(room)]);
+    };
+    loop {
+        match tokio::time::timeout_at(deadline, ch.wait()).await {
+            Err(_) => {
+                timed_out = true;
+                // A signal asks the server to end it; closing alone would leave it running.
+                let _ = ch.signal(Sig::TERM).await;
+                let _ = ch.close().await;
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(m)) => match m {
+                ChannelMsg::Data { data } => keep(&mut out, &data[..], &mut truncated),
+                ChannelMsg::ExtendedData { data, ext: 1 } => keep(&mut err, &data[..], &mut truncated),
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                ChannelMsg::ExitSignal { signal_name, .. } => signal = Some(format!("{:?}", signal_name)),
+                ChannelMsg::Failure => refused = true,
+                _ => {}
+            },
+        }
+    }
+    let mut o = json!({
+        "exit": exit, "signal": signal, "ok": exit == Some(0), "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err),
+        "timed_out": timed_out, "ms": start.elapsed().as_millis() as i64,
+    });
+    if truncated {
+        o["truncated"] = json!(true);
+    }
+    if refused {
+        o["refused"] = json!(true);
+    }
+    Ok(o)
+}
+
+async fn run_one(host: String, j: Arc<Job>, connect_limit: Duration) -> Result<Value, String> {
+    let h = connection(&host, connect_limit, false).await?;
+    match exec_on(&h, &j).await {
+        Ok(v) => Ok(v),
+        // A kept connection the server dropped: one more try, on a new one, as nothing ran.
+        Err(_) => {
+            let h = connection(&host, connect_limit, true).await?;
+            exec_on(&h, &j).await.map_err(|e| format!("running on {}: {}", host, e))
+        }
+    }
+}
+
+fn connect_limit(o: &Value) -> Duration {
+    Duration::from_millis(o["connect_timeout_ms"].as_i64().unwrap_or(10_000).clamp(50, 120_000) as u64)
+}
+
+/// Runs a shell command on `host` ("" for SSH_EXEC_HOST). `options`: `timeout_ms` (60000; the command is sent TERM and `timed_out` is true), `stdin` (a text), `max_output` (bytes kept of each stream, 10 MB; `truncated` says when some went), `connect_timeout_ms`. Gives `{ exit, signal, ok, stdout, stderr, timed_out, ms }`; a command that fails is not an error here, as `exit` says so.
+pub fn ssh_exec_run(host: &str, command: &str, options: serde_json::Value) -> Result<Value, String> {
+    runtime().block_on(run_one(host.to_string(), Arc::new(job(command, &options)), connect_limit(&options)))
+}
+
+/// Runs a command that must succeed, and gives its stdout. An exit other than 0, a signal or a timeout is an error holding the end of stderr.
+pub fn ssh_exec_output(host: &str, command: &str, options: serde_json::Value) -> Result<String, String> {
+    let r = ssh_exec_run(host, command, options)?;
+    if r["ok"] == true {
+        return Ok(r["stdout"].as_str().unwrap_or("").to_string());
+    }
+    let err: String = r["stderr"].as_str().unwrap_or("").trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+    if r["timed_out"] == true {
+        return Err(format!("`{}` took longer than its timeout", command));
+    }
+    if !r["signal"].is_null() {
+        return Err(format!("`{}` ended by signal {}: {}", command, r["signal"].as_str().unwrap_or(""), err));
+    }
+    Err(format!("`{}` exited with {}: {}", command, r["exit"], err))
+}
+
+/// Runs one command on several hosts at once. Gives a list in the same order, each `{ host, result }`, or `{ host, error }` for a host that could not be reached; one down does not stop the others.
+pub fn ssh_exec_many(hosts: Vec<String>, command: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let j = Arc::new(job(command, &options));
+    let limit = connect_limit(&options);
+    Ok(runtime().block_on(async {
+        let tasks: Vec<_> = hosts.iter().map(|h| tokio::spawn(run_one(h.clone(), j.clone(), limit))).collect();
+        let mut out = vec![];
+        for (h, t) in hosts.iter().zip(tasks) {
+            out.push(match t.await {
+                Ok(Ok(v)) => json!({ "host": h, "result": v }),
+                Ok(Err(e)) => json!({ "host": h, "error": e }),
+                Err(e) => json!({ "host": h, "error": e.to_string() }),
+            });
+        }
+        out
+    }))
+}
+
+/// The fingerprint a server offers, without signing in, for setting SSH_EXEC_HOST_KEY after checking it against the server: `SHA256:...`.
+pub fn ssh_exec_fingerprint(host: &str) -> Result<String, String> {
+    let (name, port) = split_host(host)?;
+    runtime().block_on(async {
+        let (h, seen) = dial(&name, port, None, Duration::from_secs(10)).await?;
+        let f = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let _ = h.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+        f.ok_or("the server showed no key".to_string())
+    })
+}
+
+/// An argument quoted for a POSIX shell: a plain word as it is, anything else in single quotes, so that a visitor's text stays one argument.
+pub fn ssh_exec_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b)) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// A command line from a list, each part quoted: `ssh_exec_command(["ls", "-l", "a b"])` gives `ls -l 'a b'`.
+pub fn ssh_exec_command(args: Vec<String>) -> String {
+    args.iter().map(|a| ssh_exec_quote(a)).collect::<Vec<_>>().join(" ")
+}

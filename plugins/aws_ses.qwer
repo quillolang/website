@@ -1,0 +1,502 @@
+//! Amazon SES v2 without an SDK: mail sent plainly, as a raw MIME message built here with attachments, or from a template, bulk sends, templates kept and rendered, the account's sending limits and the suppression list, and the bounce, complaint and delivery notices SES sends through SNS read into recipients to act on, signed with Signature Version 4.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+// ---- AWS: credentials from the environment, Signature Version 4, one signed HTTP call ----
+
+struct Aws {
+    region: String,
+    key: String,
+    secret: String,
+    token: Option<String>,
+    base: String,
+    host: String,
+    service: String,
+    timeout: Duration,
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+fn opt_text(o: &Value, k: &str) -> Option<String> {
+    match o.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The account to call: keys from the environment only, the region from `region` or AWS_REGION, the address from `url_var` when set.
+fn account(o: &Value, service: &str, url_var: &str, host_prefix: &str) -> Result<Aws, String> {
+    let key = var("AWS_ACCESS_KEY_ID").ok_or("no AWS key: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")?;
+    let secret = var("AWS_SECRET_ACCESS_KEY").ok_or("no AWS secret: set AWS_SECRET_ACCESS_KEY")?;
+    let region = opt_text(o, "region").or_else(|| var("AWS_REGION")).or_else(|| var("AWS_DEFAULT_REGION")).ok_or("no region: set AWS_REGION, or give the option region")?;
+    let base = var(url_var).unwrap_or_else(|| {
+        let suffix = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        format!("https://{}.{}.{}", host_prefix, region, suffix)
+    });
+    let base = base.trim_end_matches('/').to_string();
+    let host = base.split("://").nth(1).unwrap_or(&base).split('/').next().unwrap_or("").to_string();
+    let ms = o.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(15_000).clamp(100, 900_000);
+    Ok(Aws { region, key, secret, token: var("AWS_SESSION_TOKEN"), base, host, service: service.to_string(), timeout: Duration::from_millis(ms) })
+}
+
+fn hmac(key: &[u8], msg: &str) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(msg.as_bytes());
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+/// RFC 3986 encoding: only A-Z a-z 0-9 - _ . ~ kept (and `/` when asked).
+fn enc(s: &str, keep_slash: bool) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn civil(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn amz_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (y, m, d) = civil(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400);
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// The headers that sign a request. `path` is as sent (already encoded once); all services here but S3 sign it encoded a second time.
+fn sign(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Vec<(String, String)> {
+    let stamp = amz_now();
+    let date = &stamp[..8];
+    let mut heads: Vec<(String, String)> = vec![("host".into(), a.host.clone()), ("x-amz-date".into(), stamp.clone())];
+    if let Some(t) = &a.token {
+        heads.push(("x-amz-security-token".into(), t.clone()));
+    }
+    for (k, v) in extra {
+        heads.push((k.to_lowercase(), v.trim().to_string()));
+    }
+    heads.sort();
+    let names = heads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canon_heads: String = heads.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect();
+    let mut pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    pairs.sort();
+    let canon = format!("{}\n{}\n{}\n{}\n{}\n{}", method, enc(path, true), pairs.join("&"), canon_heads, names, sha_hex(body));
+    let scope = format!("{}/{}/{}/aws4_request", date, a.region, a.service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", stamp, scope, sha_hex(canon.as_bytes()));
+    let k = hmac(format!("AWS4{}", a.secret).as_bytes(), date);
+    let k = hmac(&k, &a.region);
+    let k = hmac(&k, &a.service);
+    let k = hmac(&k, "aws4_request");
+    let sig = hex::encode(hmac(&k, &to_sign));
+    let mut out = extra.to_vec();
+    out.push(("X-Amz-Date".into(), stamp.clone()));
+    if let Some(t) = &a.token {
+        out.push(("X-Amz-Security-Token".into(), t.clone()));
+    }
+    out.push(("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", a.key, scope, names, sig)));
+    out
+}
+
+/// One signed call. Any status comes back as a Reply; only a network failure is an error.
+fn send(a: &Aws, method: &str, path: &str, query: &str, extra: &[(String, String)], body: &[u8]) -> Result<Reply, String> {
+    let url = if query.is_empty() { format!("{}{}", a.base, path) } else { format!("{}{}?{}", a.base, path, query) };
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(a.timeout).redirects(0).build();
+    let mut r = agent.request(method, &url);
+    for (k, v) in sign(a, method, path, query, extra, body) {
+        r = r.set(&k, &v);
+    }
+    let res = if body.is_empty() && method != "POST" && method != "PUT" { r.call() } else { r.send_bytes(body) };
+    let resp = match res {
+        Ok(x) => x,
+        Err(ureq::Error::Status(_, x)) => x,
+        Err(e) => return Err(format!("cannot reach AWS at {}: {}", a.base, e)),
+    };
+    let status = resp.status();
+    let headers = resp.headers_names().iter().map(|n| (n.clone(), resp.header(n).unwrap_or("").to_string())).collect();
+    let mut body = vec![];
+    resp.into_reader().take(64 << 20).read_to_end(&mut body).map_err(|e| format!("cut off reading AWS's answer: {}", e))?;
+    Ok(Reply { status, headers, body })
+}
+
+// ---- SES v2's REST calls ----
+
+fn raw_call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Reply, String> {
+    let a = account(o, "ses", "SES_API_URL", "email")?;
+    let text = body.map(|b| b.to_string()).unwrap_or_default();
+    let heads: Vec<(String, String)> = if body.is_some() { vec![("Content-Type".to_string(), "application/json".to_string())] } else { vec![] };
+    let mut n = 0u32;
+    loop {
+        n += 1;
+        let r = send(&a, method, path, "", &heads, text.as_bytes())?;
+        if (r.status == 429 || r.status >= 500) && n < 6 {
+            std::thread::sleep(Duration::from_millis(100 << n));
+            continue;
+        }
+        return Ok(r);
+    }
+}
+
+fn kind_of(r: &Reply, v: &Value) -> String {
+    r.header("x-amzn-errortype").map(|k| k.split(':').next().unwrap_or(k).to_string()).or(v["__type"].as_str().map(|t| t.rsplit('#').next().unwrap_or(t).to_string())).unwrap_or_else(|| r.status.to_string())
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let r = raw_call(method, path, body, o)?;
+    let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+    if r.status >= 300 {
+        let msg = v["message"].as_str().or(v["Message"].as_str()).map(str::to_string).unwrap_or_else(|| r.text().chars().take(200).collect());
+        return Err(format!("SES: {}: {}", kind_of(&r, &v), msg));
+    }
+    Ok(v)
+}
+
+fn list_of(v: Option<&Value>) -> Vec<Value> {
+    match v {
+        Some(Value::String(s)) => vec![json!(s)],
+        Some(Value::Array(a)) => a.clone(),
+        _ => vec![],
+    }
+}
+
+fn utf8(text: &str) -> Value {
+    json!({ "Data": text, "Charset": "UTF-8" })
+}
+
+/// The fields every kind of send shares.
+fn envelope(mail: &Value, content: Value) -> Result<Value, String> {
+    let from = opt_text(mail, "from").or_else(|| var("SES_FROM")).ok_or("no sender: give `from`, or set SES_FROM")?;
+    let (to, cc, bcc) = (list_of(mail.get("to")), list_of(mail.get("cc")), list_of(mail.get("bcc")));
+    if to.len() + cc.len() + bcc.len() > 50 {
+        return Err("SES takes at most 50 recipients on a message: use ses_send_bulk".into());
+    }
+    let mut out = json!({ "FromEmailAddress": from, "Content": content });
+    let mut dest = Map::new();
+    for (k, l) in [("ToAddresses", to), ("CcAddresses", cc), ("BccAddresses", bcc)] {
+        if !l.is_empty() {
+            dest.insert(k.into(), json!(l));
+        }
+    }
+    if !dest.is_empty() {
+        out["Destination"] = Value::Object(dest);
+    }
+    let reply_to = list_of(mail.get("reply_to"));
+    if !reply_to.is_empty() {
+        out["ReplyToAddresses"] = json!(reply_to);
+    }
+    if let Some(c) = opt_text(mail, "configuration_set").or_else(|| var("SES_CONFIGURATION_SET")) {
+        out["ConfigurationSetName"] = json!(c);
+    }
+    if let Some(t) = mail.get("tags").and_then(|t| t.as_object()) {
+        out["EmailTags"] = json!(t.iter().map(|(k, v)| json!({ "Name": k, "Value": v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()) })).collect::<Vec<_>>());
+    }
+    Ok(out)
+}
+
+/// Sends a message: `mail` is { from (or SES_FROM), to, cc, bcc, reply_to, subject, text, html, tags, configuration_set }. Each address field takes one or a list. Gives the message id.
+pub fn ses_send(mail: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let subject = opt_text(&mail, "subject").ok_or("the message has no subject")?;
+    let mut body = Map::new();
+    if let Some(t) = opt_text(&mail, "text") {
+        body.insert("Text".into(), utf8(&t));
+    }
+    if let Some(h) = opt_text(&mail, "html") {
+        body.insert("Html".into(), utf8(&h));
+    }
+    if body.is_empty() {
+        return Err("the message has neither text nor html".into());
+    }
+    let req = envelope(&mail, json!({ "Simple": { "Subject": utf8(&subject), "Body": body } }))?;
+    let r = call("POST", "/v2/email/outbound-emails", Some(&req), &options)?;
+    Ok(r["MessageId"].as_str().unwrap_or("").to_string())
+}
+
+// ---- Raw MIME ----
+
+fn header_word(s: &str) -> String {
+    if s.is_ascii() && !s.contains(|c: char| c.is_control()) {
+        return s.to_string();
+    }
+    // RFC 2047, cut between characters so no encoded word holds half of one.
+    let (mut out, mut cur) = (vec![], String::new());
+    for c in s.chars() {
+        if cur.len() + c.len_utf8() > 45 {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    out.push(cur);
+    out.iter().map(|w| format!("=?UTF-8?B?{}?=", B64.encode(w))).collect::<Vec<_>>().join("\r\n ")
+}
+
+fn lines76(b64: &str) -> String {
+    b64.as_bytes().chunks(76).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("\r\n")
+}
+
+fn part(ctype: &str, text: &str) -> String {
+    format!("Content-Type: {}; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n", ctype, lines76(&B64.encode(text)))
+}
+
+fn boundary(tag: &str, seed: &str) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("=_{}_{}", tag, &sha_hex(format!("{}{}", now, seed).as_bytes())[..24])
+}
+
+/// Builds a MIME message: { from, to, cc, reply_to, subject, text, html, attachments: [{ filename, content_type, data (base64), inline_id }], headers: { name: value } }. Bcc stays out of the text. Gives the message as text, for `ses_send_raw` or to look at.
+pub fn ses_raw_message(mail: serde_json::Value) -> Result<String, String> {
+    let from = opt_text(&mail, "from").or_else(|| var("SES_FROM")).ok_or("no sender: give `from`, or set SES_FROM")?;
+    let mut h = format!("From: {}\r\n", from);
+    for (k, f) in [("to", "To"), ("cc", "Cc"), ("reply_to", "Reply-To")] {
+        let l: Vec<String> = list_of(mail.get(k)).iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+        if !l.is_empty() {
+            h.push_str(&format!("{}: {}\r\n", f, l.join(", ")));
+        }
+    }
+    h.push_str(&format!("Subject: {}\r\nMIME-Version: 1.0\r\n", header_word(&opt_text(&mail, "subject").ok_or("the message has no subject")?)));
+    for (k, v) in mail.get("headers").and_then(|x| x.as_object()).into_iter().flatten() {
+        let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+        if k.contains(|c: char| c.is_control() || c == ':') || t.contains(['\r', '\n']) {
+            return Err(format!("header {} holds a line break", k));
+        }
+        h.push_str(&format!("{}: {}\r\n", k, header_word(&t)));
+    }
+    let seed = mail.to_string();
+    let (text, html) = (opt_text(&mail, "text"), opt_text(&mail, "html"));
+    let (ctype, body) = match (&text, &html) {
+        (Some(t), Some(x)) => {
+            let b = boundary("alt", &seed);
+            (format!("multipart/alternative; boundary=\"{}\"", b), format!("--{}\r\n{}--{}\r\n{}--{}--\r\n", b, part("text/plain", t), b, part("text/html", x), b))
+        }
+        (Some(t), None) => ("".to_string(), part("text/plain", t)),
+        (None, Some(x)) => ("".to_string(), part("text/html", x)),
+        (None, None) => return Err("the message has neither text nor html".into()),
+    };
+    let inner = if ctype.is_empty() { body } else { format!("Content-Type: {}\r\n\r\n{}", ctype, body) };
+    let files = mail.get("attachments").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    if files.is_empty() {
+        return Ok(format!("{}{}", h, inner));
+    }
+    let b = boundary("mixed", &seed);
+    let mut out = format!("{}Content-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n--{}\r\n{}", h, b, b, inner);
+    for f in &files {
+        let name = opt_text(f, "filename").ok_or("an attachment has no filename")?;
+        if name.contains(['"', '\r', '\n']) {
+            return Err(format!("the filename {:?} cannot go in a header", name));
+        }
+        let data = opt_text(f, "data").ok_or(format!("attachment {} has no data", name))?;
+        B64.decode(data.replace(['\r', '\n'], "")).map_err(|_| format!("attachment {} is not base64", name))?;
+        let ctype = opt_text(f, "content_type").unwrap_or("application/octet-stream".into());
+        let cid = opt_text(f, "inline_id").map(|c| format!("Content-ID: <{}>\r\n", c)).unwrap_or_default();
+        out.push_str(&format!("\r\n--{}\r\nContent-Type: {}; name=\"{}\"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: {}; filename=\"{}\"\r\n{}\r\n{}\r\n", b, ctype, name, if cid.is_empty() { "attachment" } else { "inline" }, name, cid, lines76(&data)));
+    }
+    out.push_str(&format!("\r\n--{}--\r\n", b));
+    if out.len() > 40 << 20 {
+        return Err("the message is over SES's 40 MB".into());
+    }
+    Ok(out)
+}
+
+/// Sends a MIME message as it stands, built by `ses_raw_message` or elsewhere; `mail` may be its text, or a map to be built. Gives the message id.
+pub fn ses_send_raw(mail: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let raw = |text: &str| json!({ "Raw": { "Data": B64.encode(text.as_bytes()) } });
+    let req = match &mail {
+        Value::String(s) => json!({ "Content": raw(s) }),
+        _ => envelope(&mail, raw(&ses_raw_message(mail.clone())?))?,
+    };
+    let r = call("POST", "/v2/email/outbound-emails", Some(&req), &options)?;
+    Ok(r["MessageId"].as_str().unwrap_or("").to_string())
+}
+
+// ---- Templates ----
+
+/// Sends a stored template with `data` filling it: `mail` is { from, to, ... }. Gives the message id.
+pub fn ses_send_template(template: &str, data: serde_json::Value, mail: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let req = envelope(&mail, json!({ "Template": { "TemplateName": template, "TemplateData": data.to_string() } }))?;
+    let r = call("POST", "/v2/email/outbound-emails", Some(&req), &options)?;
+    Ok(r["MessageId"].as_str().unwrap_or("").to_string())
+}
+
+/// One template to many people, each with their own data: `people` is [{ to, data }], sent 50 at a time. Gives [{ to, status, message_id, error }], in order.
+pub fn ses_send_bulk(template: &str, defaults: serde_json::Value, people: serde_json::Value, mail: serde_json::Value, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let list = people.as_array().ok_or("people is a list of { to, data }")?;
+    let mut out = vec![];
+    for batch in list.chunks(50) {
+        let entries: Vec<Value> = batch.iter().map(|p| json!({ "Destination": { "ToAddresses": list_of(p.get("to")) }, "ReplacementEmailContent": { "ReplacementTemplate": { "ReplacementTemplateData": p.get("data").cloned().unwrap_or(json!({})).to_string() } } })).collect();
+        let mut req = envelope(&mail, Value::Null)?;
+        req.as_object_mut().unwrap().remove("Content");
+        req["DefaultContent"] = json!({ "Template": { "TemplateName": template, "TemplateData": defaults.to_string() } });
+        req["BulkEmailEntries"] = json!(entries);
+        let r = call("POST", "/v2/email/outbound-bulk-emails", Some(&req), &options)?;
+        for (p, e) in batch.iter().zip(r["BulkEmailEntryResults"].as_array().cloned().unwrap_or_default()) {
+            out.push(json!({ "to": p["to"], "status": e["Status"], "message_id": e["MessageId"], "error": e["Error"] }));
+        }
+    }
+    Ok(out)
+}
+
+/// Stores a template, making it or replacing it: { subject, text, html }, with {{names}} to fill.
+pub fn ses_template_put(name: &str, template: serde_json::Value, options: serde_json::Value) -> Result<bool, String> {
+    let content = json!({ "Subject": template.get("subject"), "Text": template.get("text"), "Html": template.get("html") });
+    let made = call("POST", "/v2/email/templates", Some(&json!({ "TemplateName": name, "TemplateContent": content })), &options);
+    match made {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("AlreadyExistsException") => {
+            call("PUT", &format!("/v2/email/templates/{}", enc(name, false)), Some(&json!({ "TemplateContent": content })), &options)?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A stored template: { subject, text, html }.
+pub fn ses_template_get(name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = call("GET", &format!("/v2/email/templates/{}", enc(name, false)), None, &options)?;
+    let c = &r["TemplateContent"];
+    Ok(json!({ "subject": c["Subject"], "text": c["Text"], "html": c["Html"] }))
+}
+
+/// Removes a template.
+pub fn ses_template_delete(name: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/email/templates/{}", enc(name, false)), None, &options)?;
+    Ok(true)
+}
+
+/// A template filled in by SES without sending: the MIME text it would send, to catch a missing {{name}}.
+pub fn ses_template_render(name: &str, data: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let r = call("POST", &format!("/v2/email/templates/{}/render", enc(name, false)), Some(&json!({ "TemplateData": data.to_string() })), &options)?;
+    Ok(r["RenderedTemplate"].as_str().unwrap_or("").to_string())
+}
+
+// ---- The account ----
+
+/// What the account may send: { production, sending, per_day, per_second, sent_today, suppressed_reasons }.
+pub fn ses_account(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = call("GET", "/v2/email/account", None, &options)?;
+    let q = &r["SendQuota"];
+    Ok(json!({ "production": r["ProductionAccessEnabled"], "sending": r["SendingEnabled"], "per_day": q["Max24HourSend"], "per_second": q["MaxSendRate"], "sent_today": q["SentLast24Hours"], "suppressed_reasons": r["SuppressionAttributes"]["SuppressedReasons"] }))
+}
+
+/// Puts an address on the account's suppression list; `reason` is BOUNCE or COMPLAINT.
+pub fn ses_suppress(email: &str, reason: &str, options: serde_json::Value) -> Result<bool, String> {
+    if reason != "BOUNCE" && reason != "COMPLAINT" {
+        return Err(format!("`{}` is not a reason: BOUNCE or COMPLAINT", reason));
+    }
+    call("PUT", "/v2/email/suppression/addresses", Some(&json!({ "EmailAddress": email, "Reason": reason })), &options)?;
+    Ok(true)
+}
+
+/// Why an address is suppressed, or null if it is not: { email, reason, since }.
+pub fn ses_suppressed(email: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = raw_call("GET", &format!("/v2/email/suppression/addresses/{}", enc(email, false)), None, &options)?;
+    if r.status == 404 {
+        return Ok(Value::Null);
+    }
+    let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+    if r.status >= 300 {
+        return Err(format!("SES: {}: {}", kind_of(&r, &v), v["message"].as_str().unwrap_or("")));
+    }
+    let d = &v["SuppressedDestination"];
+    Ok(json!({ "email": d["EmailAddress"], "reason": d["Reason"], "since": d["LastUpdateTime"] }))
+}
+
+/// Takes an address off the suppression list.
+pub fn ses_unsuppress(email: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/v2/email/suppression/addresses/{}", enc(email, false)), None, &options)?;
+    Ok(true)
+}
+
+// ---- Notices ----
+
+/// Reads what SES sends through SNS, the envelope's text or its raw message: { kind, ... }. `kind` is "subscribe" (with subscribe_url: visit it after checking the signature, which the aws_sns plugin does), "bounce" (permanent, type, subtype, recipients, stop), "complaint" (type, recipients, stop), "delivery" (recipients, smtp), or the event's own name in lowercase. `stop` lists the addresses to mail no more: a hard bounce's and a complaint's, not a soft bounce's. All have message_id, source, subject, time.
+pub fn ses_notice(body: &str) -> Result<serde_json::Value, String> {
+    let outer: Value = serde_json::from_str(body).map_err(|_| "the notice is not JSON".to_string())?;
+    let mut sns = Value::Null;
+    let n = match outer["Type"].as_str() {
+        Some("SubscriptionConfirmation") => return Ok(json!({ "kind": "subscribe", "topic": outer["TopicArn"], "subscribe_url": outer["SubscribeURL"], "token": outer["Token"] })),
+        Some("UnsubscribeConfirmation") => return Ok(json!({ "kind": "unsubscribed", "topic": outer["TopicArn"] })),
+        Some("Notification") => {
+            sns = outer.clone();
+            let m = outer["Message"].as_str().ok_or("the notification has no Message")?;
+            if m == "Successfully validated SNS topic for Amazon SES event publishing." {
+                return Ok(json!({ "kind": "test" }));
+            }
+            serde_json::from_str::<Value>(m).map_err(|_| "the notification's Message is not JSON".to_string())?
+        }
+        _ => outer,
+    };
+    let kind = n["notificationType"].as_str().or(n["eventType"].as_str()).ok_or("this is no SES notice: it has no notificationType or eventType")?.to_lowercase();
+    let mail = &n["mail"];
+    let mut out = json!({ "kind": kind, "message_id": mail["messageId"], "source": mail["source"], "subject": mail["commonHeaders"]["subject"], "time": mail["timestamp"], "sns_id": sns["MessageId"] });
+    match kind.as_str() {
+        "bounce" => {
+            let b = &n["bounce"];
+            let permanent = b["bounceType"] == "Permanent";
+            let list = b["bouncedRecipients"].as_array().cloned().unwrap_or_default();
+            let people: Vec<Value> = list.iter().map(|r| json!({ "email": r["emailAddress"], "status": r["status"], "action": r["action"], "diagnostic": r["diagnosticCode"] })).collect();
+            out["permanent"] = json!(permanent);
+            out["type"] = b["bounceType"].clone();
+            out["subtype"] = b["bounceSubType"].clone();
+            out["recipients"] = json!(people);
+            out["stop"] = if permanent { json!(list.iter().map(|r| r["emailAddress"].clone()).collect::<Vec<_>>()) } else { json!([]) };
+            out["feedback_id"] = b["feedbackId"].clone();
+        }
+        "complaint" => {
+            let c = &n["complaint"];
+            let list: Vec<Value> = c["complainedRecipients"].as_array().into_iter().flatten().map(|r| r["emailAddress"].clone()).collect();
+            out["type"] = c["complaintFeedbackType"].clone();
+            out["recipients"] = json!(list);
+            out["stop"] = json!(list);
+            out["feedback_id"] = c["feedbackId"].clone();
+        }
+        "delivery" => {
+            let d = &n["delivery"];
+            out["recipients"] = d["recipients"].clone();
+            out["smtp"] = d["smtpResponse"].clone();
+            out["ms"] = d["processingTimeMillis"].clone();
+        }
+        _ => {}
+    }
+    Ok(out)
+}

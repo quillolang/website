@@ -1,0 +1,331 @@
+//! Google Calendar's v3 API: events read through every page, incremental sync with its tokens and the 410 that ends one, events made and changed, free/busy across calendars, service-account sign-in by RS256 JWT with a subject to impersonate, retries on quota errors, and RFC 3339 times and all-day dates handled, end dates exclusive as Google counts them.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! jsonwebtoken = "9"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+// GOOGLE_CALENDAR_API_URL is the API (https://www.googleapis.com/calendar/v3 when not set).
+// GOOGLE_SERVICE_ACCOUNT_JSON holds the service account's JSON, or GOOGLE_APPLICATION_CREDENTIALS
+// its file. GOOGLE_CALENDAR_SUBJECT is the user to act as, by domain-wide delegation; `subject` in a
+// call's options says it for that call. Without one, share the calendar with the service account.
+
+const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn api() -> String {
+    setting("GOOGLE_CALENDAR_API_URL").unwrap_or_else(|| "https://www.googleapis.com/calendar/v3".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn credentials() -> Result<Value, String> {
+    let text = match (setting("GOOGLE_SERVICE_ACCOUNT_JSON"), setting("GOOGLE_APPLICATION_CREDENTIALS")) {
+        (Some(t), _) => t,
+        (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p, e))?,
+        _ => return Err("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS".into()),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("the service account is not JSON: {}", e))?;
+    for k in ["client_email", "private_key"] {
+        if !v[k].is_string() {
+            return Err(format!("the service account has no {}", k));
+        }
+    }
+    Ok(v)
+}
+
+// One token per person impersonated.
+static TOKENS: Mutex<Option<HashMap<String, (String, i64)>>> = Mutex::new(None);
+
+fn token(subject: &str) -> Result<String, String> {
+    if let Some((t, until)) = TOKENS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(subject) {
+        if *until > now() + 300 {
+            return Ok(t.clone());
+        }
+    }
+    let sa = credentials()?;
+    let uri = sa["token_uri"].as_str().unwrap_or("https://oauth2.googleapis.com/token").to_string();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa["private_key"].as_str().unwrap_or("").as_bytes()).map_err(|e| format!("the service account's private key: {}", e))?;
+    let mut head = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    head.kid = sa["private_key_id"].as_str().map(str::to_string);
+    let t = now();
+    let mut claims = json!({ "iss": sa["client_email"], "scope": SCOPE, "aud": uri, "iat": t, "exp": t + 3600 });
+    if !subject.is_empty() {
+        claims["sub"] = json!(subject);
+    }
+    let jwt = jsonwebtoken::encode(&head, &claims, &key).map_err(|e| e.to_string())?;
+    let res = ureq::post(&uri).timeout(Duration::from_secs(20)).send_form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            let hint = if v["error"] == "unauthorized_client" { " (give the service account domain-wide delegation for this scope)" } else { "" };
+            return Err(format!("the token server answered {}: {} {}{}", c, v["error"].as_str().unwrap_or(""), v["error_description"].as_str().unwrap_or(&b), hint));
+        }
+        Err(e) => return Err(format!("cannot reach the token server: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tok = v["access_token"].as_str().ok_or("the token server gave no access_token")?.to_string();
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(subject.to_string(), (tok.clone(), t + v["expires_in"].as_i64().unwrap_or(3600)));
+    Ok(tok)
+}
+
+fn subject_of(options: &Value) -> String {
+    options["subject"].as_str().map(str::to_string).or_else(|| setting("GOOGLE_CALENDAR_SUBJECT")).unwrap_or_default()
+}
+
+struct Fail {
+    code: u16,
+    reason: String,
+    text: String,
+}
+
+fn fetch(method: &str, path: &str, body: Option<&Value>, options: &Value) -> Result<Value, Fail> {
+    let plain = |text: String| Fail { code: 0, reason: String::new(), text };
+    let tok = token(&subject_of(options)).map_err(plain)?;
+    let url = format!("{}{}", api(), path);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    for attempt in 0..5u32 {
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", tok));
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| plain(e.to_string()))?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|e| plain(e.to_string())) };
+            }
+            Err(ureq::Error::Status(c, r)) => {
+                let retry = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok());
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let reason = v["error"]["errors"][0]["reason"].as_str().unwrap_or("").to_string();
+                let rate = c == 429 || c == 503 || (c == 403 && (reason == "rateLimitExceeded" || reason == "userRateLimitExceeded"));
+                if rate && attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(retry.map_or(400u64 << attempt, |s| s * 1000).min(30_000)));
+                    continue;
+                }
+                let m = v["error"]["message"].as_str().unwrap_or(&t).to_string();
+                let hint = if c == 404 { " (is the calendar shared with the service account, or a `subject` set?)" } else { "" };
+                return Err(Fail { code: c, text: format!("Calendar {} {}: {}{}", c, reason, m, hint), reason });
+            }
+            Err(e) => return Err(plain(format!("cannot reach Calendar at {}: {}", api(), e))),
+        }
+    }
+    Err(plain("Calendar stayed busy through five tries".into()))
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, options: &Value) -> Result<Value, String> {
+    fetch(method, path, body, options).map_err(|f| f.text)
+}
+
+fn is_date(t: &str) -> bool {
+    let b = t.as_bytes();
+    t.len() == 10 && b[4] == b'-' && b[7] == b'-' && t.bytes().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+fn has_offset(t: &str) -> bool {
+    let tail = t.get(19..).unwrap_or("");
+    tail.ends_with('Z') || tail.ends_with('z') || (tail.len() >= 6 && matches!(tail.as_bytes()[tail.len() - 6], b'+' | b'-') && tail.as_bytes()[tail.len() - 3] == b':')
+}
+
+fn is_time(t: &str) -> bool {
+    let b = t.as_bytes();
+    t.len() >= 19 && t.get(..10).map_or(false, is_date) && (b[10] == b'T' || b[10] == b't') && b[13] == b':' && b[16] == b':' && [11, 12, 14, 15, 17, 18].iter().all(|i| b[*i].is_ascii_digit())
+}
+
+fn days(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil(z: i64) -> String {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn date_parts(t: &str) -> Result<(i64, i64, i64), String> {
+    if !is_date(t) {
+        return Err(format!("`{}` is not a date, like 2026-11-20", t));
+    }
+    let (y, m, d) = (t[..4].parse::<i64>().unwrap_or(0), t[5..7].parse::<i64>().unwrap_or(0), t[8..10].parse::<i64>().unwrap_or(0));
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let last = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31].get((m - 1).clamp(0, 11) as usize).copied().unwrap_or(31);
+    if !(1..=12).contains(&m) || d < 1 || d > last {
+        return Err(format!("`{}` is not a date in the calendar", t));
+    }
+    Ok((y, m, d))
+}
+
+/// A time for an event: `google_calendar_time("2026-11-20", "")` is `{ date }`, all day; "2026-11-20T10:00:00+01:00" is `{ dateTime }`; a time with no offset needs `time_zone` ("Europe/Paris") and is `{ dateTime, timeZone }`. Anything else is an error.
+pub fn google_calendar_time(value: &str, time_zone: &str) -> Result<serde_json::Value, String> {
+    if is_date(value) {
+        date_parts(value)?;
+        return Ok(json!({ "date": value }));
+    }
+    if !is_time(value) {
+        return Err(format!("`{}` is neither a date nor an RFC 3339 time", value));
+    }
+    if has_offset(value) {
+        let mut v = json!({ "dateTime": value });
+        if !time_zone.is_empty() {
+            v["timeZone"] = json!(time_zone);
+        }
+        return Ok(v);
+    }
+    if time_zone.is_empty() {
+        return Err(format!("`{}` has no offset: give an offset, or a time zone", value));
+    }
+    Ok(json!({ "dateTime": value, "timeZone": time_zone }))
+}
+
+/// An all-day event's start and end from its first and last day: Google's `end` is the day after, so `("2026-11-20", "2026-11-22")` gives `{ start: { date: "2026-11-20" }, end: { date: "2026-11-23" } }`.
+pub fn google_calendar_all_day(first_day: &str, last_day: &str) -> Result<serde_json::Value, String> {
+    let (a, b) = (date_parts(first_day)?, date_parts(last_day)?);
+    let (from, to) = (days(a.0, a.1, a.2), days(b.0, b.1, b.2));
+    if to < from {
+        return Err(format!("the last day {} is before the first, {}", last_day, first_day));
+    }
+    Ok(json!({ "start": { "date": first_day }, "end": { "date": civil(to + 1) } }))
+}
+
+/// An event's times made plain: { all_day, start, end, last_day, days }, `end` as Google has it, `last_day` the day it really ends for an all-day event.
+pub fn google_calendar_span(event: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let (Some(s), Some(e)) = (event["start"]["date"].as_str(), event["end"]["date"].as_str()) {
+        let (a, b) = (date_parts(s)?, date_parts(e)?);
+        let (from, to) = (days(a.0, a.1, a.2), days(b.0, b.1, b.2));
+        return Ok(json!({ "all_day": true, "start": s, "end": e, "last_day": civil(to - 1), "days": to - from }));
+    }
+    Ok(json!({ "all_day": false, "start": event["start"]["dateTime"], "end": event["end"]["dateTime"], "last_day": Value::Null, "days": Value::Null }))
+}
+
+fn query(q: &Value) -> Result<String, String> {
+    let mut parts = vec![];
+    if let Some(m) = q.as_object() {
+        for (k, v) in m {
+            if (k == "timeMin" || k == "timeMax" || k == "updatedMin") && v.as_str().map_or(true, |t| !is_time(t) || !has_offset(t)) {
+                return Err(format!("{} needs an RFC 3339 time with an offset, like 2026-11-20T00:00:00Z", k));
+            }
+            parts.push(format!("{}={}", enc(k), enc(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+        }
+    }
+    Ok(parts.join("&"))
+}
+
+fn pages(calendar: &str, q: &str, options: &Value, max_items: i64) -> Result<(Vec<Value>, Value), Fail> {
+    let base = format!("/calendars/{}/events", enc(calendar));
+    let mut items = vec![];
+    let mut next = String::new();
+    loop {
+        let page = if next.is_empty() { String::new() } else { format!("&pageToken={}", enc(&next)) };
+        let v = fetch("GET", &format!("{}?maxResults=2500{}{}{}", base, if q.is_empty() { "" } else { "&" }, q, page), None, options)?;
+        items.extend(v["items"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && items.len() as i64 >= max_items {
+            items.truncate(max_items as usize);
+            return Ok((items, Value::Null));
+        }
+        match v["nextPageToken"].as_str() {
+            Some(t) => next = t.to_string(),
+            None => return Ok((items, v["nextSyncToken"].clone())),
+        }
+    }
+}
+
+/// Events through every page. `query` is Google's (`timeMin`, `timeMax`, `q`, `singleEvents`, `orderBy`, `showDeleted`...), `options` may hold `subject` and `max_items`. Gives { items, sync_token }; keep `sync_token` for google_calendar_sync. A query with times gives none usable for sync.
+pub fn google_calendar_events(calendar: &str, query_map: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = query(&query_map)?;
+    let (items, sync) = pages(calendar, &q, &options, options["max_items"].as_i64().unwrap_or(0)).map_err(|f| f.text)?;
+    Ok(json!({ "items": items, "sync_token": sync }))
+}
+
+/// What changed since `sync_token`, cancelled events included. Gives { items, sync_token, full_sync_required }: when Google has dropped the token (a 410) that is true, `items` is empty, and you start over with google_calendar_events.
+pub fn google_calendar_sync(calendar: &str, sync_token: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if sync_token.is_empty() {
+        return Err("no sync token: list with google_calendar_events first".into());
+    }
+    match pages(calendar, &format!("syncToken={}", enc(sync_token)), &options, 0) {
+        Ok((items, sync)) => Ok(json!({ "items": items, "sync_token": sync, "full_sync_required": false })),
+        Err(f) if f.code == 410 => Ok(json!({ "items": [], "sync_token": Value::Null, "full_sync_required": true })),
+        Err(f) => Err(f.text),
+    }
+}
+
+fn send_q(options: &Value) -> String {
+    options["send_updates"].as_str().map_or(String::new(), |s| format!("?sendUpdates={}", enc(s)))
+}
+
+/// One event by id.
+pub fn google_calendar_event(calendar: &str, id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("GET", &format!("/calendars/{}/events/{}", enc(calendar), enc(id)), None, &options)
+}
+
+/// Makes an event: `event` has `summary`, `start`, `end` (see google_calendar_time and google_calendar_all_day), `attendees`, `description`... `options` may hold `subject` and `send_updates` ("all", "externalOnly", "none").
+pub fn google_calendar_create(calendar: &str, event: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    for k in ["start", "end"] {
+        if !event[k].is_object() {
+            return Err(format!("an event needs `{}`: see google_calendar_time", k));
+        }
+    }
+    if event["start"]["date"].is_string() != event["end"]["date"].is_string() {
+        return Err("an event's start and end must both be dates, or both times".into());
+    }
+    call("POST", &format!("/calendars/{}/events{}", enc(calendar), send_q(&options)), Some(&event), &options)
+}
+
+/// Changes the fields of an event that are given.
+pub fn google_calendar_patch(calendar: &str, id: &str, fields: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call("PATCH", &format!("/calendars/{}/events/{}{}", enc(calendar), enc(id), send_q(&options)), Some(&fields), &options)
+}
+
+/// Deletes an event. Deleting one already deleted is Google's 410, an error here too.
+pub fn google_calendar_delete(calendar: &str, id: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/calendars/{}/events/{}{}", enc(calendar), enc(id), send_q(&options)), None, &options)?;
+    Ok(true)
+}
+
+/// When people are busy: `calendars` a list of ids, `time_min` and `time_max` RFC 3339 with an offset. Gives { id: { busy: [{ start, end }], errors } }, a calendar that cannot be read saying so in `errors`.
+pub fn google_calendar_freebusy(calendars: Vec<String>, time_min: &str, time_max: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if calendars.is_empty() || calendars.len() > 50 {
+        return Err(format!("free/busy takes 1 to 50 calendars, not {}", calendars.len()));
+    }
+    for t in [time_min, time_max] {
+        if !is_time(t) || !has_offset(t) {
+            return Err(format!("`{}` needs to be an RFC 3339 time with an offset", t));
+        }
+    }
+    let items: Vec<Value> = calendars.iter().map(|c| json!({ "id": c })).collect();
+    let v = call("POST", "/freeBusy", Some(&json!({ "timeMin": time_min, "timeMax": time_max, "items": items })), &options)?;
+    let mut out = serde_json::Map::new();
+    for (k, c) in v["calendars"].as_object().into_iter().flatten() {
+        out.insert(k.clone(), json!({ "busy": c["busy"].as_array().cloned().unwrap_or_default(), "errors": c["errors"].as_array().cloned().unwrap_or_default() }));
+    }
+    Ok(Value::Object(out))
+}

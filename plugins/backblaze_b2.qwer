@@ -1,0 +1,423 @@
+//! Backblaze B2's native API: accounts authorized and tokens renewed when they expire, files uploaded with their SHA-1, large files sent in parts and finished or cancelled, upload URLs replaced when a pod is busy, download authorizations, downloads checked against their SHA-1, and every listing paged.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! sha1 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use std::io::Read;
+use std::sync::Mutex;
+use std::time::Duration;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+#[derive(Clone)]
+struct Auth {
+    account: String,
+    token: String,
+    api_url: String,
+    download_url: String,
+    part_size: u64,
+    min_part: u64,
+}
+
+static AUTH: Mutex<Option<Auth>> = Mutex::new(None);
+
+fn var(n: &str) -> Option<String> {
+    std::env::var(n).ok().filter(|v| !v.is_empty())
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(120)).build()
+}
+
+/// B2's own URL encoding for file names: `/` stays, the rest of the unreserved set stays, others are %XX.
+fn enc_name(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/!$'()*;=:@".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn check_name(n: &str) -> Result<(), String> {
+    if n.is_empty() || n.len() > 1024 {
+        return Err("a file name is 1 to 1024 bytes".into());
+    }
+    if n.starts_with('/') || n.ends_with('/') || n.contains("//") {
+        return Err(format!("`{}`: a B2 file name cannot start or end with / or hold //", n));
+    }
+    if n.chars().any(|c| (c as u32) < 32 || c == '\u{7f}') {
+        return Err(format!("{:?}: a B2 file name cannot hold control characters", n));
+    }
+    Ok(())
+}
+
+/// A B2 error body: { status, code, message }. Gives (code, text).
+fn b2_error(status: u16, text: &str) -> (String, String) {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let code = v["code"].as_str().unwrap_or("").to_string();
+    (code.clone(), format!("B2 {} {}: {}", status, code, v["message"].as_str().map(str::to_string).unwrap_or_else(|| text.chars().take(160).collect())))
+}
+
+fn authorize() -> Result<Auth, String> {
+    let id = var("B2_APPLICATION_KEY_ID").ok_or("no key: set B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY")?;
+    let key = var("B2_APPLICATION_KEY").ok_or("no key: set B2_APPLICATION_KEY")?;
+    let base = var("B2_API_URL").unwrap_or("https://api.backblazeb2.com".into());
+    let url = format!("{}/b2api/v3/b2_authorize_account", base.trim_end_matches('/'));
+    let basic = format!("Basic {}", B64.encode(format!("{}:{}", id, key)));
+    let r = match agent().get(&url).set("Authorization", &basic).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(c, r)) => return Err(b2_error(c, &r.into_string().unwrap_or_default()).1),
+        Err(e) => return Err(format!("cannot reach B2 at {}: {}", base, e)),
+    };
+    let v: Value = r.into_json_value()?;
+    let api = &v["apiInfo"]["storageApi"];
+    let a = Auth {
+        account: v["accountId"].as_str().unwrap_or("").to_string(),
+        token: v["authorizationToken"].as_str().unwrap_or("").to_string(),
+        api_url: api["apiUrl"].as_str().unwrap_or("").to_string(),
+        download_url: api["downloadUrl"].as_str().unwrap_or("").to_string(),
+        part_size: api["recommendedPartSize"].as_u64().unwrap_or(100_000_000),
+        min_part: api["absoluteMinimumPartSize"].as_u64().unwrap_or(5_000_000),
+    };
+    if let Ok(mut g) = AUTH.lock() {
+        *g = Some(a.clone());
+    }
+    Ok(a)
+}
+
+trait JsonValue {
+    fn into_json_value(self) -> Result<Value, String>;
+}
+
+impl JsonValue for ureq::Response {
+    fn into_json_value(self) -> Result<Value, String> {
+        let t = self.into_string().map_err(|e| e.to_string())?;
+        serde_json::from_str(&t).map_err(|e| format!("B2: not JSON: {}", e))
+    }
+}
+
+fn auth() -> Result<Auth, String> {
+    if let Some(a) = AUTH.lock().ok().and_then(|g| g.clone()) {
+        return Ok(a);
+    }
+    authorize()
+}
+
+/// A JSON API call. An expired token is renewed once, quietly; 429 and 503 wait as Retry-After says.
+fn call(name: &str, body: &Value) -> Result<Value, String> {
+    let mut renewed = false;
+    let mut tries = 0u64;
+    loop {
+        tries += 1;
+        let a = auth()?;
+        let url = format!("{}/b2api/v3/{}", a.api_url, name);
+        match agent().post(&url).set("Authorization", &a.token).set("Content-Type", "application/json").send_string(&body.to_string()) {
+            Ok(r) => return r.into_json_value(),
+            Err(ureq::Error::Status(c, r)) => {
+                let wait = r.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let (code, msg) = b2_error(c, &r.into_string().unwrap_or_default());
+                if c == 401 && (code == "expired_auth_token" || code == "bad_auth_token") && !renewed {
+                    renewed = true;
+                    authorize()?;
+                    continue;
+                }
+                if (c == 429 || c == 503 || c == 500) && tries < 5 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1 << (tries - 1)).min(30)));
+                    continue;
+                }
+                return Err(msg);
+            }
+            Err(e) => {
+                if tries < 3 {
+                    continue;
+                }
+                return Err(format!("cannot reach B2: {}", e));
+            }
+        }
+    }
+}
+
+/// Authorizes now, and gives { account, api_url, download_url, part_size, min_part }. Other calls do this themselves.
+pub fn b2_authorize() -> Result<serde_json::Value, String> {
+    let a = authorize()?;
+    Ok(json!({ "account": a.account, "api_url": a.api_url, "download_url": a.download_url, "part_size": a.part_size, "min_part": a.min_part }))
+}
+
+/// The account's buckets: { bucketId, bucketName, bucketType, ... }.
+pub fn b2_buckets() -> Result<Vec<serde_json::Value>, String> {
+    let a = auth()?;
+    Ok(call("b2_list_buckets", &json!({ "accountId": a.account }))?["buckets"].as_array().cloned().unwrap_or_default())
+}
+
+fn sha1_hex(b: &[u8]) -> String {
+    hex::encode(Sha1::digest(b))
+}
+
+fn upload_url(kind: &str, body: &Value) -> Result<(String, String), String> {
+    let r = call(kind, body)?;
+    Ok((r["uploadUrl"].as_str().ok_or("no uploadUrl in the answer")?.to_string(), r["authorizationToken"].as_str().unwrap_or("").to_string()))
+}
+
+/// Sends bytes to an upload URL, asking for a fresh URL on the failures B2 says to do so for: 401 of an upload token, 408, 429, 5xx, a broken connection.
+fn send_bytes(data: &[u8], url_kind: &str, url_body: &Value, heads: &[(String, String)]) -> Result<Value, String> {
+    let sha = sha1_hex(data);
+    let mut tries = 0;
+    let mut last = String::new();
+    while tries < 5 {
+        tries += 1;
+        let (url, token) = upload_url(url_kind, url_body)?;
+        let mut r = agent().post(&url).set("Authorization", &token).set("Content-Length", &data.len().to_string()).set("X-Bz-Content-Sha1", &sha);
+        for (k, v) in heads {
+            r = r.set(k, v);
+        }
+        match r.send_bytes(data) {
+            Ok(x) => return x.into_json_value(),
+            Err(ureq::Error::Status(c, x)) => {
+                let wait = x.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok()).unwrap_or(0);
+                let (_, msg) = b2_error(c, &x.into_string().unwrap_or_default());
+                last = msg;
+                if !(c == 401 || c == 408 || c == 429 || c >= 500) {
+                    return Err(last);
+                }
+                std::thread::sleep(Duration::from_millis((wait * 1000).max(100) * tries));
+            }
+            Err(e) => last = format!("the upload broke off: {}", e),
+        }
+    }
+    Err(last)
+}
+
+fn plain_file(v: &Value) -> Value {
+    json!({ "file_id": v["fileId"], "name": v["fileName"], "size": v["contentLength"], "sha1": v["contentSha1"], "content_type": v["contentType"], "info": v["fileInfo"], "action": v["action"], "uploaded": v["uploadTimestamp"] })
+}
+
+fn info_heads(o: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut out = vec![];
+    let list = o.get("info").and_then(|i| i.as_object()).cloned().unwrap_or_default();
+    if list.len() > 10 {
+        return Err("B2 keeps at most 10 file info items".into());
+    }
+    for (k, v) in list {
+        if !k.chars().all(|c| c.is_ascii_alphanumeric() || "-_.`~!#$%^&*'|+".contains(c)) {
+            return Err(format!("`{}` cannot be a file info name", k));
+        }
+        out.push((format!("X-Bz-Info-{}", k), enc_name(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))));
+    }
+    Ok(out)
+}
+
+fn upload_small(bucket: &str, name: &str, data: &[u8], o: &Value) -> Result<Value, String> {
+    let ctype = o.get("content_type").and_then(|c| c.as_str()).unwrap_or("b2/x-auto").to_string();
+    let mut heads = vec![("X-Bz-File-Name".to_string(), enc_name(name)), ("Content-Type".to_string(), ctype)];
+    heads.extend(info_heads(o)?);
+    let v = send_bytes(data, "b2_get_upload_url", &json!({ "bucketId": bucket }), &heads)?;
+    Ok(plain_file(&v))
+}
+
+/// Uploads text as a file. Options: content_type (B2 guesses by default), info (a map of up to 10). Gives { file_id, name, size, sha1, ... }.
+pub fn b2_upload(bucket_id: &str, name: &str, text: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_name(name)?;
+    upload_small(bucket_id, name, text.as_bytes(), &options)
+}
+
+/// Uploads a local file, in parts when it is past the account's recommended part size (or the option part_size). Takes content_type and info. Gives the file, with `parts` when it went in parts.
+pub fn b2_upload_file(bucket_id: &str, name: &str, path: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    check_name(name)?;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("cannot open {}: {}", path, e))?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    let a = auth()?;
+    let part = options.get("part_size").and_then(|p| p.as_u64()).unwrap_or(a.part_size);
+    if part < a.min_part {
+        return Err(format!("part_size {} is under B2's minimum of {} bytes", part, a.min_part));
+    }
+    if size <= part {
+        let mut data = vec![];
+        f.read_to_end(&mut data).map_err(|e| e.to_string())?;
+        return upload_small(bucket_id, name, &data, &options);
+    }
+    if size / part >= 10_000 {
+        return Err(format!("{} bytes in parts of {} is over B2's 10,000 parts: raise part_size", size, part));
+    }
+    let info: serde_json::Map<String, Value> = options.get("info").and_then(|i| i.as_object()).cloned().unwrap_or_default();
+    let ctype = options.get("content_type").and_then(|c| c.as_str()).unwrap_or("b2/x-auto");
+    let started = call("b2_start_large_file", &json!({ "bucketId": bucket_id, "fileName": name, "contentType": ctype, "fileInfo": info }))?;
+    let id = started["fileId"].as_str().ok_or("no fileId in the answer")?.to_string();
+    let mut shas = vec![];
+    let mut buf = vec![0u8; part as usize];
+    let mut n = 0;
+    let result = (|| -> Result<Value, String> {
+        loop {
+            let mut got = 0;
+            while got < buf.len() {
+                let k = f.read(&mut buf[got..]).map_err(|e| e.to_string())?;
+                if k == 0 {
+                    break;
+                }
+                got += k;
+            }
+            if got == 0 {
+                break;
+            }
+            n += 1;
+            let r = send_bytes(&buf[..got], "b2_get_upload_part_url", &json!({ "fileId": id }), &[("X-Bz-Part-Number".to_string(), n.to_string())])?;
+            shas.push(json!(r["contentSha1"].as_str().unwrap_or("")));
+        }
+        call("b2_finish_large_file", &json!({ "fileId": id, "partSha1Array": shas }))
+    })();
+    match result {
+        Ok(v) => {
+            let mut out = plain_file(&v);
+            out["parts"] = json!(n);
+            Ok(out)
+        }
+        Err(e) => {
+            // Unfinished parts are billed, so they go. The error said first is what matters.
+            let _ = call("b2_cancel_large_file", &json!({ "fileId": id }));
+            Err(e)
+        }
+    }
+}
+
+/// Large files started and never finished in a bucket, which are billed: { file_id, name, started }.
+pub fn b2_unfinished(bucket_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut next = Value::Null;
+    loop {
+        let r = call("b2_list_unfinished_large_files", &json!({ "bucketId": bucket_id, "startFileId": next, "maxFileCount": 100 }))?;
+        for f in r["files"].as_array().into_iter().flatten() {
+            out.push(json!({ "file_id": f["fileId"], "name": f["fileName"], "started": f["uploadTimestamp"] }));
+        }
+        next = r["nextFileId"].clone();
+        if next.is_null() {
+            return Ok(out);
+        }
+    }
+}
+
+/// Throws away an unfinished large file and its parts.
+pub fn b2_cancel(file_id: &str) -> Result<bool, String> {
+    call("b2_cancel_large_file", &json!({ "fileId": file_id }))?;
+    Ok(true)
+}
+
+/// One page of file names: options prefix, delimiter (like / for folders), start, max (1000). Gives { files, next }; `next` is the `start` of the next page, null at the end.
+pub fn b2_list(bucket_id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let body = json!({ "bucketId": bucket_id, "startFileName": options.get("start"), "maxFileCount": options.get("max").cloned().unwrap_or(json!(1000)), "prefix": options.get("prefix"), "delimiter": options.get("delimiter") });
+    let r = call("b2_list_file_names", &body)?;
+    Ok(json!({ "files": r["files"].as_array().map(|l| l.iter().map(plain_file).collect::<Vec<_>>()), "next": r["nextFileName"] }))
+}
+
+/// Every file name, all pages. Options as for `b2_list`, with max the page size.
+pub fn b2_list_all(bucket_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut o = if options.is_object() { options } else { json!({}) };
+    let mut out = vec![];
+    loop {
+        let p = b2_list(bucket_id, o.clone())?;
+        out.extend(p["files"].as_array().cloned().unwrap_or_default());
+        if p["next"].is_null() {
+            return Ok(out);
+        }
+        o["start"] = p["next"].clone();
+    }
+}
+
+/// Every version of the files, hidden ones too, all pages. Option prefix. Each has `action`: upload, hide or start.
+pub fn b2_versions(bucket_id: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let (mut name, mut id) = (Value::Null, Value::Null);
+    let mut out = vec![];
+    loop {
+        let r = call("b2_list_file_versions", &json!({ "bucketId": bucket_id, "startFileName": name, "startFileId": id, "maxFileCount": 1000, "prefix": options.get("prefix") }))?;
+        out.extend(r["files"].as_array().into_iter().flatten().map(plain_file));
+        name = r["nextFileName"].clone();
+        id = r["nextFileId"].clone();
+        if name.is_null() {
+            return Ok(out);
+        }
+    }
+}
+
+/// Hides a file: names no longer list it, its versions stay.
+pub fn b2_hide(bucket_id: &str, name: &str) -> Result<serde_json::Value, String> {
+    Ok(plain_file(&call("b2_hide_file", &json!({ "bucketId": bucket_id, "fileName": name }))?))
+}
+
+/// Deletes one version of a file, by name and id.
+pub fn b2_delete(name: &str, file_id: &str) -> Result<bool, String> {
+    call("b2_delete_file_version", &json!({ "fileName": name, "fileId": file_id }))?;
+    Ok(true)
+}
+
+/// A token letting whoever holds it download files starting with `prefix` from a private bucket for `seconds` (1 to 604800). Gives { token, prefix, bucket_id }.
+pub fn b2_download_auth(bucket_id: &str, prefix: &str, seconds: i64) -> Result<serde_json::Value, String> {
+    if !(1..=604800).contains(&seconds) {
+        return Err("seconds is 1 to 604800, a week".into());
+    }
+    let r = call("b2_get_download_authorization", &json!({ "bucketId": bucket_id, "fileNamePrefix": prefix, "validDurationInSeconds": seconds }))?;
+    Ok(json!({ "token": r["authorizationToken"], "prefix": r["fileNamePrefix"], "bucket_id": r["bucketId"] }))
+}
+
+/// A link to a file, with a token from `b2_download_auth`, or "" for a public bucket.
+pub fn b2_download_url(bucket_name: &str, name: &str, token: &str) -> Result<String, String> {
+    let a = auth()?;
+    let q = if token.is_empty() { String::new() } else { format!("?Authorization={}", enc_name(token).replace('/', "%2F")) };
+    Ok(format!("{}/file/{}/{}{}", a.download_url, bucket_name, enc_name(name), q))
+}
+
+/// Downloads a file as { text or base64, size, sha1, content_type, file_id, info, checked }, the SHA-1 checked when B2 knows it (a large file's is `none` unless given at upload). Option token: a download authorization; the account's own otherwise. Option range: "bytes=0-99".
+pub fn b2_download(bucket_name: &str, name: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut renewed = false;
+    loop {
+        let a = auth()?;
+        let url = format!("{}/file/{}/{}", a.download_url, bucket_name, enc_name(name));
+        let token = options.get("token").and_then(|t| t.as_str()).map(str::to_string);
+        let mut r = agent().get(&url).set("Authorization", token.as_deref().unwrap_or(&a.token));
+        if let Some(x) = options.get("range").and_then(|t| t.as_str()) {
+            r = r.set("Range", x);
+        }
+        let resp = match r.call() {
+            Ok(x) => x,
+            Err(ureq::Error::Status(c, x)) => {
+                let (code, msg) = b2_error(c, &x.into_string().unwrap_or_default());
+                if c == 401 && code.contains("expired") && !renewed && token.is_none() {
+                    renewed = true;
+                    authorize()?;
+                    continue;
+                }
+                return Err(msg);
+            }
+            Err(e) => return Err(format!("cannot reach B2: {}", e)),
+        };
+        let status = resp.status();
+        let sha = resp.header("x-bz-content-sha1").unwrap_or("none").to_string();
+        let ctype = resp.header("content-type").unwrap_or("").to_string();
+        let id = resp.header("x-bz-file-id").unwrap_or("").to_string();
+        let mut info = serde_json::Map::new();
+        for n in resp.headers_names() {
+            if let Some(k) = n.strip_prefix("x-bz-info-") {
+                info.insert(k.to_string(), json!(resp.header(&n).unwrap_or("")));
+            }
+        }
+        let mut data = vec![];
+        resp.into_reader().take(512 << 20).read_to_end(&mut data).map_err(|e| format!("the download broke off: {}", e))?;
+        let bare = sha.strip_prefix("unverified:").unwrap_or(&sha);
+        let checkable = bare.len() == 40 && status == 200;
+        if checkable && sha1_hex(&data) != bare {
+            return Err(format!("{}: the download's SHA-1 does not match: expected {}, got {}", name, bare, sha1_hex(&data)));
+        }
+        let mut out = json!({ "size": data.len(), "sha1": bare, "content_type": ctype, "file_id": id, "info": info, "checked": checkable });
+        match String::from_utf8(data) {
+            Ok(t) => out["text"] = json!(t),
+            Err(e) => out["base64"] = json!(B64.encode(e.as_bytes())),
+        }
+        return Ok(out);
+    }
+}
+
+/// Forgets the token held, so the next call authorizes again: for a test, or after rotating keys.
+pub fn b2_forget() -> bool {
+    AUTH.lock().map(|mut g| g.take().is_some()).unwrap_or(false)
+}

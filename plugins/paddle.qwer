@@ -1,0 +1,285 @@
+//! Paddle Billing's API without an SDK: prices, transactions and subscriptions, lists followed through their next links, subscription changes with the proration Paddle insists on, cancels, pauses and resumes, money as Paddle's strings of the lowest denomination, field errors read, and the Paddle-Signature header checked with its timestamp and rotating keys.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// PADDLE_API_KEY is the key; PADDLE_API_URL the API (https://api.paddle.com when not set,
+// https://sandbox-api.paddle.com for the sandbox). This is Paddle Billing, not Paddle Classic.
+
+const ZERO: &[&str] = &["JPY", "KRW"];
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("PADDLE_API_URL").unwrap_or_else(|| "https://api.paddle.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(status: u16, text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let e = &v["error"];
+    let Some(code) = e["code"].as_str() else {
+        return format!("Paddle {}: {}", status, text.trim().chars().take(300).collect::<String>());
+    };
+    let mut t = format!("Paddle {} {}: {}", status, code, e["detail"].as_str().unwrap_or(""));
+    if let Some(list) = e["errors"].as_array() {
+        let parts: Vec<String> = list.iter().map(|x| format!("{}: {}", x["field"].as_str().unwrap_or("?"), x["message"].as_str().unwrap_or(""))).collect();
+        if !parts.is_empty() {
+            t.push_str(&format!(" ({})", parts.join("; ")));
+        }
+    }
+    if let Some(r) = v["meta"]["request_id"].as_str() {
+        t.push_str(&format!(" [{}]", r));
+    }
+    t
+}
+
+// `url` is whole, as a next link is. Writes are not repeated: Paddle takes no idempotency key.
+fn fetch(method: &str, url: &str, body: Option<&Value>) -> Result<Value, String> {
+    let token = setting("PADDLE_API_KEY").ok_or("PADDLE_API_KEY is not set")?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let tries = if method == "GET" { 5u32 } else { 1 };
+    for attempt in 0..tries {
+        let req = agent.request(method, url).set("Authorization", &format!("Bearer {}", token)).set("Paddle-Version", "1").set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(r) => {
+                let t = r.into_string().map_err(|e| e.to_string())?;
+                return if t.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&t).map_err(|_| format!("Paddle's answer is not JSON: {}", t.chars().take(200).collect::<String>())) };
+            }
+            // 240 requests a minute by IP, and a Retry-After in seconds beyond that.
+            Err(ureq::Error::Status(429 | 502 | 503 | 504, r)) if attempt + 1 < tries => {
+                let wait = r.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).map_or(400u64 << attempt, |s| s * 1000);
+                std::thread::sleep(Duration::from_millis(wait.min(60_000)));
+            }
+            Err(ureq::Error::Status(c, r)) => return Err(error_text(c, &r.into_string().unwrap_or_default())),
+            Err(e) => return Err(format!("cannot reach Paddle at {}: {}", api(), e)),
+        }
+    }
+    Err("Paddle stayed busy through five tries".into())
+}
+
+fn data(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    Ok(fetch(method, &format!("{}{}", api(), path), body)?["data"].clone())
+}
+
+fn walk(path: &str, filter: &Value, max_items: i64) -> Result<Vec<Value>, String> {
+    let mut q = vec![];
+    if let Some(m) = filter.as_object() {
+        for (k, v) in m {
+            let t = match v {
+                Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect::<Vec<_>>().join(","),
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            q.push(format!("{}={}", enc(k), enc(&t)));
+        }
+    }
+    if !filter.get("per_page").is_some() {
+        q.push("per_page=200".into());
+    }
+    let mut url = format!("{}{}?{}", api(), path, q.join("&"));
+    let mut out = vec![];
+    loop {
+        let v = fetch("GET", &url, None)?;
+        out.extend(v["data"].as_array().cloned().unwrap_or_default());
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        match (v["meta"]["pagination"]["has_more"].as_bool(), v["meta"]["pagination"]["next"].as_str()) {
+            (Some(true), Some(n)) => url = n.to_string(),
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// Money as Paddle wants it, a string of the lowest denomination: `paddle_money("19.99", "USD")` is `{ amount: "1999", currency_code: "USD" }`, `("1500", "JPY")` keeps it whole.
+pub fn paddle_money(amount: &str, currency: &str) -> Result<serde_json::Value, String> {
+    let c = currency.to_uppercase();
+    if c.len() != 3 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("`{}` is not a three-letter currency code", currency));
+    }
+    let places = if ZERO.contains(&c.as_str()) { 0 } else { 2 };
+    let a = amount.trim();
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{}` is not an amount", amount));
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > places {
+        return Err(format!("{} has {} decimals; {} has {}", amount, frac.len(), c, places));
+    }
+    let digits = format!("{}{}{}", whole, frac, "0".repeat(places - frac.len()));
+    let n = digits.trim_start_matches('0');
+    Ok(json!({ "amount": if n.is_empty() { "0" } else { n }, "currency_code": c }))
+}
+
+/// Paddle's money back as text: `paddle_money_text("1999", "USD")` is "19.99". A transaction's totals are strings like this.
+pub fn paddle_money_text(amount: &str, currency: &str) -> Result<String, String> {
+    let c = currency.to_uppercase();
+    let n: i64 = amount.parse().map_err(|_| format!("`{}` is not Paddle's money, a whole number as text", amount))?;
+    if ZERO.contains(&c.as_str()) {
+        return Ok(n.to_string());
+    }
+    let (sign, abs) = if n < 0 { ("-", -n) } else { ("", n) };
+    Ok(format!("{}{}.{:02}", sign, abs / 100, abs % 100))
+}
+
+/// Makes a price for a product: `unit_price` from paddle_money, `params` adds `billing_cycle` ({ interval, frequency }; none: one-time), `trial_period`, `name`, `custom_data`, `quantity`.
+pub fn paddle_price_create(product_id: &str, description: &str, unit_price: serde_json::Value, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !unit_price["amount"].is_string() {
+        return Err("unit_price must be { amount, currency_code } with a text amount: see paddle_money".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["product_id"] = json!(product_id);
+    b["description"] = json!(description);
+    b["unit_price"] = unit_price;
+    data("POST", "/prices", Some(&b))
+}
+
+/// One price by id (pri_...).
+pub fn paddle_price(id: &str) -> Result<serde_json::Value, String> {
+    data("GET", &format!("/prices/{}", enc(id)), None)
+}
+
+/// Changes a price's fields; `status: "archived"` retires it, as Paddle deletes nothing.
+pub fn paddle_price_update(id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    data("PATCH", &format!("/prices/{}", enc(id)), Some(&fields))
+}
+
+/// Prices through every page: `filter` is Paddle's (`product_id`, `status`, `recurring`...), `max_items` caps them (0: all).
+pub fn paddle_prices(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/prices", &filter, max_items)
+}
+
+/// Makes a transaction: `items` a list of { price_id, quantity }; `params` adds `customer_id`, `address_id`, `currency_code`, `collection_mode`, `custom_data`. Without a customer it stays a draft that Paddle.js can open.
+pub fn paddle_transaction_create(items: Vec<serde_json::Value>, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if items.is_empty() {
+        return Err("a transaction needs at least one item".into());
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["items"] = Value::Array(items);
+    data("POST", "/transactions", Some(&b))
+}
+
+/// One transaction by id (txn_...).
+pub fn paddle_transaction(id: &str) -> Result<serde_json::Value, String> {
+    data("GET", &format!("/transactions/{}", enc(id)), None)
+}
+
+/// Transactions through every page: `filter` is Paddle's (`status`, `customer_id`, `subscription_id`, `billed_at[GTE]`...), `max_items` caps them (0: all).
+pub fn paddle_transactions(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/transactions", &filter, max_items)
+}
+
+/// One subscription by id (sub_...).
+pub fn paddle_subscription(id: &str) -> Result<serde_json::Value, String> {
+    data("GET", &format!("/subscriptions/{}", enc(id)), None)
+}
+
+/// Subscriptions through every page: `filter` is Paddle's (`status`, `customer_id`, `price_id`...), `max_items` caps them (0: all).
+pub fn paddle_subscriptions(filter: serde_json::Value, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    walk("/subscriptions", &filter, max_items)
+}
+
+/// Changes a subscription: `fields` are Paddle's (`items`, `custom_data`, `next_billed_at`...). When `items` or `next_billed_at` change Paddle wants `proration` too: "prorated_immediately", "prorated_next_billing_period", "full_immediately", "full_next_billing_period" or "do_not_bill"; pass "" when neither changes.
+pub fn paddle_subscription_update(id: &str, fields: serde_json::Value, proration: &str) -> Result<serde_json::Value, String> {
+    let mut b = if fields.is_object() { fields } else { json!({}) };
+    let wants = b.get("items").is_some() || b.get("next_billed_at").is_some();
+    if wants && proration.is_empty() {
+        return Err("changing items or next_billed_at needs a proration, like \"prorated_immediately\"".into());
+    }
+    if !proration.is_empty() {
+        const MODES: &[&str] = &["prorated_immediately", "prorated_next_billing_period", "full_immediately", "full_next_billing_period", "do_not_bill"];
+        if !MODES.contains(&proration) {
+            return Err(format!("`{}` is not a proration; it takes {}", proration, MODES.join(", ")));
+        }
+        b["proration_billing_mode"] = json!(proration);
+    }
+    data("PATCH", &format!("/subscriptions/{}", enc(id)), Some(&b))
+}
+
+fn when(effective: &str) -> Result<Value, String> {
+    match effective {
+        "" => Ok(json!({ "effective_from": "next_billing_period" })),
+        "next_billing_period" | "immediately" => Ok(json!({ "effective_from": effective })),
+        o => Err(format!("`{}` is not a time: \"next_billing_period\" or \"immediately\"", o)),
+    }
+}
+
+/// Cancels a subscription, `effective` being "next_billing_period" (or "") or "immediately". Gives it, with `scheduled_change` until the time comes.
+pub fn paddle_subscription_cancel(id: &str, effective: &str) -> Result<serde_json::Value, String> {
+    data("POST", &format!("/subscriptions/{}/cancel", enc(id)), Some(&when(effective)?))
+}
+
+/// Pauses a subscription, `effective` as for a cancel.
+pub fn paddle_subscription_pause(id: &str, effective: &str) -> Result<serde_json::Value, String> {
+    data("POST", &format!("/subscriptions/{}/pause", enc(id)), Some(&when(effective)?))
+}
+
+/// Resumes a paused subscription at once.
+pub fn paddle_subscription_resume(id: &str) -> Result<serde_json::Value, String> {
+    data("POST", &format!("/subscriptions/{}/resume", enc(id)), Some(&json!({ "effective_from": "immediately" })))
+}
+
+fn signature(ts: &str, body: &str, secret: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    m.update(ts.as_bytes());
+    m.update(b":");
+    m.update(body.as_bytes());
+    m
+}
+
+/// Checks a webhook: `body` raw, `header` the Paddle-Signature (`ts=...;h1=...`, with more than one h1 while a key rotates), `secret` the destination's, refused when signed more than `tolerance_seconds` ago (0 skips that; Paddle's own libraries use 5). Gives the event { event_type, event_id, occurred_at, data }.
+pub fn paddle_webhook(body: &str, header: &str, secret: &str, tolerance_seconds: i64) -> Result<serde_json::Value, String> {
+    if header.is_empty() {
+        return Err("no Paddle-Signature header: this did not come from Paddle".into());
+    }
+    let mut ts = None;
+    let mut sigs = vec![];
+    for part in header.split(';') {
+        match part.trim().split_once('=') {
+            Some(("ts", v)) => ts = Some(v.to_string()),
+            Some(("h1", v)) => sigs.push(v.to_string()),
+            _ => {}
+        }
+    }
+    let ts = ts.ok_or("the Paddle-Signature header has no ts=")?;
+    let at: i64 = ts.parse().map_err(|_| format!("the Paddle-Signature timestamp `{}` is not a number", ts))?;
+    if sigs.is_empty() {
+        return Err("the Paddle-Signature header has no h1=".into());
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if tolerance_seconds > 0 && (now - at).abs() > tolerance_seconds {
+        return Err(format!("the webhook was signed {} s ago, more than the {} s allowed", (now - at).abs(), tolerance_seconds));
+    }
+    let ok = sigs.iter().any(|s| hex::decode(s).map_or(false, |raw| signature(&ts, body, secret).verify_slice(&raw).is_ok()));
+    if !ok {
+        return Err("the webhook's signature does not match: a wrong secret, or the body was changed (use the raw body)".into());
+    }
+    serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))
+}
+
+/// A Paddle-Signature header for `body`, as Paddle signs, at time `ts` (0: now). For tests.
+pub fn paddle_webhook_sign(body: &str, secret: &str, ts: i64) -> String {
+    let at = if ts > 0 { ts } else { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) }.to_string();
+    format!("ts={};h1={}", at, hex::encode(signature(&at, body, secret).finalize().into_bytes()))
+}

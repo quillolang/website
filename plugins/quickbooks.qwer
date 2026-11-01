@@ -1,0 +1,353 @@
+//! QuickBooks Online's Accounting API without an SDK: queries in Intuit's own language with values quoted and pages walked by start position, invoices and customers, the SyncToken dance for sparse updates, voids and deletes, refresh tokens that move on and are kept for you, Fault answers read, and webhook signatures with both payload shapes flattened.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// QUICKBOOKS_CLIENT_ID, QUICKBOOKS_CLIENT_SECRET and QUICKBOOKS_REFRESH_TOKEN sign in, and
+// QUICKBOOKS_REALM_ID names the company. The refresh token can change on any refresh, so
+// QUICKBOOKS_TOKEN_FILE keeps the newest, and is read first. QUICKBOOKS_API_URL is the API
+// (https://quickbooks.api.intuit.com; https://sandbox-quickbooks.api.intuit.com for a sandbox),
+// QUICKBOOKS_TOKEN_URL the token endpoint, QUICKBOOKS_MINOR_VERSION the minor version.
+
+const PAGE: i64 = 1000;
+
+fn setting(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+fn api() -> String {
+    setting("QUICKBOOKS_API_URL").unwrap_or_else(|| "https://quickbooks.api.intuit.com".into()).trim_end_matches('/').to_string()
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+#[derive(Default)]
+struct Session {
+    access: String,
+    until: i64,
+    refresh: String,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+fn stored_refresh() -> Result<String, String> {
+    if let Some(p) = setting("QUICKBOOKS_TOKEN_FILE") {
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            if !t.trim().is_empty() {
+                return Ok(t.trim().to_string());
+            }
+        }
+    }
+    setting("QUICKBOOKS_REFRESH_TOKEN").ok_or("QUICKBOOKS_REFRESH_TOKEN is not set (and QUICKBOOKS_TOKEN_FILE holds none)".to_string())
+}
+
+fn token(force: bool) -> Result<String, String> {
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let s = guard.get_or_insert_with(Session::default);
+    if !force && !s.access.is_empty() && s.until > now() + 60 {
+        return Ok(s.access.clone());
+    }
+    let refresh = if s.refresh.is_empty() { stored_refresh()? } else { s.refresh.clone() };
+    let id = setting("QUICKBOOKS_CLIENT_ID").ok_or("QUICKBOOKS_CLIENT_ID is not set")?;
+    let secret = setting("QUICKBOOKS_CLIENT_SECRET").ok_or("QUICKBOOKS_CLIENT_SECRET is not set")?;
+    let url = setting("QUICKBOOKS_TOKEN_URL").unwrap_or_else(|| "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer".into());
+    let res = ureq::post(&url).timeout(Duration::from_secs(20)).set("Authorization", &format!("Basic {}", STANDARD.encode(format!("{}:{}", id, secret)))).set("Accept", "application/json").send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let text = match res {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+            return Err(format!("Intuit refused the token refresh, {}: {}{}", c, v["error"].as_str().unwrap_or(&b), v["error_description"].as_str().map_or(String::new(), |d| format!(": {}", d))));
+        }
+        Err(e) => return Err(format!("cannot reach Intuit's token endpoint: {}", e)),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    s.access = v["access_token"].as_str().ok_or("Intuit gave no access_token")?.to_string();
+    s.until = now() + v["expires_in"].as_i64().unwrap_or(3600);
+    if let Some(n) = v["refresh_token"].as_str() {
+        s.refresh = n.to_string();
+        if let Some(p) = setting("QUICKBOOKS_TOKEN_FILE") {
+            let tmp = format!("{}.tmp", p);
+            std::fs::write(&tmp, n).and_then(|_| std::fs::rename(&tmp, &p)).map_err(|e| format!("cannot keep the new refresh token in {}: {}", p, e))?;
+        }
+    }
+    Ok(s.access.clone())
+}
+
+/// The newest refresh token, to store if you do not use QUICKBOOKS_TOKEN_FILE; "" before the first refresh.
+pub fn quickbooks_refresh_token() -> String {
+    SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(String::new(), |s| s.refresh.clone())
+}
+
+// A Fault has capital letters, but an authentication failure comes in lower case.
+fn fault_text(status: u16, text: &str, tid: &str) -> (String, String) {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let f = if v["Fault"].is_object() { &v["Fault"] } else { &v["fault"] };
+    let list = if f["Error"].is_array() { &f["Error"] } else { &f["error"] };
+    let tail = if tid.is_empty() { String::new() } else { format!(" [{}]", tid) };
+    let Some(items) = list.as_array().filter(|l| !l.is_empty()) else {
+        return (String::new(), format!("QuickBooks {}: {}{}", status, text.trim().chars().take(300).collect::<String>(), tail));
+    };
+    let first_code = items[0]["code"].as_str().unwrap_or("").to_string();
+    let parts: Vec<String> = items
+        .iter()
+        .map(|e| {
+            let msg = e["Message"].as_str().or(e["message"].as_str()).unwrap_or("");
+            let detail = e["Detail"].as_str().or(e["detail"].as_str()).unwrap_or("");
+            let mut t = format!("{} {}", e["code"].as_str().unwrap_or(""), msg);
+            if !detail.is_empty() && detail != msg {
+                t.push_str(&format!(": {}", detail));
+            }
+            if let Some(el) = e["element"].as_str().filter(|x| !x.is_empty()) {
+                t.push_str(&format!(" (element {})", el));
+            }
+            t
+        })
+        .collect();
+    (first_code, format!("QuickBooks {} {}: {}{}", status, f["type"].as_str().unwrap_or("Fault"), parts.join("; "), tail))
+}
+
+fn realm() -> Result<String, String> {
+    setting("QUICKBOOKS_REALM_ID").ok_or("QUICKBOOKS_REALM_ID is not set".to_string())
+}
+
+fn fetch(method: &str, tail: &str, body: Option<&Value>) -> Result<Value, (String, String)> {
+    let plain = |e: String| (String::new(), e);
+    let r = realm().map_err(plain)?;
+    let minor = setting("QUICKBOOKS_MINOR_VERSION").unwrap_or_else(|| "75".into());
+    let url = format!("{}/v3/company/{}/{}{}minorversion={}", api(), r, tail, if tail.contains('?') { "&" } else { "?" }, enc(&minor));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+    let mut renewed = false;
+    for attempt in 0..5u32 {
+        let t = token(false).map_err(plain)?;
+        let req = agent.request(method, &url).set("Authorization", &format!("Bearer {}", t)).set("Accept", "application/json");
+        let res = match body {
+            Some(b) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
+            None => req.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let tid = resp.header("intuit_tid").unwrap_or("").to_string();
+                let text = resp.into_string().map_err(|e| plain(e.to_string()))?;
+                let v: Value = serde_json::from_str(&text).map_err(|_| plain(format!("QuickBooks' answer is not JSON: {}", text.chars().take(200).collect::<String>())))?;
+                // A Fault can arrive with a 200.
+                if v.get("Fault").is_some() {
+                    return Err(fault_text(200, &text, &tid));
+                }
+                return Ok(v);
+            }
+            Err(ureq::Error::Status(401, _)) if !renewed => {
+                renewed = true;
+                token(true).map_err(plain)?;
+            }
+            // Throttled: 500 requests a minute a company, with no Retry-After to go by.
+            Err(ureq::Error::Status(429 | 503, _)) if attempt < 4 => std::thread::sleep(Duration::from_millis(500u64 << attempt)),
+            Err(ureq::Error::Status(c, resp)) => {
+                let tid = resp.header("intuit_tid").unwrap_or("").to_string();
+                return Err(fault_text(c, &resp.into_string().unwrap_or_default(), &tid));
+            }
+            Err(e) => return Err(plain(format!("cannot reach QuickBooks at {}: {}", api(), e))),
+        }
+    }
+    Err(plain("QuickBooks stayed busy through five tries".into()))
+}
+
+fn call(method: &str, tail: &str, body: Option<&Value>) -> Result<Value, String> {
+    fetch(method, tail, body).map_err(|(_, e)| e)
+}
+
+fn resource(entity: &str) -> Result<String, String> {
+    if entity.is_empty() || !entity.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(format!("`{}` is not an entity name, like Invoice or Customer", entity));
+    }
+    Ok(entity.to_lowercase())
+}
+
+/// A value quoted for a query: `quickbooks_quote("O'Brien")` is `'O\'Brien'`.
+pub fn quickbooks_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Runs a query as written, like `select * from Customer where DisplayName = 'Ada'`. Gives Intuit's QueryResponse.
+pub fn quickbooks_query(query: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("query?query={}", enc(query)), None)?["QueryResponse"].clone())
+}
+
+/// Every row of `entity`, walking STARTPOSITION: `clause` is what follows the entity ("where Balance > '0' orderby Id", or ""; no STARTPOSITION or MAXRESULTS of your own), `max_items` caps them (0: all).
+pub fn quickbooks_query_all(entity: &str, clause: &str, max_items: i64) -> Result<Vec<serde_json::Value>, String> {
+    resource(entity)?;
+    let low = clause.to_lowercase();
+    if low.contains("startposition") || low.contains("maxresults") {
+        return Err("this function pages for you: leave out STARTPOSITION and MAXRESULTS".into());
+    }
+    let mut out = vec![];
+    let mut at = 1;
+    loop {
+        let q = format!("select * from {} {} STARTPOSITION {} MAXRESULTS {}", entity, clause, at, PAGE);
+        let v = quickbooks_query(q.replace("  ", " ").trim())?;
+        let rows = v[entity].as_array().cloned().unwrap_or_default();
+        let n = rows.len() as i64;
+        out.extend(rows);
+        if max_items > 0 && out.len() as i64 >= max_items {
+            out.truncate(max_items as usize);
+            return Ok(out);
+        }
+        if n < PAGE {
+            return Ok(out);
+        }
+        at += PAGE;
+    }
+}
+
+/// How many rows match: `clause` as for quickbooks_query_all.
+pub fn quickbooks_count(entity: &str, clause: &str) -> Result<i64, String> {
+    resource(entity)?;
+    let q = format!("select count(*) from {} {}", entity, clause);
+    Ok(quickbooks_query(q.trim())?["totalCount"].as_i64().unwrap_or(0))
+}
+
+/// One record by id. `entity` is "Invoice", "Customer", "Item"...
+pub fn quickbooks_get(entity: &str, id: &str) -> Result<serde_json::Value, String> {
+    Ok(call("GET", &format!("{}/{}", resource(entity)?, enc(id)), None)?[entity].clone())
+}
+
+/// Makes a record from Intuit's fields.
+pub fn quickbooks_create(entity: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &resource(entity)?, Some(&fields))?[entity].clone())
+}
+
+/// A sparse update: `record` is one you read (its Id and SyncToken are used), `fields` what changes. If someone changed it since, this is QuickBooks' stale object error, so you can look before overwriting.
+pub fn quickbooks_update(entity: &str, record: serde_json::Value, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = if fields.is_object() { fields } else { json!({}) };
+    b["Id"] = record["Id"].clone();
+    b["SyncToken"] = record["SyncToken"].clone();
+    b["sparse"] = json!(true);
+    if !b["Id"].is_string() || !b["SyncToken"].is_string() {
+        return Err("the record needs its Id and SyncToken: read it first".into());
+    }
+    Ok(call("POST", &resource(entity)?, Some(&b))?[entity].clone())
+}
+
+/// A sparse update that reads the newest SyncToken first, and once more if it went stale between. The last write wins: use quickbooks_update when that matters.
+pub fn quickbooks_update_latest(entity: &str, id: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let res = resource(entity)?;
+    for attempt in 0..2 {
+        let cur = quickbooks_get(entity, id)?;
+        let mut b = fields.clone();
+        if !b.is_object() {
+            return Err("fields must be a map".into());
+        }
+        b["Id"] = cur["Id"].clone();
+        b["SyncToken"] = cur["SyncToken"].clone();
+        b["sparse"] = json!(true);
+        match fetch("POST", &res, Some(&b)) {
+            Ok(v) => return Ok(v[entity].clone()),
+            Err((code, _)) if code == "5010" && attempt == 0 => {}
+            Err((_, e)) => return Err(e),
+        }
+    }
+    Err("the record kept changing under this update".into())
+}
+
+/// Deletes a transaction (Invoice, Payment...): `record` needs its Id and SyncToken. Customers and items cannot be deleted: set `Active` false.
+pub fn quickbooks_delete(entity: &str, record: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = json!({ "Id": record["Id"], "SyncToken": record["SyncToken"] });
+    Ok(call("POST", &format!("{}?operation=delete", resource(entity)?), Some(&b))?[entity].clone())
+}
+
+/// Voids an invoice: it stays, at zero. `record` needs its Id and SyncToken.
+pub fn quickbooks_void(record: serde_json::Value) -> Result<serde_json::Value, String> {
+    let b = json!({ "Id": record["Id"], "SyncToken": record["SyncToken"], "sparse": true });
+    Ok(call("POST", "invoice?operation=void", Some(&b))?["Invoice"].clone())
+}
+
+/// Makes a customer: `display_name` must be unique; `fields` adds `PrimaryEmailAddr`, `GivenName`...
+pub fn quickbooks_customer_create(display_name: &str, fields: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = if fields.is_object() { fields } else { json!({}) };
+    b["DisplayName"] = json!(display_name);
+    quickbooks_create("Customer", b)
+}
+
+/// Makes an invoice from plain lines: each { amount, description, item, qty, unit_price } (`item` an Item's id; `amount` is worked out from qty and unit_price if left out), `params` adds `DueDate`, `TxnDate`, `DocNumber`...
+pub fn quickbooks_invoice_create(customer_id: &str, lines: Vec<serde_json::Value>, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    if lines.is_empty() {
+        return Err("an invoice needs at least one line".into());
+    }
+    let mut out = vec![];
+    for l in &lines {
+        let qty = l["qty"].as_f64().unwrap_or(1.0);
+        let unit = l["unit_price"].as_f64();
+        let amount = l["amount"].as_f64().or(unit.map(|u| (u * qty * 100.0).round() / 100.0)).ok_or("each line needs an amount, or a unit_price")?;
+        let mut detail = json!({ "Qty": qty });
+        if let Some(u) = unit {
+            detail["UnitPrice"] = json!(u);
+        }
+        if let Some(i) = l["item"].as_str() {
+            detail["ItemRef"] = json!({ "value": i });
+        }
+        let mut line = json!({ "DetailType": "SalesItemLineDetail", "Amount": amount, "SalesItemLineDetail": detail });
+        if let Some(d) = l["description"].as_str() {
+            line["Description"] = json!(d);
+        }
+        out.push(line);
+    }
+    let mut b = if params.is_object() { params } else { json!({}) };
+    b["CustomerRef"] = json!({ "value": customer_id });
+    b["Line"] = Value::Array(out);
+    quickbooks_create("Invoice", b)
+}
+
+fn sign(body: &str, verifier: &str) -> Hmac<sha2::Sha256> {
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(verifier.as_bytes()).expect("HMAC takes any key");
+    m.update(body.as_bytes());
+    m
+}
+
+/// Checks a webhook: `signature` the intuit-signature header, `verifier` the app's verifier token, `body` raw. Gives a flat list of { realm, entity, id, operation, updated } from either of Intuit's shapes, the older eventNotifications or the CloudEvents list; an error when not signed by that verifier.
+pub fn quickbooks_webhook(body: &str, signature: &str, verifier: &str) -> Result<Vec<serde_json::Value>, String> {
+    if signature.is_empty() {
+        return Err("no intuit-signature header: this did not come from Intuit".into());
+    }
+    let raw = STANDARD.decode(signature).map_err(|_| "the intuit-signature header is not base64".to_string())?;
+    if sign(body, verifier).verify_slice(&raw).is_err() {
+        return Err("the webhook's signature does not match: a wrong verifier token, or the body was changed (use the raw body)".into());
+    }
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("the webhook's body is not JSON: {}", e))?;
+    let mut out = vec![];
+    if let Some(list) = v.as_array() {
+        for e in list {
+            // qbo.customer.created.v1
+            let parts: Vec<&str> = e["type"].as_str().unwrap_or("").split('.').collect();
+            out.push(json!({ "realm": e["intuitaccountid"], "entity": parts.get(1).copied().unwrap_or(""), "id": e["intuitentityid"], "operation": parts.get(2).copied().unwrap_or(""), "updated": e["time"] }));
+        }
+        return Ok(out);
+    }
+    for n in v["eventNotifications"].as_array().into_iter().flatten() {
+        for e in n["dataChangeEvent"]["entities"].as_array().into_iter().flatten() {
+            out.push(json!({ "realm": n["realmId"], "entity": e["name"].as_str().unwrap_or("").to_lowercase(), "id": e["id"], "operation": e["operation"].as_str().unwrap_or("").to_lowercase(), "updated": e["lastUpdated"] }));
+        }
+    }
+    Ok(out)
+}
+
+/// The intuit-signature value for `body`, for tests.
+pub fn quickbooks_webhook_sign(body: &str, verifier: &str) -> String {
+    STANDARD.encode(sign(body, verifier).finalize().into_bytes())
+}

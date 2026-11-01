@@ -1,0 +1,383 @@
+//! Mapbox from the server: Geocoding v6 forward and reverse, directions with polyline6 decoded, travel time matrices, static map URLs with markers and paths, slippy-map tile numbers and tile URLs, with the token kept out of errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const PUBLIC: &str = "https://api.mapbox.com";
+
+fn base() -> String {
+    std::env::var("MAPBOX_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or(PUBLIC.to_string()).trim_end_matches('/').to_string()
+}
+
+fn token() -> Result<String, String> {
+    std::env::var("MAPBOX_TOKEN").ok().filter(|v| !v.is_empty()).ok_or("set MAPBOX_TOKEN to a Mapbox access token: a secret one (sk.) stays on the server, and a public one (pk.) may go in a page".to_string())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn get(path: &str, params: &[(String, String)]) -> Result<Value, String> {
+    let t = token()?;
+    let mut q: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect();
+    q.push(format!("access_token={}", enc(&t)));
+    let url = format!("{}{}?{}", base(), path, q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    for attempt in 0..3 {
+        match agent.get(&url).call() {
+            Ok(r) => {
+                let text = r.into_string().map_err(|e| e.to_string())?;
+                return serde_json::from_str(&text).map_err(|_| "Mapbox's answer is not JSON".to_string());
+            }
+            Err(ureq::Error::Status(429, r)) if attempt < 2 => {
+                // X-Rate-Limit-Reset is a Unix time, not a delay.
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let wait = r.header("x-rate-limit-reset").and_then(|v| v.parse::<u64>().ok()).map(|t| t.saturating_sub(now)).unwrap_or(1).clamp(1, 10);
+                sleep(Duration::from_secs(wait));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let t = r.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+                let hint = match code {
+                    401 => " (check MAPBOX_TOKEN)",
+                    403 => " (the token lacks that scope, or this is not one of its URLs)",
+                    _ => "",
+                };
+                return Err(format!("Mapbox answered {}: {}{}", code, if msg.is_empty() { t.chars().take(200).collect() } else { msg }, hint));
+            }
+            // ureq's error text holds the URL, and the URL holds the token.
+            Err(ureq::Error::Transport(e)) => return Err(format!("cannot reach Mapbox at {}: {}", base(), e.message().unwrap_or("connection failed"))),
+            Err(_) => return Err("cannot reach Mapbox".into()),
+        }
+    }
+    Err("Mapbox kept answering 429".into())
+}
+
+fn feature(f: &Value) -> Value {
+    let p = &f["properties"];
+    let c = &p["context"];
+    let name = |k: &str| c.get(k).and_then(|x| x.get("name")).cloned().unwrap_or(Value::Null);
+    json!({
+        "id": p["mapbox_id"], "type": p["feature_type"], "name": p["name"], "address": p.get("full_address").cloned().unwrap_or(p["place_formatted"].clone()),
+        "lat": p["coordinates"]["latitude"], "lon": p["coordinates"]["longitude"], "accuracy": p["coordinates"].get("accuracy"),
+        "house_number": c.get("address").and_then(|x| x.get("address_number")), "street": name("street"), "postcode": name("postcode"), "place": name("place"), "region": name("region"), "country": name("country"),
+        "country_code": c.get("country").and_then(|x| x.get("country_code")),
+    })
+}
+
+fn opts(options: &Value, known: &[&str]) -> Result<Vec<(String, String)>, String> {
+    let mut o = vec![];
+    for (k, v) in options.as_object().ok_or("options must be a map")? {
+        if !known.contains(&k.as_str()) {
+            return Err(format!("no option `{}`; there are {}", k, known.join(", ")));
+        }
+        o.push((k.clone(), match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().map(|x| x.as_str().map(String::from).unwrap_or(x.to_string())).collect::<Vec<_>>().join(","),
+            x => x.to_string(),
+        }));
+    }
+    Ok(o)
+}
+
+/// Places for a query, best first: [{ id, type, name, address, lat, lon, accuracy, house_number, street, postcode, place, region, country, country_code }]. `options`: { limit, country, language, proximity, bbox, types, autocomplete, permanent }. Results may be kept only with `permanent: true`, a paid term of its own.
+pub fn mapbox_geocode(query: &str, options: serde_json::Value) -> Result<Value, String> {
+    if query.trim().is_empty() {
+        return Err("nothing to search for".into());
+    }
+    let mut p = vec![("q".to_string(), query.trim().to_string())];
+    p.extend(opts(&options, &["limit", "country", "language", "proximity", "bbox", "types", "autocomplete", "permanent"])?);
+    let v = get("/search/geocode/v6/forward", &p)?;
+    Ok(json!(v["features"].as_array().into_iter().flatten().map(feature).collect::<Vec<_>>()))
+}
+
+/// What is at a position, by the same rows as mapbox_geocode, nearest first. `options`: { limit, types, language, country, permanent }.
+pub fn mapbox_reverse(lat: f64, lon: f64, options: serde_json::Value) -> Result<Value, String> {
+    let mut p = vec![("longitude".to_string(), lon.to_string()), ("latitude".to_string(), lat.to_string())];
+    p.extend(opts(&options, &["limit", "types", "language", "country", "permanent"])?);
+    let v = get("/search/geocode/v6/reverse", &p)?;
+    Ok(json!(v["features"].as_array().into_iter().flatten().map(feature).collect::<Vec<_>>()))
+}
+
+fn decode(text: &str, precision: i32) -> Result<Vec<[f64; 2]>, String> {
+    let f = 10f64.powi(precision);
+    let b = text.as_bytes();
+    let (mut i, mut la, mut lo) = (0, 0i64, 0i64);
+    let mut out = vec![];
+    while i < b.len() {
+        let mut d = [0i64; 2];
+        for s in d.iter_mut() {
+            let (mut r, mut shift) = (0i64, 0);
+            loop {
+                let c = *b.get(i).ok_or("a polyline ends in the middle of a number")? as i64 - 63;
+                if !(0..64).contains(&c) || shift > 58 {
+                    return Err("that is not a polyline".into());
+                }
+                i += 1;
+                r |= (c & 31) << shift;
+                shift += 5;
+                if c < 32 {
+                    break;
+                }
+            }
+            *s = if r & 1 == 1 { !(r >> 1) } else { r >> 1 };
+        }
+        la += d[0];
+        lo += d[1];
+        out.push([la as f64 / f, lo as f64 / f]);
+    }
+    Ok(out)
+}
+
+fn encode(points: &[[f64; 2]], precision: i32) -> String {
+    let f = 10f64.powi(precision);
+    let (mut a0, mut b0, mut out) = (0i64, 0i64, String::new());
+    let mut put = |v: i64| {
+        let mut x = if v < 0 { !(v << 1) } else { v << 1 } as u64;
+        while x >= 32 {
+            out.push(char::from_u32((32 | (x & 31)) as u32 + 63).unwrap_or('?'));
+            x >>= 5;
+        }
+        out.push(char::from_u32(x as u32 + 63).unwrap_or('?'));
+    };
+    for p in points {
+        let (a, b) = ((p[0] * f).round() as i64, (p[1] * f).round() as i64);
+        put(a - a0);
+        put(b - b0);
+        a0 = a;
+        b0 = b;
+    }
+    out
+}
+
+fn points_of(v: &Value) -> Result<Vec<[f64; 2]>, String> {
+    v.as_array().ok_or("give a list of [lat, lon]")?.iter().map(|p| {
+        let (a, b) = (p.get(0).and_then(|x| x.as_f64()), p.get(1).and_then(|x| x.as_f64()));
+        match (a, b) {
+            (Some(a), Some(b)) if a.abs() <= 90.0 && b.abs() <= 180.0 => Ok([a, b]),
+            _ => Err(format!("{} is not [lat, lon]", p)),
+        }
+    }).collect()
+}
+
+/// A polyline6 string, as Mapbox gives, as [[lat, lon]]. Precision 5 is the older polyline.
+pub fn mapbox_decode_polyline(text: &str, precision: i64) -> Result<Value, String> {
+    Ok(json!(decode(text, precision.clamp(1, 8) as i32)?))
+}
+
+/// [[lat, lon]] as a polyline string; use 6 for Directions, 5 for a Static Images path.
+pub fn mapbox_encode_polyline(points: serde_json::Value, precision: i64) -> Result<String, String> {
+    Ok(encode(&points_of(&points)?, precision.clamp(1, 8) as i32))
+}
+
+fn lon_lat(p: &[[f64; 2]]) -> String {
+    p.iter().map(|x| format!("{},{}", x[1], x[0])).collect::<Vec<_>>().join(";")
+}
+
+fn profile_of(options: &Value) -> Result<String, String> {
+    let p = options.get("profile").and_then(|v| v.as_str()).unwrap_or("driving");
+    if !["driving", "driving-traffic", "walking", "cycling"].contains(&p) {
+        return Err(format!("no profile `{}`; there are driving, driving-traffic, walking and cycling", p));
+    }
+    Ok(p.to_string())
+}
+
+fn without(options: &Value, key: &str) -> Value {
+    let mut o = options.clone();
+    if let Some(m) = o.as_object_mut() {
+        m.remove(key);
+    }
+    o
+}
+
+/// Directions through [lat, lon] points, 2 to 25: { routes: [{ distance_m, duration_s, geometry, legs }], waypoints }. `geometry` is decoded to [lat, lon]; steps carry Mapbox's own `instruction`. `options`: { profile, steps, alternatives, overview, annotations, language, exclude, voice_instructions, banner_instructions }. A route that cannot be found is an error value.
+pub fn mapbox_directions(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let pts = points_of(&points)?;
+    if pts.len() < 2 || pts.len() > 25 {
+        return Err(format!("directions take 2 to 25 points, not {}", pts.len()));
+    }
+    let profile = profile_of(&options)?;
+    let mut p = opts(&without(&options, "profile"), &["steps", "alternatives", "overview", "annotations", "language", "exclude", "continue_straight", "radiuses", "banner_instructions", "voice_instructions", "max_height", "max_weight", "depart_at"])?;
+    p.push(("geometries".into(), "polyline6".into()));
+    if options.get("overview").is_none() {
+        p.push(("overview".into(), "full".into()));
+    }
+    let v = get(&format!("/directions/v5/mapbox/{}/{}", profile, enc(&lon_lat(&pts)).replace("%2C", ",").replace("%3B", ";")), &p)?;
+    if v.get("code").and_then(|c| c.as_str()) != Some("Ok") {
+        return Err(format!("Mapbox says {}: {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or("no route")));
+    }
+    let line = |g: &Value| -> Result<Value, String> { Ok(g.as_str().map(|s| decode(s, 6)).transpose()?.map(|l| json!(l)).unwrap_or(Value::Null)) };
+    let mut routes = vec![];
+    for r in v["routes"].as_array().into_iter().flatten() {
+        let mut legs = vec![];
+        for l in r["legs"].as_array().into_iter().flatten() {
+            let mut steps = vec![];
+            for s in l["steps"].as_array().into_iter().flatten() {
+                steps.push(json!({ "instruction": s["maneuver"]["instruction"], "type": s["maneuver"]["type"], "modifier": s["maneuver"].get("modifier"), "name": s["name"], "distance_m": s["distance"], "duration_s": s["duration"], "geometry": line(&s["geometry"])? }));
+            }
+            legs.push(json!({ "distance_m": l["distance"], "duration_s": l["duration"], "summary": l["summary"], "steps": steps, "annotation": l.get("annotation") }));
+        }
+        routes.push(json!({ "distance_m": r["distance"], "duration_s": r["duration"], "geometry": line(&r["geometry"])?, "legs": legs }));
+    }
+    Ok(json!({ "routes": routes, "waypoints": v["waypoints"].as_array().into_iter().flatten().map(|w| json!({ "name": w["name"], "location": [w["location"][1], w["location"][0]], "snapped_m": w["distance"] })).collect::<Vec<_>>() }))
+}
+
+/// Travel times between points, 2 to 25 (10 for driving-traffic): { durations, distances }, by source and destination, null where no route. `options`: { profile, sources, destinations, annotations }; sources and destinations are lists of positions joined by `;`.
+pub fn mapbox_matrix(points: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    let pts = points_of(&points)?;
+    let profile = profile_of(&options)?;
+    let most = if profile == "driving-traffic" { 10 } else { 25 };
+    if pts.len() < 2 || pts.len() > most {
+        return Err(format!("the matrix takes 2 to {} points on {}, not {}", most, profile, pts.len()));
+    }
+    let mut o = without(&options, "profile");
+    if let Some(m) = o.as_object_mut() {
+        for k in ["sources", "destinations"] {
+            if let Some(Value::Array(a)) = m.get(k) {
+                let t = a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";");
+                m.insert(k.to_string(), json!(t));
+            }
+        }
+    }
+    let p = opts(&o, &["sources", "destinations", "annotations", "approaches", "fallback_speed"])?;
+    let v = get(&format!("/directions-matrix/v1/mapbox/{}/{}", profile, lon_lat(&pts)), &p)?;
+    if v.get("code").and_then(|c| c.as_str()) != Some("Ok") {
+        return Err(format!("Mapbox says {}: {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or("")));
+    }
+    Ok(json!({ "durations": v.get("durations"), "distances": v.get("distances") }))
+}
+
+fn pct_keep(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~,+".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn color_ok(c: &str) -> bool {
+    matches!(c.len(), 3 | 6) && c.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A Static Images URL. `options`: { style (default mapbox/streets-v12), lat, lon, zoom, bearing, pitch, width, height, retina, markers: [{ lat, lon, label, color, size }], path: { points, color, width, opacity }, padding, auto }. With overlays and no centre the map fits them (`auto`). The size is 1 to 1280, and a URL over 8192 characters, Mapbox's limit, is refused. The URL holds a token: give a public one to pages.
+pub fn mapbox_static_url(options: serde_json::Value) -> Result<String, String> {
+    let t = token()?;
+    if t.starts_with("sk.") {
+        return Err("a Static Images URL goes to the browser, so it needs a public pk. token, not a secret one".into());
+    }
+    let style = options.get("style").and_then(|v| v.as_str()).unwrap_or("mapbox/streets-v12");
+    let (w, h) = (options.get("width").and_then(|v| v.as_i64()).unwrap_or(600), options.get("height").and_then(|v| v.as_i64()).unwrap_or(400));
+    if !(1..=1280).contains(&w) || !(1..=1280).contains(&h) {
+        return Err(format!("a static map is 1 to 1280 pixels each way, not {} by {}", w, h));
+    }
+    let mut over = vec![];
+    for m in options.get("markers").and_then(|v| v.as_array()).into_iter().flatten() {
+        let (lat, lon) = (m.get("lat").and_then(|v| v.as_f64()).ok_or("a marker has lat")?, m.get("lon").and_then(|v| v.as_f64()).ok_or("a marker has lon")?);
+        let size = m.get("size").and_then(|v| v.as_str()).unwrap_or("s");
+        if size != "s" && size != "l" {
+            return Err("a marker's size is s or l".into());
+        }
+        let mut s = format!("pin-{}", size);
+        if let Some(l) = m.get("label").map(|v| v.as_str().map(String::from).unwrap_or(v.to_string())) {
+            let low = l.to_lowercase();
+            if !(low.len() == 1 && low.as_bytes()[0].is_ascii_alphanumeric()) && low.parse::<u8>().map(|n| n > 99).unwrap_or(true) {
+                return Err(format!("a marker's label is a letter or a number to 99, not `{}`", l));
+            }
+            s.push_str(&format!("-{}", low));
+        }
+        if let Some(c) = m.get("color").and_then(|v| v.as_str()) {
+            let c = c.trim_start_matches('#');
+            if !color_ok(c) {
+                return Err(format!("`{}` is not a colour: 3 or 6 hex digits", c));
+            }
+            s.push_str(&format!("+{}", c));
+        }
+        over.push(format!("{}({},{})", s, lon, lat));
+    }
+    if let Some(p) = options.get("path") {
+        let pts = points_of(p.get("points").ok_or("a path has points")?)?;
+        let line = pct_keep(&encode(&pts, 5));
+        let mut s = format!("path-{}", p.get("width").and_then(|v| v.as_f64()).unwrap_or(3.0));
+        if let Some(c) = p.get("color").and_then(|v| v.as_str()) {
+            let c = c.trim_start_matches('#');
+            if !color_ok(c) {
+                return Err(format!("`{}` is not a colour: 3 or 6 hex digits", c));
+            }
+            s.push_str(&format!("+{}", c));
+            if let Some(o) = p.get("opacity").and_then(|v| v.as_f64()) {
+                s.push_str(&format!("-{}", o));
+            }
+        }
+        over.push(format!("{}({})", s, line));
+    }
+    let view = match (options.get("lat").and_then(|v| v.as_f64()), options.get("lon").and_then(|v| v.as_f64())) {
+        (Some(lat), Some(lon)) => {
+            let zoom = options.get("zoom").and_then(|v| v.as_f64()).unwrap_or(12.0);
+            if !(0.0..=22.0).contains(&zoom) {
+                return Err(format!("zoom is 0 to 22, not {}", zoom));
+            }
+            let (b, p) = (options.get("bearing").and_then(|v| v.as_f64()).unwrap_or(0.0), options.get("pitch").and_then(|v| v.as_f64()).unwrap_or(0.0));
+            if b == 0.0 && p == 0.0 { format!("{},{},{}", lon, lat, zoom) } else { format!("{},{},{},{},{}", lon, lat, zoom, b, p) }
+        }
+        _ if !over.is_empty() => "auto".to_string(),
+        _ => return Err("give lat and lon, or markers or a path to fit".into()),
+    };
+    let retina = if options.get("retina").and_then(|v| v.as_bool()).unwrap_or(false) { "@2x" } else { "" };
+    let mut url = format!("{}/styles/v1/{}/static/{}{}/{}x{}{}?access_token={}", base(), style, if over.is_empty() { String::new() } else { over.join(",") + "/" }, view, w, h, retina, enc(&t));
+    if let Some(p) = options.get("padding").and_then(|v| v.as_i64()) {
+        url.push_str(&format!("&padding={}", p));
+    }
+    if url.len() > 8192 {
+        return Err(format!("that URL is {} characters; Mapbox takes 8192: simplify the path", url.len()));
+    }
+    Ok(url)
+}
+
+/// The slippy-map tile of a position at a zoom: { z, x, y, north, south, west, east }, with the tile's edges in degrees. Latitudes past ±85.0511 are off Web Mercator.
+pub fn mapbox_tile_at(lat: f64, lon: f64, zoom: i64) -> Result<Value, String> {
+    if !(0..=30).contains(&zoom) {
+        return Err(format!("zoom is 0 to 30, not {}", zoom));
+    }
+    if lat.abs() > 85.0511 || lon.abs() > 180.0 {
+        return Err(format!("({}, {}) is off Web Mercator", lat, lon));
+    }
+    let n = (1u64 << zoom) as f64;
+    let x = (((lon + 180.0) / 360.0 * n).floor() as i64).min(n as i64 - 1);
+    let r = lat.to_radians();
+    let y = (((1.0 - (r.tan() + 1.0 / r.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor() as i64).min(n as i64 - 1);
+    let edge = |t: f64| (std::f64::consts::PI * (1.0 - 2.0 * t / n)).sinh().atan().to_degrees();
+    let f = |v: f64| (v * 1e7).round() / 1e7;
+    Ok(json!({ "z": zoom, "x": x, "y": y, "north": f(edge(y as f64)), "south": f(edge(y as f64 + 1.0)), "west": f(x as f64 / n * 360.0 - 180.0), "east": f((x as f64 + 1.0) / n * 360.0 - 180.0) }))
+}
+
+/// A tile's URL. `kind` is a tileset id for raster or vector tiles (`mapbox.satellite`, `mapbox.mapbox-streets-v8`), or a style like `mapbox/streets-v12`. `options`: { format: png, jpg90, webp, mvt, retina, size: 256 or 512 }. For MapLibre, write `{z}/{x}/{y}` by passing them as -1.
+pub fn mapbox_tile_url(kind: &str, z: i64, x: i64, y: i64, options: serde_json::Value) -> Result<String, String> {
+    let t = token()?;
+    let (zs, xs, ys) = if z < 0 && x < 0 && y < 0 {
+        ("{z}".to_string(), "{x}".to_string(), "{y}".to_string())
+    } else {
+        if !(0..=30).contains(&z) || x < 0 || y < 0 || x >= 1 << z || y >= 1 << z {
+            return Err(format!("{}/{}/{} is off the map", z, x, y));
+        }
+        (z.to_string(), x.to_string(), y.to_string())
+    };
+    let retina = if options.get("retina").and_then(|v| v.as_bool()).unwrap_or(false) { "@2x" } else { "" };
+    if kind.contains('/') {
+        let size = options.get("size").and_then(|v| v.as_i64()).unwrap_or(512);
+        if size != 256 && size != 512 {
+            return Err("a style's tiles are 256 or 512".into());
+        }
+        return Ok(format!("{}/styles/v1/{}/tiles/{}/{}/{}/{}{}?access_token={}", base(), kind, size, zs, xs, ys, retina, enc(&t)));
+    }
+    let format = options.get("format").and_then(|v| v.as_str()).unwrap_or("png");
+    if !["png", "png32", "png64", "png128", "png256", "jpg70", "jpg80", "jpg90", "webp", "mvt"].contains(&format) {
+        return Err(format!("no tile format `{}`", format));
+    }
+    if format == "mvt" && !retina.is_empty() {
+        return Err("vector tiles have no @2x".into());
+    }
+    Ok(format!("{}/v4/{}/{}/{}/{}{}.{}?access_token={}", base(), kind, zs, xs, ys, retina, format, enc(&t)))
+}

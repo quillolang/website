@@ -1,0 +1,280 @@
+//! Cloudflare's API: DNS records listed, created, changed and upserted, the cache purged by URL, tag or host, Workers KV read and written, every list paged, and the `success` envelope turned into results or clear errors.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::time::Duration;
+
+const PURGE_BATCH: usize = 30;
+const KV_BULK: usize = 10_000;
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn errors_of(v: &Value) -> String {
+    let list: Vec<String> = v["errors"].as_array().map(|l| l.iter().map(|e| {
+        let chain: Vec<String> = e["error_chain"].as_array().map(|c| c.iter().filter_map(|x| x["message"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let more = if chain.is_empty() { String::new() } else { format!(" ({})", chain.join("; ")) };
+        format!("{} {}{}", e["code"], e["message"].as_str().unwrap_or("error"), more)
+    }).collect()).unwrap_or_default();
+    if list.is_empty() { "no details given".to_string() } else { list.join("; ") }
+}
+
+// A plain `text/...` body for KV; JSON otherwise. Gives the status and the text.
+fn raw(method: &str, path: &str, body: Option<(&str, String)>, o: &Value) -> Result<(u16, String), String> {
+    let token = opt(o, "token", "CLOUDFLARE_API_TOKEN").ok_or("no token: set CLOUDFLARE_API_TOKEN, or give the option token")?;
+    let base = opt(o, "base_url", "CLOUDFLARE_API_URL").unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let mut tries = 0;
+    loop {
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("User-Agent", "quillo-cloudflare/1.0");
+        let res = match &body {
+            Some((ctype, t)) => r.set("Content-Type", ctype).send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let s = resp.status();
+                return Ok((s, resp.into_string().map_err(|e| e.to_string())?));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<u64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                if (code == 429 || (method == "GET" && code >= 500)) && tries < 2 && wait.unwrap_or(1) <= 60 {
+                    std::thread::sleep(Duration::from_secs(wait.unwrap_or(1)));
+                    tries += 1;
+                    continue;
+                }
+                return Ok((code, t));
+            }
+            Err(e) => return Err(format!("cannot reach Cloudflare at {}: {}", base, e)),
+        }
+    }
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<Value, String> {
+    let (status, t) = raw(method, path, body.map(|b| ("application/json", b.to_string())), o)?;
+    // In front of the API, an edge error is HTML.
+    let v: Value = serde_json::from_str(&t).map_err(|_| format!("Cloudflare {}: not a JSON answer: {:?}", status, t.trim().chars().take(120).collect::<String>()))?;
+    if v["success"] != true {
+        let hint = if status == 403 || t.contains("\"code\":10000") { " (check the token's permissions)" } else { "" };
+        return Err(format!("Cloudflare {}: {}{}", status, errors_of(&v), hint));
+    }
+    Ok(v)
+}
+
+/// Calls any endpoint: `method`, `path` like /zones, `body` or null. Options: token (else CLOUDFLARE_API_TOKEN), base_url (else CLOUDFLARE_API_URL). Gives the envelope: { result, result_info, messages, ... }; `success: false` is an error value.
+pub fn cloudflare_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)
+}
+
+/// Every item of a list, by page numbers at `per_page` 100 (or the option per_page).
+pub fn cloudflare_all(path: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let per = options.get("per_page").and_then(|v| v.as_u64()).unwrap_or(100);
+    let sep = if path.contains('?') { "&" } else { "?" };
+    let mut out = vec![];
+    let mut page = 1;
+    loop {
+        let r = call("GET", &format!("{}{}page={}&per_page={}", path, sep, page, per), None, &options)?;
+        let got = r["result"].as_array().cloned().unwrap_or_default();
+        let n = got.len();
+        out.extend(got);
+        let pages = r.pointer("/result_info/total_pages").and_then(|t| t.as_u64());
+        if n == 0 || pages.map(|t| page >= t).unwrap_or(true) {
+            return Ok(out);
+        }
+        page += 1;
+    }
+}
+
+/// The id of the zone named `name`, like example.com.
+pub fn cloudflare_zone_id(name: &str, options: serde_json::Value) -> Result<String, String> {
+    let r = call("GET", &format!("/zones?name={}", enc(name)), None, &options)?;
+    r.pointer("/result/0/id").and_then(|i| i.as_str()).map(str::to_string).ok_or(format!("no zone called {} on this account", name))
+}
+
+/// A zone's DNS records, all pages. Options add filters: type, name, content.
+pub fn cloudflare_dns_list(zone: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut q = vec![];
+    for k in ["type", "name", "content"] {
+        if let Some(v) = options.get(k).and_then(|v| v.as_str()) {
+            q.push(format!("{}={}", k, enc(v)));
+        }
+    }
+    cloudflare_all(&format!("/zones/{}/dns_records{}{}", enc(zone), if q.is_empty() { "" } else { "?" }, q.join("&")), options)
+}
+
+/// Makes a DNS record: `record` holds type, name, content, and ttl (1 is automatic), proxied, comment, priority, tags.
+pub fn cloudflare_dns_create(zone: &str, record: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("POST", &format!("/zones/{}/dns_records", enc(zone)), Some(&record), &options)?["result"].clone())
+}
+
+/// Changes the named fields of a DNS record.
+pub fn cloudflare_dns_update(zone: &str, id: &str, record: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call("PATCH", &format!("/zones/{}/dns_records/{}", enc(zone), enc(id)), Some(&record), &options)?["result"].clone())
+}
+
+/// Deletes a DNS record. Gives its id.
+pub fn cloudflare_dns_delete(zone: &str, id: &str, options: serde_json::Value) -> Result<String, String> {
+    let r = call("DELETE", &format!("/zones/{}/dns_records/{}", enc(zone), enc(id)), None, &options)?;
+    Ok(r.pointer("/result/id").and_then(|i| i.as_str()).unwrap_or(id).to_string())
+}
+
+/// Makes the one record of this `type` and `name` say what `record` says: changed if there is one, created if not. With several the same, an error, as which to change is your choice.
+pub fn cloudflare_dns_upsert(zone: &str, record: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (kind, name) = (record["type"].as_str().unwrap_or(""), record["name"].as_str().unwrap_or(""));
+    if kind.is_empty() || name.is_empty() {
+        return Err("a record needs `type` and `name`".into());
+    }
+    let mut q = options.clone();
+    q["type"] = json!(kind);
+    q["name"] = json!(name);
+    let found = cloudflare_dns_list(zone, q)?;
+    match found.as_slice() {
+        [] => cloudflare_dns_create(zone, record, options),
+        [one] => cloudflare_dns_update(zone, one["id"].as_str().unwrap_or(""), record, options),
+        many => Err(format!("{} {} has {} records: delete some, or update one by id", kind, name, many.len())),
+    }
+}
+
+/// Purges URLs from the cache, in requests of 30. Gives how many requests it took.
+pub fn cloudflare_purge(zone: &str, files: Vec<String>, options: serde_json::Value) -> Result<i64, String> {
+    let mut n = 0;
+    for chunk in files.chunks(PURGE_BATCH) {
+        call("POST", &format!("/zones/{}/purge_cache", enc(zone)), Some(&json!({ "files": chunk })), &options)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Purges by `kind`: "tags", "hosts" or "prefixes" (a paid plan's features), in requests of 30.
+pub fn cloudflare_purge_by(zone: &str, kind: &str, values: Vec<String>, options: serde_json::Value) -> Result<i64, String> {
+    if !["tags", "hosts", "prefixes"].contains(&kind) {
+        return Err(format!("{:?} is not a way to purge: tags, hosts or prefixes (cloudflare_purge for URLs)", kind));
+    }
+    let mut n = 0;
+    for chunk in values.chunks(PURGE_BATCH) {
+        let mut b = json!({});
+        b[kind] = json!(chunk);
+        call("POST", &format!("/zones/{}/purge_cache", enc(zone)), Some(&b), &options)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Purges everything in the zone's cache.
+pub fn cloudflare_purge_all(zone: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("POST", &format!("/zones/{}/purge_cache", enc(zone)), Some(&json!({ "purge_everything": true })), &options)?;
+    Ok(true)
+}
+
+fn kv_path(ns: &str, tail: &str, o: &Value) -> Result<String, String> {
+    let acct = opt(o, "account_id", "CLOUDFLARE_ACCOUNT_ID").ok_or("no account: set CLOUDFLARE_ACCOUNT_ID, or give the option account_id")?;
+    Ok(format!("/accounts/{}/storage/kv/namespaces/{}{}", enc(&acct), enc(ns), tail))
+}
+
+fn key_ok(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > 512 {
+        return Err(format!("a KV key is 1 to 512 bytes; this one is {}", key.len()));
+    }
+    Ok(())
+}
+
+fn ttl_ok(o: &Value) -> Result<(), String> {
+    if let Some(t) = o.get("expiration_ttl").and_then(|t| t.as_i64()) {
+        if t < 60 {
+            return Err(format!("expiration_ttl is at least 60 seconds, not {}", t));
+        }
+    }
+    Ok(())
+}
+
+/// Writes a text to a KV key. Options: expiration_ttl (seconds, at least 60), expiration (a Unix time), metadata (a map). What is written can take a minute to reach every location.
+pub fn cloudflare_kv_put(namespace: &str, key: &str, value: &str, options: serde_json::Value) -> Result<bool, String> {
+    key_ok(key)?;
+    ttl_ok(&options)?;
+    if value.len() > 25 * 1024 * 1024 {
+        return Err(format!("a KV value is at most 25 MiB; this one is {} bytes", value.len()));
+    }
+    // A value with metadata has no plain PUT; a bulk write of one has both.
+    if options.get("metadata").is_some() {
+        let mut item = json!({ "key": key, "value": value, "metadata": options["metadata"] });
+        for k in ["expiration_ttl", "expiration"] {
+            if let Some(v) = options.get(k) {
+                item[k] = v.clone();
+            }
+        }
+        cloudflare_kv_bulk(namespace, vec![item], options)?;
+        return Ok(true);
+    }
+    let mut q = vec![];
+    for k in ["expiration_ttl", "expiration"] {
+        if let Some(v) = options.get(k).and_then(|v| v.as_i64()) {
+            q.push(format!("{}={}", k, v));
+        }
+    }
+    let path = kv_path(namespace, &format!("/values/{}{}{}", enc(key), if q.is_empty() { "" } else { "?" }, q.join("&")), &options)?;
+    let (status, t) = raw("PUT", &path, Some(("text/plain; charset=utf-8", value.to_string())), &options)?;
+    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+    if status >= 300 || v["success"] != true {
+        return Err(format!("Cloudflare {}: {}", status, errors_of(&v)));
+    }
+    Ok(true)
+}
+
+/// Reads a KV key: its text, or null when there is none. Here the answer is the value itself, with no envelope, except on an error.
+pub fn cloudflare_kv_get(namespace: &str, key: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    key_ok(key)?;
+    let (status, t) = raw("GET", &kv_path(namespace, &format!("/values/{}", enc(key)), &options)?, None, &options)?;
+    match status {
+        200 => Ok(json!(t)),
+        404 => {
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            // 10009 is the key; anything else, such as a wrong namespace, is a real failure.
+            if v["errors"].as_array().map(|l| l.iter().any(|e| e["code"] == 10009)).unwrap_or(true) { Ok(Value::Null) } else { Err(format!("Cloudflare 404: {}", errors_of(&v))) }
+        }
+        c => Err(format!("Cloudflare {}: {}", c, errors_of(&serde_json::from_str(&t).unwrap_or(Value::Null)))),
+    }
+}
+
+/// Deletes a KV key.
+pub fn cloudflare_kv_delete(namespace: &str, key: &str, options: serde_json::Value) -> Result<bool, String> {
+    key_ok(key)?;
+    call("DELETE", &kv_path(namespace, &format!("/values/{}", enc(key)), &options)?, None, &options)?;
+    Ok(true)
+}
+
+/// Writes many keys at once, each { key, value, expiration_ttl, expiration, metadata, base64 }, in requests of 10,000.
+pub fn cloudflare_kv_bulk(namespace: &str, items: Vec<serde_json::Value>, options: serde_json::Value) -> Result<i64, String> {
+    let path = kv_path(namespace, "/bulk", &options)?;
+    for chunk in items.chunks(KV_BULK) {
+        call("PUT", &path, Some(&json!(chunk)), &options)?;
+    }
+    Ok(items.len() as i64)
+}
+
+/// The keys in a namespace with a `prefix` (or ""), following the cursor: each { name, expiration, metadata }.
+pub fn cloudflare_kv_keys(namespace: &str, prefix: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = vec![];
+    let mut cursor = String::new();
+    loop {
+        let mut q = "?limit=1000".to_string();
+        if !prefix.is_empty() { q.push_str(&format!("&prefix={}", enc(prefix))); }
+        if !cursor.is_empty() { q.push_str(&format!("&cursor={}", enc(&cursor))); }
+        let r = call("GET", &kv_path(namespace, &format!("/keys{}", q), &options)?, None, &options)?;
+        out.extend(r["result"].as_array().cloned().unwrap_or_default());
+        match r.pointer("/result_info/cursor").and_then(|c| c.as_str()) {
+            Some(c) if !c.is_empty() => cursor = c.to_string(),
+            _ => return Ok(out),
+        }
+    }
+}

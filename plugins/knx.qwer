@@ -1,0 +1,729 @@
+//! KNX building automation over KNXnet/IP tunnelling (UDP): a tunnel connected and kept alive, group addresses written and read with DPT values encoded and decoded, telegrams on the bus buffered for the program, sequence numbers, retries and bus confirmations handled, and group and individual address notation.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const CONNECT_REQ: u16 = 0x0205;
+const CONNECT_RES: u16 = 0x0206;
+const STATE_REQ: u16 = 0x0207;
+const STATE_RES: u16 = 0x0208;
+const DISCONNECT_REQ: u16 = 0x0209;
+const DISCONNECT_RES: u16 = 0x020a;
+const TUNNEL_REQ: u16 = 0x0420;
+const TUNNEL_ACK: u16 = 0x0421;
+const SEARCH_REQ: u16 = 0x0201;
+const SEARCH_RES: u16 = 0x0202;
+
+const L_DATA_REQ: u8 = 0x11;
+const L_DATA_CON: u8 = 0x2e;
+const L_DATA_IND: u8 = 0x29;
+
+fn packet(service: u16, body: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x06, 0x10];
+    p.extend(service.to_be_bytes());
+    p.extend(((body.len() + 6) as u16).to_be_bytes());
+    p.extend(body);
+    p
+}
+
+const NAT_HPAI: [u8; 8] = [8, 1, 0, 0, 0, 0, 0, 0];
+
+fn status_name(s: u8) -> String {
+    match s {
+        0x00 => "no error".into(),
+        0x21 => "E_CONNECTION_ID: the gateway does not know this connection".into(),
+        0x22 => "E_CONNECTION_TYPE: connection type not supported".into(),
+        0x23 => "E_CONNECTION_OPTION: connection option not supported".into(),
+        0x24 => "E_NO_MORE_CONNECTIONS: every tunnel of the gateway is in use".into(),
+        0x26 => "E_DATA_CONNECTION: the gateway's data connection failed".into(),
+        0x27 => "E_KNX_CONNECTION: the gateway has no connection to the bus".into(),
+        0x29 => "E_TUNNELLING_LAYER: tunnelling layer not supported".into(),
+        x => format!("status 0x{:02x}", x),
+    }
+}
+
+fn group_of(g: &Value) -> Result<u16, String> {
+    match g {
+        Value::Number(n) => n.as_u64().filter(|x| *x <= 0xffff).map(|x| x as u16).ok_or(format!("{} is not a group address", n)),
+        Value::String(s) => {
+            let p: Vec<Option<u32>> = s.split('/').map(|x| x.parse().ok()).collect();
+            let bad = || format!("`{}` is not a group address: main/middle/sub (31/7/255) or main/sub (31/2047)", s);
+            match p.as_slice() {
+                [Some(a), Some(b), Some(c)] if *a <= 31 && *b <= 7 && *c <= 255 => Ok((*a << 11 | *b << 8 | *c) as u16),
+                [Some(a), Some(b)] if *a <= 31 && *b <= 2047 => Ok((*a << 11 | *b) as u16),
+                _ => Err(bad()),
+            }
+        }
+        _ => Err("give a group address as text or a number".into()),
+    }
+}
+
+fn group_name(g: u16) -> String {
+    format!("{}/{}/{}", g >> 11, (g >> 8) & 7, g & 255)
+}
+
+fn individual_name(a: u16) -> String {
+    format!("{}.{}.{}", a >> 12, (a >> 8) & 15, a & 255)
+}
+
+fn individual_of(s: &str) -> Result<u16, String> {
+    let p: Vec<Option<u16>> = s.split('.').map(|x| x.parse().ok()).collect();
+    match p.as_slice() {
+        [Some(a), Some(l), Some(d)] if *a <= 15 && *l <= 15 && *d <= 255 => Ok(*a << 12 | *l << 8 | *d),
+        _ => Err(format!("`{}` is not an individual address: area.line.device (15.15.255)", s)),
+    }
+}
+
+/// Group address notation both ways: "1/2/3" or "1/515" to its number and three-level and two-level text; a number works too.
+pub fn knx_group_address(address: serde_json::Value) -> Result<Value, String> {
+    let g = group_of(&address)?;
+    Ok(json!({ "raw": g, "three_level": group_name(g), "two_level": format!("{}/{}", g >> 11, g & 0x7ff) }))
+}
+
+/// Individual address notation both ways: "1.1.10" to 4362, or 4362 to "1.1.10".
+pub fn knx_individual_address(address: serde_json::Value) -> Result<Value, String> {
+    let a = match &address {
+        Value::Number(n) => n.as_u64().filter(|x| *x <= 0xffff).map(|x| x as u16).ok_or("an individual address fits 16 bits")?,
+        Value::String(s) => individual_of(s)?,
+        _ => return Err("give an address as text or a number".into()),
+    };
+    Ok(json!({ "raw": a, "text": individual_name(a) }))
+}
+
+// A datapoint: its type's main number comes first. `small` values travel inside the APCI's six bits.
+
+fn dpt_main(dpt: &str) -> Result<(u32, u32), String> {
+    let mut p = dpt.trim_start_matches("DPT").trim_start_matches("dpt").split('.');
+    let main = p.next().and_then(|x| x.parse().ok()).ok_or(format!("`{}` is not a datapoint type", dpt))?;
+    let sub = p.next().map(|x| x.parse().map_err(|_| format!("`{}` is not a datapoint type", dpt))).transpose()?.unwrap_or(0);
+    Ok((main, sub))
+}
+
+fn num(v: &Value, what: &str) -> Result<f64, String> {
+    v.as_f64().ok_or(format!("DPT {} needs a number, not {}", what, v))
+}
+
+fn ranged(v: &Value, lo: f64, hi: f64, what: &str) -> Result<i64, String> {
+    let x = num(v, what)?;
+    if x < lo || x > hi {
+        return Err(format!("{} is out of range for DPT {} ({} to {})", x, what, lo, hi));
+    }
+    Ok(x.round() as i64)
+}
+
+fn flag(v: &Value, what: &str) -> Result<bool, String> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Number(n) if n.as_i64() == Some(0) => Ok(false),
+        Value::Number(n) if n.as_i64() == Some(1) => Ok(true),
+        Value::String(s) if s == "on" => Ok(true),
+        Value::String(s) if s == "off" => Ok(false),
+        _ => Err(format!("DPT {} needs true or false, not {}", what, v)),
+    }
+}
+
+fn float16(x: f64) -> Result<[u8; 2], String> {
+    if !(-671088.64..=670760.96).contains(&x) {
+        return Err(format!("{} does not fit a 2-byte KNX float", x));
+    }
+    let mut m = (x * 100.0).round() as i64;
+    let mut e = 0;
+    while !(-2048..=2047).contains(&m) {
+        m = (m as f64 / 2.0).round() as i64;
+        e += 1;
+    }
+    let raw = ((m as i16 as u16) & 0x87ff) | if m < 0 { 0x8000 } else { 0 } | (e << 11) as u16;
+    Ok(raw.to_be_bytes())
+}
+
+fn from_float16(b: &[u8]) -> f64 {
+    let raw = u16::from_be_bytes([b[0], b[1]]);
+    let e = ((raw >> 11) & 15) as i32;
+    let mut m = (raw & 0x7ff) as i32;
+    if raw & 0x8000 != 0 {
+        m -= 2048;
+    }
+    ((m as f64 * 0.01 * 2f64.powi(e)) * 100.0).round() / 100.0
+}
+
+fn encode(dpt: &str, v: &Value) -> Result<(Vec<u8>, bool), String> {
+    let (main, sub) = dpt_main(dpt)?;
+    let text = v.as_str();
+    let out: (Vec<u8>, bool) = match main {
+        1 => (vec![flag(v, dpt)? as u8], true),
+        2 => {
+            let c = flag(v.get("control").unwrap_or(&Value::Null), dpt)?;
+            let x = flag(v.get("value").unwrap_or(&Value::Null), dpt)?;
+            (vec![(c as u8) << 1 | x as u8], true)
+        }
+        3 => {
+            let up = flag(v.get("increase").unwrap_or(&Value::Null), dpt)?;
+            let step = v.get("step").and_then(|s| s.as_u64()).filter(|s| *s <= 7).ok_or("DPT 3 needs `increase` and `step`, 0 to 7")?;
+            (vec![(up as u8) << 3 | step as u8], true)
+        }
+        4 => {
+            let c = text.and_then(|t| t.chars().next()).ok_or("DPT 4 needs a character")?;
+            if (sub == 1 && !c.is_ascii()) || c as u32 > 255 {
+                return Err(format!("`{}` does not fit DPT {}", c, dpt));
+            }
+            (vec![c as u8], false)
+        }
+        5 => match sub {
+            1 => {
+                let x = num(v, dpt)?;
+                if !(0.0..=100.0).contains(&x) {
+                    return Err(format!("{} is out of range for DPT {} (0 to 100)", x, dpt));
+                }
+                (vec![(x * 255.0 / 100.0).round() as u8], false)
+            }
+            3 => {
+                let x = num(v, dpt)?;
+                if !(0.0..=360.0).contains(&x) {
+                    return Err(format!("{} is out of range for DPT {} (0 to 360)", x, dpt));
+                }
+                (vec![(x * 255.0 / 360.0).round() as u8], false)
+            }
+            _ => (vec![ranged(v, 0.0, 255.0, dpt)? as u8], false),
+        },
+        6 => (vec![ranged(v, -128.0, 127.0, dpt)? as i8 as u8], false),
+        7 => ((ranged(v, 0.0, 65535.0, dpt)? as u16).to_be_bytes().to_vec(), false),
+        8 => ((ranged(v, -32768.0, 32767.0, dpt)? as i16).to_be_bytes().to_vec(), false),
+        9 => (float16(num(v, dpt)?)?.to_vec(), false),
+        10 => {
+            let t = text.ok_or("DPT 10 needs \"HH:MM:SS\", optionally after a weekday 1 (Monday) to 7: \"3 10:00:00\"")?;
+            let (day, clock) = t.split_once(' ').map(|(d, c)| (d.parse::<u8>().unwrap_or(0), c)).unwrap_or((0, t));
+            let p: Vec<u8> = clock.split(':').filter_map(|x| x.parse().ok()).collect();
+            if p.len() != 3 || p[0] > 23 || p[1] > 59 || p[2] > 59 || day > 7 {
+                return Err(format!("`{}` is not a DPT 10 time", t));
+            }
+            (vec![day << 5 | p[0], p[1], p[2]], false)
+        }
+        11 => {
+            let t = text.ok_or("DPT 11 needs \"YYYY-MM-DD\"")?;
+            let p: Vec<u32> = t.split('-').filter_map(|x| x.parse().ok()).collect();
+            if p.len() != 3 || !(1990..=2089).contains(&p[0]) || !(1..=12).contains(&p[1]) || !(1..=31).contains(&p[2]) {
+                return Err(format!("`{}` is not a DPT 11 date (1990 to 2089)", t));
+            }
+            (vec![p[2] as u8, p[1] as u8, (p[0] % 100) as u8], false)
+        }
+        12 => ((ranged(v, 0.0, 4294967295.0, dpt)? as u32).to_be_bytes().to_vec(), false),
+        13 => ((ranged(v, -2147483648.0, 2147483647.0, dpt)? as i32).to_be_bytes().to_vec(), false),
+        14 => ((num(v, dpt)? as f32).to_be_bytes().to_vec(), false),
+        16 => {
+            let t = text.ok_or("DPT 16 needs text")?;
+            let mut b: Vec<u8> = vec![];
+            for c in t.chars() {
+                if (sub == 0 && !c.is_ascii()) || c as u32 > 255 {
+                    return Err(format!("`{}` does not fit DPT {}", c, dpt));
+                }
+                b.push(c as u8);
+            }
+            if b.len() > 14 {
+                return Err(format!("DPT 16 holds 14 characters; this is {}", b.len()));
+            }
+            b.resize(14, 0);
+            (b, false)
+        }
+        17 => (vec![ranged(v, 0.0, 63.0, dpt)? as u8], false),
+        18 => {
+            let learn = v.get("learn").and_then(|l| l.as_bool()).unwrap_or(false);
+            let scene = v.get("scene").and_then(|s| s.as_u64()).filter(|s| *s <= 63).ok_or("DPT 18 needs `scene`, 0 to 63, and `learn`")?;
+            (vec![(learn as u8) << 7 | scene as u8], false)
+        }
+        19 => {
+            let t = text.ok_or("DPT 19 needs \"YYYY-MM-DDTHH:MM:SS\"")?;
+            let n: Vec<u32> = t.split(|c: char| !c.is_ascii_digit()).filter_map(|x| x.parse().ok()).collect();
+            if n.len() < 6 || !(1900..=2155).contains(&n[0]) {
+                return Err(format!("`{}` is not a DPT 19 date and time", t));
+            }
+            // Sakamoto's weekday, 1 being Monday as KNX counts.
+            let (y, m, d) = (n[0] as i32, n[1] as i32, n[2] as i32);
+            let k = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4][(m - 1).clamp(0, 11) as usize];
+            let yy = if m < 3 { y - 1 } else { y };
+            let w = (yy + yy / 4 - yy / 100 + yy / 400 + k + d).rem_euclid(7);
+            let w = if w == 0 { 7 } else { w } as u32;
+            (vec![(n[0] - 1900) as u8, n[1] as u8, n[2] as u8, (w << 5 | n[3]) as u8, n[4] as u8, n[5] as u8, 0x00, 0x00], false)
+        }
+        20 => (vec![ranged(v, 0.0, 255.0, dpt)? as u8], false),
+        232 => {
+            let t = text.ok_or("DPT 232 needs \"#rrggbb\"")?.trim_start_matches('#');
+            let b = hex::decode(t).ok().filter(|b| b.len() == 3).ok_or(format!("`{}` is not #rrggbb", t))?;
+            (b, false)
+        }
+        _ => return Err(format!("DPT {} is not one this knows; `knx_write_raw` sends bytes as they are", dpt)),
+    };
+    Ok(out)
+}
+
+fn decode(dpt: &str, b: &[u8]) -> Result<Value, String> {
+    let (main, sub) = dpt_main(dpt)?;
+    let need = |n: usize| -> Result<(), String> {
+        if b.len() < n {
+            Err(format!("DPT {} needs {} bytes; the telegram has {}", dpt, n, b.len()))
+        } else {
+            Ok(())
+        }
+    };
+    need(1)?;
+    Ok(match main {
+        1 => json!(b[0] & 1 != 0),
+        2 => json!({ "control": b[0] & 2 != 0, "value": b[0] & 1 != 0 }),
+        3 => json!({ "increase": b[0] & 8 != 0, "step": b[0] & 7 }),
+        4 => json!((b[0] as char).to_string()),
+        5 => match sub {
+            1 => json!((b[0] as f64 * 100.0 / 255.0 * 10.0).round() / 10.0),
+            3 => json!((b[0] as f64 * 360.0 / 255.0 * 10.0).round() / 10.0),
+            _ => json!(b[0]),
+        },
+        6 => json!(b[0] as i8),
+        7 => { need(2)?; json!(u16::from_be_bytes([b[0], b[1]])) }
+        8 => { need(2)?; json!(i16::from_be_bytes([b[0], b[1]])) }
+        9 => {
+            need(2)?;
+            if b[0] == 0x7f && b[1] == 0xff {
+                return Ok(Value::Null); // the invalid value
+            }
+            json!(from_float16(b))
+        }
+        10 => {
+            need(3)?;
+            let d = b[0] >> 5;
+            let c = format!("{:02}:{:02}:{:02}", b[0] & 31, b[1] & 63, b[2] & 63);
+            json!(if d == 0 { c } else { format!("{} {}", d, c) })
+        }
+        11 => {
+            need(3)?;
+            let y = (b[2] & 127) as u32;
+            json!(format!("{}-{:02}-{:02}", if y >= 90 { 1900 + y } else { 2000 + y }, b[1] & 15, b[0] & 31))
+        }
+        12 => { need(4)?; json!(u32::from_be_bytes([b[0], b[1], b[2], b[3]])) }
+        13 => { need(4)?; json!(i32::from_be_bytes([b[0], b[1], b[2], b[3]])) }
+        14 => { need(4)?; json!(f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64) }
+        16 => json!(b.iter().take_while(|x| **x != 0).map(|x| *x as char).collect::<String>()),
+        17 => json!(b[0] & 63),
+        18 => json!({ "learn": b[0] & 0x80 != 0, "scene": b[0] & 63 }),
+        19 => {
+            need(8)?;
+            json!(format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}", 1900 + b[0] as u32, b[1] & 15, b[2] & 31, b[3] & 31, b[4] & 63, b[5] & 63))
+        }
+        20 => json!(b[0]),
+        232 => { need(3)?; json!(format!("#{}", hex::encode(&b[..3]))) }
+        _ => return Err(format!("DPT {} is not one this knows", dpt)),
+    })
+}
+
+/// A value as a datapoint's bytes, in hex: `knx_encode("9.001", 21.5)` is "0c33". Types 1 to 20 and 232 as the standard numbers them.
+pub fn knx_encode(dpt: &str, value: serde_json::Value) -> Result<String, String> {
+    Ok(hex::encode(encode(dpt, &value)?.0))
+}
+
+/// A datapoint's bytes (hex) as a value: `knx_decode("9.001", "0c33")` is 21.5.
+pub fn knx_decode(dpt: &str, data: &str) -> Result<Value, String> {
+    decode(dpt, &hex::decode(data.replace(' ', "")).map_err(|_| "not hex")?)
+}
+
+fn cemi_group(group: u16, apci: u16, data: &[u8], small: bool) -> Vec<u8> {
+    let mut c = vec![L_DATA_REQ, 0, 0xbc, 0xe0, 0, 0];
+    c.extend(group.to_be_bytes());
+    if small {
+        c.push(1);
+        c.extend((apci | (data[0] as u16 & 0x3f)).to_be_bytes());
+    } else {
+        c.push(1 + data.len() as u8);
+        c.extend(apci.to_be_bytes());
+        c.extend(data);
+    }
+    c
+}
+
+fn read_cemi(c: &[u8]) -> Result<Value, String> {
+    if c.len() < 2 {
+        return Err("a cEMI frame is cut off".into());
+    }
+    let code = c[0];
+    let i = 2 + c[1] as usize;
+    if c.len() < i + 7 {
+        return Err("a cEMI frame is cut off".into());
+    }
+    let (ctrl1, ctrl2) = (c[i], c[i + 1]);
+    let src = u16::from_be_bytes([c[i + 2], c[i + 3]]);
+    let dst = u16::from_be_bytes([c[i + 4], c[i + 5]]);
+    let len = c[i + 6] as usize;
+    let tp = c.get(i + 7..i + 8 + len).ok_or("a cEMI frame's length runs past its end")?;
+    let kind = match code {
+        L_DATA_REQ => "request",
+        L_DATA_CON => "confirmation",
+        L_DATA_IND => "indication",
+        _ => "other",
+    };
+    let group = ctrl2 & 0x80 != 0;
+    let mut m = json!({
+        "message": kind,
+        "source": individual_name(src),
+        "destination": if group { group_name(dst) } else { individual_name(dst) },
+        "group": group,
+        "hops": (ctrl2 >> 4) & 7,
+        "repeated": ctrl1 & 0x20 == 0,
+    });
+    if code == L_DATA_CON {
+        m["failed"] = json!(ctrl1 & 1 != 0);
+    }
+    if tp.len() >= 2 && group {
+        let apci = ((tp[0] as u16 & 3) << 8) | tp[1] as u16;
+        let (name, data): (&str, Vec<u8>) = match apci & 0x3c0 {
+            0x000 => ("read", vec![]),
+            0x040 => ("response", if tp.len() > 2 { tp[2..].to_vec() } else { vec![tp[1] & 0x3f] }),
+            0x080 => ("write", if tp.len() > 2 { tp[2..].to_vec() } else { vec![tp[1] & 0x3f] }),
+            _ => ("other", tp[1..].to_vec()),
+        };
+        m["service"] = json!(name);
+        m["data"] = json!(hex::encode(data));
+    }
+    Ok(m)
+}
+
+/// Reads a cEMI frame (hex): message code, source, destination, hops, and for group telegrams the service (`read`, `write`, `response`) and data.
+pub fn knx_parse_cemi(frame: &str) -> Result<Value, String> {
+    read_cemi(&hex::decode(frame.replace(' ', "")).map_err(|_| "not hex")?)
+}
+
+/// The cEMI L_Data.req frame a write of this value is, as hex: what goes inside a tunnelling request.
+pub fn knx_cemi_write(group: serde_json::Value, dpt: &str, value: serde_json::Value) -> Result<String, String> {
+    let (d, small) = encode(dpt, &value)?;
+    Ok(hex::encode(cemi_group(group_of(&group)?, 0x80, &d, small)))
+}
+
+#[derive(Default)]
+struct State {
+    acks: HashSet<u8>,
+    confirms: Vec<(u16, bool)>,
+    telegrams: VecDeque<Value>,
+    closed: Option<String>,
+    alive: bool,
+}
+
+struct Tunnel {
+    sock: Arc<UdpSocket>,
+    peer: SocketAddr,
+    channel: u8,
+    seq: Mutex<u8>,
+    state: Arc<(Mutex<State>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    timeout: Duration,
+}
+
+fn tunnels() -> &'static Mutex<HashMap<String, Arc<Tunnel>>> {
+    static T: OnceLock<Mutex<HashMap<String, Arc<Tunnel>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tunnel(name: &str) -> Result<Arc<Tunnel>, String> {
+    let t = tunnels().lock().map_err(|_| "lock")?.get(name).cloned().ok_or(format!("no tunnel `{}`: call knx_connect first", name))?;
+    if let Some(why) = &t.state.0.lock().map_err(|_| "lock")?.closed {
+        return Err(format!("tunnel `{}` is closed: {}", name, why));
+    }
+    Ok(t)
+}
+
+fn reader(sock: Arc<UdpSocket>, peer: SocketAddr, channel: u8, state: Arc<(Mutex<State>, Condvar)>, stop: Arc<AtomicBool>) {
+    let mut expected = 0u8;
+    let mut buf = [0u8; 600];
+    let mut next_beat = Instant::now() + Duration::from_secs(60);
+    let mut missed = 0;
+    let mut waiting_beat = false;
+    while !stop.load(Ordering::Relaxed) {
+        if Instant::now() >= next_beat {
+            // The gateway drops a tunnel after 120 s without this; three misses end it here.
+            if waiting_beat {
+                missed += 1;
+            }
+            if missed >= 3 {
+                let mut g = state.0.lock().unwrap();
+                g.closed = Some("the gateway stopped answering heartbeats".into());
+                state.1.notify_all();
+                return;
+            }
+            let mut b = vec![channel, 0];
+            b.extend(NAT_HPAI);
+            let _ = sock.send_to(&packet(STATE_REQ, &b), peer);
+            waiting_beat = true;
+            next_beat = Instant::now() + Duration::from_secs(if missed > 0 { 10 } else { 60 });
+        }
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if from != peer || n < 6 || buf[0] != 6 || buf[1] != 0x10 {
+            continue;
+        }
+        let service = u16::from_be_bytes([buf[2], buf[3]]);
+        let body = &buf[6..n];
+        match service {
+            TUNNEL_ACK if body.len() >= 4 && body[1] == channel => {
+                let mut g = state.0.lock().unwrap();
+                if body[3] == 0 {
+                    g.acks.insert(body[2]);
+                } else {
+                    g.closed = Some(status_name(body[3]));
+                }
+                state.1.notify_all();
+            }
+            TUNNEL_REQ if body.len() >= 5 && body[1] == channel => {
+                let seq = body[2];
+                let ack = |status: u8| {
+                    let _ = sock.send_to(&packet(TUNNEL_ACK, &[4, channel, seq, status]), peer);
+                };
+                if seq == expected {
+                    expected = expected.wrapping_add(1);
+                    ack(0);
+                    let cemi = &body[body[0] as usize..];
+                    if let Ok(m) = read_cemi(cemi) {
+                        let mut g = state.0.lock().unwrap();
+                        if m["message"] == "confirmation" {
+                            let dst = m["destination"].as_str().and_then(|d| group_of(&json!(d)).ok()).unwrap_or(0);
+                            g.confirms.push((dst, m["failed"].as_bool().unwrap_or(false)));
+                        } else if m["message"] == "indication" {
+                            if g.telegrams.len() >= 1000 {
+                                g.telegrams.pop_front();
+                            }
+                            g.telegrams.push_back(m);
+                        }
+                        state.1.notify_all();
+                    }
+                } else if seq == expected.wrapping_sub(1) {
+                    ack(0); // a repeat: acknowledged again and otherwise ignored
+                }
+                // Any other number is dropped unacknowledged, as the specification says.
+            }
+            STATE_RES if body.len() >= 2 && body[0] == channel => {
+                waiting_beat = false;
+                if body[1] == 0 {
+                    missed = 0;
+                    state.0.lock().unwrap().alive = true;
+                    next_beat = Instant::now() + Duration::from_secs(60);
+                } else {
+                    let mut g = state.0.lock().unwrap();
+                    g.closed = Some(status_name(body[1]));
+                    state.1.notify_all();
+                    return;
+                }
+            }
+            DISCONNECT_REQ if !body.is_empty() && body[0] == channel => {
+                let _ = sock.send_to(&packet(DISCONNECT_RES, &[channel, 0]), peer);
+                let mut g = state.0.lock().unwrap();
+                g.closed = Some("the gateway ended the tunnel".into());
+                state.1.notify_all();
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn gateway_addr(g: &str) -> Result<SocketAddr, String> {
+    let t = if g.contains(':') { g.to_string() } else { format!("{}:3671", g) };
+    t.to_socket_addrs().map_err(|e| format!("{}: {}", t, e))?.find(|a| a.is_ipv4()).ok_or(format!("{}: no IPv4 address", t))
+}
+
+/// Opens a tunnel to a KNX IP interface ("host", port 3671, or "host:port") as a link-layer connection, kept alive on a thread of its own. Options: `timeout_ms`. Answers `{ channel, address }`, the individual address the gateway gave this tunnel.
+pub fn knx_connect(name: &str, gateway: &str, options: serde_json::Value) -> Result<Value, String> {
+    let peer = gateway_addr(gateway)?;
+    let timeout = Duration::from_millis(options.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000));
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    // Route-back: 0.0.0.0:0 in both HPAIs tells the gateway to answer where this came from.
+    let mut b = NAT_HPAI.to_vec();
+    b.extend(NAT_HPAI);
+    b.extend([4, 4, 2, 0]); // TUNNEL_CONNECTION, TUNNEL_LINKLAYER
+    sock.send_to(&packet(CONNECT_REQ, &b), peer).map_err(|e| format!("cannot reach {}: {}", peer, e))?;
+    let mut buf = [0u8; 256];
+    let n = loop {
+        let (n, from) = sock.recv_from(&mut buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!("no KNX gateway answered at {}", peer),
+            _ => format!("cannot reach {}: {}", peer, e),
+        })?;
+        if from == peer && n >= 8 && u16::from_be_bytes([buf[2], buf[3]]) == CONNECT_RES {
+            break n;
+        }
+    };
+    let body = &buf[6..n];
+    if body[1] != 0 {
+        return Err(format!("the gateway refused the tunnel: {}", status_name(body[1])));
+    }
+    if body.len() < 14 {
+        return Err("a connect response is cut off".into());
+    }
+    let channel = body[0];
+    let address = u16::from_be_bytes([body[12], body[13]]);
+    // The reader's timeout is short, so that a heartbeat and a stop are noticed.
+    sock.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let sock = Arc::new(sock);
+    let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (s2, st2, stop2) = (sock.clone(), state.clone(), stop.clone());
+    std::thread::spawn(move || reader(s2, peer, channel, st2, stop2));
+    let t = Arc::new(Tunnel { sock, peer, channel, seq: Mutex::new(0), state, stop, timeout });
+    if let Some(old) = tunnels().lock().map_err(|_| "lock")?.insert(name.to_string(), t) {
+        old.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(json!({ "channel": channel, "address": individual_name(address) }))
+}
+
+// Sends a cEMI frame: acknowledged by the gateway (one repeat, as the specification allows), then
+// confirmed from the bus.
+fn send_cemi(t: &Tunnel, cemi: &[u8], group: u16) -> Result<(), String> {
+    let mut seq = t.seq.lock().map_err(|_| "lock")?;
+    let s = *seq;
+    let mut b = vec![4, t.channel, s, 0];
+    b.extend(cemi);
+    let p = packet(TUNNEL_REQ, &b);
+    let mut acked = false;
+    for _ in 0..2 {
+        t.sock.send_to(&p, t.peer).map_err(|e| e.to_string())?;
+        let end = Instant::now() + Duration::from_secs(1);
+        let mut g = t.state.0.lock().map_err(|_| "lock")?;
+        loop {
+            if g.acks.remove(&s) {
+                acked = true;
+                break;
+            }
+            if let Some(w) = &g.closed {
+                return Err(format!("the tunnel closed: {}", w));
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            g = t.state.1.wait_timeout(g, left).map_err(|_| "lock")?.0;
+        }
+        if acked {
+            break;
+        }
+    }
+    if !acked {
+        return Err("the gateway did not acknowledge the telegram, sent twice".into());
+    }
+    *seq = s.wrapping_add(1);
+    let end = Instant::now() + t.timeout;
+    let mut g = t.state.0.lock().map_err(|_| "lock")?;
+    loop {
+        if let Some(i) = g.confirms.iter().position(|c| c.0 == group) {
+            let (_, failed) = g.confirms.remove(i);
+            return if failed { Err(format!("the bus did not take the telegram for {}: no device acknowledged it", group_name(group))) } else { Ok(()) };
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("no confirmation from the bus for {}", group_name(group)));
+        }
+        g = t.state.1.wait_timeout(g, left).map_err(|_| "lock")?.0;
+    }
+}
+
+/// Writes a value to a group address, encoded by `dpt` ("1.001", "5.001", "9.001"...), and waits for the bus to confirm it. Answers the bytes sent, in hex.
+pub fn knx_write(name: &str, group: serde_json::Value, dpt: &str, value: serde_json::Value) -> Result<String, String> {
+    let g = group_of(&group)?;
+    let (d, small) = encode(dpt, &value)?;
+    let t = tunnel(name)?;
+    send_cemi(&t, &cemi_group(g, 0x80, &d, small), g)?;
+    Ok(hex::encode(d))
+}
+
+/// Writes bytes as they are (hex) to a group address, for a datapoint type this does not know.
+pub fn knx_write_raw(name: &str, group: serde_json::Value, data: &str) -> Result<i64, String> {
+    let g = group_of(&group)?;
+    let d = hex::decode(data.replace(' ', "")).map_err(|_| "not hex")?;
+    if d.is_empty() || d.len() > 14 {
+        return Err("a group telegram carries 1 to 14 bytes".into());
+    }
+    let t = tunnel(name)?;
+    send_cemi(&t, &cemi_group(g, 0x80, &d, false), g)?;
+    Ok(d.len() as i64)
+}
+
+/// Asks a group address for its value (GroupValueRead) and decodes the answer by `dpt`; null when no device answers in `wait_ms`. Other telegrams stay for `knx_receive`.
+pub fn knx_read(name: &str, group: serde_json::Value, dpt: &str, wait_ms: i64) -> Result<Value, String> {
+    let g = group_of(&group)?;
+    let t = tunnel(name)?;
+    send_cemi(&t, &cemi_group(g, 0, &[], false), g)?;
+    let want = group_name(g);
+    let end = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    let mut st = t.state.0.lock().map_err(|_| "lock")?;
+    loop {
+        if let Some(i) = st.telegrams.iter().position(|m| m["service"] == "response" && m["destination"] == want.as_str()) {
+            let m = st.telegrams.remove(i).expect("just found");
+            let d = hex::decode(m["data"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+            return decode(dpt, &d);
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Value::Null);
+        }
+        st = t.state.1.wait_timeout(st, left).map_err(|_| "lock")?.0;
+    }
+}
+
+/// Up to `max` telegrams heard on the bus (`{ source, destination, service, data }`, the newest 1000 kept), waiting up to `wait_ms` for the first. Decode `data` with `knx_decode`.
+pub fn knx_receive(name: &str, max: i64, wait_ms: i64) -> Result<Vec<Value>, String> {
+    let t = tunnel(name)?;
+    let end = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    let mut g = t.state.0.lock().map_err(|_| "lock")?;
+    while g.telegrams.is_empty() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(vec![]);
+        }
+        g = t.state.1.wait_timeout(g, left).map_err(|_| "lock")?.0;
+    }
+    let n = (max.max(0) as usize).min(g.telegrams.len());
+    Ok(g.telegrams.drain(..n).collect())
+}
+
+/// Ends a tunnel with a disconnect request; true when there was one.
+pub fn knx_close(name: &str) -> Result<bool, String> {
+    let Some(t) = tunnels().lock().map_err(|_| "lock")?.remove(name) else { return Ok(false) };
+    let mut b = vec![t.channel, 0];
+    b.extend(NAT_HPAI);
+    let _ = t.sock.send_to(&packet(DISCONNECT_REQ, &b), t.peer);
+    std::thread::sleep(Duration::from_millis(50));
+    t.stop.store(true, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Asks a gateway what it is (SEARCH_REQUEST, sent to it directly): `{ name, address, serial, mac, knx_address }`, or null when nothing answers in `wait_ms`.
+pub fn knx_search(gateway: &str, wait_ms: i64) -> Result<Option<Value>, String> {
+    let peer = gateway_addr(gateway)?;
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(wait_ms.max(1) as u64))).map_err(|e| e.to_string())?;
+    sock.send_to(&packet(SEARCH_REQ, &NAT_HPAI), peer).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 600];
+    loop {
+        let n = match sock.recv_from(&mut buf) {
+            Ok((n, _)) => n,
+            Err(_) => return Ok(None),
+        };
+        if n < 6 || u16::from_be_bytes([buf[2], buf[3]]) != SEARCH_RES {
+            continue;
+        }
+        // An HPAI (8), then the device information DIB: 54 bytes.
+        let d = buf.get(6 + 8..n).ok_or("a search response is cut off")?;
+        if d.len() < 54 || d[1] != 1 {
+            return Err("a search response without device information".into());
+        }
+        let name: Vec<u8> = d[24..54].iter().cloned().take_while(|x| *x != 0).collect();
+        return Ok(Some(json!({
+            "name": String::from_utf8_lossy(&name),
+            "knx_address": individual_name(u16::from_be_bytes([d[4], d[5]])),
+            "serial": hex::encode(&d[8..14]),
+            "mac": d[18..24].iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":"),
+        })));
+    }
+}

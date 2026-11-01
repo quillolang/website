@@ -1,0 +1,1046 @@
+//! SAML 2.0 sign-in as a service provider, by hand in pure Rust: IdP metadata read and SP metadata written, AuthnRequests sent by the redirect binding, optionally signed, and Responses read, with the XML signature verified through exclusive canonicalization, audience, recipient, time window and InResponseTo checked, replays refused, and the assertion used being the one the signature covers, so signature wrapping fails.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! sha1 = { version = "0.10", features = ["oid"] }
+//! sha2 = { version = "0.10", features = ["oid"] }
+//! rsa = "0.9"
+//! p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+//! flate2 = "1"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
+use serde_json::{json, Map, Value};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
+use std::sync::Mutex;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+const NS_P: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+const NS_A: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+const NS_MD: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
+const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const NS_EC: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+const EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+const BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+const SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
+const RSA_SHA256_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+// ---- DER, read and written by hand ----
+
+#[derive(Clone, Copy)]
+struct Tlv<'a> {
+    tag: u8,
+    body: &'a [u8],
+    raw: &'a [u8],
+}
+
+fn tlv_at(b: &[u8]) -> Result<(Tlv<'_>, &[u8]), String> {
+    if b.len() < 2 {
+        return Err("cut-off DER".into());
+    }
+    let (len, head) = if b[1] < 0x80 {
+        (b[1] as usize, 2)
+    } else {
+        let n = (b[1] & 0x7f) as usize;
+        if n == 0 || n > 4 || b.len() < 2 + n {
+            return Err("DER with a bad length".into());
+        }
+        (b[2..2 + n].iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
+    };
+    if b.len() < head + len {
+        return Err("cut-off DER".into());
+    }
+    Ok((Tlv { tag: b[0], body: &b[head..head + len], raw: &b[..head + len] }, &b[head + len..]))
+}
+
+fn items(b: &[u8]) -> Result<Vec<Tlv<'_>>, String> {
+    let mut out = vec![];
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (t, r) = tlv_at(rest)?;
+        out.push(t);
+        rest = r;
+    }
+    Ok(out)
+}
+
+impl<'a> Tlv<'a> {
+    fn kids(&self) -> Result<Vec<Tlv<'a>>, String> {
+        items(self.body)
+    }
+    fn oid(&self) -> String {
+        oid_text(self.body)
+    }
+}
+
+fn oid_text(b: &[u8]) -> String {
+    let mut out = vec![];
+    let mut n = 0u64;
+    for (i, x) in b.iter().enumerate() {
+        n = n << 7 | (*x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            if out.is_empty() {
+                let first = (n / 40).min(2);
+                out.push(first);
+                out.push(n - first * 40);
+            } else {
+                out.push(n);
+            }
+            n = 0;
+        }
+        let _ = i;
+    }
+    out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".")
+}
+
+fn mk(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u32).to_be_bytes();
+        let skip = b.iter().position(|x| *x != 0).unwrap_or(3);
+        out.push(0x80 | (4 - skip) as u8);
+        out.extend(&b[skip..]);
+    }
+    out.extend(body);
+    out
+}
+
+fn seq(parts: &[&[u8]]) -> Vec<u8> {
+    mk(0x30, &parts.concat())
+}
+
+fn mk_oid(s: &str) -> Vec<u8> {
+    let p: Vec<u64> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    let mut out = vec![(p[0] * 40 + p[1]) as u8];
+    for x in &p[2..] {
+        let mut b = vec![(*x & 0x7f) as u8];
+        let mut v = *x >> 7;
+        while v > 0 {
+            b.insert(0, (v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.extend(b);
+    }
+    mk(6, &out)
+}
+
+fn mk_int(n: u64) -> Vec<u8> {
+    let b = n.to_be_bytes();
+    let skip = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let mut v = b[skip..].to_vec();
+    if v[0] & 0x80 != 0 {
+        v.insert(0, 0);
+    }
+    mk(2, &v)
+}
+
+fn int_of(t: &Tlv) -> u64 {
+    t.body.iter().fold(0u64, |a, x| a << 8 | *x as u64)
+}
+
+fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
+    let (open, close) = (format!("-----BEGIN {}-----", label), format!("-----END {}-----", label));
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(a) = rest.find(&open) {
+        let body = &rest[a + open.len()..];
+        let Some(b) = body.find(&close) else { break };
+        let clean: String = body[..b].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(d) = B64.decode(clean) {
+            out.push(d);
+        }
+        rest = &body[b + close.len()..];
+    }
+    out
+}
+
+fn pem_of(label: &str, der: &[u8]) -> String {
+    let b = B64.encode(der);
+    let lines: Vec<&str> = b.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN {}-----\n{}\n-----END {}-----\n", label, lines.join("\n"), label)
+}
+
+fn iso(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let r = secs.rem_euclid(86400);
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, r / 3600, r % 3600 / 60, r % 60)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// UTCTime or GeneralizedTime as Unix seconds.
+fn time_of(t: &Tlv) -> Result<i64, String> {
+    let s = std::str::from_utf8(t.body).map_err(|_| "a time that is not text".to_string())?;
+    let s = s.trim_end_matches('Z');
+    let s = s.split('.').next().unwrap_or(s);
+    let full = if t.tag == 0x17 {
+        let yy: i64 = s.get(..2).and_then(|x| x.parse().ok()).ok_or("a bad time")?;
+        format!("{}{}", if yy >= 50 { 19 } else { 20 }, s)
+    } else {
+        s.to_string()
+    };
+    let n = |a: usize, b: usize| -> Result<i64, String> { full.get(a..b).and_then(|x| x.parse().ok()).ok_or(format!("the time `{}` cannot be read", s)) };
+    let (y, mo, d, h, mi, sec) = (n(0, 4)?, n(4, 6)?, n(6, 8)?, n(8, 10)?, n(10, 12)?, full.get(12..14).and_then(|x| x.parse().ok()).unwrap_or(0));
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    Ok((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+// ---- Certificates and signatures ----
+
+struct Cert {
+    der: Vec<u8>,
+    tbs: Vec<u8>,
+    issuer: Vec<u8>,
+    subject: Vec<u8>,
+    serial: Vec<u8>,
+    spki: Vec<u8>,
+    key_bits: Vec<u8>,
+    not_before: i64,
+    not_after: i64,
+    exts: Vec<(String, Vec<u8>)>,
+    sig_alg: String,
+    signature: Vec<u8>,
+}
+
+fn cert_of(der: &[u8]) -> Result<Cert, String> {
+    let (c, _) = tlv_at(der).map_err(|_| "that is not a certificate".to_string())?;
+    let top = c.kids().map_err(|_| "that is not a certificate".to_string())?;
+    if top.len() != 3 {
+        return Err("that is not a certificate".into());
+    }
+    let t = top[0].kids()?;
+    let s = usize::from(t.first().is_some_and(|x| x.tag == 0xa0));
+    let get = |i: usize| t.get(s + i).ok_or("a certificate cut short".to_string());
+    let validity = get(3)?.kids()?;
+    let spki = get(5)?;
+    let mut exts = vec![];
+    if let Some(e) = t.iter().find(|x| x.tag == 0xa3) {
+        for x in e.kids()?.first().ok_or("empty extensions")?.kids()? {
+            let k = x.kids()?;
+            exts.push((k[0].oid(), k.last().ok_or("an empty extension")?.body.to_vec()));
+        }
+    }
+    Ok(Cert {
+        der: c.raw.to_vec(), tbs: top[0].raw.to_vec(), issuer: get(2)?.raw.to_vec(), subject: get(4)?.raw.to_vec(), serial: get(0)?.body.to_vec(), spki: spki.raw.to_vec(),
+        key_bits: spki.kids()?.get(1).ok_or("no public key")?.body.get(1..).unwrap_or(&[]).to_vec(),
+        not_before: time_of(&validity[0])?, not_after: time_of(&validity[1])?, exts,
+        sig_alg: top[1].kids()?.first().ok_or("no signature algorithm")?.oid(), signature: top[2].body.get(1..).unwrap_or(&[]).to_vec(),
+    })
+}
+
+fn pem_cert(text: &str, what: &str) -> Result<Cert, String> {
+    let der = pem_blocks(text, "CERTIFICATE").into_iter().next().ok_or(format!("{} is not a PEM certificate", what))?;
+    cert_of(&der)
+}
+
+/// Whether `sig` is a good signature over `msg`. `alg` is an X.509 signature algorithm's OID.
+fn verify_sig(spki: &[u8], alg: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    use rsa::signature::Verifier;
+    macro_rules! with_rsa {
+        ($h:ty) => {{
+            let key = rsa::RsaPublicKey::from_public_key_der(spki).map_err(|_| "the key is not RSA".to_string())?;
+            let s = rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(rsa::pkcs1v15::VerifyingKey::<$h>::new(key).verify(msg, &s).is_ok())
+        }};
+    }
+    match alg {
+        "1.2.840.113549.1.1.5" => with_rsa!(sha1::Sha1),
+        "1.2.840.113549.1.1.11" => with_rsa!(Sha256),
+        "1.2.840.113549.1.1.12" => with_rsa!(sha2::Sha384),
+        "1.2.840.113549.1.1.13" => with_rsa!(sha2::Sha512),
+        "1.2.840.10045.4.3.2" => {
+            let key = p256::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-256".to_string())?;
+            let s = p256::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        "1.2.840.10045.4.3.3" => {
+            let key = p384::ecdsa::VerifyingKey::from_public_key_der(spki).map_err(|_| "the key is not P-384".to_string())?;
+            let s = p384::ecdsa::Signature::from_der(sig).map_err(|_| "a signature of the wrong form".to_string())?;
+            Ok(key.verify(msg, &s).is_ok())
+        }
+        other => Err(format!("the signature algorithm {} is not one this checks", other)),
+    }
+}
+
+// ---- XML, as much as SAML needs ----
+
+enum Kid {
+    El(usize),
+    Text(String),
+}
+
+#[derive(Default)]
+struct Node {
+    prefix: String,
+    local: String,
+    attrs: Vec<(String, String, String)>, // prefix, local, value
+    decls: Vec<(String, String)>,         // prefix, uri
+    kids: Vec<Kid>,
+    parent: Option<usize>,
+}
+
+struct Doc {
+    nodes: Vec<Node>,
+    root: usize,
+}
+
+fn unescape(s: &str, attr: bool) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\r' {
+            if chars.peek().map(|x| x.1) == Some('\n') {
+                chars.next();
+            }
+            out.push(if attr { ' ' } else { '\n' });
+        } else if attr && (c == '\n' || c == '\t') {
+            out.push(' ');
+        } else if c == '&' {
+            let end = s[i..].find(';').ok_or("an unended entity")? + i;
+            let name = &s[i + 1..end];
+            match name {
+                "amp" => out.push('&'),
+                "lt" => out.push('<'),
+                "gt" => out.push('>'),
+                "quot" => out.push('"'),
+                "apos" => out.push('\''),
+                _ => {
+                    let n = if let Some(h) = name.strip_prefix("#x") { u32::from_str_radix(h, 16) } else if let Some(d) = name.strip_prefix('#') { d.parse() } else { return Err(format!("the entity &{}; is not allowed", name)) };
+                    out.push(n.ok().and_then(char::from_u32).ok_or("a bad character reference")?);
+                }
+            }
+            while chars.peek().is_some_and(|x| x.0 <= end) {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+fn split_q(q: &str) -> (String, String) {
+    match q.split_once(':') {
+        Some((p, l)) => (p.to_string(), l.to_string()),
+        None => (String::new(), q.to_string()),
+    }
+}
+
+/// Parses XML strictly: no DTD and no entities of its own, so no XXE and no expansion bombs.
+fn parse_xml(text: &str) -> Result<Doc, String> {
+    let bad = |m: &str| format!("not valid XML: {}", m);
+    let t = text.trim_start_matches('\u{feff}');
+    if t.len() > 8 << 20 {
+        return Err("the XML is over 8 MB".into());
+    }
+    let mut nodes: Vec<Node> = vec![];
+    let mut stack: Vec<usize> = vec![];
+    let mut root = None;
+    let mut i = 0;
+    while i < t.len() {
+        let rest = &t[i..];
+        if !rest.starts_with('<') {
+            let end = rest.find('<').unwrap_or(rest.len());
+            if let Some(&top) = stack.last() {
+                nodes[top].kids.push(Kid::Text(unescape(&rest[..end], false)?));
+            } else if !rest[..end].trim().is_empty() {
+                return Err(bad("text outside the root"));
+            }
+            i += end;
+        } else if rest.starts_with("<!--") {
+            i += rest.find("-->").ok_or(bad("an unended comment"))? + 3;
+        } else if rest.starts_with("<![CDATA[") {
+            let end = rest.find("]]>").ok_or(bad("an unended CDATA"))?;
+            let top = *stack.last().ok_or(bad("CDATA outside the root"))?;
+            nodes[top].kids.push(Kid::Text(rest[9..end].to_string()));
+            i += end + 3;
+        } else if rest.starts_with("<?") {
+            i += rest.find("?>").ok_or(bad("an unended instruction"))? + 2;
+        } else if rest.starts_with("<!") {
+            return Err("a DOCTYPE is refused: SAML has no use for one, and attacks do".into());
+        } else if rest.starts_with("</") {
+            let end = rest.find('>').ok_or(bad("an unended tag"))?;
+            let q = rest[2..end].trim();
+            let top = stack.pop().ok_or(bad("a closing tag with nothing open"))?;
+            let (p, l) = split_q(q);
+            if nodes[top].prefix != p || nodes[top].local != l {
+                return Err(bad(&format!("</{}> closes the wrong element", q)));
+            }
+            i += end + 1;
+        } else {
+            let mut j = 1;
+            let b = rest.as_bytes();
+            let mut quote = 0u8;
+            while j < b.len() {
+                if quote != 0 {
+                    if b[j] == quote {
+                        quote = 0;
+                    }
+                } else if b[j] == b'"' || b[j] == b'\'' {
+                    quote = b[j];
+                } else if b[j] == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= b.len() {
+                return Err(bad("an unended tag"));
+            }
+            let empty = b[j - 1] == b'/';
+            let inner = &rest[1..if empty { j - 1 } else { j }];
+            let name_end = inner.find(|c: char| c.is_whitespace()).unwrap_or(inner.len());
+            let (prefix, local) = split_q(&inner[..name_end]);
+            if local.is_empty() {
+                return Err(bad("an element with no name"));
+            }
+            let mut n = Node { prefix, local, parent: stack.last().copied(), ..Default::default() };
+            let mut a = inner[name_end..].trim_start();
+            while !a.is_empty() {
+                let eq = a.find('=').ok_or(bad("an attribute with no value"))?;
+                let q = a[..eq].trim();
+                let v = a[eq + 1..].trim_start();
+                let qc = v.chars().next().filter(|c| *c == '"' || *c == '\'').ok_or(bad("an unquoted attribute"))?;
+                let end = v[1..].find(qc).ok_or(bad("an unended attribute"))?;
+                let value = unescape(&v[1..end + 1], true)?;
+                let (p, l) = split_q(q);
+                if q == "xmlns" {
+                    n.decls.push((String::new(), value));
+                } else if p == "xmlns" {
+                    n.decls.push((l, value));
+                } else {
+                    if n.attrs.iter().any(|x| x.0 == p && x.1 == l) {
+                        return Err(bad(&format!("the attribute {} is doubled", q)));
+                    }
+                    n.attrs.push((p, l, value));
+                }
+                a = v[end + 2..].trim_start();
+            }
+            let id = nodes.len();
+            nodes.push(n);
+            match stack.last() {
+                Some(&top) => nodes[top].kids.push(Kid::El(id)),
+                None if root.is_none() => root = Some(id),
+                None => return Err(bad("two root elements")),
+            }
+            if stack.len() > 64 {
+                return Err(bad("nested too deep"));
+            }
+            if !empty {
+                stack.push(id);
+            }
+            i += j + 1;
+        }
+    }
+    if !stack.is_empty() {
+        return Err(bad("an element left open"));
+    }
+    let doc = Doc { nodes, root: root.ok_or(bad("no root element"))? };
+    for id in 0..doc.nodes.len() {
+        let n = &doc.nodes[id];
+        if !n.prefix.is_empty() && doc.resolve(id, &n.prefix).is_none() {
+            return Err(bad(&format!("the prefix {} is not declared", n.prefix)));
+        }
+        for a in &n.attrs {
+            if !a.0.is_empty() && a.0 != "xml" && doc.resolve(id, &a.0).is_none() {
+                return Err(bad(&format!("the prefix {} is not declared", a.0)));
+            }
+        }
+    }
+    Ok(doc)
+}
+
+impl Doc {
+    fn resolve(&self, id: usize, prefix: &str) -> Option<&str> {
+        let mut at = Some(id);
+        while let Some(i) = at {
+            if let Some(d) = self.nodes[i].decls.iter().find(|d| d.0 == prefix) {
+                return if d.1.is_empty() { None } else { Some(&d.1) };
+            }
+            at = self.nodes[i].parent;
+        }
+        None
+    }
+    fn is(&self, id: usize, uri: &str, local: &str) -> bool {
+        self.nodes[id].local == local && self.resolve(id, &self.nodes[id].prefix) == Some(uri)
+    }
+    fn kids(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+        self.nodes[id].kids.iter().filter_map(|k| if let Kid::El(e) = k { Some(*e) } else { None })
+    }
+    fn kid(&self, id: usize, uri: &str, local: &str) -> Option<usize> {
+        self.kids(id).find(|k| self.is(*k, uri, local))
+    }
+    fn kids_named<'a>(&'a self, id: usize, uri: &'a str, local: &'a str) -> impl Iterator<Item = usize> + 'a {
+        self.kids(id).filter(move |k| self.is(*k, uri, local))
+    }
+    /// An element's own text, joined across any comment inside it, as canonical XML sees it. A reader that stopped at a comment is how `admin@a.com<!---->.evil.com` gets through.
+    fn text(&self, id: usize) -> String {
+        self.nodes[id].kids.iter().filter_map(|k| if let Kid::Text(t) = k { Some(t.as_str()) } else { None }).collect()
+    }
+    fn attr(&self, id: usize, local: &str) -> Option<&str> {
+        self.nodes[id].attrs.iter().find(|a| a.0.is_empty() && a.1 == local).map(|a| a.2.as_str())
+    }
+    fn all(&self, uri: &str, local: &str) -> Vec<usize> {
+        (0..self.nodes.len()).filter(|i| self.is(*i, uri, local)).collect()
+    }
+}
+
+// ---- Exclusive canonicalization, without comments ----
+
+fn esc_text(s: &str, out: &mut Vec<u8>) {
+    for c in s.chars() {
+        match c {
+            '&' => out.extend(b"&amp;"),
+            '<' => out.extend(b"&lt;"),
+            '>' => out.extend(b"&gt;"),
+            '\r' => out.extend(b"&#xD;"),
+            c => out.extend(c.to_string().as_bytes()),
+        }
+    }
+}
+
+fn esc_attr(s: &str, out: &mut Vec<u8>) {
+    for c in s.chars() {
+        match c {
+            '&' => out.extend(b"&amp;"),
+            '<' => out.extend(b"&lt;"),
+            '"' => out.extend(b"&quot;"),
+            '\t' => out.extend(b"&#x9;"),
+            '\n' => out.extend(b"&#xA;"),
+            '\r' => out.extend(b"&#xD;"),
+            c => out.extend(c.to_string().as_bytes()),
+        }
+    }
+}
+
+fn qname(p: &str, l: &str) -> String {
+    if p.is_empty() { l.to_string() } else { format!("{}:{}", p, l) }
+}
+
+fn render(doc: &Doc, id: usize, skip: Option<usize>, inclusive: &[String], scope: &mut Vec<(String, String)>, out: &mut Vec<u8>) {
+    if Some(id) == skip {
+        return;
+    }
+    let n = &doc.nodes[id];
+    let mut want = BTreeSet::new();
+    want.insert(n.prefix.clone());
+    for a in &n.attrs {
+        if !a.0.is_empty() && a.0 != "xml" {
+            want.insert(a.0.clone());
+        }
+    }
+    for p in inclusive {
+        if doc.resolve(id, p).is_some() {
+            want.insert(p.clone());
+        }
+    }
+    let mark = scope.len();
+    let name = qname(&n.prefix, &n.local);
+    out.extend(format!("<{}", name).as_bytes());
+    for p in want {
+        let uri = doc.resolve(id, &p).unwrap_or("").to_string();
+        let shown = scope.iter().rev().find(|s| s.0 == p).map_or("", |s| s.1.as_str());
+        if shown != uri {
+            out.extend(if p.is_empty() { " xmlns=\"".to_string() } else { format!(" xmlns:{}=\"", p) }.as_bytes());
+            esc_attr(&uri, out);
+            out.push(b'"');
+            scope.push((p, uri));
+        }
+    }
+    let mut attrs: Vec<(String, &str, &str, &str)> = n.attrs.iter().map(|a| (if a.0.is_empty() { String::new() } else if a.0 == "xml" { "http://www.w3.org/XML/1998/namespace".to_string() } else { doc.resolve(id, &a.0).unwrap_or("").to_string() }, a.1.as_str(), a.0.as_str(), a.2.as_str())).collect();
+    attrs.sort();
+    for (_, local, prefix, value) in attrs {
+        out.extend(format!(" {}=\"", qname(prefix, local)).as_bytes());
+        esc_attr(value, out);
+        out.push(b'"');
+    }
+    out.push(b'>');
+    for k in &n.kids {
+        match k {
+            Kid::Text(t) => esc_text(t, out),
+            Kid::El(e) => render(doc, *e, skip, inclusive, scope, out),
+        }
+    }
+    out.extend(format!("</{}>", name).as_bytes());
+    scope.truncate(mark);
+}
+
+fn c14n(doc: &Doc, id: usize, skip: Option<usize>, inclusive: &[String]) -> Vec<u8> {
+    let mut out = vec![];
+    render(doc, id, skip, inclusive, &mut vec![], &mut out);
+    out
+}
+
+/// A whole XML document in exclusive canonical form, without comments. `prefixes` is the InclusiveNamespaces list, usually []. It is what `xmllint --exc-c14n` gives.
+pub fn saml_c14n(xml: &str, prefixes: Vec<String>) -> Result<String, String> {
+    let doc = parse_xml(xml)?;
+    String::from_utf8(c14n(&doc, doc.root, None, &prefixes)).map_err(|e| e.to_string())
+}
+
+// ---- XML signatures ----
+
+fn prefix_list(doc: &Doc, method: usize) -> Vec<String> {
+    doc.kid(method, NS_EC, "InclusiveNamespaces").and_then(|i| doc.attr(i, "PrefixList")).map(|l| l.split_whitespace().map(|p| if p == "#default" { String::new() } else { p.to_string() }).collect()).unwrap_or_default()
+}
+
+fn clean_b64(s: &str) -> Result<Vec<u8>, String> {
+    B64.decode(s.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "a signature value is not base64".to_string())
+}
+
+/// Verifies one enveloped signature against the keys in the config, never one the message carries. Gives the element it covers, always the Signature's own parent: a signature pointing elsewhere is how wrapping starts.
+fn verify_signature(doc: &Doc, sig: usize, keys: &[Cert], allow_sha1: bool) -> Result<usize, String> {
+    let info = doc.kid(sig, NS_DS, "SignedInfo").ok_or("the Signature has no SignedInfo")?;
+    if doc.kids_named(sig, NS_DS, "SignedInfo").count() != 1 {
+        return Err("the Signature has two SignedInfo".into());
+    }
+    let canon = doc.kid(info, NS_DS, "CanonicalizationMethod").ok_or("no CanonicalizationMethod")?;
+    let canon_alg = doc.attr(canon, "Algorithm").unwrap_or("");
+    if canon_alg != EXC_C14N {
+        return Err(format!("the canonicalization {} is not exclusive C14N without comments, the only one taken", canon_alg));
+    }
+    let method = doc.kid(info, NS_DS, "SignatureMethod").and_then(|m| doc.attr(m, "Algorithm")).ok_or("no SignatureMethod")?;
+    let refs: Vec<usize> = doc.kids_named(info, NS_DS, "Reference").collect();
+    if refs.len() != 1 {
+        return Err(format!("the Signature has {} References, and exactly one is taken", refs.len()));
+    }
+    let r = refs[0];
+    let uri = doc.attr(r, "URI").unwrap_or("");
+    let target = uri.strip_prefix('#').filter(|u| !u.is_empty()).ok_or(format!("the Reference URI `{}` does not name an element", uri))?;
+    let holders: Vec<usize> = (0..doc.nodes.len()).filter(|i| doc.attr(*i, "ID") == Some(target)).collect();
+    if holders.len() != 1 {
+        return Err(format!("the ID {} is held by {} elements: signature wrapping?", target, holders.len()));
+    }
+    let signed = holders[0];
+    let parent = doc.nodes[sig].parent.ok_or("a Signature with no parent")?;
+    if signed != parent {
+        return Err("the Signature does not cover the element it sits in: signature wrapping?".into());
+    }
+    let mut inclusive = vec![];
+    let mut enveloped = false;
+    if let Some(ts) = doc.kid(r, NS_DS, "Transforms") {
+        for t in doc.kids_named(ts, NS_DS, "Transform") {
+            match doc.attr(t, "Algorithm").unwrap_or("") {
+                ENVELOPED => enveloped = true,
+                EXC_C14N => inclusive = prefix_list(doc, t),
+                other => return Err(format!("the transform {} is not taken", other)),
+            }
+        }
+    }
+    if !enveloped {
+        return Err("the Signature has no enveloped-signature transform".into());
+    }
+    let canon_bytes = c14n(doc, signed, Some(sig), &inclusive);
+    let digest_alg = doc.kid(r, NS_DS, "DigestMethod").and_then(|m| doc.attr(m, "Algorithm")).ok_or("no DigestMethod")?;
+    let got = match digest_alg {
+        "http://www.w3.org/2001/04/xmlenc#sha256" => Sha256::digest(&canon_bytes).to_vec(),
+        "http://www.w3.org/2000/09/xmldsig#sha1" if allow_sha1 => Sha1::digest(&canon_bytes).to_vec(),
+        "http://www.w3.org/2000/09/xmldsig#sha1" => return Err("SHA-1 digests are refused: ask the IdP for SHA-256, or set allow_sha1".into()),
+        other => return Err(format!("the digest {} is not taken", other)),
+    };
+    let want = clean_b64(&doc.text(doc.kid(r, NS_DS, "DigestValue").ok_or("no DigestValue")?))?;
+    if got != want {
+        return Err("the signed element's digest does not match: it was changed after signing".into());
+    }
+    let value = clean_b64(&doc.text(doc.kid(sig, NS_DS, "SignatureValue").ok_or("no SignatureValue")?))?;
+    let signed_info = c14n(doc, info, None, &prefix_list(doc, canon));
+    let (oid, raw_ec) = match method {
+        RSA_SHA256_URI => ("1.2.840.113549.1.1.11", false),
+        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => ("1.2.840.113549.1.1.12", false),
+        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => ("1.2.840.113549.1.1.13", false),
+        "http://www.w3.org/2000/09/xmldsig#rsa-sha1" if allow_sha1 => ("1.2.840.113549.1.1.5", false),
+        "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => return Err("RSA-SHA1 signatures are refused: ask the IdP for SHA-256, or set allow_sha1".into()),
+        "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => ("1.2.840.10045.4.3.2", true),
+        "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => ("1.2.840.10045.4.3.3", true),
+        other => return Err(format!("the signature method {} is not taken", other)),
+    };
+    let der_sig = if raw_ec {
+        // XML signatures carry ECDSA as r || s.
+        if value.len() == 64 {
+            p256::ecdsa::Signature::from_slice(&value).map_err(|_| "a bad ECDSA signature".to_string())?.to_der().as_bytes().to_vec()
+        } else {
+            p384::ecdsa::Signature::from_slice(&value).map_err(|_| "a bad ECDSA signature".to_string())?.to_der().as_bytes().to_vec()
+        }
+    } else {
+        value
+    };
+    for k in keys {
+        if verify_sig(&k.spki, oid, &signed_info, &der_sig).unwrap_or(false) {
+            return Ok(signed);
+        }
+    }
+    Err("the signature does not verify with the IdP's certificate".into())
+}
+
+// ---- Configuration ----
+
+fn text_of<'a>(o: &'a Value, k: &str) -> Option<&'a str> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+}
+
+fn must<'a>(o: &'a Value, k: &str) -> Result<&'a str, String> {
+    text_of(o, k).ok_or(format!("the config needs `{}`", k))
+}
+
+fn idp_keys(config: &Value) -> Result<Vec<Cert>, String> {
+    let idp = config.get("idp").ok_or("the config needs `idp`: { entity_id, sso_url, certificate }")?;
+    let mut texts: Vec<String> = idp.get("certificates").and_then(|c| c.as_array()).into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+    if let Some(c) = text_of(idp, "certificate") {
+        texts.push(c.to_string());
+    }
+    if texts.is_empty() {
+        return Err("the IdP has no `certificate`: without one nothing can be verified".into());
+    }
+    texts.iter().map(|t| {
+        let pem = if t.contains("BEGIN CERTIFICATE") { t.clone() } else { format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", t) };
+        pem_cert(&pem, "the IdP certificate")
+    }).collect()
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn new_id() -> Result<String, String> {
+    let mut b = [0u8; 20];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    // An xs:ID starts with a letter or underscore.
+    Ok(format!("_{}", hex::encode(b)))
+}
+
+/// Reads an IdP's metadata XML: { entity_id, sso_redirect, sso_post, slo_redirect, certificates, name_id_formats }, ready to use as `idp` in the config. Check where the metadata came from: its own signature is not looked at here.
+pub fn saml_idp_metadata(xml: &str) -> Result<serde_json::Value, String> {
+    let doc = parse_xml(xml)?;
+    let eds: Vec<usize> = doc.all(NS_MD, "EntityDescriptor");
+    let ed = *eds.first().ok_or("this is not SAML metadata: no EntityDescriptor")?;
+    let idp = doc.kid(ed, NS_MD, "IDPSSODescriptor").ok_or("this metadata has no IDPSSODescriptor")?;
+    let by = |name: &str, binding: &str| doc.kids_named(idp, NS_MD, name).find(|s| doc.attr(*s, "Binding") == Some(binding)).and_then(|s| doc.attr(s, "Location")).map(str::to_string);
+    let mut certs = vec![];
+    for k in doc.kids_named(idp, NS_MD, "KeyDescriptor") {
+        if doc.attr(k, "use") == Some("encryption") {
+            continue;
+        }
+        let info = doc.kid(k, NS_DS, "KeyInfo").ok_or("a KeyDescriptor with no KeyInfo")?;
+        for d in doc.kids_named(info, NS_DS, "X509Data") {
+            for c in doc.kids_named(d, NS_DS, "X509Certificate") {
+                let der = clean_b64(&doc.text(c))?;
+                cert_of(&der)?;
+                certs.push(pem_of("CERTIFICATE", &der));
+            }
+        }
+    }
+    if certs.is_empty() {
+        return Err("the metadata names no signing certificate".into());
+    }
+    let formats: Vec<String> = doc.kids_named(idp, NS_MD, "NameIDFormat").map(|n| doc.text(n).trim().to_string()).collect();
+    let sso = by("SingleSignOnService", REDIRECT).or(by("SingleSignOnService", POST)).ok_or("the metadata has no SingleSignOnService")?;
+    Ok(json!({ "entity_id": doc.attr(ed, "entityID"), "sso_url": sso, "sso_redirect": by("SingleSignOnService", REDIRECT), "sso_post": by("SingleSignOnService", POST), "slo_redirect": by("SingleLogoutService", REDIRECT), "certificates": certs, "name_id_formats": formats }))
+}
+
+/// This service provider's metadata, to give the IdP: `config` is { entity_id, acs_url, sp_certificate (PEM, with signed requests), want_assertions_signed, name_id_format }.
+pub fn saml_metadata(config: serde_json::Value) -> Result<String, String> {
+    let (id, acs) = (must(&config, "entity_id")?, must(&config, "acs_url")?);
+    let key = match text_of(&config, "sp_certificate") {
+        Some(c) => {
+            let der = pem_blocks(c, "CERTIFICATE").into_iter().next().ok_or("sp_certificate is not PEM")?;
+            format!("<md:KeyDescriptor use=\"signing\"><ds:KeyInfo xmlns:ds=\"{}\"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>", NS_DS, B64.encode(der))
+        }
+        None => String::new(),
+    };
+    let format = text_of(&config, "name_id_format").unwrap_or("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<md:EntityDescriptor xmlns:md=\"{}\" entityID=\"{}\"><md:SPSSODescriptor AuthnRequestsSigned=\"{}\" WantAssertionsSigned=\"true\" protocolSupportEnumeration=\"{}\">{}<md:NameIDFormat>{}</md:NameIDFormat><md:AssertionConsumerService Binding=\"{}\" Location=\"{}\" index=\"0\" isDefault=\"true\"/></md:SPSSODescriptor></md:EntityDescriptor>\n",
+        NS_MD, esc(id), !key.is_empty(), NS_P, key, esc(format), POST, esc(acs)
+    ))
+}
+
+fn iso_ms() -> String {
+    iso(now())
+}
+
+/// Starts a sign-in by the redirect binding: gives { url, id, relay_state, xml }. Send the visitor to `url` and keep `id` in their session, to give `saml_read_response` as request_id. Options: relay_state, force_authn, is_passive, name_id_format, authn_context. When SAML_SP_KEY holds a PKCS#8 RSA key the request is signed with RSA-SHA256.
+pub fn saml_authn_request(config: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let idp = config.get("idp").ok_or("the config needs `idp`: { entity_id, sso_url, certificate }")?;
+    let sso = must(idp, "sso_url")?;
+    let (entity, acs) = (must(&config, "entity_id")?, must(&config, "acs_url")?);
+    let id = new_id()?;
+    let mut attrs = format!("ID=\"{}\" Version=\"2.0\" IssueInstant=\"{}\" Destination=\"{}\" AssertionConsumerServiceURL=\"{}\" ProtocolBinding=\"{}\"", id, iso_ms(), esc(sso), esc(acs), POST);
+    for (o, a) in [("force_authn", "ForceAuthn"), ("is_passive", "IsPassive")] {
+        if options.get(o) == Some(&Value::Bool(true)) {
+            attrs.push_str(&format!(" {}=\"true\"", a));
+        }
+    }
+    let format = text_of(&options, "name_id_format").or(text_of(&config, "name_id_format"));
+    let policy = format.map(|f| format!("<samlp:NameIDPolicy Format=\"{}\" AllowCreate=\"true\"/>", esc(f))).unwrap_or_default();
+    let context = text_of(&options, "authn_context").map(|c| format!("<samlp:RequestedAuthnContext Comparison=\"exact\"><saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>", esc(c))).unwrap_or_default();
+    let xml = format!("<samlp:AuthnRequest xmlns:samlp=\"{}\" xmlns:saml=\"{}\" {}><saml:Issuer>{}</saml:Issuer>{}{}</samlp:AuthnRequest>", NS_P, NS_A, attrs, esc(entity), policy, context);
+    let mut z = DeflateEncoder::new(Vec::new(), Compression::default());
+    z.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
+    let packed = z.finish().map_err(|e| e.to_string())?;
+    let mut q = format!("SAMLRequest={}", enc(&B64.encode(packed)));
+    let relay = text_of(&options, "relay_state");
+    if let Some(r) = relay {
+        if r.len() > 80 {
+            return Err("RelayState is at most 80 bytes: keep a key in it, not a URL".into());
+        }
+        q.push_str(&format!("&RelayState={}", enc(r)));
+    }
+    let signed = std::env::var("SAML_SP_KEY").ok().filter(|k| !k.is_empty());
+    if let Some(k) = &signed {
+        use rsa::signature::{SignatureEncoding, Signer};
+        q.push_str(&format!("&SigAlg={}", enc(RSA_SHA256_URI)));
+        let key = rsa::RsaPrivateKey::from_pkcs8_pem(k).map_err(|_| "SAML_SP_KEY is not a PKCS#8 RSA key".to_string())?;
+        let sig = rsa::pkcs1v15::SigningKey::<Sha256>::new(key).try_sign(q.as_bytes()).map_err(|e| e.to_string())?;
+        q.push_str(&format!("&Signature={}", enc(&B64.encode(sig.to_bytes()))));
+    }
+    let sep = if sso.contains('?') { '&' } else { '?' };
+    Ok(json!({ "url": format!("{}{}{}", sso, sep, q), "id": id, "relay_state": relay, "xml": xml, "signed": signed.is_some() }))
+}
+
+// ---- Reading a Response ----
+
+fn parse_time(s: &str) -> Result<i64, String> {
+    let t = s.trim();
+    let n = |a: usize, b: usize| t.get(a..b).and_then(|x| x.parse::<i64>().ok()).ok_or(format!("`{}` is not a SAML time", s));
+    let (y, mo, d, h, mi, se) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    if !t.ends_with('Z') {
+        return Err(format!("`{}` is not in UTC, as SAML requires", s));
+    }
+    let (yy, mm) = if mo > 2 { (y, mo) } else { (y - 1, mo + 12) };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    Ok((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (mm - 3) + 2) / 5 + d - 1 - 719468) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Assertion ids already used, with when they stop mattering.
+static SEEN: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+fn first_use(id: &str, until: i64, t: i64) -> bool {
+    let Ok(mut g) = SEEN.lock() else { return false };
+    let m = g.get_or_insert_with(HashMap::new);
+    m.retain(|_, u| *u > t);
+    m.insert(id.to_string(), until).is_none()
+}
+
+fn status_of(doc: &Doc, root: usize) -> Result<(), String> {
+    let st = doc.kid(root, NS_P, "Status").ok_or("the Response has no Status")?;
+    let code = doc.kid(st, NS_P, "StatusCode").ok_or("the Status has no StatusCode")?;
+    let v = doc.attr(code, "Value").unwrap_or("");
+    if v == SUCCESS {
+        return Ok(());
+    }
+    let short = |x: &str| x.rsplit(':').next().unwrap_or(x).to_string();
+    let sub = doc.kid(code, NS_P, "StatusCode").and_then(|c| doc.attr(c, "Value")).map(short);
+    let msg = doc.kid(st, NS_P, "StatusMessage").map(|m| doc.text(m));
+    Err(format!("the IdP refused: {}{}{}", short(v), sub.map(|s| format!(" / {}", s)).unwrap_or_default(), msg.map(|m| format!(": {}", m)).unwrap_or_default()))
+}
+
+/// Reads and checks what the IdP posted to your ACS URL: `response` is the SAMLResponse field (base64) or its XML. `config` is { entity_id, acs_url, idp: { entity_id, certificate } }. Options: request_id (from `saml_authn_request`; without it the option allow_unsolicited must be true), skew_s (120), now, allow_sha1, allow_replay. Gives { name_id, name_id_format, session_index, session_not_on_or_after, attributes: { name: [values] }, issuer, audience, assertion_id, not_on_or_after, authn_context, in_response_to, signed }; anything wrong is an error value and nothing is read from an element no signature covers.
+pub fn saml_read_response(config: serde_json::Value, response: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (sp, acs) = (must(&config, "entity_id")?, must(&config, "acs_url")?);
+    let idp_id = config.get("idp").and_then(|i| text_of(i, "entity_id")).ok_or("the config needs `idp.entity_id`")?;
+    let keys = idp_keys(&config)?;
+    let text = if response.trim_start().starts_with('<') {
+        response.to_string()
+    } else {
+        String::from_utf8(clean_b64(response).map_err(|_| "the SAMLResponse is not base64".to_string())?).map_err(|_| "the SAMLResponse is not text".to_string())?
+    };
+    let doc = parse_xml(&text)?;
+    let root = doc.root;
+    if !doc.is(root, NS_P, "Response") {
+        return Err(format!("this is not a SAML Response but <{}>", doc.nodes[root].local));
+    }
+    if doc.attr(root, "Version") != Some("2.0") {
+        return Err("the Response is not SAML 2.0".into());
+    }
+    status_of(&doc, root)?;
+    let t = options.get("now").and_then(|n| n.as_i64()).unwrap_or_else(now);
+    let skew = options.get("skew_s").and_then(|n| n.as_i64()).unwrap_or(120);
+    let allow_sha1 = options.get("allow_sha1") == Some(&Value::Bool(true));
+    if let Some(d) = doc.attr(root, "Destination") {
+        if d != acs {
+            return Err(format!("the Response's Destination is {}, not this service", d));
+        }
+    }
+    let want_req = text_of(&options, "request_id");
+    let in_resp = doc.attr(root, "InResponseTo");
+    match (want_req, in_resp) {
+        (Some(w), Some(g)) if w != g => return Err(format!("InResponseTo {} is not the request sent", g)),
+        (Some(_), None) if options.get("allow_unsolicited") != Some(&Value::Bool(true)) => return Err("the Response has no InResponseTo, though a request was sent".into()),
+        (None, _) if options.get("allow_unsolicited") != Some(&Value::Bool(true)) => return Err("an unsolicited Response: give request_id, or set allow_unsolicited".into()),
+        _ => {}
+    }
+    if let Some(i) = doc.kid(root, NS_A, "Issuer") {
+        if doc.text(i).trim() != idp_id {
+            return Err(format!("the Response's Issuer {} is not the IdP", doc.text(i).trim()));
+        }
+    }
+    if !doc.all(NS_A, "EncryptedAssertion").is_empty() {
+        return Err("the assertion is encrypted, which this plugin does not read: turn assertion encryption off for this SP".into());
+    }
+    // The one assertion: a direct child of the Response, and no other anywhere, even buried in a
+    // ds:Object or an Extensions, as wrapping attacks bury them.
+    let every = doc.all(NS_A, "Assertion");
+    let direct: Vec<usize> = doc.kids_named(root, NS_A, "Assertion").collect();
+    if every.len() != 1 || direct.len() != 1 {
+        return Err(format!("{} assertions, {} of them in place: exactly one is taken. Signature wrapping?", every.len(), direct.len()));
+    }
+    let assertion = direct[0];
+    let sigs = doc.all(NS_DS, "Signature");
+    for s in &sigs {
+        let p = doc.nodes[*s].parent;
+        if p != Some(assertion) && p != Some(root) {
+            return Err("a Signature outside the Response and the assertion: signature wrapping?".into());
+        }
+    }
+    let on_assertion = doc.kid(assertion, NS_DS, "Signature");
+    let on_response = doc.kid(root, NS_DS, "Signature");
+    if doc.kids_named(assertion, NS_DS, "Signature").count() > 1 || doc.kids_named(root, NS_DS, "Signature").count() > 1 {
+        return Err("two Signatures on one element".into());
+    }
+    let mut covered = false;
+    let mut by = vec![];
+    if let Some(s) = on_response {
+        if verify_signature(&doc, s, &keys, allow_sha1)? != root {
+            return Err("the Response's Signature covers something else: signature wrapping?".into());
+        }
+        covered = true;
+        by.push("response");
+    }
+    if let Some(s) = on_assertion {
+        if verify_signature(&doc, s, &keys, allow_sha1)? != assertion {
+            return Err("the assertion's Signature covers something else: signature wrapping?".into());
+        }
+        covered = true;
+        by.push("assertion");
+    }
+    if !covered {
+        return Err("neither the Response nor its assertion is signed: refused".into());
+    }
+    // From here on only `assertion`, which a signature covers, is read.
+    if doc.attr(assertion, "Version") != Some("2.0") {
+        return Err("the assertion is not SAML 2.0".into());
+    }
+    let issuer = doc.kid(assertion, NS_A, "Issuer").map(|i| doc.text(i).trim().to_string()).ok_or("the assertion has no Issuer")?;
+    if issuer != idp_id {
+        return Err(format!("the assertion's Issuer {} is not the IdP", issuer));
+    }
+    let subject = doc.kid(assertion, NS_A, "Subject").ok_or("the assertion has no Subject")?;
+    let name = doc.kid(subject, NS_A, "NameID").ok_or("the Subject has no NameID: an EncryptedID is not read here")?;
+    let mut confirmed = None;
+    let mut why = "the assertion has no bearer SubjectConfirmation".to_string();
+    for c in doc.kids_named(subject, NS_A, "SubjectConfirmation") {
+        if doc.attr(c, "Method") != Some(BEARER) {
+            continue;
+        }
+        let Some(d) = doc.kid(c, NS_A, "SubjectConfirmationData") else {
+            why = "the bearer confirmation has no SubjectConfirmationData".to_string();
+            continue;
+        };
+        if doc.attr(d, "Recipient") != Some(acs) {
+            why = format!("the assertion's Recipient is {}, not this service", doc.attr(d, "Recipient").unwrap_or("missing"));
+            continue;
+        }
+        let Some(until) = doc.attr(d, "NotOnOrAfter") else {
+            why = "the bearer confirmation has no NotOnOrAfter".to_string();
+            continue;
+        };
+        let until = parse_time(until)?;
+        if t >= until + skew {
+            why = format!("the assertion's confirmation ended at {}", iso(until));
+            continue;
+        }
+        if let Some(b) = doc.attr(d, "NotBefore") {
+            if t + skew < parse_time(b)? {
+                why = format!("the assertion's confirmation starts at {}", b);
+                continue;
+            }
+        }
+        if let (Some(w), Some(g)) = (want_req, doc.attr(d, "InResponseTo")) {
+            if w != g {
+                why = format!("the assertion's InResponseTo {} is not the request sent", g);
+                continue;
+            }
+        }
+        confirmed = Some(until);
+        break;
+    }
+    let confirmed = confirmed.ok_or(why)?;
+    let cond = doc.kid(assertion, NS_A, "Conditions").ok_or("the assertion has no Conditions")?;
+    if let Some(b) = doc.attr(cond, "NotBefore") {
+        let b = parse_time(b)?;
+        if t + skew < b {
+            return Err(format!("the assertion is not valid until {}", iso(b)));
+        }
+    }
+    let mut ends = confirmed;
+    if let Some(a) = doc.attr(cond, "NotOnOrAfter") {
+        let a = parse_time(a)?;
+        if t >= a + skew {
+            return Err(format!("the assertion expired at {}", iso(a)));
+        }
+        ends = ends.min(a);
+    }
+    let restrictions: Vec<usize> = doc.kids_named(cond, NS_A, "AudienceRestriction").collect();
+    if restrictions.is_empty() {
+        return Err("the assertion names no audience: it could be meant for any service".into());
+    }
+    for r in &restrictions {
+        let names: Vec<String> = doc.kids_named(*r, NS_A, "Audience").map(|a| doc.text(a).trim().to_string()).collect();
+        if !names.iter().any(|a| a == sp) {
+            return Err(format!("the assertion is for {}, not this service", names.join(", ")));
+        }
+    }
+    let id = doc.attr(assertion, "ID").ok_or("the assertion has no ID")?;
+    if options.get("allow_replay") != Some(&Value::Bool(true)) && !first_use(id, ends + skew, t) {
+        return Err(format!("the assertion {} was already used: a replay", id));
+    }
+    let mut attributes = Map::new();
+    for st in doc.kids_named(assertion, NS_A, "AttributeStatement") {
+        for a in doc.kids_named(st, NS_A, "Attribute") {
+            let key = doc.attr(a, "Name").unwrap_or("").to_string();
+            let vals: Vec<Value> = doc.kids_named(a, NS_A, "AttributeValue").map(|v| json!(doc.text(v))).collect();
+            if let Some(f) = doc.attr(a, "FriendlyName") {
+                attributes.entry(f.to_string()).or_insert(json!(vals.clone()));
+            }
+            attributes.insert(key, json!(vals));
+        }
+    }
+    let authn = doc.kid(assertion, NS_A, "AuthnStatement");
+    let context = authn.and_then(|s| doc.kid(s, NS_A, "AuthnContext")).and_then(|c| doc.kid(c, NS_A, "AuthnContextClassRef")).map(|c| doc.text(c).trim().to_string());
+    Ok(json!({
+        "name_id": doc.text(name).trim(), "name_id_format": doc.attr(name, "Format"), "session_index": authn.and_then(|s| doc.attr(s, "SessionIndex")),
+        "session_not_on_or_after": authn.and_then(|s| doc.attr(s, "SessionNotOnOrAfter")), "attributes": attributes, "issuer": issuer, "audience": sp,
+        "assertion_id": id, "not_on_or_after": iso(ends), "authn_context": context, "in_response_to": in_resp, "signed": by,
+    }))
+}

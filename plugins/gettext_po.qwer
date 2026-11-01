@@ -1,0 +1,687 @@
+//! gettext catalogs: .po files read and written, plural forms evaluated, .mo files compiled and read, fuzzy and obsolete entries kept apart, and what a catalog is missing.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+
+const MO_MAGIC: u32 = 0x9504_12de;
+const EOT: char = '\u{4}';
+
+#[derive(Clone, Debug, Default)]
+struct Entry {
+    context: Option<String>,
+    id: String,
+    plural: Option<String>,
+    strs: Vec<String>,
+    translator: Vec<String>,
+    extracted: Vec<String>,
+    references: Vec<String>,
+    flags: Vec<String>,
+    previous: Vec<String>,
+    obsolete: bool,
+    line: usize,
+}
+
+impl Entry {
+    fn fuzzy(&self) -> bool {
+        self.flags.iter().any(|f| f == "fuzzy")
+    }
+    fn translated(&self) -> bool {
+        !self.strs.is_empty() && self.strs.iter().all(|s| !s.is_empty())
+    }
+}
+
+fn unquote(s: &str, n: usize) -> Result<String, String> {
+    let t = s.trim();
+    if t.len() < 2 || !t.starts_with('"') || !t.ends_with('"') {
+        return Err(format!("line {}: `{}` should be a quoted string", n, t.chars().take(40).collect::<String>()));
+    }
+    let inner = &t[1..t.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut c = inner.chars();
+    while let Some(ch) = c.next() {
+        if ch == '"' {
+            return Err(format!("line {}: a quote inside a string must be written \\\"", n));
+        }
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match c.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(o) => return Err(format!("line {}: unknown escape \\{}", n, o)),
+            None => return Err(format!("line {}: a string ends in a backslash", n)),
+        }
+    }
+    Ok(out)
+}
+
+fn quote(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            x => o.push(x),
+        }
+    }
+    o.push('"');
+    o
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Field {
+    None,
+    Ctx,
+    Id,
+    Plural,
+    Str(usize),
+}
+
+fn parse(text: &str) -> Result<Vec<Entry>, String> {
+    let mut out: Vec<Entry> = vec![];
+    let mut e = Entry::default();
+    let mut f = Field::None;
+    let mut started = false; // msgid seen in this entry
+    let finish = |e: &mut Entry, out: &mut Vec<Entry>, started: &mut bool| -> Result<(), String> {
+        if *started {
+            if e.strs.is_empty() {
+                return Err(format!("line {}: msgid {} has no msgstr", e.line, quote(&e.id)));
+            }
+            if e.plural.is_some() && e.strs.len() < 2 && e.obsolete {
+                e.strs.push(String::new());
+            }
+            out.push(std::mem::take(e));
+            *started = false;
+        }
+        Ok(())
+    };
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let mut line = raw.trim();
+        if line.is_empty() {
+            finish(&mut e, &mut out, &mut started)?;
+            f = Field::None;
+            continue;
+        }
+        let mut obsolete = false;
+        if let Some(r) = line.strip_prefix("#~") {
+            obsolete = true;
+            line = r.strip_prefix('|').unwrap_or(r).trim();
+            if line.is_empty() {
+                continue;
+            }
+        } else if line.starts_with('#') {
+            // A comment after a string starts the next entry.
+            if started && !e.strs.is_empty() {
+                finish(&mut e, &mut out, &mut started)?;
+            }
+            let (head, rest) = line.split_at(line.len().min(2));
+            let rest = rest.trim();
+            match head {
+                "#." => e.extracted.push(rest.to_string()),
+                "#:" => e.references.extend(rest.split_whitespace().map(str::to_string)),
+                "#," => e.flags.extend(rest.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty())),
+                "#|" => e.previous.push(rest.to_string()),
+                _ => e.translator.push(line.trim_start_matches('#').strip_prefix(' ').unwrap_or(line.trim_start_matches('#')).to_string()),
+            }
+            continue;
+        }
+        if line.starts_with('"') {
+            let piece = unquote(line, n)?;
+            match f {
+                Field::Ctx => e.context.get_or_insert_default().push_str(&piece),
+                Field::Id => e.id.push_str(&piece),
+                Field::Plural => e.plural.get_or_insert_default().push_str(&piece),
+                Field::Str(k) => e.strs[k].push_str(&piece),
+                Field::None => return Err(format!("line {}: a string with no keyword before it", n)),
+            }
+            continue;
+        }
+        let (word, rest) = line.split_once(|c: char| c.is_whitespace() || c == '"').map_or((line, ""), |(a, _)| (a, line[a.len()..].trim()));
+        if (word == "msgctxt" || word == "msgid") && started && !e.strs.is_empty() {
+            finish(&mut e, &mut out, &mut started)?;
+        }
+        if obsolete {
+            e.obsolete = true;
+        }
+        match word {
+            "msgctxt" => { e.context = Some(unquote(rest, n)?); e.line = n; f = Field::Ctx; }
+            "msgid" => {
+                if started {
+                    return Err(format!("line {}: a second msgid with no msgstr before it", n));
+                }
+                e.id = unquote(rest, n)?;
+                if e.line == 0 {
+                    e.line = n;
+                }
+                started = true;
+                f = Field::Id;
+            }
+            "msgid_plural" => { e.plural = Some(unquote(rest, n)?); f = Field::Plural; }
+            "msgstr" => { e.strs = vec![unquote(rest, n)?]; f = Field::Str(0); }
+            w if w.starts_with("msgstr[") => {
+                let k: usize = w[7..].trim_end_matches(']').parse().map_err(|_| format!("line {}: `{}` has no good index", n, w))?;
+                if k != e.strs.len() {
+                    return Err(format!("line {}: msgstr[{}] out of order", n, k));
+                }
+                e.strs.push(unquote(rest, n)?);
+                f = Field::Str(k);
+            }
+            w => return Err(format!("line {}: `{}` is no keyword of a .po file", n, w)),
+        }
+    }
+    finish(&mut e, &mut out, &mut started)?;
+    let mut seen = std::collections::HashSet::new();
+    for x in out.iter().filter(|x| !x.obsolete) {
+        if !seen.insert((x.context.clone(), x.id.clone())) {
+            return Err(format!("line {}: msgid {} appears twice{}", x.line, quote(&x.id), x.context.as_ref().map_or(String::new(), |c| format!(" in context {}", quote(c)))));
+        }
+    }
+    Ok(out)
+}
+
+fn to_json(e: &Entry) -> Value {
+    json!({
+        "context": e.context, "id": e.id, "plural": e.plural, "strings": e.strs, "fuzzy": e.fuzzy(), "obsolete": e.obsolete,
+        "flags": e.flags, "references": e.references, "comments": e.translator, "extracted": e.extracted, "previous": e.previous, "line": e.line,
+    })
+}
+
+fn from_json(v: &Value) -> Result<Entry, String> {
+    let list = |k: &str| -> Vec<String> { v[k].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect() };
+    let mut flags = list("flags");
+    if v["fuzzy"] == true && !flags.iter().any(|f| f == "fuzzy") {
+        flags.push("fuzzy".into());
+    }
+    if v["fuzzy"] == false {
+        flags.retain(|f| f != "fuzzy");
+    }
+    let mut strs = list("strings");
+    if strs.is_empty() {
+        strs = vec![String::new()];
+    }
+    Ok(Entry {
+        context: v["context"].as_str().map(str::to_string), id: v["id"].as_str().ok_or("an entry has no id")?.to_string(), plural: v["plural"].as_str().map(str::to_string),
+        strs, translator: list("comments"), extracted: list("extracted"), references: list("references"), flags, previous: list("previous"), obsolete: v["obsolete"] == true, line: 0,
+    })
+}
+
+fn headers_of(e: &[Entry]) -> Map<String, Value> {
+    let mut m = Map::new();
+    if let Some(h) = e.iter().find(|x| x.id.is_empty() && x.context.is_none() && !x.obsolete) {
+        for l in h.strs.first().map_or("", |s| s.as_str()).lines() {
+            if let Some((k, v)) = l.split_once(':') {
+                m.insert(k.trim().to_string(), json!(v.trim()));
+            }
+        }
+    }
+    m
+}
+
+/// Reads a .po file: `{ headers, entries: [{ context, id, plural, strings, fuzzy, obsolete, flags, references, comments, extracted, previous, line }] }`, the header entry apart. A mistake is an error naming its line.
+pub fn gettext_po_parse(text: &str) -> Result<Value, String> {
+    let e = parse(text)?;
+    let list: Vec<Value> = e.iter().filter(|x| !(x.id.is_empty() && x.context.is_none())).map(to_json).collect();
+    Ok(json!({ "headers": headers_of(&e), "entries": list }))
+}
+
+fn wrap(word: &str, s: &str, prefix: &str, out: &mut String) {
+    if s.contains('\n') && s.trim_end_matches('\n').contains('\n') || s.chars().count() > 70 {
+        out.push_str(&format!("{}{} \"\"\n", prefix, word));
+        for piece in s.split_inclusive('\n') {
+            // At spaces under 76 columns, as msgcat does.
+            let mut cur = String::new();
+            for w in piece.split_inclusive(' ') {
+                if cur.chars().count() + w.chars().count() > 74 && !cur.is_empty() {
+                    out.push_str(&format!("{}{}\n", prefix, quote(&cur)));
+                    cur.clear();
+                }
+                cur.push_str(w);
+            }
+            if !cur.is_empty() {
+                out.push_str(&format!("{}{}\n", prefix, quote(&cur)));
+            }
+        }
+    } else {
+        out.push_str(&format!("{}{} {}\n", prefix, word, quote(s)));
+    }
+}
+
+fn write_entry(e: &Entry, out: &mut String) {
+    for c in &e.translator {
+        out.push_str(&if c.is_empty() { "#\n".to_string() } else { format!("# {}\n", c) });
+    }
+    for c in &e.extracted {
+        out.push_str(&format!("#. {}\n", c));
+    }
+    if !e.references.is_empty() {
+        out.push_str(&format!("#: {}\n", e.references.join(" ")));
+    }
+    if !e.flags.is_empty() {
+        out.push_str(&format!("#, {}\n", e.flags.join(", ")));
+    }
+    for c in &e.previous {
+        out.push_str(&format!("#| {}\n", c));
+    }
+    let p = if e.obsolete { "#~ " } else { "" };
+    if let Some(c) = &e.context {
+        wrap("msgctxt", c, p, out);
+    }
+    wrap("msgid", &e.id, p, out);
+    if let Some(pl) = &e.plural {
+        wrap("msgid_plural", pl, p, out);
+        for (i, s) in e.strs.iter().enumerate() {
+            wrap(&format!("msgstr[{}]", i), s, p, out);
+        }
+    } else {
+        wrap("msgstr", e.strs.first().map_or("", |s| s.as_str()), p, out);
+    }
+}
+
+/// Writes a .po file from `gettext_po_parse`'s value, the same shape with your changes. `headers` come first, obsolete entries last.
+pub fn gettext_po_write(catalog: serde_json::Value) -> Result<String, String> {
+    let mut out = String::new();
+    let mut head = String::new();
+    for (k, v) in catalog["headers"].as_object().into_iter().flatten() {
+        head.push_str(&format!("{}: {}\n", k, v.as_str().unwrap_or("")));
+    }
+    if !head.is_empty() {
+        out.push_str("msgid \"\"\nmsgstr \"\"\n");
+        for l in head.split_inclusive('\n') {
+            out.push_str(&format!("{}\n", quote(l)));
+        }
+    }
+    let entries = catalog["entries"].as_array().ok_or("the catalog has no entries")?.iter().map(from_json).collect::<Result<Vec<_>, _>>()?;
+    for e in entries.iter().filter(|e| !e.obsolete).chain(entries.iter().filter(|e| e.obsolete)) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        write_entry(e, &mut out);
+    }
+    Ok(out)
+}
+
+/// A C expression over `n`, as Plural-Forms holds it.
+struct Expr<'a> {
+    s: &'a [u8],
+    p: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Node {
+    N,
+    Num(u64),
+    Bin(&'static str, Box<Node>, Box<Node>),
+    Not(Box<Node>),
+    If(Box<Node>, Box<Node>, Box<Node>),
+}
+
+impl Expr<'_> {
+    fn ws(&mut self) {
+        while self.p < self.s.len() && self.s[self.p].is_ascii_whitespace() {
+            self.p += 1;
+        }
+    }
+    fn eat(&mut self, t: &str) -> bool {
+        self.ws();
+        if self.s[self.p..].starts_with(t.as_bytes()) {
+            self.p += t.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn ternary(&mut self, depth: usize) -> Result<Node, String> {
+        if depth > 64 {
+            return Err("the plural expression is nested too deep".into());
+        }
+        let c = self.binary(0, depth)?;
+        if self.eat("?") {
+            let a = self.ternary(depth + 1)?;
+            if !self.eat(":") {
+                return Err("`?` with no `:`".into());
+            }
+            let b = self.ternary(depth + 1)?;
+            return Ok(Node::If(Box::new(c), Box::new(a), Box::new(b)));
+        }
+        Ok(c)
+    }
+    fn binary(&mut self, level: usize, depth: usize) -> Result<Node, String> {
+        const LEVELS: [&[&str]; 6] = [&["||"], &["&&"], &["==", "!="], &["<=", ">=", "<", ">"], &["+", "-"], &["*", "/", "%"]];
+        if level == LEVELS.len() {
+            return self.unary(depth);
+        }
+        let mut left = self.binary(level + 1, depth)?;
+        'outer: loop {
+            for op in LEVELS[level] {
+                if self.eat(op) {
+                    let right = self.binary(level + 1, depth)?;
+                    left = Node::Bin(op, Box::new(left), Box::new(right));
+                    continue 'outer;
+                }
+            }
+            return Ok(left);
+        }
+    }
+    fn unary(&mut self, depth: usize) -> Result<Node, String> {
+        if self.eat("!") && !self.s[self.p..].starts_with(b"=") {
+            return Ok(Node::Not(Box::new(self.unary(depth + 1)?)));
+        }
+        if self.eat("(") {
+            let x = self.ternary(depth + 1)?;
+            if !self.eat(")") {
+                return Err("`(` is never closed".into());
+            }
+            return Ok(x);
+        }
+        self.ws();
+        if self.s.get(self.p) == Some(&b'n') {
+            self.p += 1;
+            return Ok(Node::N);
+        }
+        let start = self.p;
+        while self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+            self.p += 1;
+        }
+        if start == self.p {
+            return Err(format!("unexpected `{}` at position {}", self.s.get(self.p).map_or("end".to_string(), |c| (*c as char).to_string()), self.p));
+        }
+        std::str::from_utf8(&self.s[start..self.p]).unwrap().parse().map(Node::Num).map_err(|_| "a number too large".to_string())
+    }
+}
+
+fn eval(x: &Node, n: u64) -> Result<u64, String> {
+    Ok(match x {
+        Node::N => n,
+        Node::Num(v) => *v,
+        Node::Not(a) => (eval(a, n)? == 0) as u64,
+        Node::If(c, a, b) => if eval(c, n)? != 0 { eval(a, n)? } else { eval(b, n)? },
+        Node::Bin(op, a, b) => {
+            let (l, r) = (eval(a, n)?, eval(b, n)?);
+            match *op {
+                "||" => (l != 0 || r != 0) as u64,
+                "&&" => (l != 0 && r != 0) as u64,
+                "==" => (l == r) as u64,
+                "!=" => (l != r) as u64,
+                "<=" => (l <= r) as u64,
+                ">=" => (l >= r) as u64,
+                "<" => (l < r) as u64,
+                ">" => (l > r) as u64,
+                "+" => l.wrapping_add(r),
+                "-" => l.wrapping_sub(r),
+                "*" => l.wrapping_mul(r),
+                "/" => l.checked_div(r).ok_or("division by zero in the plural expression")?,
+                "%" => l.checked_rem(r).ok_or("division by zero in the plural expression")?,
+                _ => unreachable!(),
+            }
+        }
+    })
+}
+
+/// (nplurals, expression) of a Plural-Forms header.
+fn plural_rule(header: &str) -> Result<(usize, Node), String> {
+    let mut nplurals = None;
+    let mut plural = None;
+    for part in header.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim() {
+                "nplurals" => nplurals = v.trim().parse::<usize>().ok(),
+                "plural" => plural = Some(v.trim()),
+                _ => {}
+            }
+        }
+    }
+    let n = nplurals.filter(|n| *n > 0).ok_or(format!("`{}` has no good nplurals", header))?;
+    let text = plural.ok_or(format!("`{}` has no plural=", header))?;
+    let mut e = Expr { s: text.as_bytes(), p: 0 };
+    let tree = e.ternary(0).map_err(|m| format!("plural expression `{}`: {}", text, m))?;
+    e.ws();
+    if e.p != e.s.len() {
+        return Err(format!("plural expression `{}`: stray text at position {}", text, e.p));
+    }
+    Ok((n, tree))
+}
+
+/// Which plural form a number takes, under a `Plural-Forms` header, as gettext works it out: `gettext_po_plural("nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);", 22)` is 1. An index past `nplurals` is an error.
+pub fn gettext_po_plural(header: &str, n: i64) -> Result<i64, String> {
+    let (count, rule) = plural_rule(header)?;
+    let i = eval(&rule, n.unsigned_abs())?;
+    if i as usize >= count {
+        return Err(format!("n={} gives form {}, and there are only {}", n, i, count));
+    }
+    Ok(i as i64)
+}
+
+fn key_of(e: &Entry) -> String {
+    match &e.context {
+        Some(c) => format!("{}{}{}", c, EOT, e.id),
+        None => e.id.clone(),
+    }
+}
+
+fn compile(entries: &[Entry]) -> Vec<u8> {
+    // msgfmt's choice: fuzzy, untranslated and obsolete entries stay out, the header stays in.
+    let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for e in entries.iter().filter(|e| !e.obsolete && !(e.fuzzy() && !e.id.is_empty()) && e.translated()) {
+        let id = match &e.plural {
+            Some(p) => format!("{}\0{}", key_of(e), p),
+            None => key_of(e),
+        };
+        map.insert(id.into_bytes(), e.strs.join("\0").into_bytes());
+    }
+    let n = map.len() as u32;
+    let mut out = vec![];
+    let head = 28u32;
+    for v in [MO_MAGIC, 0, n, head, head + 8 * n, 0, head + 16 * n] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut off = head + 16 * n;
+    let mut strings = vec![];
+    let mut table = |x: &[u8], out: &mut Vec<u8>, strings: &mut Vec<u8>| {
+        out.extend_from_slice(&(x.len() as u32).to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        strings.extend_from_slice(x);
+        strings.push(0);
+        off += x.len() as u32 + 1;
+    };
+    for k in map.keys() {
+        table(k, &mut out, &mut strings);
+    }
+    for v in map.values() {
+        table(v, &mut out, &mut strings);
+    }
+    out.extend_from_slice(&strings);
+    out
+}
+
+/// Compiles a .po text and writes the binary .mo at `path`, as `msgfmt` does: fuzzy, untranslated and obsolete entries left out, and also a plural entry with some forms empty, which msgfmt would keep and show as nothing. Plural counts are checked first: an entry with more or fewer forms than `nplurals` is an error, which msgfmt also refuses. Gives `{ path, messages, bytes }`.
+pub fn gettext_po_compile(text: &str, path: &str) -> Result<Value, String> {
+    let e = parse(text)?;
+    let h = headers_of(&e);
+    let want = h.get("Plural-Forms").and_then(Value::as_str).map(plural_rule).transpose()?.map(|x| x.0);
+    for x in e.iter().filter(|x| x.plural.is_some() && !x.obsolete) {
+        if let Some(w) = want {
+            if x.strs.len() != w {
+                return Err(format!("line {}: msgid {} has {} forms, and the header says {}", x.line, quote(&x.id), x.strs.len(), w));
+            }
+        }
+    }
+    let b = compile(&e);
+    std::fs::write(path, &b).map_err(|e| format!("{}: {}", path, e))?;
+    let messages = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+    Ok(json!({ "path": path, "messages": messages, "bytes": b.len() }))
+}
+
+/// Reads a .mo file, either byte order: `{ headers, messages: [{ context, id, plural, strings }] }`.
+pub fn gettext_po_read_mo(path: &str) -> Result<Value, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    if b.len() < 28 {
+        return Err(format!("{} is too short to be a .mo file", path));
+    }
+    let le = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == MO_MAGIC;
+    if !le && u32::from_be_bytes([b[0], b[1], b[2], b[3]]) != MO_MAGIC {
+        return Err(format!("{} is not a .mo file: the magic number is wrong", path));
+    }
+    let u = |at: usize| -> Result<usize, String> {
+        let s: [u8; 4] = b.get(at..at + 4).ok_or("the .mo file ends early")?.try_into().unwrap();
+        Ok(if le { u32::from_le_bytes(s) } else { u32::from_be_bytes(s) } as usize)
+    };
+    if u(4)? >> 16 > 1 {
+        return Err(format!("{}: .mo major version {} is not known", path, u(4)? >> 16));
+    }
+    let (n, o, t) = (u(8)?, u(12)?, u(16)?);
+    let piece = |table: usize, i: usize| -> Result<String, String> {
+        let (len, off) = (u(table + i * 8)?, u(table + i * 8 + 4)?);
+        let end = off.checked_add(len).ok_or("the .mo file is damaged")?;
+        Ok(String::from_utf8_lossy(b.get(off..end).ok_or("the .mo file ends early")?).into_owned())
+    };
+    let mut headers = Map::new();
+    let mut list = vec![];
+    for i in 0..n {
+        let (id, tr) = (piece(o, i)?, piece(t, i)?);
+        if id.is_empty() {
+            for l in tr.lines() {
+                if let Some((k, v)) = l.split_once(':') {
+                    headers.insert(k.trim().to_string(), json!(v.trim()));
+                }
+            }
+            continue;
+        }
+        let (rest, plural) = id.split_once('\0').map_or((id.as_str(), None), |(a, b)| (a, Some(b)));
+        let (context, msg) = rest.split_once(EOT).map_or((None, rest), |(a, b)| (Some(a), b));
+        list.push(json!({ "context": context, "id": msg, "plural": plural, "strings": tr.split('\0').collect::<Vec<_>>() }));
+    }
+    Ok(json!({ "headers": headers, "messages": list }))
+}
+
+/// Looks up a message in a .po text as a program would: `n` picks the plural form, 1 or null for none, `context` is empty for none. A fuzzy or empty translation gives back the source, singular or plural by English's rule, as gettext does when a message is missing.
+pub fn gettext_po_translate(text: &str, id: &str, n: Option<i64>, context: &str) -> Result<String, String> {
+    let e = parse(text)?;
+    let h = headers_of(&e);
+    let found = e.iter().find(|x| !x.obsolete && x.id == id && x.context.as_deref().unwrap_or("") == context && !x.fuzzy() && x.translated());
+    let Some(x) = found else {
+        let source = e.iter().find(|x| x.id == id).and_then(|x| x.plural.clone());
+        return Ok(match (n, source) {
+            (Some(k), Some(p)) if k != 1 => p,
+            _ => id.to_string(),
+        });
+    };
+    if x.plural.is_none() {
+        return Ok(x.strs[0].clone());
+    }
+    let form = match h.get("Plural-Forms").and_then(Value::as_str) {
+        Some(p) => gettext_po_plural(p, n.unwrap_or(1))? as usize,
+        None => (n.unwrap_or(1) != 1) as usize,
+    };
+    x.strs.get(form).cloned().ok_or(format!("msgid {} has no form {}", quote(id), form))
+}
+
+/// What a catalog is missing: `{ total, translated, percent, untranslated, fuzzy, obsolete, partial, placeholders }`, `untranslated` and `fuzzy` listing ids with their line, `partial` plural entries with some forms empty, and `placeholders` the translations whose `%d`, `%s`, `{name}` differ from their source's.
+pub fn gettext_po_status(text: &str) -> Result<Value, String> {
+    let e = parse(text)?;
+    let live: Vec<&Entry> = e.iter().filter(|x| !x.obsolete && !(x.id.is_empty() && x.context.is_none())).collect();
+    let row = |x: &&Entry| json!({ "id": x.id, "context": x.context, "line": x.line });
+    let fuzzy: Vec<Value> = live.iter().filter(|x| x.fuzzy()).map(row).collect();
+    let empty: Vec<Value> = live.iter().filter(|x| !x.fuzzy() && x.strs.iter().all(|s| s.is_empty())).map(row).collect();
+    let partial: Vec<Value> = live.iter().filter(|x| !x.fuzzy() && !x.translated() && x.strs.iter().any(|s| !s.is_empty())).map(row).collect();
+    let done = live.iter().filter(|x| x.translated() && !x.fuzzy()).count();
+    let holders = |s: &str| -> Vec<String> {
+        let b: Vec<char> = s.chars().collect();
+        let mut o = vec![];
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '%' && i + 1 < b.len() {
+                if b[i + 1] == '%' {
+                    i += 2;
+                    continue;
+                }
+                let mut k = i + 1;
+                while k < b.len() && (b[k].is_ascii_digit() || "-+ #.$l".contains(b[k])) {
+                    k += 1;
+                }
+                if k < b.len() && "diuoxXfFeEgGcsp".contains(b[k]) {
+                    o.push(format!("%{}", b[k]));
+                }
+                i = k + 1;
+                continue;
+            }
+            if b[i] == '{' {
+                if let Some(end) = b[i..].iter().position(|c| *c == '}') {
+                    o.push(b[i..=i + end].iter().collect());
+                    i += end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        o.sort();
+        o
+    };
+    let mut mismatched = vec![];
+    for x in live.iter().filter(|x| !x.fuzzy()) {
+        let source = holders(&x.id);
+        for s in x.strs.iter().filter(|s| !s.is_empty()) {
+            let got = holders(s);
+            if got != source {
+                mismatched.push(json!({ "id": x.id, "line": x.line, "translation": s, "expected": source, "found": got }));
+                break;
+            }
+        }
+    }
+    let total = live.len();
+    Ok(json!({
+        "total": total, "translated": done, "percent": if total == 0 { 100 } else { done * 100 / total }, "untranslated": empty, "fuzzy": fuzzy,
+        "obsolete": e.iter().filter(|x| x.obsolete).count(), "partial": partial, "placeholders": mismatched,
+    }))
+}
+
+/// Brings a catalog up to a new template (.pot), as `msgmerge` does without guessing: translations of ids still there are kept, new ids come in empty, references and extracted comments come from the template, and ids gone become obsolete.
+pub fn gettext_po_merge(po: &str, pot: &str) -> Result<String, String> {
+    let old = parse(po)?;
+    let new = parse(pot)?;
+    let mut out: Vec<Entry> = vec![];
+    if let Some(h) = old.iter().find(|x| x.id.is_empty() && x.context.is_none()) {
+        out.push(h.clone());
+    }
+    for t in new.iter().filter(|x| !x.id.is_empty() || x.context.is_some()) {
+        let mut e = t.clone();
+        if let Some(o) = old.iter().find(|o| !o.obsolete && o.id == t.id && o.context == t.context) {
+            e.strs = o.strs.clone();
+            e.translator = o.translator.clone();
+            e.flags = o.flags.clone();
+            e.previous = o.previous.clone();
+        }
+        out.push(e);
+    }
+    for o in old.iter().filter(|o| !o.id.is_empty() && o.translated()) {
+        if !new.iter().any(|n| n.id == o.id && n.context == o.context) {
+            let mut x = o.clone();
+            x.obsolete = true;
+            out.push(x);
+        }
+    }
+    let mut text = String::new();
+    for e in out.iter().filter(|e| !e.obsolete).chain(out.iter().filter(|e| e.obsolete)) {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        write_entry(e, &mut text);
+    }
+    Ok(text)
+}

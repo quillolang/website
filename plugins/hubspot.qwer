@@ -1,0 +1,252 @@
+//! HubSpot's CRM API: contacts and deals made, read and searched, every list followed through its `after` cursor, batch upserts in hundreds with partial failures read, associations, and webhook v3 signatures checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! ureq = "2"
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! base64 = "0.22"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const BATCH: usize = 100;
+const SEARCH_PAGE: usize = 200;
+// Search stops at this many results, however the pages are walked.
+const SEARCH_MAX: usize = 10_000;
+
+fn opt(o: &Value, k: &str, var: &str) -> Option<String> {
+    o.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty()))
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn error_text(code: u16, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let cat = v["category"].as_str().unwrap_or("ERROR");
+    let msg = v["message"].as_str().map(str::to_string).unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let more: Vec<String> = v["errors"].as_array().map(|l| l.iter().filter_map(|e| e["message"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let tail = if more.is_empty() { String::new() } else { format!(" ({})", more.join("; ")) };
+    let hint = match code {
+        401 => " (check HUBSPOT_TOKEN)",
+        403 => " (the private app lacks this scope)",
+        _ => "",
+    };
+    format!("HubSpot {} {}: {}{}{}", code, cat, msg, tail, hint)
+}
+
+fn call(method: &str, path: &str, body: Option<&Value>, o: &Value) -> Result<(u16, Value), String> {
+    let token = opt(o, "token", "HUBSPOT_TOKEN").ok_or("no token: set HUBSPOT_TOKEN (a private app's), or give the option token")?;
+    let base = opt(o, "base_url", "HUBSPOT_API_URL").unwrap_or_else(|| "https://api.hubapi.com".into());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
+    let text = body.map(|b| b.to_string());
+    let mut tries = 0;
+    loop {
+        let r = agent.request(method, &url).set("Authorization", &format!("Bearer {}", token)).set("User-Agent", "quillo-hubspot/1.0");
+        let res = match &text {
+            Some(t) => r.set("Content-Type", "application/json").send_string(t),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => {
+                let status = resp.status();
+                let t = resp.into_string().map_err(|e| e.to_string())?;
+                return Ok((status, if t.trim().is_empty() { Value::Null } else { serde_json::from_str(&t).map_err(|_| format!("HubSpot's answer is not JSON: {:?}", t.chars().take(200).collect::<String>()))? }));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let wait = resp.header("retry-after").and_then(|h| h.trim().parse::<f64>().ok());
+                let t = resp.into_string().unwrap_or_default();
+                // Over a ten-second window a 429 passes quickly; the daily limit says so and does not.
+                let daily = t.contains("DAILY") || t.contains("\"policyName\":\"DAILY\"");
+                if (code == 429 && !daily || code == 502 || code == 503) && tries < 3 && wait.unwrap_or(1.0) <= 30.0 {
+                    std::thread::sleep(Duration::from_secs_f64(wait.unwrap_or(1.0 + tries as f64)));
+                    tries += 1;
+                    continue;
+                }
+                return Err(error_text(code, &t));
+            }
+            Err(e) => return Err(format!("cannot reach HubSpot at {}: {}", base, e)),
+        }
+    }
+}
+
+/// Calls any endpoint: `method`, `path`, `body` or null. Options: token (else HUBSPOT_TOKEN), base_url (else HUBSPOT_API_URL).
+pub fn hubspot_request(method: &str, path: &str, body: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(call(&method.to_uppercase(), path, if body.is_null() { None } else { Some(&body) }, &options)?.1)
+}
+
+fn props_q(o: &Value) -> String {
+    match o.get("properties").and_then(|p| p.as_array()) {
+        Some(l) if !l.is_empty() => format!("properties={}", enc(&l.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","))),
+        _ => String::new(),
+    }
+}
+
+/// Creates an object of `kind` ("contacts", "deals", "companies", "tickets"...), `properties` a map. Options add associations (as the API documents them). Gives { id, properties, createdAt, ... }. A contact whose email is taken is an error naming the existing id.
+pub fn hubspot_create(kind: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut b = json!({ "properties": properties });
+    if let Some(a) = options.get("associations") {
+        b["associations"] = a.clone();
+    }
+    Ok(call("POST", &format!("/crm/v3/objects/{}", enc(kind)), Some(&b), &options)?.1)
+}
+
+/// One object by id. Options: properties (a list, as HubSpot gives only a few by default), id_property ("email" to look a contact up by its email).
+pub fn hubspot_get(kind: &str, id: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut q: Vec<String> = vec![];
+    let p = props_q(&options);
+    if !p.is_empty() { q.push(p); }
+    if let Some(i) = options.get("id_property").and_then(|v| v.as_str()) { q.push(format!("idProperty={}", enc(i))); }
+    let path = format!("/crm/v3/objects/{}/{}{}{}", enc(kind), enc(id), if q.is_empty() { "" } else { "?" }, q.join("&"));
+    Ok(call("GET", &path, None, &options)?.1)
+}
+
+/// Changes an object's properties by id. Options add id_property.
+pub fn hubspot_update(kind: &str, id: &str, properties: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let q = options.get("id_property").and_then(|v| v.as_str()).map(|i| format!("?idProperty={}", enc(i))).unwrap_or_default();
+    Ok(call("PATCH", &format!("/crm/v3/objects/{}/{}{}", enc(kind), enc(id), q), Some(&json!({ "properties": properties })), &options)?.1)
+}
+
+/// Archives an object: it goes to the recycling bin for 90 days.
+pub fn hubspot_archive(kind: &str, id: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("DELETE", &format!("/crm/v3/objects/{}/{}", enc(kind), enc(id)), None, &options)?;
+    Ok(true)
+}
+
+/// Every object of a kind, following paging.next.after at 100 a page. Options: properties, max_items.
+pub fn hubspot_list(kind: &str, options: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let max = options.get("max_items").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+    let mut out = vec![];
+    let mut after: Option<String> = None;
+    let p = props_q(&options);
+    loop {
+        let mut q = vec!["limit=100".to_string()];
+        if !p.is_empty() { q.push(p.clone()); }
+        if let Some(a) = &after { q.push(format!("after={}", enc(a))); }
+        let (_, r) = call("GET", &format!("/crm/v3/objects/{}?{}", enc(kind), q.join("&")), None, &options)?;
+        out.extend(r["results"].as_array().cloned().unwrap_or_default());
+        match r.pointer("/paging/next/after").and_then(|a| a.as_str()) {
+            Some(a) if out.len() < max => after = Some(a.to_string()),
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(out)
+}
+
+/// One filter for hubspot_search: `property`, `operator` (EQ, NEQ, LT, GT, LTE, GTE, BETWEEN, IN, HAS_PROPERTY, CONTAINS_TOKEN...), `value` (a list for IN).
+pub fn hubspot_filter(property: &str, operator: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut f = json!({ "propertyName": property, "operator": operator });
+    match value {
+        Value::Null => {}
+        Value::Array(l) => f["values"] = json!(l.iter().map(|v| v.as_str().map(str::to_string).unwrap_or(v.to_string())).collect::<Vec<_>>()),
+        Value::String(s) => f["value"] = json!(s),
+        other => f["value"] = json!(other.to_string()),
+    }
+    f
+}
+
+/// Searches a kind: `filters` is a list of filters (all must hold), or a list of such lists (any may hold: HubSpot takes 5 groups of 6). Options: query (free text), sorts ([{ propertyName, direction }]), properties, max_items. Gives { total, results }, all pages of them, up to the 10,000 search can reach.
+pub fn hubspot_search(kind: &str, filters: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = filters.as_array().cloned().unwrap_or_default();
+    let groups: Vec<Value> = if list.iter().all(|f| f.is_array()) && !list.is_empty() {
+        list.iter().map(|g| json!({ "filters": g })).collect()
+    } else if list.is_empty() {
+        vec![]
+    } else {
+        vec![json!({ "filters": list })]
+    };
+    if groups.len() > 5 || groups.iter().any(|g| g["filters"].as_array().map(|f| f.len()).unwrap_or(0) > 6) {
+        return Err("HubSpot takes at most 5 filter groups of 6 filters".into());
+    }
+    let mut b = json!({ "filterGroups": groups, "limit": SEARCH_PAGE });
+    for k in ["query", "sorts", "properties"] {
+        if let Some(v) = options.get(k) {
+            b[k] = v.clone();
+        }
+    }
+    let max = options.get("max_items").and_then(|v| v.as_u64()).map(|m| m as usize).unwrap_or(SEARCH_MAX).min(SEARCH_MAX);
+    let mut out = vec![];
+    let mut total = Value::Null;
+    loop {
+        let (_, r) = call("POST", &format!("/crm/v3/objects/{}/search", enc(kind)), Some(&b), &options)?;
+        total = r.get("total").cloned().unwrap_or(total);
+        out.extend(r["results"].as_array().cloned().unwrap_or_default());
+        match r.pointer("/paging/next/after").and_then(|a| a.as_str()) {
+            Some(a) if out.len() < max => b["after"] = json!(a),
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    Ok(json!({ "total": total, "results": out }))
+}
+
+/// Creates or updates many objects by a unique property (contacts: "email"), in requests of 100. `records` are maps of properties holding that one. Gives { created, updated, errors, results }: a batch can half work, answering 207, and the failures are in `errors`.
+pub fn hubspot_batch_upsert(kind: &str, id_property: &str, records: Vec<serde_json::Value>, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut inputs = vec![];
+    for (i, r) in records.iter().enumerate() {
+        let id = r.get(id_property).map(|v| v.as_str().map(str::to_string).unwrap_or(v.to_string())).filter(|s| !s.is_empty()).ok_or(format!("record {} has no `{}`", i, id_property))?;
+        // HubSpot compares emails in lower case: two spellings in one batch would be refused.
+        inputs.push(json!({ "id": if id_property == "email" { id.to_lowercase() } else { id }, "idProperty": id_property, "properties": r }));
+    }
+    let (mut created, mut updated) = (0, 0);
+    let (mut results, mut errors) = (vec![], vec![]);
+    for chunk in inputs.chunks(BATCH) {
+        let (_, r) = call("POST", &format!("/crm/v3/objects/{}/batch/upsert", enc(kind)), Some(&json!({ "inputs": chunk })), &options)?;
+        for x in r["results"].as_array().into_iter().flatten() {
+            if x["new"] == true { created += 1 } else { updated += 1 }
+            results.push(x.clone());
+        }
+        errors.extend(r["errors"].as_array().cloned().unwrap_or_default());
+    }
+    Ok(json!({ "created": created, "updated": updated, "errors": errors, "results": results }))
+}
+
+/// Links two objects with their default association: `hubspot_associate("deals", id, "contacts", contact_id, {})`.
+pub fn hubspot_associate(from_kind: &str, from_id: &str, to_kind: &str, to_id: &str, options: serde_json::Value) -> Result<bool, String> {
+    call("PUT", &format!("/crm/v4/objects/{}/{}/associations/default/{}/{}", enc(from_kind), enc(from_id), enc(to_kind), enc(to_id)), None, &options)?;
+    Ok(true)
+}
+
+/// The ids of the objects of `to_kind` linked to an object.
+pub fn hubspot_associations(from_kind: &str, from_id: &str, to_kind: &str, options: serde_json::Value) -> Result<Vec<String>, String> {
+    let (_, r) = call("GET", &format!("/crm/v4/objects/{}/{}/associations/{}", enc(from_kind), enc(from_id), enc(to_kind)), None, &options)?;
+    Ok(r["results"].as_array().map(|l| l.iter().filter_map(|x| x["toObjectId"].as_i64().map(|n| n.to_string()).or(x["toObjectId"].as_str().map(str::to_string))).collect()).unwrap_or_default())
+}
+
+// In the URI signed, these and nothing else are decoded.
+fn signed_uri(uri: &str) -> String {
+    let mut u = uri.to_string();
+    for (a, b) in [("%3A", ":"), ("%2F", "/"), ("%3F", "?"), ("%40", "@"), ("%21", "!"), ("%24", "$"), ("%27", "'"), ("%28", "("), ("%29", ")"), ("%2A", "*"), ("%2C", ","), ("%3B", ";")] {
+        u = u.replace(a, b).replace(&a.to_lowercase(), b);
+    }
+    u
+}
+
+/// Checks a v3 webhook signature: the HTTP `method`, the full `uri` it was sent to (scheme, host, path, query), the raw `body`, the X-HubSpot-Request-Timestamp (ms) and X-HubSpot-Signature-v3 headers, and the app's client secret (else HUBSPOT_CLIENT_SECRET). `max_age_ms` refuses old requests (0: HubSpot's five minutes, -1: no limit). An error says why it was refused.
+pub fn hubspot_signature_check(method: &str, uri: &str, body: &str, timestamp: &str, signature: &str, secret: &str, max_age_ms: i64) -> Result<bool, String> {
+    let key = if secret.is_empty() { std::env::var("HUBSPOT_CLIENT_SECRET").unwrap_or_default() } else { secret.to_string() };
+    if key.is_empty() {
+        return Err("no client secret: set HUBSPOT_CLIENT_SECRET".into());
+    }
+    let ts: i64 = timestamp.trim().parse().map_err(|_| format!("{:?} is not a timestamp in ms", timestamp))?;
+    if max_age_ms >= 0 {
+        let limit = if max_age_ms == 0 { 300_000 } else { max_age_ms };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        if now - ts > limit {
+            return Err(format!("the request is {} ms old, over the {} ms allowed", now - ts, limit));
+        }
+    }
+    let got = base64::engine::general_purpose::STANDARD.decode(signature.trim()).map_err(|_| "the signature is not base64".to_string())?;
+    let mut m = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key");
+    m.update(format!("{}{}{}{}", method.to_uppercase(), signed_uri(uri), body, timestamp.trim()).as_bytes());
+    m.verify_slice(&got).map_err(|_| "the signature does not match: a wrong secret, a different URI, or a changed body".to_string())?;
+    Ok(true)
+}

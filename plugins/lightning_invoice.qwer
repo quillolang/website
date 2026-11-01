@@ -1,0 +1,392 @@
+//! BOLT-11 Lightning invoices decoded and checked: amount, timestamp, expiry, every tag with its route hints, fallback addresses and feature bits, and the signature verified or the payee's key recovered from it, by the specification's rules for what must fail.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+//! sha2 = "0.10"
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use k256::ecdsa::signature::hazmat::PrehashVerifier;
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const B32: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+fn polymod(vals: impl Iterator<Item = u8>) -> u32 {
+    let mut chk: u32 = 1;
+    for v in vals {
+        let top = chk >> 25;
+        chk = (chk & 0x1ffffff) << 5 ^ v as u32;
+        for (i, g) in [0x3b6a57b2u32, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3].iter().enumerate() {
+            if top >> i & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+fn hrp_expand(hrp: &str) -> Vec<u8> {
+    let mut v: Vec<u8> = hrp.bytes().map(|b| b >> 5).collect();
+    v.push(0);
+    v.extend(hrp.bytes().map(|b| b & 31));
+    v
+}
+
+fn bech32_encode(hrp: &str, data: &[u8], constant: u32) -> String {
+    let sum = polymod(hrp_expand(hrp).into_iter().chain(data.iter().copied()).chain([0u8; 6])) ^ constant;
+    let mut s = format!("{}1", hrp);
+    s.extend(data.iter().map(|d| B32[*d as usize] as char));
+    s.extend((0..6).map(|i| B32[(sum >> (5 * (5 - i)) & 31) as usize] as char));
+    s
+}
+
+fn base58check(version: u8, payload: &[u8]) -> String {
+    let mut b = vec![version];
+    b.extend_from_slice(payload);
+    let c = Sha256::digest(Sha256::digest(&b));
+    b.extend_from_slice(&c[..4]);
+    let mut digits: Vec<u8> = vec![];
+    for x in &b {
+        let mut carry = *x as u32;
+        for d in digits.iter_mut() {
+            let v = ((*d as u32) << 8) + carry;
+            *d = (v % 58) as u8;
+            carry = v / 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let mut s = "1".repeat(b.iter().take_while(|x| **x == 0).count());
+    s.extend(digits.iter().rev().map(|d| B58[*d as usize] as char));
+    s
+}
+
+// Five-bit words as bytes: `pad` keeps a last short byte, as the signed data does; without it
+// the leftover bits are dropped, as in tagged fields.
+fn to_bytes(words: &[u8], pad: bool) -> Vec<u8> {
+    let (mut acc, mut bits, mut out) = (0u32, 0u32, vec![]);
+    for v in words {
+        acc = (acc << 5 | *v as u32) & 0xffff;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits & 255) as u8);
+        }
+    }
+    if pad && bits > 0 {
+        out.push((acc << (8 - bits) & 255) as u8);
+    }
+    out
+}
+
+fn uint(words: &[u8]) -> u64 {
+    words.iter().fold(0u64, |a, w| a << 5 | *w as u64)
+}
+
+struct Hrp {
+    network: &'static str,
+    msat: Option<u128>,
+}
+
+fn read_hrp(hrp: &str) -> Result<Hrp, String> {
+    let rest = hrp.strip_prefix("ln").ok_or(format!("`{}` does not start with `ln`", hrp))?;
+    let (network, amt) = if let Some(r) = rest.strip_prefix("bcrt") {
+        ("regtest", r)
+    } else if let Some(r) = rest.strip_prefix("bc") {
+        ("mainnet", r)
+    } else if let Some(r) = rest.strip_prefix("tbs") {
+        ("signet", r)
+    } else if let Some(r) = rest.strip_prefix("tb") {
+        ("testnet", r)
+    } else {
+        return Err(format!("`{}` is no currency this reader knows: lnbc, lntb, lntbs and lnbcrt", hrp));
+    };
+    if amt.is_empty() {
+        return Ok(Hrp { network, msat: None });
+    }
+    let (num, mult) = match amt.chars().last() {
+        Some(c) if c.is_ascii_digit() => (amt, None),
+        Some(c) => (&amt[..amt.len() - 1], Some(c)),
+        None => (amt, None),
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("the amount `{}` is not a number with a multiplier", amt));
+    }
+    if num.starts_with('0') {
+        return Err(format!("the amount `{}` starts with a zero", amt));
+    }
+    let n: u128 = num.parse().map_err(|_| format!("the amount `{}` is too large", amt))?;
+    // In picobitcoin: 1 BTC = 10^12 pico; a millisatoshi is 10 pico.
+    let scale: u128 = match mult {
+        None => 1_000_000_000_000,
+        Some('m') => 1_000_000_000,
+        Some('u') => 1_000_000,
+        Some('n') => 1_000,
+        Some('p') => 1,
+        Some(c) => return Err(format!("`{}` is not a multiplier; there are m, u, n and p", c)),
+    };
+    let pico = n.checked_mul(scale).ok_or(format!("the amount `{}` is too large", amt))?;
+    if pico % 10 != 0 {
+        return Err(format!("the amount `{}` is not a whole number of millisatoshis: with `p` its last digit must be 0", amt));
+    }
+    Ok(Hrp { network, msat: Some(pico / 10) })
+}
+
+fn fallback(version: u8, program: &[u8], network: &str) -> Value {
+    let hrp = match network {
+        "mainnet" => "bc",
+        "regtest" => "bcrt",
+        _ => "tb",
+    };
+    let (pkh, sh) = if network == "mainnet" { (0x00, 0x05) } else { (0x6f, 0xc4) };
+    let address = match version {
+        17 if program.len() == 20 => base58check(pkh, program),
+        18 if program.len() == 20 => base58check(sh, program),
+        0..=16 => {
+            let mut d = vec![version];
+            let (mut acc, mut bits) = (0u32, 0u32);
+            for b in program {
+                acc = (acc << 8 | *b as u32) & 0xffff;
+                bits += 8;
+                while bits >= 5 {
+                    bits -= 5;
+                    d.push((acc >> bits & 31) as u8);
+                }
+            }
+            if bits > 0 {
+                d.push((acc << (5 - bits) & 31) as u8);
+            }
+            bech32_encode(hrp, &d, if version == 0 { 1 } else { 0x2bc830a3 })
+        }
+        _ => String::new(),
+    };
+    json!({ "version": version, "hash": hex::encode(program), "address": address })
+}
+
+const FEATURES: &[(usize, &str)] = &[(8, "var_onion_optin"), (14, "payment_secret"), (16, "basic_mpp"), (24, "option_route_blinding"), (48, "option_payment_metadata")];
+
+fn features(words: &[u8]) -> (Value, Option<usize>) {
+    let mut bits = vec![];
+    let total = words.len() * 5;
+    for (i, w) in words.iter().enumerate() {
+        for b in 0..5 {
+            if w >> b & 1 == 1 {
+                bits.push(total - 5 * (i + 1) + b);
+            }
+        }
+    }
+    bits.sort();
+    let name = |b: usize| FEATURES.iter().find(|f| f.0 == b & !1).map(|f| f.1);
+    let required: Vec<Value> = bits.iter().filter(|b| *b % 2 == 0).map(|b| json!(name(*b).map(String::from).unwrap_or(format!("bit {}", b)))).collect();
+    let optional: Vec<Value> = bits.iter().filter(|b| *b % 2 == 1).map(|b| json!(name(*b).map(String::from).unwrap_or(format!("bit {}", b)))).collect();
+    let unknown = bits.iter().find(|b| *b % 2 == 0 && name(**b).is_none()).copied();
+    (json!({ "bits": bits, "required": required, "optional": optional }), unknown)
+}
+
+fn decode_invoice(input: &str) -> Result<Value, String> {
+    let t = input.trim();
+    let t = t.strip_prefix("lightning:").or(t.strip_prefix("LIGHTNING:")).unwrap_or(t);
+    if t.bytes().any(|b| b.is_ascii_lowercase()) && t.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err("the invoice mixes capitals and small letters".into());
+    }
+    let low = t.to_ascii_lowercase();
+    let at = low.rfind('1').ok_or("the invoice has no `1` after its prefix")?;
+    let hrp = &low[..at];
+    if !hrp.starts_with("ln") {
+        return Err("a BOLT-11 invoice starts with `ln`".into());
+    }
+    let mut words = vec![];
+    for (i, c) in low[at + 1..].bytes().enumerate() {
+        words.push(B32.iter().position(|x| *x == c).ok_or(format!("`{}` at position {} is not in Bech32", c as char, at + 2 + i))? as u8);
+    }
+    if words.len() < 7 + 104 + 6 {
+        return Err(format!("the invoice is too short: {} characters of data, with room for no signature", words.len()));
+    }
+    if polymod(hrp_expand(hrp).into_iter().chain(words.iter().copied())) != 1 {
+        return Err("the invoice fails its Bech32 checksum".into());
+    }
+    let h = read_hrp(hrp)?;
+    let words = &words[..words.len() - 6];
+    let body = &words[..words.len() - 104];
+    let sig = to_bytes(&words[words.len() - 104..], false);
+    let timestamp = uint(&body[..7]);
+    let mut o = Map::new();
+    let (mut payment_hash, mut secret, mut description, mut desc_hash, mut payee) = (None, None, None, None, None);
+    let (mut expiry, mut cltv, mut metadata) = (3600u64, 18u64, Value::Null);
+    let (mut falls, mut routes, mut feat, mut unknown_tags) = (vec![], vec![], Value::Null, vec![]);
+    let mut i = 7;
+    while i < body.len() {
+        if i + 3 > body.len() {
+            return Err("a tagged field runs past the end of the invoice".into());
+        }
+        let tag = body[i];
+        let len = uint(&body[i + 1..i + 3]) as usize;
+        i += 3;
+        if i + len > body.len() {
+            return Err("a tagged field runs past the end of the invoice".into());
+        }
+        let f = &body[i..i + len];
+        i += len;
+        let name = B32[tag as usize] as char;
+        let fixed = |want: usize| if len == want { Ok(hex::encode(to_bytes(f, false))) } else { Err(format!("the `{}` field is {} long; it must be {}", name, len, want)) };
+        let once = |seen: bool| if seen { Err(format!("there are two `{}` fields; there must be one", name)) } else { Ok(()) };
+        let minimal = || if f.first() == Some(&0) { Err(format!("the `{}` field has leading zeros", name)) } else { Ok(()) };
+        match name {
+            'p' => {
+                once(payment_hash.is_some())?;
+                payment_hash = Some(fixed(52)?);
+            }
+            's' => {
+                once(secret.is_some())?;
+                secret = Some(fixed(52)?);
+            }
+            'h' => {
+                once(desc_hash.is_some())?;
+                desc_hash = Some(fixed(52)?);
+            }
+            'n' => {
+                once(payee.is_some())?;
+                payee = Some(fixed(53)?);
+            }
+            'd' => {
+                once(description.is_some())?;
+                description = Some(String::from_utf8(to_bytes(f, false)).map_err(|_| "the description is not valid UTF-8".to_string())?);
+            }
+            'm' => metadata = json!(hex::encode(to_bytes(f, false))),
+            'x' => {
+                minimal()?;
+                expiry = uint(f);
+            }
+            'c' => {
+                minimal()?;
+                cltv = uint(f);
+            }
+            '9' => {
+                minimal()?;
+                let (v, unknown) = features(f);
+                if let Some(b) = unknown {
+                    return Err(format!("the invoice requires unknown feature bit {}", b));
+                }
+                feat = v;
+            }
+            'f' => {
+                if f.is_empty() || f[0] > 18 {
+                    continue; // An unknown version is skipped, as the specification says.
+                }
+                falls.push(fallback(f[0], &to_bytes(&f[1..], false), h.network));
+            }
+            'r' => {
+                let b = to_bytes(f, false);
+                let mut hops = vec![];
+                for e in b.chunks_exact(51) {
+                    let scid = u64::from_be_bytes(e[33..41].try_into().unwrap());
+                    hops.push(json!({
+                        "pubkey": hex::encode(&e[..33]),
+                        "short_channel_id": format!("{}x{}x{}", scid >> 40, scid >> 16 & 0xffffff, scid & 0xffff),
+                        "fee_base_msat": u32::from_be_bytes(e[41..45].try_into().unwrap()),
+                        "fee_proportional_millionths": u32::from_be_bytes(e[45..49].try_into().unwrap()),
+                        "cltv_expiry_delta": u16::from_be_bytes(e[49..51].try_into().unwrap()),
+                    }));
+                }
+                routes.push(Value::Array(hops));
+            }
+            _ => unknown_tags.push(json!({ "tag": name.to_string(), "length": len })),
+        }
+    }
+    let payment_hash = payment_hash.ok_or("the invoice has no `p` field (payment hash)")?;
+    let secret = secret.ok_or("the invoice has no `s` field (payment secret)")?;
+    if description.is_some() == desc_hash.is_some() {
+        return Err(if description.is_some() { "the invoice has both a description and its hash".to_string() } else { "the invoice has neither a description nor its hash".to_string() });
+    }
+    // The signature covers the human part as text, then the data as bytes, padded with zeros.
+    let mut signed = hrp.as_bytes().to_vec();
+    signed.extend(to_bytes(body, true));
+    let digest: [u8; 32] = Sha256::digest(&signed).into();
+    let raw = Signature::from_slice(&sig[..64]).map_err(|_| "the signature's r or s is out of range".to_string())?;
+    let rec = sig[64];
+    if rec > 3 {
+        return Err(format!("the signature's recovery id is {}; it is 0 to 3", rec));
+    }
+    let high = raw.normalize_s();
+    let recovered = payee.is_none();
+    let key = match &payee {
+        Some(n) => {
+            if high.is_some() {
+                return Err("the signature has a high S with an `n` field, which must fail".into());
+            }
+            let k = VerifyingKey::from_sec1_bytes(&hex::decode(n).unwrap_or_default()).map_err(|_| "the `n` field is not a public key".to_string())?;
+            k.verify_prehash(&digest, &raw).map_err(|_| "the signature does not match the `n` field's key".to_string())?;
+            n.clone()
+        }
+        None => {
+            let (s, id) = match high {
+                Some(low) => (low, rec ^ 1),
+                None => (raw, rec),
+            };
+            let id = RecoveryId::from_byte(id).ok_or("bad recovery id")?;
+            let k = VerifyingKey::recover_from_prehash(&digest, &s, id).map_err(|_| "no public key can be recovered from the signature".to_string())?;
+            hex::encode(k.to_encoded_point(true).as_bytes())
+        }
+    };
+    o.insert("network".into(), json!(h.network));
+    o.insert("amount_msat".into(), json!(h.msat.map(|m| m as u64)));
+    o.insert("amount_sat".into(), json!(h.msat.map(|m| (m / 1000) as u64)));
+    o.insert("timestamp".into(), json!(timestamp));
+    o.insert("expiry".into(), json!(expiry));
+    o.insert("expires_at".into(), json!(timestamp + expiry));
+    o.insert("payment_hash".into(), json!(payment_hash));
+    o.insert("payment_secret".into(), json!(secret));
+    o.insert("description".into(), json!(description));
+    o.insert("description_hash".into(), json!(desc_hash));
+    o.insert("payee".into(), json!(key));
+    o.insert("payee_recovered".into(), json!(recovered));
+    o.insert("min_final_cltv_expiry".into(), json!(cltv));
+    o.insert("metadata".into(), metadata);
+    o.insert("fallbacks".into(), Value::Array(falls));
+    o.insert("routes".into(), Value::Array(routes));
+    o.insert("features".into(), feat);
+    o.insert("unknown_tags".into(), Value::Array(unknown_tags));
+    o.insert("signature".into(), json!({ "r": hex::encode(&sig[..32]), "s": hex::encode(&sig[32..64]), "recovery": rec, "high_s": high.is_some() }));
+    Ok(Value::Object(o))
+}
+
+/// An invoice decoded and its signature checked: { network, amount_msat, amount_sat, timestamp, expiry, expires_at, payment_hash, payment_secret, description, description_hash, payee, payee_recovered, min_final_cltv_expiry, metadata, fallbacks, routes, features, unknown_tags, signature }. `amount_msat` null means the payer chooses. Takes a `lightning:` prefix. Whatever BOLT-11 says must fail is an error value.
+pub fn ln_decode(invoice: &str) -> Result<Value, String> {
+    decode_invoice(invoice)
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Whether an invoice can still be paid: { expired, seconds_left }. `at` is seconds since 1970, or 0 for now.
+pub fn ln_expired(invoice: &str, at: i64) -> Result<Value, String> {
+    let i = decode_invoice(invoice)?;
+    let t = if at > 0 { at as u64 } else { now() };
+    let end = i["expires_at"].as_u64().unwrap_or(0);
+    Ok(json!({ "expired": t >= end, "seconds_left": end.saturating_sub(t) }))
+}
+
+/// Whether a payment's preimage in hex is the one the invoice asks for: its SHA-256 equals the payment hash. It proves the invoice was paid.
+pub fn ln_verify_preimage(invoice: &str, preimage: &str) -> Result<bool, String> {
+    let i = decode_invoice(invoice)?;
+    let p = hex::decode(preimage.trim()).map_err(|_| "the preimage is not hex".to_string())?;
+    if p.len() != 32 {
+        return Err(format!("a preimage is 32 bytes; this is {}", p.len()));
+    }
+    Ok(hex::encode(Sha256::digest(&p)) == i["payment_hash"].as_str().unwrap_or(""))
+}
+
+/// Whether a long description is the one an invoice's `h` field commits to. Error value if the invoice has a plain description instead.
+pub fn ln_verify_description(invoice: &str, description: &str) -> Result<bool, String> {
+    let i = decode_invoice(invoice)?;
+    let h = i["description_hash"].as_str().ok_or("the invoice has a plain description, not a hash")?;
+    Ok(hex::encode(Sha256::digest(description.as_bytes())) == h)
+}

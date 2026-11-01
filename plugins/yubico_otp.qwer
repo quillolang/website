@@ -1,0 +1,252 @@
+//! YubiKey one-time passwords: modhex both ways (and the Dvorak layout's), the token decrypted with its AES key and its CRC-16 checked for a self-hosted server with replay detection, tokens made for tests, and the YubiCloud verify call with its nonce and signed answer checked.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! aes = "0.8"
+//! hmac = "0.12"
+//! sha1 = "0.10"
+//! hex = "0.4"
+//! base64 = "0.22"
+//! getrandom = "0.2"
+//! ureq = "2"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::Aes128;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha1::Sha1;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const MODHEX: &[u8; 16] = b"cbdefghijklnrtuv";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+const DVORAK: &str = "jxe.uidchtnbpygk";
+
+fn to_modhex(bytes: &[u8]) -> String {
+    bytes.iter().flat_map(|b| [MODHEX[(b >> 4) as usize] as char, MODHEX[(b & 15) as usize] as char]).collect()
+}
+
+fn from_modhex(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err("modhex comes in pairs: the length is odd".into());
+    }
+    let nib = |c: u8| MODHEX.iter().position(|m| *m == c).map(|p| p as u8).ok_or(format!("`{}` is not a modhex letter: cbdefghijklnrtuv", c as char));
+    text.as_bytes().chunks(2).map(|p| Ok(nib(p[0])? << 4 | nib(p[1])?)).collect()
+}
+
+/// Text in modhex, whatever the keyboard made of it: upper case folded, and a key typed on a Dvorak layout (jxe.uidchtnbpygk) turned back.
+fn normalize(otp: &str) -> Result<String, String> {
+    let t = otp.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return Err("no OTP given".into());
+    }
+    if t.bytes().all(|c| MODHEX.contains(&c)) {
+        return Ok(t);
+    }
+    if t.chars().all(|c| DVORAK.contains(c)) {
+        return Ok(t.chars().map(|c| MODHEX[DVORAK.find(c).unwrap_or(0)] as char).collect());
+    }
+    Err(format!("`{}` is not modhex", t.chars().take(60).collect::<String>()))
+}
+
+/// Hex text as modhex.
+pub fn yubico_modhex_encode(hex_text: &str) -> Result<String, String> {
+    Ok(hex_text.to_ascii_lowercase().bytes().map(|c| HEX.iter().position(|h| *h == c).map(|p| MODHEX[p] as char).ok_or(format!("`{}` is not hex", c as char))).collect::<Result<String, _>>()?)
+}
+
+/// Modhex as hex text.
+pub fn yubico_modhex_decode(modhex: &str) -> Result<String, String> {
+    Ok(hex::encode(from_modhex(&normalize(modhex)?)?))
+}
+
+/// CRC-16 as the OTP uses it (ISO 13239, starting at 0xffff, no final inversion).
+fn crc16(data: &[u8]) -> u16 {
+    let mut c = 0xffffu16;
+    for &b in data {
+        c ^= b as u16;
+        for _ in 0..8 {
+            let low = c & 1;
+            c >>= 1;
+            if low != 0 {
+                c ^= 0x8408;
+            }
+        }
+    }
+    c
+}
+
+/// Splits an OTP into its public id and its 32-letter token: { public_id, token, serial }. Up to 16 letters of public id. `serial` is the key's number when a factory-set id holds it, as ids starting `cccc` do, else null.
+pub fn yubico_otp_parse(otp: &str) -> Result<serde_json::Value, String> {
+    let t = normalize(otp)?;
+    if t.len() < 32 || t.len() > 48 {
+        return Err(format!("an OTP is 32 to 48 letters, this has {}", t.len()));
+    }
+    let (id, token) = t.split_at(t.len() - 32);
+    let serial = from_modhex(id).ok().filter(|b| b.len() == 6 && b[0] == 0 && b[1] == 0).map(|b| u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
+    Ok(json!({ "public_id": id, "token": token, "serial": serial }))
+}
+
+fn aes_key(hex_key: &str) -> Result<Aes128, String> {
+    let k = hex::decode(hex_key.trim()).map_err(|_| "the AES key is not hex".to_string())?;
+    Aes128::new_from_slice(&k).map_err(|_| format!("an AES key is 16 bytes (32 hex digits), this has {}", k.len()))
+}
+
+/// Decrypts an OTP with the key's AES secret, for a self-hosted check, and checks its CRC: a wrong key fails here. Gives { public_id, uid, counter, session_use, timestamp, random, crc_ok: true }. `uid` is the private id (hex), to compare with the one stored for the key.
+pub fn yubico_otp_decrypt(otp: &str, aes_key_hex: &str) -> Result<serde_json::Value, String> {
+    let p = yubico_otp_parse(otp)?;
+    let mut block = from_modhex(p["token"].as_str().unwrap_or(""))?;
+    let ga = GenericArray::from_mut_slice(&mut block[..16]);
+    aes_key(aes_key_hex)?.decrypt_block(ga);
+    // The CRC over all 16 bytes leaves a fixed remainder.
+    if crc16(&block) != 0xf0b8 {
+        return Err("the CRC does not match: a wrong AES key, or a mistyped OTP".into());
+    }
+    Ok(json!({
+        "public_id": p["public_id"],
+        "uid": hex::encode(&block[..6]),
+        "counter": u16::from_le_bytes([block[6], block[7]]),
+        "timestamp": (block[10] as u32) << 16 | u16::from_le_bytes([block[8], block[9]]) as u32,
+        "session_use": block[11],
+        "random": u16::from_le_bytes([block[12], block[13]]),
+        "crc_ok": true,
+    }))
+}
+
+/// The full check of a self-hosted server: decrypts, compares the private id with `uid`, and refuses a replay: (counter, session_use) must be past those last accepted, given as `last` { counter, session_use } or null. Gives what `yubico_otp_decrypt` gives, with `state`, to keep for next time.
+pub fn yubico_otp_check(otp: &str, aes_key_hex: &str, uid: &str, last: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut d = yubico_otp_decrypt(otp, aes_key_hex)?;
+    if d["uid"].as_str() != Some(uid.trim().to_ascii_lowercase().as_str()) {
+        return Err("the private id does not match this key's".into());
+    }
+    let (c, u) = (d["counter"].as_i64().unwrap_or(0), d["session_use"].as_i64().unwrap_or(0));
+    if !last.is_null() {
+        let (lc, lu) = (last["counter"].as_i64().unwrap_or(-1), last["session_use"].as_i64().unwrap_or(-1));
+        if (c, u) <= (lc, lu) {
+            return Err(format!("replayed OTP: counter {}.{} is not past {}.{}", c, u, lc, lu));
+        }
+    }
+    d["state"] = json!({ "counter": c, "session_use": u });
+    Ok(d)
+}
+
+/// Makes an OTP from { uid, counter, session_use, timestamp, random } with an AES key: for tests and for programming a soft token.
+pub fn yubico_otp_make(public_id: &str, aes_key_hex: &str, fields: serde_json::Value) -> Result<String, String> {
+    from_modhex(public_id)?;
+    let uid = hex::decode(fields["uid"].as_str().ok_or("fields need `uid`, 12 hex digits")?).map_err(|_| "uid is not hex".to_string())?;
+    if uid.len() != 6 {
+        return Err("uid is 6 bytes (12 hex digits)".into());
+    }
+    let n = |k: &str| fields[k].as_u64().unwrap_or(0);
+    let (counter, ts, random) = (n("counter") as u16, n("timestamp") as u32, n("random") as u16);
+    let mut b = uid.clone();
+    b.extend(counter.to_le_bytes());
+    b.extend((ts as u16).to_le_bytes());
+    b.push((ts >> 16) as u8);
+    b.push(n("session_use") as u8);
+    b.extend(random.to_le_bytes());
+    let crc = !crc16(&b);
+    b.extend(crc.to_le_bytes());
+    let ga = GenericArray::from_mut_slice(&mut b[..16]);
+    aes_key(aes_key_hex)?.encrypt_block(ga);
+    Ok(format!("{}{}", public_id, to_modhex(&b)))
+}
+
+// ---- YubiCloud ----
+
+fn signature(params: &BTreeMap<String, String>, key: &[u8]) -> String {
+    let text = params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    let mut m = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC takes any key");
+    m.update(text.as_bytes());
+    B64.encode(m.finalize().into_bytes())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+}
+
+fn nonce() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(hex::encode(b))
+}
+
+fn status_text(s: &str) -> &'static str {
+    match s {
+        "BAD_OTP" => "the OTP is invalid",
+        "REPLAYED_OTP" => "this OTP was already used",
+        "BAD_SIGNATURE" => "the request's signature was wrong: check YUBICO_SECRET_KEY",
+        "MISSING_PARAMETER" => "the request lacks a parameter",
+        "NO_SUCH_CLIENT" => "the client id does not exist: check YUBICO_CLIENT_ID",
+        "OPERATION_NOT_ALLOWED" => "this client may not verify OTPs",
+        "BACKEND_ERROR" => "YubiCloud had an internal failure",
+        "NOT_ENOUGH_ANSWERS" => "too few validation servers answered for the sync asked",
+        "REPLAYED_REQUEST" => "the same nonce was already used with this OTP",
+        _ => "unknown status",
+    }
+}
+
+/// Verifies an OTP with YubiCloud (YUBICO_API_URL for another server): a fresh nonce, the request signed when YUBICO_SECRET_KEY is set, and the answer's signature, OTP and nonce checked, so a forged or replayed answer fails. Needs YUBICO_CLIENT_ID. Options: sl (0 to 100, or fast, secure), timeout (seconds). Gives { ok, status, meaning, public_id, serial, timestamp, session_counter, session_use, sl }: `ok` false for an invalid OTP; a bad answer is an error value.
+pub fn yubico_verify(otp: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let parsed = yubico_otp_parse(otp)?;
+    let code = normalize(otp)?;
+    let id = std::env::var("YUBICO_CLIENT_ID").ok().filter(|v| !v.is_empty()).ok_or("no client id: set YUBICO_CLIENT_ID (upgrade.yubico.com/getapikey)")?;
+    let key = match std::env::var("YUBICO_SECRET_KEY").ok().filter(|v| !v.is_empty()) {
+        Some(k) => Some(B64.decode(k.trim()).map_err(|_| "YUBICO_SECRET_KEY is not base64".to_string())?),
+        None => None,
+    };
+    let nonce = nonce()?;
+    let mut params = BTreeMap::new();
+    params.insert("id".to_string(), id);
+    params.insert("otp".to_string(), code.clone());
+    params.insert("nonce".to_string(), nonce.clone());
+    params.insert("timestamp".to_string(), "1".to_string());
+    if let Some(s) = options.get("sl") {
+        params.insert("sl".to_string(), s.as_str().map(str::to_string).unwrap_or_else(|| s.to_string()));
+    }
+    if let Some(s) = options.get("timeout").and_then(|t| t.as_u64()) {
+        params.insert("timeout".to_string(), s.to_string());
+    }
+    let mut q: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect();
+    if let Some(k) = &key {
+        q.push(format!("h={}", enc(&signature(&params, k))));
+    }
+    let base = std::env::var("YUBICO_API_URL").ok().filter(|v| !v.is_empty()).unwrap_or("https://api.yubico.com".into());
+    let url = format!("{}/wsapi/2.0/verify?{}", base.trim_end_matches('/'), q.join("&"));
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    let text = match agent.get(&url).call() {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(c, _)) => return Err(format!("YubiCloud answered {}", c)),
+        Err(e) => return Err(format!("cannot reach YubiCloud: {}", e)),
+    };
+    // Lines of name=value, whose value may itself hold `=`, as the base64 of h does.
+    let mut got = BTreeMap::new();
+    for l in text.lines() {
+        if let Some((k, v)) = l.trim().split_once('=') {
+            got.insert(k.to_string(), v.to_string());
+        }
+    }
+    let status = got.get("status").cloned().ok_or("the answer has no status")?;
+    if let Some(k) = &key {
+        let given = got.remove("h").ok_or("the answer is not signed")?;
+        if signature(&got, k) != given {
+            return Err("the answer's signature does not match: not from YubiCloud, or the wrong YUBICO_SECRET_KEY".into());
+        }
+    }
+    if status == "BAD_SIGNATURE" || status == "NO_SUCH_CLIENT" || status == "OPERATION_NOT_ALLOWED" || status == "MISSING_PARAMETER" || status == "BACKEND_ERROR" {
+        return Err(format!("YubiCloud: {}: {}", status, status_text(&status)));
+    }
+    // Only OK answers must echo; the protocol's errors may lack them.
+    if status == "OK" {
+        if got.get("otp") != Some(&code) {
+            return Err("the answer is for another OTP".into());
+        }
+        if got.get("nonce") != Some(&nonce) {
+            return Err("the answer has another nonce: a replayed answer".into());
+        }
+    }
+    let num = |k: &str| got.get(k).and_then(|v| v.parse::<i64>().ok());
+    Ok(json!({ "ok": status == "OK", "status": status, "meaning": if status == "OK" { "valid" } else { status_text(&status) }, "public_id": parsed["public_id"], "serial": parsed["serial"], "timestamp": num("timestamp"), "session_counter": num("sessioncounter"), "session_use": num("sessionuse"), "sl": num("sl") }))
+}

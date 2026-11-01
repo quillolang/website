@@ -1,0 +1,513 @@
+//! NDEF, the message format on NFC tags: URI, text, MIME, smart poster, Android application and external records built and parsed, with the URI prefix table, short and long records, chunked records joined, and the TLV wrapper a Type 2 tag stores them in.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Value};
+
+// A message is hex here, the way readers show tags; a parse also takes a list of bytes. A record in
+// a program is a map:
+//   { type: "uri", uri: "https://example.com/" }
+//   { type: "text", text: "Hello", lang: "en", encoding: "utf-16" (default utf-8) }
+//   { type: "mime", mime: "text/vcard", text: "..." or hex: "..." }
+//   { type: "smart_poster", uri, title (a string, or a map of lang to title), action: "open", "save" or "edit", size, content_type }
+//   { type: "android_app", package: "com.example.app" }
+//   { type: "external", domain_type: "example.com:thing", hex or text }
+//   { type: "absolute_uri", uri, hex or text }, { type: "empty" }, { type: "unknown", hex }
+// Any record may have an `id`.
+
+const PREFIXES: [&str; 36] = [
+    "", "http://www.", "https://www.", "http://", "https://", "tel:", "mailto:", "ftp://anonymous:anonymous@", "ftp://ftp.", "ftps://",
+    "sftp://", "smb://", "nfs://", "ftp://", "dav://", "news:", "telnet://", "imap:", "rtsp://", "urn:",
+    "pop:", "sip:", "sips:", "tftp:", "btspp://", "btl2cap://", "btgoep://", "tcpobex://", "irdaobex://", "file://",
+    "urn:epc:id:", "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
+];
+
+const EMPTY: u8 = 0;
+const WELL_KNOWN: u8 = 1;
+const MIME: u8 = 2;
+const ABSOLUTE: u8 = 3;
+const EXTERNAL: u8 = 4;
+const UNKNOWN: u8 = 5;
+const UNCHANGED: u8 = 6;
+
+struct Rec {
+    tnf: u8,
+    kind: Vec<u8>,
+    id: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+fn bytes_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Array(a) => a.iter().map(|x| x.as_u64().filter(|n| *n < 256).map(|n| n as u8).ok_or("a byte list holds numbers from 0 to 255".to_string())).collect(),
+        Value::String(s) => {
+            let t: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+            hex::decode(&t).map_err(|_| "not hex".to_string())
+        }
+        _ => Err("give the bytes as hex or a list of numbers".into()),
+    }
+}
+
+fn s<'a>(r: &'a Value, k: &str) -> Option<&'a str> {
+    r.get(k).and_then(|v| v.as_str())
+}
+
+fn body_of(r: &Value) -> Result<Vec<u8>, String> {
+    if let Some(h) = s(r, "hex") {
+        return hex::decode(h.replace(' ', "")).map_err(|_| "`hex` is not hex".to_string());
+    }
+    Ok(s(r, "text").unwrap_or("").as_bytes().to_vec())
+}
+
+fn uri_payload(uri: &str) -> Vec<u8> {
+    let best = PREFIXES.iter().enumerate().filter(|(_, p)| !p.is_empty() && uri.starts_with(**p)).max_by_key(|(_, p)| p.len());
+    match best {
+        Some((i, p)) => {
+            let mut b = vec![i as u8];
+            b.extend(uri[p.len()..].as_bytes());
+            b
+        }
+        None => {
+            let mut b = vec![0];
+            b.extend(uri.as_bytes());
+            b
+        }
+    }
+}
+
+fn text_payload(text: &str, lang: &str, utf16: bool) -> Result<Vec<u8>, String> {
+    if lang.is_empty() || lang.len() > 63 || !lang.is_ascii() {
+        return Err(format!("`{}` is not a language code: it must be 1 to 63 ASCII characters", lang));
+    }
+    let mut b = vec![(lang.len() as u8) | if utf16 { 0x80 } else { 0 }];
+    b.extend(lang.as_bytes());
+    if utf16 {
+        b.extend([0xfe, 0xff]);
+        for u in text.encode_utf16() {
+            b.extend(u.to_be_bytes());
+        }
+    } else {
+        b.extend(text.as_bytes());
+    }
+    Ok(b)
+}
+
+fn record_of(r: &Value) -> Result<Rec, String> {
+    let ty = s(r, "type").ok_or("a record needs `type`")?;
+    let need = |k: &str| s(r, k).ok_or(format!("a {} record needs `{}`", ty, k));
+    let (tnf, kind, payload): (u8, Vec<u8>, Vec<u8>) = match ty {
+        "uri" => (WELL_KNOWN, b"U".to_vec(), uri_payload(need("uri")?)),
+        "text" => {
+            let utf16 = match s(r, "encoding").unwrap_or("utf-8") {
+                "utf-8" => false,
+                "utf-16" => true,
+                e => return Err(format!("`{}` is not a text record's encoding: utf-8 or utf-16", e)),
+            };
+            (WELL_KNOWN, b"T".to_vec(), text_payload(need("text")?, s(r, "lang").unwrap_or("en"), utf16)?)
+        }
+        "mime" => {
+            let m = need("mime")?;
+            if !m.is_ascii() || !m.contains('/') {
+                return Err(format!("`{}` is not a MIME type", m));
+            }
+            (MIME, m.as_bytes().to_vec(), body_of(r)?)
+        }
+        "smart_poster" => {
+            let mut inner = vec![Rec { tnf: WELL_KNOWN, kind: b"U".to_vec(), id: vec![], payload: uri_payload(need("uri")?) }];
+            match r.get("title") {
+                Some(Value::String(t)) => inner.push(Rec { tnf: WELL_KNOWN, kind: b"T".to_vec(), id: vec![], payload: text_payload(t, s(r, "lang").unwrap_or("en"), false)? }),
+                Some(Value::Object(m)) => {
+                    for (lang, t) in m {
+                        inner.push(Rec { tnf: WELL_KNOWN, kind: b"T".to_vec(), id: vec![], payload: text_payload(t.as_str().ok_or("a title must be text")?, lang, false)? });
+                    }
+                }
+                _ => {}
+            }
+            if let Some(a) = s(r, "action") {
+                let code = ["open", "save", "edit"].iter().position(|x| *x == a).ok_or(format!("`{}` is not an action: open, save or edit", a))?;
+                inner.push(Rec { tnf: WELL_KNOWN, kind: b"act".to_vec(), id: vec![], payload: vec![code as u8] });
+            }
+            if let Some(n) = r.get("size").and_then(|v| v.as_u64()) {
+                let n = u32::try_from(n).map_err(|_| "`size` must fit 32 bits")?;
+                inner.push(Rec { tnf: WELL_KNOWN, kind: b"s".to_vec(), id: vec![], payload: n.to_be_bytes().to_vec() });
+            }
+            if let Some(t) = s(r, "content_type") {
+                inner.push(Rec { tnf: WELL_KNOWN, kind: b"t".to_vec(), id: vec![], payload: t.as_bytes().to_vec() });
+            }
+            (WELL_KNOWN, b"Sp".to_vec(), write_all(&inner, 0)?)
+        }
+        "android_app" => (EXTERNAL, b"android.com:pkg".to_vec(), need("package")?.as_bytes().to_vec()),
+        "external" => {
+            let t = need("domain_type")?.to_lowercase();
+            if !t.contains(':') || !t.is_ascii() {
+                return Err(format!("`{}` is not an external type: it is domain:type", t));
+            }
+            (EXTERNAL, t.into_bytes(), body_of(r)?)
+        }
+        "absolute_uri" => (ABSOLUTE, need("uri")?.as_bytes().to_vec(), body_of(r)?),
+        "well_known" => (WELL_KNOWN, need("name")?.as_bytes().to_vec(), body_of(r)?),
+        "empty" => (EMPTY, vec![], vec![]),
+        "unknown" => (UNKNOWN, vec![], body_of(r)?),
+        t => return Err(format!("`{}` is not a record type: uri, text, mime, smart_poster, android_app, external, absolute_uri, well_known, empty or unknown", t)),
+    };
+    if kind.len() > 255 {
+        return Err("a record's type is at most 255 bytes".into());
+    }
+    let id = s(r, "id").unwrap_or("").as_bytes().to_vec();
+    if id.len() > 255 {
+        return Err("a record's id is at most 255 bytes".into());
+    }
+    Ok(Rec { tnf, kind, id, payload })
+}
+
+fn write_one(out: &mut Vec<u8>, first: bool, last: bool, chunk: bool, tnf: u8, kind: &[u8], id: &[u8], payload: &[u8]) {
+    let sr = payload.len() < 256;
+    let mut h = tnf;
+    if first {
+        h |= 0x80;
+    }
+    if last {
+        h |= 0x40;
+    }
+    if chunk {
+        h |= 0x20;
+    }
+    if sr {
+        h |= 0x10;
+    }
+    if !id.is_empty() {
+        h |= 0x08;
+    }
+    out.push(h);
+    out.push(kind.len() as u8);
+    if sr {
+        out.push(payload.len() as u8);
+    } else {
+        out.extend((payload.len() as u32).to_be_bytes());
+    }
+    if !id.is_empty() {
+        out.push(id.len() as u8);
+    }
+    out.extend(kind);
+    out.extend(id);
+    out.extend(payload);
+}
+
+fn write_all(recs: &[Rec], chunk_size: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let n = recs.len();
+    for (i, r) in recs.iter().enumerate() {
+        let (first, last) = (i == 0, i + 1 == n);
+        if chunk_size == 0 || r.payload.len() <= chunk_size {
+            write_one(&mut out, first, last, false, r.tnf, &r.kind, &r.id, &r.payload);
+            continue;
+        }
+        if r.tnf == EMPTY {
+            return Err("an empty record cannot be chunked".into());
+        }
+        // The first chunk has the type and id; the others say UNCHANGED, with neither.
+        let parts: Vec<&[u8]> = r.payload.chunks(chunk_size).collect();
+        for (k, p) in parts.iter().enumerate() {
+            let end = k + 1 == parts.len();
+            if k == 0 {
+                write_one(&mut out, first, false, true, r.tnf, &r.kind, &r.id, p);
+            } else {
+                write_one(&mut out, false, last && end, !end, UNCHANGED, &[], &[], p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn read_all(b: &[u8]) -> Result<(Vec<Rec>, usize), String> {
+    if b.is_empty() {
+        return Err("an empty NDEF message".into());
+    }
+    let mut recs: Vec<Rec> = vec![];
+    let mut i = 0;
+    let mut in_chunks = false;
+    let mut chunked = 0;
+    let mut first = true;
+    loop {
+        let at = i;
+        let h = *b.get(i).ok_or(format!("the message ends at byte {} with no record marked last (ME)", i))?;
+        i += 1;
+        let (mb, me, cf, sr, il, tnf) = (h & 0x80 != 0, h & 0x40 != 0, h & 0x20 != 0, h & 0x10 != 0, h & 0x08 != 0, h & 7);
+        if first != mb {
+            return Err(format!("record at byte {}: {}", at, if first { "the first record is not marked MB" } else { "MB set on a record inside the message" }));
+        }
+        first = false;
+        let cut = || format!("record at byte {} runs past the end of the message", at);
+        let tl = *b.get(i).ok_or_else(cut)? as usize;
+        i += 1;
+        let pl = if sr {
+            let v = *b.get(i).ok_or_else(cut)? as usize;
+            i += 1;
+            v
+        } else {
+            let v = b.get(i..i + 4).ok_or_else(cut)?;
+            i += 4;
+            u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as usize
+        };
+        let il = if il {
+            let v = *b.get(i).ok_or_else(cut)? as usize;
+            i += 1;
+            v
+        } else {
+            0
+        };
+        let total = tl.checked_add(il).and_then(|x| x.checked_add(pl)).ok_or_else(cut)?;
+        if i.checked_add(total).map_or(true, |e| e > b.len()) {
+            return Err(cut());
+        }
+        let kind = b[i..i + tl].to_vec();
+        i += tl;
+        let id = b[i..i + il].to_vec();
+        i += il;
+        let payload = &b[i..i + pl];
+        i += pl;
+        if in_chunks {
+            if tnf != UNCHANGED || tl != 0 || il != 0 {
+                return Err(format!("record at byte {}: a middle or last chunk must say UNCHANGED, with no type or id", at));
+            }
+            recs.last_mut().expect("a chunk has a first").payload.extend(payload);
+            in_chunks = cf;
+        } else {
+            if tnf == UNCHANGED {
+                return Err(format!("record at byte {}: UNCHANGED outside a chunked record", at));
+            }
+            if tnf == 7 {
+                return Err(format!("record at byte {}: TNF 7 is reserved", at));
+            }
+            if tnf == EMPTY && (tl != 0 || il != 0 || pl != 0) {
+                return Err(format!("record at byte {}: an empty record holds something", at));
+            }
+            if tnf == UNKNOWN && tl != 0 {
+                return Err(format!("record at byte {}: an unknown record has no type", at));
+            }
+            recs.push(Rec { tnf, kind, id, payload: payload.to_vec() });
+            in_chunks = cf;
+            if cf {
+                chunked += 1;
+            }
+        }
+        if me {
+            if in_chunks {
+                return Err(format!("record at byte {}: the message ends inside a chunked record", at));
+            }
+            return Ok((recs, chunked));
+        }
+    }
+}
+
+fn text_of(p: &[u8]) -> Result<Value, String> {
+    let st = *p.first().ok_or("an empty text record")?;
+    let n = (st & 0x3f) as usize;
+    if 1 + n > p.len() {
+        return Err("a text record's language runs past its end".into());
+    }
+    let lang = String::from_utf8_lossy(&p[1..1 + n]).to_string();
+    let body = &p[1 + n..];
+    let (text, enc) = if st & 0x80 != 0 {
+        if body.len() % 2 != 0 {
+            return Err("UTF-16 text with an odd number of bytes".into());
+        }
+        let (le, data) = match body {
+            [0xff, 0xfe, r @ ..] => (true, r),
+            [0xfe, 0xff, r @ ..] => (false, r),
+            r => (false, r),
+        };
+        let u: Vec<u16> = data.chunks(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+        (String::from_utf16(&u).map_err(|_| "bad UTF-16 in a text record")?, "utf-16")
+    } else {
+        (String::from_utf8(body.to_vec()).map_err(|_| "bad UTF-8 in a text record")?, "utf-8")
+    };
+    Ok(json!({ "type": "text", "lang": lang, "encoding": enc, "text": text }))
+}
+
+fn uri_of(p: &[u8]) -> Result<String, String> {
+    let code = *p.first().ok_or("an empty URI record")? as usize;
+    let prefix = PREFIXES.get(code).ok_or(format!("URI prefix code 0x{:02x} is reserved", code))?;
+    Ok(format!("{}{}", prefix, std::str::from_utf8(&p[1..]).map_err(|_| "a URI record is not UTF-8")?))
+}
+
+fn text_or_hex(m: &mut Value, p: &[u8]) {
+    match std::str::from_utf8(p) {
+        Ok(t) if !t.chars().any(|c| c.is_control() && !c.is_whitespace()) => m["text"] = json!(t),
+        _ => m["hex"] = json!(hex::encode(p)),
+    }
+}
+
+fn describe(r: &Rec, depth: usize) -> Result<Value, String> {
+    let mut m = match (r.tnf, r.kind.as_slice()) {
+        (WELL_KNOWN, b"U") => json!({ "type": "uri", "uri": uri_of(&r.payload)? }),
+        (WELL_KNOWN, b"T") => text_of(&r.payload)?,
+        (WELL_KNOWN, b"Sp") => {
+            if depth > 4 {
+                return Err("smart posters nested too deep".into());
+            }
+            let (inner, _) = read_all(&r.payload).map_err(|e| format!("inside a smart poster: {}", e))?;
+            let mut m = json!({ "type": "smart_poster", "uri": Value::Null });
+            let mut titles = serde_json::Map::new();
+            for x in &inner {
+                match (x.tnf, x.kind.as_slice()) {
+                    (WELL_KNOWN, b"U") => m["uri"] = json!(uri_of(&x.payload)?),
+                    (WELL_KNOWN, b"T") => {
+                        let t = text_of(&x.payload)?;
+                        titles.insert(t["lang"].as_str().unwrap_or("").to_string(), t["text"].clone());
+                    }
+                    (WELL_KNOWN, b"act") => m["action"] = json!(match x.payload.first() { Some(0) => "open", Some(1) => "save", Some(2) => "edit", _ => "unknown" }),
+                    (WELL_KNOWN, b"s") if x.payload.len() == 4 => m["size"] = json!(u32::from_be_bytes([x.payload[0], x.payload[1], x.payload[2], x.payload[3]])),
+                    (WELL_KNOWN, b"t") => m["content_type"] = json!(String::from_utf8_lossy(&x.payload)),
+                    _ => {}
+                }
+            }
+            if m["uri"].is_null() {
+                return Err("a smart poster with no URI record".into());
+            }
+            if !titles.is_empty() {
+                m["title"] = titles.values().next().cloned().unwrap_or(Value::Null);
+                m["titles"] = Value::Object(titles);
+            }
+            m
+        }
+        (EXTERNAL, b"android.com:pkg") => json!({ "type": "android_app", "package": String::from_utf8_lossy(&r.payload) }),
+        (EXTERNAL, k) => {
+            let mut m = json!({ "type": "external", "domain_type": String::from_utf8_lossy(k) });
+            text_or_hex(&mut m, &r.payload);
+            m
+        }
+        (MIME, k) => {
+            let mut m = json!({ "type": "mime", "mime": String::from_utf8_lossy(k) });
+            text_or_hex(&mut m, &r.payload);
+            m
+        }
+        (ABSOLUTE, k) => {
+            let mut m = json!({ "type": "absolute_uri", "uri": String::from_utf8_lossy(k) });
+            text_or_hex(&mut m, &r.payload);
+            m
+        }
+        (EMPTY, _) => json!({ "type": "empty" }),
+        (UNKNOWN, _) => json!({ "type": "unknown", "hex": hex::encode(&r.payload) }),
+        (_, k) => {
+            let mut m = json!({ "type": "well_known", "name": String::from_utf8_lossy(k) });
+            text_or_hex(&mut m, &r.payload);
+            m
+        }
+    };
+    if !r.id.is_empty() {
+        m["id"] = json!(String::from_utf8_lossy(&r.id));
+    }
+    Ok(m)
+}
+
+/// Builds an NDEF message from records (see the top of the file); answers hex. A payload of 256 bytes or more gets a long record by itself.
+pub fn ndef_build(records: Vec<serde_json::Value>) -> Result<String, String> {
+    if records.is_empty() {
+        return Err("a message needs at least one record; use { type: \"empty\" } for an empty tag".into());
+    }
+    let recs = records.iter().map(record_of).collect::<Result<Vec<_>, _>>()?;
+    Ok(hex::encode(write_all(&recs, 0)?))
+}
+
+/// Builds a message with every payload over `chunk_size` bytes split into chunked records, as a phone sending over peer-to-peer may.
+pub fn ndef_build_chunked(records: Vec<serde_json::Value>, chunk_size: i64) -> Result<String, String> {
+    if chunk_size < 1 {
+        return Err("chunk_size must be at least 1".into());
+    }
+    if records.is_empty() {
+        return Err("a message needs at least one record".into());
+    }
+    let recs = records.iter().map(record_of).collect::<Result<Vec<_>, _>>()?;
+    Ok(hex::encode(write_all(&recs, chunk_size as usize)?))
+}
+
+/// Reads an NDEF message (hex or bytes) into records, chunks joined, smart posters opened: `{ records, count, chunked }`. A damaged message is an error naming the byte.
+pub fn ndef_parse(message: serde_json::Value) -> Result<Value, String> {
+    let b = bytes_of(&message)?;
+    let (recs, chunked) = read_all(&b)?;
+    let list = recs.iter().map(|r| describe(r, 0)).collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({ "count": list.len(), "chunked": chunked, "records": list }))
+}
+
+/// Each record's header as it is on the tag, for looking at one: flags, TNF, type, lengths. Chunks are shown one by one.
+pub fn ndef_inspect(message: serde_json::Value) -> Result<Vec<Value>, String> {
+    let b = bytes_of(&message)?;
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let h = b[i];
+        let sr = h & 0x10 != 0;
+        let il = h & 0x08 != 0;
+        let mut at = i + 1;
+        let tl = *b.get(at).ok_or("cut off")? as usize;
+        at += 1;
+        let pl = if sr {
+            *b.get(at).ok_or("cut off")? as usize
+        } else {
+            let v = b.get(at..at + 4).ok_or("cut off")?;
+            u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as usize
+        };
+        at += if sr { 1 } else { 4 };
+        let idl = if il { *b.get(at).ok_or("cut off")? as usize } else { 0 };
+        at += il as usize;
+        let t = b.get(at..at + tl).ok_or("cut off")?;
+        out.push(json!({ "at": i, "mb": h & 0x80 != 0, "me": h & 0x40 != 0, "cf": h & 0x20 != 0, "sr": sr, "tnf": h & 7, "type": String::from_utf8_lossy(t), "id_length": idl, "payload_length": pl }));
+        i = at + tl + idl + pl;
+    }
+    Ok(out)
+}
+
+/// The URI prefix table's code for a URI, and what is left after it: `{ code, prefix, rest }`.
+pub fn ndef_uri_prefix(uri: &str) -> Value {
+    let p = uri_payload(uri);
+    json!({ "code": p[0], "prefix": PREFIXES[p[0] as usize], "rest": String::from_utf8_lossy(&p[1..]) })
+}
+
+/// Wraps a message in the TLV a Type 2 tag stores: 0x03, the length (three bytes past 254), the message, 0xFE.
+pub fn ndef_tlv_wrap(message: serde_json::Value) -> Result<String, String> {
+    let m = bytes_of(&message)?;
+    if m.len() > 0xfffe {
+        return Err("a TLV holds at most 65534 bytes".into());
+    }
+    let mut out = vec![3u8];
+    if m.len() < 255 {
+        out.push(m.len() as u8);
+    } else {
+        out.push(0xff);
+        out.extend((m.len() as u16).to_be_bytes());
+    }
+    out.extend(&m);
+    out.push(0xfe);
+    Ok(hex::encode(out))
+}
+
+/// Finds the NDEF message in a tag's memory dump (TLVs), skipping NULL, lock and memory control TLVs; answers its hex, or null when the tag holds none.
+pub fn ndef_tlv_unwrap(memory: serde_json::Value) -> Result<Option<String>, String> {
+    let b = bytes_of(&memory)?;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            0x00 => i += 1,
+            0xfe => return Ok(None),
+            t => {
+                let n0 = *b.get(i + 1).ok_or("a TLV is cut off")? as usize;
+                let (n, head) = if n0 == 0xff {
+                    let v = b.get(i + 2..i + 4).ok_or("a TLV is cut off")?;
+                    (((v[0] as usize) << 8) | v[1] as usize, 4)
+                } else {
+                    (n0, 2)
+                };
+                let body = b.get(i + head..i + head + n).ok_or(format!("the TLV at byte {} says {} bytes, past the end of the memory", i, n))?;
+                if t == 3 {
+                    return Ok(Some(hex::encode(body)));
+                }
+                i += head + n;
+            }
+        }
+    }
+    Ok(None)
+}

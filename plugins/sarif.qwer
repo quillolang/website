@@ -1,0 +1,438 @@
+//! SARIF 2.1 static-analysis reports read, built and merged: results with their rules, severities and places, a summary by rule and file, and what is new between two reports.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+const SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
+const LEVELS: [&str; 4] = ["none", "note", "warning", "error"];
+
+fn load(text: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("not JSON: {}", e))?;
+    let ver = v.get("version").and_then(Value::as_str).ok_or("not a SARIF log: it has no `version`")?;
+    if ver != "2.1.0" {
+        return Err(format!("SARIF {} is not read here: only 2.1.0", ver));
+    }
+    if !v.get("runs").map_or(false, Value::is_array) {
+        return Err("not a SARIF log: `runs` must be a list".to_string());
+    }
+    Ok(v)
+}
+
+fn s<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut at = v;
+    for p in path {
+        at = at.get(*p)?;
+    }
+    at.as_str()
+}
+
+fn rank(level: &str) -> usize {
+    LEVELS.iter().position(|l| *l == level).unwrap_or(0)
+}
+
+/// A rule from a driver or an extension, by `ruleIndex`, `rule.index` with its toolComponent, or the id.
+fn find_rule<'a>(run: &'a Value, r: &Value) -> Option<&'a Value> {
+    let tool = run.get("tool")?;
+    let driver = tool.get("driver")?;
+    let rule = r.get("rule");
+    let index = r.get("ruleIndex").and_then(Value::as_i64).or_else(|| rule.and_then(|x| x.get("index")).and_then(Value::as_i64));
+    let component = rule.and_then(|x| x.get("toolComponent")).and_then(|c| c.get("index")).and_then(Value::as_i64);
+    let holder = match component {
+        Some(i) if i >= 0 => tool.get("extensions").and_then(|e| e.get(i as usize)).unwrap_or(driver),
+        _ => driver,
+    };
+    if let Some(i) = index.filter(|i| *i >= 0) {
+        if let Some(found) = holder.get("rules").and_then(|x| x.get(i as usize)) {
+            return Some(found);
+        }
+    }
+    let id = r.get("ruleId").and_then(Value::as_str).or_else(|| rule.and_then(|x| x.get("id")).and_then(Value::as_str))?;
+    // A hierarchical id, "CA1000/1", belongs to rule CA1000.
+    let head = id.split('/').next().unwrap_or(id);
+    std::iter::once(driver)
+        .chain(tool.get("extensions").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(|d| d.get("rules").and_then(Value::as_array))
+        .flatten()
+        .find(|x| x.get("id").and_then(Value::as_str).map_or(false, |i| i == id || i == head))
+}
+
+/// `{0}` in a message replaced by its argument; `{{` and `}}` are the braces.
+fn fill(text: &str, args: &[Value]) -> String {
+    let mut out = String::new();
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '{' && it.peek() == Some(&'{') {
+            it.next();
+            out.push('{');
+        } else if c == '}' && it.peek() == Some(&'}') {
+            it.next();
+            out.push('}');
+        } else if c == '{' {
+            let mut d = String::new();
+            while let Some(n) = it.peek().copied().filter(char::is_ascii_digit) {
+                d.push(n);
+                it.next();
+            }
+            if it.peek() == Some(&'}') && !d.is_empty() {
+                it.next();
+                match d.parse::<usize>().ok().and_then(|i| args.get(i)).and_then(Value::as_str) {
+                    Some(a) => out.push_str(a),
+                    None => out.push_str(&format!("{{{}}}", d)),
+                }
+            } else {
+                out.push('{');
+                out.push_str(&d);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn message(m: Option<&Value>, rule: Option<&Value>, run: &Value) -> Option<String> {
+    let m = m?;
+    let args = m.get("arguments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if let Some(t) = m.get("text").and_then(Value::as_str) {
+        return Some(fill(t, args));
+    }
+    let id = m.get("id").and_then(Value::as_str)?;
+    let store = rule.and_then(|r| r.get("messageStrings")).and_then(|x| x.get(id)).or_else(|| run.get("tool")?.get("driver")?.get("globalMessageStrings")?.get(id));
+    store.and_then(|x| x.get("text")).and_then(Value::as_str).map(|t| fill(t, args))
+}
+
+/// The URI of a location: an index into `run.artifacts` is followed, and a `uriBaseId` kept apart.
+fn place(run: &Value, l: &Value) -> Value {
+    let phys = match l.get("physicalLocation") {
+        Some(p) => p,
+        None => {
+            let name = l.get("logicalLocations").and_then(|x| x.get(0)).and_then(|x| x.get("fullyQualifiedName").or(x.get("name"))).cloned();
+            return json!({ "file": null, "base": null, "line": null, "column": null, "end_line": null, "end_column": null, "snippet": null, "logical": name });
+        }
+    };
+    let al = phys.get("artifactLocation");
+    let mut uri = al.and_then(|a| a.get("uri")).and_then(Value::as_str).map(str::to_string);
+    let mut base = al.and_then(|a| a.get("uriBaseId")).and_then(Value::as_str).map(str::to_string);
+    if let (None, Some(i)) = (&uri, al.and_then(|a| a.get("index")).and_then(Value::as_i64)) {
+        let art = run.get("artifacts").and_then(|x| x.get(i.max(0) as usize)).and_then(|x| x.get("location"));
+        uri = art.and_then(|a| a.get("uri")).and_then(Value::as_str).map(str::to_string);
+        if base.is_none() {
+            base = art.and_then(|a| a.get("uriBaseId")).and_then(Value::as_str).map(str::to_string);
+        }
+    }
+    let reg = phys.get("region");
+    let n = |k: &str| reg.and_then(|r| r.get(k)).cloned().unwrap_or(Value::Null);
+    let line = n("startLine");
+    // endLine defaults to startLine, and startColumn to 1, when a region starts on a line.
+    let end_line = reg.and_then(|r| r.get("endLine")).cloned().unwrap_or_else(|| line.clone());
+    json!({
+        "file": uri, "base": base, "line": line, "column": n("startColumn"),
+        "end_line": end_line, "end_column": n("endColumn"),
+        "snippet": reg.and_then(|r| r.get("snippet")).and_then(|x| x.get("text")).cloned().unwrap_or(Value::Null),
+        "logical": l.get("logicalLocations").and_then(|x| x.get(0)).and_then(|x| x.get("fullyQualifiedName").or(x.get("name"))).cloned(),
+    })
+}
+
+fn flat(run: &Value, r: &Value) -> Value {
+    let rule = find_rule(run, r);
+    let cfg_level = rule.and_then(|x| s(x, &["defaultConfiguration", "level"]));
+    let kind = r.get("kind").and_then(Value::as_str).unwrap_or("fail");
+    // The spec's order: the result's own, else none when it is not a failure, else the rule's, else warning.
+    let level = r.get("level").and_then(Value::as_str).unwrap_or(if kind != "fail" { "none" } else { cfg_level.unwrap_or("warning") });
+    let id = r.get("ruleId").and_then(Value::as_str).or_else(|| s(r, &["rule", "id"])).or_else(|| rule.and_then(|x| x.get("id")).and_then(Value::as_str));
+    let locations: Vec<Value> = r.get("locations").and_then(Value::as_array).map(|l| l.iter().map(|x| place(run, x)).collect()).unwrap_or_default();
+    let first = locations.first().cloned().unwrap_or(json!({}));
+    let sup = r.get("suppressions").and_then(Value::as_array).map_or(false, |x| x.iter().any(|y| matches!(y.get("status").and_then(Value::as_str), None | Some("accepted"))));
+    json!({
+        "tool": s(run, &["tool", "driver", "name"]),
+        "rule": id,
+        "rule_name": rule.and_then(|x| x.get("name")),
+        "level": level,
+        "kind": kind,
+        "message": message(r.get("message"), rule, run),
+        "file": first.get("file"), "base": first.get("base"), "line": first.get("line"), "column": first.get("column"),
+        "end_line": first.get("end_line"), "end_column": first.get("end_column"), "snippet": first.get("snippet"),
+        "places": locations.len(),
+        "help": rule.and_then(|x| x.get("helpUri")),
+        "suppressed": sup,
+        "baseline": r.get("baselineState"),
+        "fingerprint": fingerprint(run, r),
+    })
+}
+
+/// What says two results are one: a fingerprint when the tool gave one, else rule, file and message.
+fn fingerprint(run: &Value, r: &Value) -> String {
+    for key in ["fingerprints", "partialFingerprints"] {
+        if let Some(m) = r.get(key).and_then(Value::as_object) {
+            if let Some((k, v)) = m.iter().min_by_key(|(k, _)| k.as_str()) {
+                return format!("{}:{}", k, v.as_str().unwrap_or(""));
+            }
+        }
+    }
+    let rule = find_rule(run, r);
+    let id = r.get("ruleId").and_then(Value::as_str).or_else(|| rule.and_then(|x| x.get("id")).and_then(Value::as_str)).unwrap_or("");
+    let p = r.get("locations").and_then(|l| l.get(0)).map(|l| place(run, l)).unwrap_or(Value::Null);
+    format!("{}|{}|{}", id, p.get("file").and_then(Value::as_str).unwrap_or(""), message(r.get("message"), rule, run).unwrap_or_default())
+}
+
+fn results_of(log: &Value) -> Vec<Value> {
+    log["runs"].as_array().into_iter().flatten().flat_map(|run| run.get("results").and_then(Value::as_array).into_iter().flatten().map(move |r| flat(run, r))).collect()
+}
+
+/// Reads a SARIF log: `{ version, runs: [{ tool, version, rules, results }], results }`, each result flat, with rule, level, message, file, line and column.
+pub fn sarif_read(text: &str) -> Result<Value, String> {
+    let log = load(text)?;
+    let runs: Vec<Value> = log["runs"].as_array().unwrap().iter().map(|run| {
+        let rules: Vec<Value> = run.get("tool").and_then(|t| t.get("driver")).and_then(|d| d.get("rules")).and_then(Value::as_array).map(|r| r.iter().map(|x| json!({
+            "id": x.get("id"), "name": x.get("name"),
+            "summary": s(x, &["shortDescription", "text"]),
+            "level": s(x, &["defaultConfiguration", "level"]).unwrap_or("warning"),
+            "help": x.get("helpUri"),
+        })).collect()).unwrap_or_default();
+        json!({
+            "tool": s(run, &["tool", "driver", "name"]),
+            "version": s(run, &["tool", "driver", "semanticVersion"]).or(s(run, &["tool", "driver", "version"])),
+            "rules": rules,
+            "results": run.get("results").and_then(Value::as_array).map_or(0, Vec::len),
+        })
+    }).collect();
+    let results = results_of(&log);
+    Ok(json!({ "version": "2.1.0", "runs": runs, "results": results }))
+}
+
+/// Reads a SARIF file from a path, as `sarif_read` does.
+pub fn sarif_read_file(path: &str) -> Result<Value, String> {
+    let t = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    sarif_read(&t)
+}
+
+/// Results that are not suppressed, at `min_level` or above; `path` keeps files under a prefix, `rule` one rule.
+pub fn sarif_results(text: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let log = load(text)?;
+    let min = options.get("min_level").and_then(Value::as_str).unwrap_or("none");
+    if !LEVELS.contains(&min) {
+        return Err(format!("`{}` is not a level: none, note, warning or error", min));
+    }
+    let suppressed = options.get("suppressed").and_then(Value::as_bool).unwrap_or(false);
+    let path = options.get("path").and_then(Value::as_str);
+    let rule = options.get("rule").and_then(Value::as_str);
+    Ok(results_of(&log).into_iter().filter(|r| {
+        rank(r["level"].as_str().unwrap_or("none")) >= rank(min)
+            && (suppressed || r["suppressed"] != json!(true))
+            && path.map_or(true, |p| r["file"].as_str().map_or(false, |f| f.starts_with(p)))
+            && rule.map_or(true, |x| r["rule"].as_str() == Some(x))
+    }).collect())
+}
+
+/// Counts by level, rule and file, the worst first, and whether anything at `error` is open.
+pub fn sarif_summary(text: &str) -> Result<Value, String> {
+    let log = load(text)?;
+    let all = results_of(&log);
+    let open: Vec<&Value> = all.iter().filter(|r| r["suppressed"] != json!(true)).collect();
+    let mut levels: BTreeMap<usize, i64> = BTreeMap::new();
+    let mut rules: HashMap<String, (i64, usize, Value)> = HashMap::new();
+    let mut files: HashMap<String, (i64, usize)> = HashMap::new();
+    for r in &open {
+        let level = rank(r["level"].as_str().unwrap_or("none"));
+        *levels.entry(level).or_default() += 1;
+        let e = rules.entry(r["rule"].as_str().unwrap_or("(no rule)").to_string()).or_insert((0, 0, r["rule_name"].clone()));
+        e.0 += 1;
+        e.1 = e.1.max(level);
+        let f = files.entry(r["file"].as_str().unwrap_or("(no file)").to_string()).or_insert((0, 0));
+        f.0 += 1;
+        f.1 = f.1.max(level);
+    }
+    let mut by_rule: Vec<(String, (i64, usize, Value))> = rules.into_iter().collect();
+    by_rule.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)).then(a.0.cmp(&b.0)));
+    let mut by_file: Vec<(String, (i64, usize))> = files.into_iter().collect();
+    by_file.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.1 .1.cmp(&a.1 .1)).then(a.0.cmp(&b.0)));
+    let mut level_map = Map::new();
+    for l in ["error", "warning", "note", "none"] {
+        level_map.insert(l.to_string(), json!(levels.get(&rank(l)).copied().unwrap_or(0)));
+    }
+    Ok(json!({
+        "results": all.len(), "open": open.len(), "suppressed": all.len() - open.len(),
+        "levels": level_map,
+        "rules": by_rule.into_iter().map(|(k, v)| json!({ "rule": k, "name": v.2, "count": v.0, "worst": LEVELS[v.1] })).collect::<Vec<_>>(),
+        "files": by_file.into_iter().map(|(k, v)| json!({ "file": k, "count": v.0, "worst": LEVELS[v.1] })).collect::<Vec<_>>(),
+        "clean": !levels.contains_key(&rank("error")),
+    }))
+}
+
+/// Builds a log from `{ name, version, uri }` and flat results `{ rule, level, message, file, line, column, end_line, end_column, snippet, fingerprint }`, with rules from `tool.rules` and those the results name.
+pub fn sarif_build(tool: serde_json::Value, results: Vec<serde_json::Value>) -> Result<String, String> {
+    let name = tool.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or("a tool needs a `name`")?;
+    let mut rules: Vec<Value> = vec![];
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for r in tool.get("rules").and_then(Value::as_array).into_iter().flatten() {
+        let id = r.get("id").and_then(Value::as_str).ok_or("each rule needs an `id`")?;
+        if index.contains_key(id) {
+            return Err(format!("rule {} is given twice", id));
+        }
+        let mut m = Map::new();
+        m.insert("id".into(), json!(id));
+        if let Some(n) = r.get("name") { m.insert("name".into(), n.clone()); }
+        if let Some(t) = r.get("summary").and_then(Value::as_str) { m.insert("shortDescription".into(), json!({ "text": t })); }
+        if let Some(h) = r.get("help") { m.insert("helpUri".into(), h.clone()); }
+        if let Some(l) = r.get("level").and_then(Value::as_str) {
+            check_level(l)?;
+            m.insert("defaultConfiguration".into(), json!({ "level": l }));
+        }
+        index.insert(id.to_string(), rules.len());
+        rules.push(Value::Object(m));
+    }
+    let mut artifacts: Vec<Value> = vec![];
+    let mut art_index: HashMap<String, usize> = HashMap::new();
+    let mut out = vec![];
+    for (i, r) in results.iter().enumerate() {
+        let msg = r.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).ok_or(format!("result {}: a result needs a `message`", i))?;
+        let mut m = Map::new();
+        if let Some(id) = r.get("rule").and_then(Value::as_str) {
+            let at = *index.entry(id.to_string()).or_insert_with(|| { rules.push(json!({ "id": id })); rules.len() - 1 });
+            m.insert("ruleId".into(), json!(id));
+            m.insert("ruleIndex".into(), json!(at));
+        }
+        if let Some(l) = r.get("level").and_then(Value::as_str) {
+            check_level(l).map_err(|e| format!("result {}: {}", i, e))?;
+            m.insert("level".into(), json!(l));
+        }
+        m.insert("message".into(), json!({ "text": msg }));
+        if let Some(f) = r.get("file").and_then(Value::as_str) {
+            let uri = uri_of(f);
+            let at = *art_index.entry(uri.clone()).or_insert_with(|| { artifacts.push(json!({ "location": { "uri": uri } })); artifacts.len() - 1 });
+            let mut phys = Map::new();
+            phys.insert("artifactLocation".into(), json!({ "uri": uri, "index": at }));
+            let mut region = Map::new();
+            for (from, to) in [("line", "startLine"), ("column", "startColumn"), ("end_line", "endLine"), ("end_column", "endColumn")] {
+                match r.get(from).and_then(Value::as_i64) {
+                    Some(n) if n >= 1 => { region.insert(to.into(), json!(n)); }
+                    Some(n) => return Err(format!("result {}: `{}` is {}: lines and columns start at 1", i, from, n)),
+                    None => {}
+                }
+            }
+            if let Some(t) = r.get("snippet").and_then(Value::as_str) { region.insert("snippet".into(), json!({ "text": t })); }
+            if !region.is_empty() { phys.insert("region".into(), Value::Object(region)); }
+            m.insert("locations".into(), json!([{ "physicalLocation": phys }]));
+        }
+        if let Some(f) = r.get("fingerprint").and_then(Value::as_str) {
+            m.insert("partialFingerprints".into(), json!({ "primaryLocationLineHash": f }));
+        }
+        if r.get("suppressed") == Some(&json!(true)) {
+            m.insert("suppressions".into(), json!([{ "kind": "inSource" }]));
+        }
+        out.push(Value::Object(m));
+    }
+    let mut driver = Map::new();
+    driver.insert("name".into(), json!(name));
+    if let Some(v) = tool.get("version") { driver.insert("semanticVersion".into(), v.clone()); }
+    if let Some(u) = tool.get("uri") { driver.insert("informationUri".into(), u.clone()); }
+    driver.insert("rules".into(), Value::Array(rules));
+    let log = json!({ "$schema": SCHEMA, "version": "2.1.0", "runs": [{ "tool": { "driver": driver }, "artifacts": artifacts, "results": out }] });
+    serde_json::to_string_pretty(&log).map_err(|e| e.to_string())
+}
+
+fn check_level(l: &str) -> Result<(), String> {
+    if LEVELS.contains(&l) { Ok(()) } else { Err(format!("`{}` is not a level: none, note, warning or error", l)) }
+}
+
+/// A file path as a URI reference: forward slashes, and spaces and the like percent-encoded.
+fn uri_of(path: &str) -> String {
+    let mut out = String::new();
+    for b in path.replace('\\', "/").bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' | b'%' | b'@' | b'+' | b'=' | b',' | b'$' | b'&' | b'!' | b'\'' | b'(' | b')' | b'*' | b';' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Merges logs: one run per tool and version, rule and artifact indexes made right, and a result seen twice kept once.
+pub fn sarif_merge(logs: Vec<String>) -> Result<String, String> {
+    if logs.is_empty() {
+        return Err("nothing to merge".to_string());
+    }
+    let mut merged: Vec<(String, Value, HashMap<String, usize>, HashMap<String, usize>, HashSet<String>)> = vec![];
+    for (n, text) in logs.iter().enumerate() {
+        let log = load(text).map_err(|e| format!("log {}: {}", n, e))?;
+        for run in log["runs"].as_array().unwrap() {
+            let key = format!("{}\u{0}{}", s(run, &["tool", "driver", "name"]).unwrap_or(""), s(run, &["tool", "driver", "semanticVersion"]).or(s(run, &["tool", "driver", "version"])).unwrap_or(""));
+            let at = match merged.iter().position(|m| m.0 == key) {
+                Some(i) => i,
+                None => {
+                    let mut fresh = run.clone();
+                    let d = &mut fresh["tool"]["driver"];
+                    if d.is_object() { d["rules"] = json!([]); }
+                    fresh["artifacts"] = json!([]);
+                    fresh["results"] = json!([]);
+                    merged.push((key, fresh, HashMap::new(), HashMap::new(), HashSet::new()));
+                    merged.len() - 1
+                }
+            };
+            let m = &mut merged[at];
+            for r in run.get("results").and_then(Value::as_array).into_iter().flatten() {
+                if !m.4.insert(fingerprint(run, r)) {
+                    continue;
+                }
+                let mut r2 = r.clone();
+                let rule = find_rule(run, r);
+                if let Some(rule) = rule {
+                    let id = rule.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let idx = match m.2.get(&id) {
+                        Some(i) => *i,
+                        None => {
+                            let rules = m.1["tool"]["driver"]["rules"].as_array_mut().ok_or("a run has no tool driver")?;
+                            rules.push(rule.clone());
+                            m.2.insert(id.clone(), rules.len() - 1);
+                            rules.len() - 1
+                        }
+                    };
+                    r2["ruleIndex"] = json!(idx);
+                    if r2.get("ruleId").is_none() { r2["ruleId"] = json!(id); }
+                    if let Some(o) = r2.get_mut("rule").and_then(Value::as_object_mut) {
+                        o.remove("index");
+                        o.remove("toolComponent");
+                    }
+                }
+                for loc in r2.get_mut("locations").and_then(Value::as_array_mut).into_iter().flatten() {
+                    let al = &mut loc["physicalLocation"]["artifactLocation"];
+                    if !al.is_object() { continue; }
+                    let original = al.get("index").and_then(Value::as_i64).and_then(|i| run.get("artifacts")?.get(i.max(0) as usize)).cloned();
+                    let uri = al.get("uri").and_then(Value::as_str).map(str::to_string).or_else(|| original.as_ref().and_then(|o| s(o, &["location", "uri"])).map(str::to_string));
+                    if let Some(uri) = uri {
+                        let idx = match m.3.get(&uri) {
+                            Some(i) => *i,
+                            None => {
+                                let list = m.1["artifacts"].as_array_mut().unwrap();
+                                list.push(original.unwrap_or(json!({ "location": { "uri": uri } })));
+                                m.3.insert(uri.clone(), list.len() - 1);
+                                list.len() - 1
+                            }
+                        };
+                        al["uri"] = json!(uri);
+                        al["index"] = json!(idx);
+                    }
+                }
+                m.1["results"].as_array_mut().unwrap().push(r2);
+            }
+        }
+    }
+    let runs: Vec<Value> = merged.into_iter().map(|m| m.1).collect();
+    serde_json::to_string_pretty(&json!({ "$schema": SCHEMA, "version": "2.1.0", "runs": runs })).map_err(|e| e.to_string())
+}
+
+/// What changed from a base report to a new one: `{ new, fixed, unchanged }`, by fingerprint, for failing a pull request only on what it added.
+pub fn sarif_diff(base: &str, head: &str) -> Result<Value, String> {
+    let (a, b) = (load(base).map_err(|e| format!("base: {}", e))?, load(head).map_err(|e| format!("head: {}", e))?);
+    let (a, b) = (results_of(&a), results_of(&b));
+    let key = |r: &Value| r["fingerprint"].as_str().unwrap_or("").to_string();
+    let had: HashSet<String> = a.iter().map(key).collect();
+    let has: HashSet<String> = b.iter().map(key).collect();
+    let new: Vec<&Value> = b.iter().filter(|r| !had.contains(&key(r))).collect();
+    let fixed: Vec<&Value> = a.iter().filter(|r| !has.contains(&key(r))).collect();
+    Ok(json!({ "new": new, "fixed": fixed, "unchanged": b.len() - new.len() }))
+}

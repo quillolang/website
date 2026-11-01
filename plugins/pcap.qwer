@@ -1,0 +1,777 @@
+//! Packet captures read in pure Rust: pcap in either byte order and microseconds or nanoseconds, and pcapng with its sections, interfaces, simple packets and name records; each packet summarised down through Ethernet, VLAN and QinQ tags, ARP, IPv4 and IPv6 with their extensions, TCP, UDP and ICMP, with filters, totals, top talkers, and captures written.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hex = "0.4"
+//! serde_json = { version = "1", features = ["preserve_order"] }
+
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+const MAX_PACKET: u32 = 16 << 20;
+
+const ETHERNET: u32 = 1;
+const NULL: u32 = 0;
+const RAW: u32 = 101;
+const RAW_V4: u32 = 228;
+const RAW_V6: u32 = 229;
+const LOOP: u32 = 108;
+const SLL: u32 = 113;
+const SLL2: u32 = 276;
+
+fn link_name(l: u32) -> String {
+    match l {
+        NULL => "null".into(),
+        ETHERNET => "ethernet".into(),
+        RAW | RAW_V4 | RAW_V6 => "raw ip".into(),
+        LOOP => "loopback".into(),
+        SLL => "linux cooked".into(),
+        SLL2 => "linux cooked v2".into(),
+        105 => "802.11".into(),
+        127 => "802.11 radiotap".into(),
+        n => format!("link type {}", n),
+    }
+}
+
+struct Interface {
+    link: u32,
+    snap: u32,
+    per_second: u64, // timestamp ticks in a second
+    name: Option<String>,
+    offset: i64,
+}
+
+struct Packet {
+    index: u64,
+    nanos: i128,
+    data: Vec<u8>,
+    original: u32,
+    link: u32,
+    interface: u32,
+}
+
+#[derive(Default)]
+struct Summary {
+    format: String,
+    version: String,
+    order: String,
+    resolution: String,
+    interfaces: Vec<Value>,
+    names: Map<String, Value>,
+    sections: u32,
+    cut_off: Option<String>,
+}
+
+struct R {
+    f: BufReader<File>,
+    be: bool,
+}
+
+impl R {
+    fn u16(&self, b: &[u8]) -> u16 {
+        let x = [b[0], b[1]];
+        if self.be { u16::from_be_bytes(x) } else { u16::from_le_bytes(x) }
+    }
+    fn u32(&self, b: &[u8]) -> u32 {
+        let x = [b[0], b[1], b[2], b[3]];
+        if self.be { u32::from_be_bytes(x) } else { u32::from_le_bytes(x) }
+    }
+    // Fills `buf`; false at a clean end of file.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<bool, String> {
+        let mut n = 0;
+        while n < buf.len() {
+            match self.f.read(&mut buf[n..]) {
+                Ok(0) if n == 0 => return Ok(false),
+                Ok(0) => return Err("cut off".into()),
+                Ok(k) => n += k,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn open(path: &str) -> Result<File, String> {
+    File::open(path).map_err(|e| format!("cannot open {}: {}", path, e))
+}
+
+// Reads every packet of a file, calling `each` until it says to stop.
+fn read_file(path: &str, mut each: impl FnMut(Packet) -> bool) -> Result<Summary, String> {
+    let mut r = R { f: BufReader::with_capacity(1 << 16, open(path)?), be: false };
+    let mut magic = [0u8; 4];
+    if !r.fill(&mut magic).map_err(|_| format!("{} is too short to be a capture", path))? {
+        return Err(format!("{} is empty", path));
+    }
+    match magic {
+        [0x0a, 0x0d, 0x0d, 0x0a] => read_ng(&mut r, &mut each),
+        [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] | [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => read_classic(&mut r, magic, &mut each),
+        _ => Err(format!("{} is not a pcap or pcapng file: it starts {}", path, hex::encode(magic))),
+    }
+}
+
+fn read_classic(r: &mut R, magic: [u8; 4], each: &mut impl FnMut(Packet) -> bool) -> Result<Summary, String> {
+    r.be = magic[0] == 0xa1;
+    let nano = magic == [0xa1, 0xb2, 0x3c, 0x4d] || magic == [0x4d, 0x3c, 0xb2, 0xa1];
+    let mut h = [0u8; 20];
+    r.fill(&mut h).map_err(|_| "the pcap header is cut off".to_string())?;
+    let (major, minor) = (r.u16(&h[0..]), r.u16(&h[2..]));
+    let snap = r.u32(&h[12..]);
+    let net = r.u32(&h[16..]);
+    // The top bits can carry FCS length; the link type is the low 28.
+    let link = net & 0x0fff_ffff;
+    let mut s = Summary {
+        format: "pcap".into(),
+        version: format!("{}.{}", major, minor),
+        order: if r.be { "big-endian" } else { "little-endian" }.into(),
+        resolution: if nano { "nanoseconds" } else { "microseconds" }.into(),
+        interfaces: vec![json!({ "link": link_name(link), "snaplen": snap })],
+        sections: 1,
+        ..Default::default()
+    };
+    let mut rec = [0u8; 16];
+    let mut index = 0;
+    loop {
+        match r.fill(&mut rec) {
+            Ok(true) => {}
+            Ok(false) => return Ok(s),
+            Err(_) => {
+                s.cut_off = Some(format!("the file ends inside packet {}'s header", index));
+                return Ok(s);
+            }
+        }
+        let (secs, frac, cap, orig) = (r.u32(&rec[0..]), r.u32(&rec[4..]), r.u32(&rec[8..]), r.u32(&rec[12..]));
+        if cap > MAX_PACKET {
+            return Err(format!("packet {} says {} bytes: the file is damaged", index, cap));
+        }
+        let mut data = vec![0u8; cap as usize];
+        if r.fill(&mut data).is_err() {
+            s.cut_off = Some(format!("the file ends inside packet {}", index));
+            return Ok(s);
+        }
+        let nanos = secs as i128 * 1_000_000_000 + frac as i128 * if nano { 1 } else { 1000 };
+        if !each(Packet { index, nanos, data, original: orig, link, interface: 0 }) {
+            return Ok(s);
+        }
+        index += 1;
+    }
+}
+
+fn read_ng(r: &mut R, each: &mut impl FnMut(Packet) -> bool) -> Result<Summary, String> {
+    let mut s = Summary { format: "pcapng".into(), resolution: "per interface".into(), ..Default::default() };
+    let mut interfaces: Vec<Interface> = vec![];
+    let mut index = 0u64;
+    let mut first = true;
+    let mut base = 0usize; // interfaces of earlier sections
+    loop {
+        let mut head = [0u8; 8];
+        if first {
+            head[..4].copy_from_slice(&[0x0a, 0x0d, 0x0d, 0x0a]);
+            let mut rest = [0u8; 4];
+            r.fill(&mut rest).map_err(|_| "the first block is cut off".to_string())?;
+            head[4..].copy_from_slice(&rest);
+            first = false;
+        } else {
+            match r.fill(&mut head) {
+                Ok(true) => {}
+                Ok(false) => return Ok(s),
+                Err(_) => {
+                    s.cut_off = Some("the file ends inside a block's header".into());
+                    return Ok(s);
+                }
+            }
+        }
+        let is_section = head[..4] == [0x0a, 0x0d, 0x0d, 0x0a];
+        if is_section {
+            // Each section has its own byte order, told by the first thing in it.
+            let mut bom = [0u8; 4];
+            if r.fill(&mut bom).is_err() {
+                s.cut_off = Some("the file ends inside a section header".into());
+                return Ok(s);
+            }
+            r.be = bom == [0x1a, 0x2b, 0x3c, 0x4d];
+            if !r.be && bom != [0x4d, 0x3c, 0x2b, 0x1a] {
+                return Err("a section header with no byte-order magic".into());
+            }
+            let total = r.u32(&head[4..]) as usize;
+            if total < 28 || total > MAX_PACKET as usize || total % 4 != 0 {
+                return Err(format!("a section header says {} bytes", total));
+            }
+            let mut body = vec![0u8; total - 12];
+            if r.fill(&mut body).is_err() {
+                s.cut_off = Some("the file ends inside a section header".into());
+                return Ok(s);
+            }
+            let (maj, min) = (r.u16(&body[0..]), r.u16(&body[2..]));
+            s.version = format!("{}.{}", maj, min);
+            let o = if r.be { "big-endian" } else { "little-endian" };
+            if s.order.is_empty() {
+                s.order = o.into();
+            } else if s.order != o {
+                s.order = "mixed".into();
+            }
+            s.sections += 1;
+            base = interfaces.len();
+            continue;
+        }
+        let kind = r.u32(&head[0..]);
+        let total = r.u32(&head[4..]) as usize;
+        if total < 12 || total % 4 != 0 || total > MAX_PACKET as usize + 256 {
+            return Err(format!("a block at packet {} says {} bytes: the file is damaged", index, total));
+        }
+        let mut body = vec![0u8; total - 8];
+        if r.fill(&mut body).is_err() {
+            s.cut_off = Some(format!("the file ends inside the block after packet {}", index.saturating_sub(1)));
+            return Ok(s);
+        }
+        let tail = r.u32(&body[body.len() - 4..]) as usize;
+        if tail != total {
+            return Err(format!("a block's two lengths differ ({} and {}): the file is damaged", total, tail));
+        }
+        let b = &body[..body.len() - 4];
+        match kind {
+            1 if b.len() >= 8 => {
+                let link = r.u16(&b[0..]) as u32;
+                let snap = r.u32(&b[4..]);
+                let mut per_second = 1_000_000u64;
+                let mut name = None;
+                let mut offset = 0i64;
+                let mut i = 8;
+                while i + 4 <= b.len() {
+                    let (c, n) = (r.u16(&b[i..]), r.u16(&b[i + 2..]) as usize);
+                    i += 4;
+                    if c == 0 {
+                        break;
+                    }
+                    let Some(v) = b.get(i..i + n) else { break };
+                    match c {
+                        2 => name = Some(String::from_utf8_lossy(v).to_string()),
+                        9 if n == 1 => {
+                            let e = (v[0] & 0x7f) as u32;
+                            per_second = if v[0] & 0x80 != 0 { 2u64.checked_pow(e).unwrap_or(1) } else { 10u64.checked_pow(e).unwrap_or(1) };
+                        }
+                        14 if n == 8 => {
+                            let raw = (r.u32(&v[0..]) as u64, r.u32(&v[4..]) as u64);
+                            offset = if r.be { (raw.0 << 32 | raw.1) as i64 } else { (raw.1 << 32 | raw.0) as i64 };
+                        }
+                        _ => {}
+                    }
+                    i += (n + 3) / 4 * 4;
+                }
+                s.interfaces.push(json!({ "link": link_name(link), "snaplen": snap, "name": name, "ticks_per_second": per_second }));
+                interfaces.push(Interface { link, snap, per_second, name, offset });
+            }
+            6 if b.len() >= 20 => {
+                let iface = r.u32(&b[0..]) as usize + base;
+                let i = interfaces.get(iface).ok_or(format!("a packet on interface {}, which no block defined", iface - base))?;
+                let ticks = (r.u32(&b[4..]) as u128) << 32 | r.u32(&b[8..]) as u128;
+                let (cap, orig) = (r.u32(&b[12..]), r.u32(&b[16..]));
+                let data = b.get(20..20 + cap as usize).ok_or("a packet longer than its block")?.to_vec();
+                let nanos = (ticks * 1_000_000_000 / i.per_second as u128) as i128 + i.offset as i128 * 1_000_000_000;
+                if !each(Packet { index, nanos, data, original: orig, link: i.link, interface: iface as u32 }) {
+                    return Ok(s);
+                }
+                index += 1;
+            }
+            3 if b.len() >= 4 => {
+                let i = interfaces.get(base).ok_or("a simple packet with no interface defined")?;
+                let orig = r.u32(&b[0..]);
+                let cap = (orig.min(if i.snap == 0 { u32::MAX } else { i.snap })) as usize;
+                let data = b.get(4..4 + cap).ok_or("a simple packet longer than its block")?.to_vec();
+                // A simple packet has no timestamp.
+                if !each(Packet { index, nanos: 0, data, original: orig, link: i.link, interface: base as u32 }) {
+                    return Ok(s);
+                }
+                index += 1;
+            }
+            4 => {
+                let mut i = 0;
+                while i + 4 <= b.len() {
+                    let (ty, n) = (r.u16(&b[i..]), r.u16(&b[i + 2..]) as usize);
+                    i += 4;
+                    if ty == 0 {
+                        break;
+                    }
+                    let Some(v) = b.get(i..i + n) else { break };
+                    let names = |at: usize| v[at..].split(|c| *c == 0).filter(|x| !x.is_empty()).map(|x| String::from_utf8_lossy(x).to_string()).collect::<Vec<_>>();
+                    if ty == 1 && n >= 4 {
+                        s.names.insert(Ipv4Addr::new(v[0], v[1], v[2], v[3]).to_string(), json!(names(4)));
+                    } else if ty == 2 && n >= 16 {
+                        let mut a = [0u8; 16];
+                        a.copy_from_slice(&v[..16]);
+                        s.names.insert(Ipv6Addr::from(a).to_string(), json!(names(16)));
+                    }
+                    i += (n + 3) / 4 * 4;
+                }
+            }
+            _ => {} // statistics, journals, custom blocks: not packets
+        }
+    }
+}
+
+fn mac(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(":")
+}
+
+fn flags(f: u8) -> String {
+    [(0x02, 'S'), (0x10, 'A'), (0x01, 'F'), (0x04, 'R'), (0x08, 'P'), (0x20, 'U')].iter().filter(|(b, _)| f & b != 0).map(|x| x.1).collect()
+}
+
+struct Decoded {
+    m: Map<String, Value>,
+    layers: Vec<&'static str>,
+}
+
+impl Decoded {
+    fn put(&mut self, k: &str, v: Value) {
+        self.m.insert(k.to_string(), v);
+    }
+}
+
+fn transport(d: &mut Decoded, proto: u8, b: &[u8], fragment: bool) {
+    let name = match proto {
+        1 => "icmp",
+        2 => "igmp",
+        6 => "tcp",
+        17 => "udp",
+        47 => "gre",
+        50 => "esp",
+        58 => "icmpv6",
+        132 => "sctp",
+        _ => "",
+    };
+    if name.is_empty() {
+        d.put("protocol", json!(proto));
+        return;
+    }
+    d.put("protocol", json!(name));
+    d.layers.push(name);
+    if fragment {
+        return; // the header is in the first fragment
+    }
+    match proto {
+        6 => {
+            if b.len() < 20 {
+                d.put("cut_short", json!(true));
+                return;
+            }
+            let off = ((b[12] >> 4) as usize) * 4;
+            d.put("src_port", json!(u16::from_be_bytes([b[0], b[1]])));
+            d.put("dst_port", json!(u16::from_be_bytes([b[2], b[3]])));
+            d.put("seq", json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]])));
+            d.put("ack", json!(u32::from_be_bytes([b[8], b[9], b[10], b[11]])));
+            d.put("flags", json!(flags(b[13])));
+            d.put("window", json!(u16::from_be_bytes([b[14], b[15]])));
+            d.put("payload", json!(b.len().saturating_sub(off)));
+        }
+        17 => {
+            if b.len() < 8 {
+                d.put("cut_short", json!(true));
+                return;
+            }
+            d.put("src_port", json!(u16::from_be_bytes([b[0], b[1]])));
+            d.put("dst_port", json!(u16::from_be_bytes([b[2], b[3]])));
+            d.put("payload", json!((u16::from_be_bytes([b[4], b[5]]) as usize).saturating_sub(8)));
+        }
+        1 | 58 if b.len() >= 2 => {
+            d.put("icmp_type", json!(b[0]));
+            d.put("icmp_code", json!(b[1]));
+            let t = match (proto, b[0]) {
+                (1, 0) | (58, 129) => "echo reply",
+                (1, 8) | (58, 128) => "echo request",
+                (1, 3) | (58, 1) => "unreachable",
+                (1, 11) | (58, 3) => "time exceeded",
+                (58, 135) => "neighbor solicitation",
+                (58, 136) => "neighbor advertisement",
+                _ => "",
+            };
+            if !t.is_empty() {
+                d.put("icmp", json!(t));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ipv4(d: &mut Decoded, b: &[u8]) {
+    d.layers.push("ipv4");
+    if b.len() < 20 {
+        d.put("cut_short", json!(true));
+        return;
+    }
+    let ihl = ((b[0] & 15) as usize) * 4;
+    let total = u16::from_be_bytes([b[2], b[3]]) as usize;
+    let frag = u16::from_be_bytes([b[6], b[7]]);
+    let offset = (frag & 0x1fff) as usize * 8;
+    d.put("src", json!(Ipv4Addr::new(b[12], b[13], b[14], b[15]).to_string()));
+    d.put("dst", json!(Ipv4Addr::new(b[16], b[17], b[18], b[19]).to_string()));
+    d.put("ttl", json!(b[8]));
+    d.put("ip_length", json!(total));
+    if frag & 0x2000 != 0 || offset != 0 {
+        d.put("fragment", json!({ "id": u16::from_be_bytes([b[4], b[5]]), "offset": offset, "more": frag & 0x2000 != 0 }));
+    }
+    let end = total.min(b.len()).max(ihl.min(b.len()));
+    transport(d, b[9], b.get(ihl..end).unwrap_or(&[]), offset != 0);
+}
+
+fn ipv6(d: &mut Decoded, b: &[u8]) {
+    d.layers.push("ipv6");
+    if b.len() < 40 {
+        d.put("cut_short", json!(true));
+        return;
+    }
+    let addr = |x: &[u8]| {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(x);
+        Ipv6Addr::from(a).to_string()
+    };
+    d.put("src", json!(addr(&b[8..24])));
+    d.put("dst", json!(addr(&b[24..40])));
+    d.put("ttl", json!(b[7]));
+    let mut next = b[6];
+    let mut i = 40;
+    let mut ext = vec![];
+    let mut fragment = false;
+    loop {
+        match next {
+            0 | 43 | 60 => {
+                let Some(h) = b.get(i..i + 2) else { break };
+                ext.push(match next { 0 => "hop-by-hop", 43 => "routing", _ => "destination" });
+                next = h[0];
+                i += (h[1] as usize + 1) * 8;
+            }
+            44 => {
+                let Some(h) = b.get(i..i + 8) else { break };
+                ext.push("fragment");
+                next = h[0];
+                let f = u16::from_be_bytes([h[2], h[3]]);
+                fragment = f >> 3 != 0;
+                d.put("fragment", json!({ "id": u32::from_be_bytes([h[4], h[5], h[6], h[7]]), "offset": (f >> 3) as usize * 8, "more": f & 1 != 0 }));
+                i += 8;
+            }
+            51 => {
+                let Some(h) = b.get(i..i + 2) else { break };
+                ext.push("authentication");
+                next = h[0];
+                i += (h[1] as usize + 2) * 4;
+            }
+            _ => break,
+        }
+    }
+    if !ext.is_empty() {
+        d.put("extensions", json!(ext));
+    }
+    transport(d, next, b.get(i..).unwrap_or(&[]), fragment);
+}
+
+fn arp(d: &mut Decoded, b: &[u8]) {
+    d.layers.push("arp");
+    d.put("protocol", json!("arp"));
+    if b.len() < 28 || b[4] != 6 || b[5] != 4 {
+        d.put("cut_short", json!(true));
+        return;
+    }
+    d.put("arp", json!(match u16::from_be_bytes([b[6], b[7]]) { 1 => "request", 2 => "reply", _ => "other" }));
+    d.put("src_mac_arp", json!(mac(&b[8..14])));
+    d.put("src", json!(Ipv4Addr::new(b[14], b[15], b[16], b[17]).to_string()));
+    d.put("dst", json!(Ipv4Addr::new(b[24], b[25], b[26], b[27]).to_string()));
+}
+
+fn by_ethertype(d: &mut Decoded, t: u16, b: &[u8]) {
+    match t {
+        0x0800 => ipv4(d, b),
+        0x86dd => ipv6(d, b),
+        0x0806 => arp(d, b),
+        x => d.put("ethertype", json!(format!("0x{:04x}", x))),
+    }
+}
+
+fn decode(link: u32, b: &[u8]) -> Decoded {
+    let mut d = Decoded { m: Map::new(), layers: vec![] };
+    match link {
+        ETHERNET => {
+            d.layers.push("ethernet");
+            if b.len() < 14 {
+                d.put("cut_short", json!(true));
+                return d;
+            }
+            d.put("dst_mac", json!(mac(&b[0..6])));
+            d.put("src_mac", json!(mac(&b[6..12])));
+            let mut t = u16::from_be_bytes([b[12], b[13]]);
+            let mut i = 14;
+            let mut vlans = vec![];
+            while matches!(t, 0x8100 | 0x88a8 | 0x9100) && i + 4 <= b.len() {
+                let tci = u16::from_be_bytes([b[i], b[i + 1]]);
+                vlans.push(json!(tci & 0x0fff));
+                d.layers.push("vlan");
+                t = u16::from_be_bytes([b[i + 2], b[i + 3]]);
+                i += 4;
+            }
+            if !vlans.is_empty() {
+                d.put("vlans", json!(vlans));
+            }
+            by_ethertype(&mut d, t, &b[i.min(b.len())..]);
+        }
+        NULL | LOOP => {
+            d.layers.push("loopback");
+            if b.len() < 4 {
+                return d;
+            }
+            // The family is in the capturing machine's order: 2 or 2 << 24 is IPv4, and the IPv6
+            // numbers differ by system.
+            let f = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let f = if f > 0xffff { f.swap_bytes() } else { f };
+            match f {
+                2 => ipv4(&mut d, &b[4..]),
+                24 | 28 | 30 => ipv6(&mut d, &b[4..]),
+                _ => {}
+            }
+        }
+        RAW | RAW_V4 | RAW_V6 => match b.first().map(|x| x >> 4) {
+            Some(4) => ipv4(&mut d, b),
+            Some(6) => ipv6(&mut d, b),
+            _ => {}
+        },
+        SLL if b.len() >= 16 => {
+            d.layers.push("linux cooked");
+            by_ethertype(&mut d, u16::from_be_bytes([b[14], b[15]]), &b[16..]);
+        }
+        SLL2 if b.len() >= 20 => {
+            d.layers.push("linux cooked");
+            by_ethertype(&mut d, u16::from_be_bytes([b[0], b[1]]), &b[20..]);
+        }
+        _ => {}
+    }
+    d
+}
+
+fn iso(nanos: i128) -> String {
+    let secs = nanos.div_euclid(1_000_000_000) as i64;
+    let micro = nanos.rem_euclid(1_000_000_000) / 1000;
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    // Civil from days, Howard Hinnant's.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60, micro)
+}
+
+fn described(p: &Packet) -> Value {
+    let d = decode(p.link, &p.data);
+    let mut m = Map::new();
+    m.insert("index".into(), json!(p.index));
+    if p.nanos != 0 {
+        m.insert("time".into(), json!(iso(p.nanos)));
+    }
+    m.insert("length".into(), json!(p.original));
+    m.insert("captured".into(), json!(p.data.len()));
+    if (p.data.len() as u32) < p.original {
+        m.insert("truncated".into(), json!(true));
+    }
+    m.insert("layers".into(), json!(d.layers));
+    for (k, v) in d.m {
+        m.insert(k, v);
+    }
+    m.insert("info".into(), json!(info(&m)));
+    Value::Object(m)
+}
+
+fn info(m: &Map<String, Value>) -> String {
+    let s = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let n = |k: &str| m.get(k).map(|v| v.to_string()).unwrap_or_default();
+    let proto = m.get("protocol").map(|v| v.as_str().map(String::from).unwrap_or(v.to_string())).unwrap_or_default();
+    match proto.as_str() {
+        "tcp" => format!("TCP {}:{} > {}:{} [{}] len {}", s("src"), n("src_port"), s("dst"), n("dst_port"), s("flags"), n("payload")),
+        "udp" => format!("UDP {}:{} > {}:{} len {}", s("src"), n("src_port"), s("dst"), n("dst_port"), n("payload")),
+        "arp" => format!("ARP {} {} > {}", s("arp"), s("src"), s("dst")),
+        "icmp" | "icmpv6" => format!("{} {} {} > {}", proto.to_uppercase(), s("icmp"), s("src"), s("dst")),
+        "" => "not IP".to_string(),
+        p => format!("{} {} > {}", p, s("src"), s("dst")),
+    }
+}
+
+fn wanted(v: &Value, f: &Value) -> bool {
+    if let Some(p) = f.get("protocol").and_then(|x| x.as_str()) {
+        if v["protocol"] != p {
+            return false;
+        }
+    }
+    if let Some(h) = f.get("host").and_then(|x| x.as_str()) {
+        if v["src"] != h && v["dst"] != h {
+            return false;
+        }
+    }
+    if let Some(p) = f.get("port").and_then(|x| x.as_u64()) {
+        if v["src_port"] != p && v["dst_port"] != p {
+            return false;
+        }
+    }
+    if let Some(i) = f.get("vlan").and_then(|x| x.as_u64()) {
+        if !v["vlans"].as_array().map_or(false, |a| a.iter().any(|x| x == i)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// What a capture is: `{ format, version, byte_order, resolution, sections, interfaces, packets, bytes, first, last, seconds, names, cut_off }`. A file that ends mid-packet still answers, with `cut_off` saying where.
+pub fn pcap_info(path: &str) -> Result<Value, String> {
+    let (mut n, mut bytes, mut first, mut last) = (0u64, 0u64, None, None);
+    let s = read_file(path, |p| {
+        n += 1;
+        bytes += p.original as u64;
+        if p.nanos != 0 {
+            first.get_or_insert(p.nanos);
+            last = Some(p.nanos);
+        }
+        true
+    })?;
+    Ok(json!({
+        "format": s.format, "version": s.version, "byte_order": s.order, "resolution": s.resolution, "sections": s.sections,
+        "interfaces": s.interfaces, "packets": n, "bytes": bytes,
+        "first": first.map(iso), "last": last.map(iso),
+        "seconds": match (first, last) { (Some(a), Some(b)) => json!((b - a) as f64 / 1e9), _ => Value::Null },
+        "names": s.names, "cut_off": s.cut_off,
+    }))
+}
+
+/// Packets summarised, each with `layers`, addresses, ports, TCP flags, and `info`, one line such as `TCP 192.0.2.10:51000 > 198.51.100.20:443 [S] len 0`. Options: `offset`, `limit` (1000), and `filter`: `{ protocol, host, port, vlan }`.
+pub fn pcap_packets(path: &str, options: serde_json::Value) -> Result<Vec<Value>, String> {
+    let skip = options.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = options.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
+    let filter = options.get("filter").cloned().unwrap_or(Value::Null);
+    let mut out = vec![];
+    let mut passed = 0;
+    read_file(path, |p| {
+        let v = described(&p);
+        if wanted(&v, &filter) {
+            if passed >= skip {
+                out.push(v);
+            }
+            passed += 1;
+        }
+        out.len() < limit
+    })?;
+    Ok(out)
+}
+
+/// One packet by its index, with its bytes in `hex`. An index past the end is an error.
+pub fn pcap_packet(path: &str, index: i64) -> Result<Value, String> {
+    let mut found = None;
+    read_file(path, |p| {
+        if p.index as i64 == index {
+            let mut v = described(&p);
+            v["interface"] = json!(p.interface);
+            v["hex"] = json!(hex::encode(&p.data));
+            found = Some(v);
+            return false;
+        }
+        true
+    })?;
+    found.ok_or(format!("{} has no packet {}", path, index))
+}
+
+/// Decodes one frame from hex, without a file: `link` is 1 for Ethernet, 101 for raw IP, 113 for Linux cooked.
+pub fn pcap_decode(frame: &str, link: i64) -> Result<Value, String> {
+    let b = hex::decode(frame.chars().filter(|c| !c.is_whitespace()).collect::<String>()).map_err(|_| "not hex")?;
+    let p = Packet { index: 0, nanos: 0, original: b.len() as u32, data: b, link: link as u32, interface: 0 };
+    Ok(described(&p))
+}
+
+/// Totals for a whole capture: `{ packets, bytes, protocols, vlans, talkers, conversations, ports }`, the last three the top `limit` (10) by bytes.
+pub fn pcap_summary(path: &str, limit: i64) -> Result<Value, String> {
+    let (mut packets, mut bytes) = (0u64, 0u64);
+    let mut protos: HashMap<String, u64> = HashMap::new();
+    let mut vlans: HashMap<String, u64> = HashMap::new();
+    let mut talkers: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut pairs: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut ports: HashMap<String, (u64, u64)> = HashMap::new();
+    read_file(path, |p| {
+        let v = described(&p);
+        let n = p.original as u64;
+        packets += 1;
+        bytes += n;
+        let name = match &v["protocol"] {
+            Value::String(s) => s.clone(),
+            Value::Null => "other".to_string(),
+            x => x.to_string(),
+        };
+        *protos.entry(name.clone()).or_default() += 1;
+        for t in v["vlans"].as_array().into_iter().flatten() {
+            *vlans.entry(t.to_string()).or_default() += 1;
+        }
+        if let (Some(a), Some(b)) = (v["src"].as_str(), v["dst"].as_str()) {
+            let e = talkers.entry(a.to_string()).or_default();
+            e.0 += n;
+            e.1 += 1;
+            let k = if a < b { format!("{} <> {}", a, b) } else { format!("{} <> {}", b, a) };
+            let e = pairs.entry(k).or_default();
+            e.0 += n;
+            e.1 += 1;
+        }
+        if let Some(d) = v["dst_port"].as_u64() {
+            let s = v["src_port"].as_u64().unwrap_or(0);
+            // The lower of the two is nearly always the service.
+            let port = if s == 0 { d } else { d.min(s) };
+            let e = ports.entry(format!("{}/{}", name, port)).or_default();
+            e.0 += n;
+            e.1 += 1;
+        }
+        true
+    })?;
+    let top = |m: HashMap<String, (u64, u64)>, key: &str| -> Vec<Value> {
+        let mut l: Vec<_> = m.into_iter().collect();
+        l.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+        l.into_iter().take(limit.max(0) as usize).map(|(k, v)| {
+            let mut o = Map::new();
+            o.insert(key.to_string(), json!(k));
+            o.insert("bytes".into(), json!(v.0));
+            o.insert("packets".into(), json!(v.1));
+            Value::Object(o)
+        }).collect()
+    };
+    let sorted = |m: HashMap<String, u64>| -> Value {
+        let mut l: Vec<_> = m.into_iter().collect();
+        l.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Value::Object(l.into_iter().map(|(k, v)| (k, json!(v))).collect())
+    };
+    Ok(json!({ "packets": packets, "bytes": bytes, "protocols": sorted(protos), "vlans": sorted(vlans), "talkers": top(talkers, "address"), "conversations": top(pairs, "between"), "ports": top(ports, "port") }))
+}
+
+/// Writes a classic pcap, for test data or an extract: `packets` is a list of `{ hex, time_ms, length }`, `link` is 1 for Ethernet. Answers how many went in.
+pub fn pcap_write(path: &str, packets: Vec<serde_json::Value>, link: i64) -> Result<i64, String> {
+    let f = File::create(path).map_err(|e| format!("cannot write {}: {}", path, e))?;
+    let mut w = BufWriter::new(f);
+    let mut h = vec![];
+    h.extend(0xa1b2c3d4u32.to_le_bytes());
+    h.extend(2u16.to_le_bytes());
+    h.extend(4u16.to_le_bytes());
+    h.extend([0u8; 8]);
+    h.extend(65535u32.to_le_bytes());
+    h.extend((link as u32).to_le_bytes());
+    w.write_all(&h).map_err(|e| e.to_string())?;
+    for (i, p) in packets.iter().enumerate() {
+        let d = hex::decode(p.get("hex").and_then(|v| v.as_str()).ok_or(format!("packet {} has no `hex`", i))?).map_err(|_| format!("packet {}'s hex is not hex", i))?;
+        let ms = p.get("time_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let orig = p.get("length").and_then(|v| v.as_u64()).unwrap_or(d.len() as u64) as u32;
+        let mut r = vec![];
+        r.extend(((ms / 1000) as u32).to_le_bytes());
+        r.extend((((ms % 1000) * 1000) as u32).to_le_bytes());
+        r.extend((d.len() as u32).to_le_bytes());
+        r.extend(orig.to_le_bytes());
+        w.write_all(&r).map_err(|e| e.to_string())?;
+        w.write_all(&d).map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(packets.len() as i64)
+}

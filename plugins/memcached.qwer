@@ -1,0 +1,504 @@
+//! Memcached's text protocol over a few pooled connections: get and multi-get, set, add, replace, gets and cas, incr and decr, append, touch, delete and flush, expiry that turns long lifetimes into the absolute times the protocol wants, values kept as text or JSON, and several servers shared by ketama consistent hashing, so that adding one moves few keys.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! md-5 = "0.10"
+
+use md5::{Digest, Md5};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// MEMCACHED_HOST lists the servers, comma separated: host, host:port (11211 by default), or
+// host:port:weight. MEMCACHED_TIMEOUT_MS bounds each step (2000 when not set).
+
+const FLAG_TEXT: u32 = 0;
+const FLAG_JSON: u32 = 2;
+const THIRTY_DAYS: i64 = 60 * 60 * 24 * 30;
+const MAX_VALUE: usize = 1024 * 1024;
+
+fn timeout() -> Duration {
+    Duration::from_millis(std::env::var("MEMCACHED_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000).clamp(50, 60_000))
+}
+
+#[derive(Clone)]
+struct Server {
+    addr: String,
+    weight: u32,
+}
+
+fn parse_servers(list: &str) -> Result<Vec<Server>, String> {
+    let mut out = vec![];
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let bits: Vec<&str> = part.split(':').collect();
+        let (host, port, weight) = match bits.as_slice() {
+            [h] => (*h, 11211, 1),
+            [h, p] => (*h, p.parse::<u16>().map_err(|_| format!("{}: the port is not a number", part))?, 1),
+            [h, p, w] => (*h, p.parse::<u16>().map_err(|_| format!("{}: the port is not a number", part))?, w.parse::<u32>().map_err(|_| format!("{}: the weight is not a number", part))?),
+            _ => return Err(format!("{}: write host, host:port or host:port:weight", part)),
+        };
+        out.push(Server { addr: format!("{}:{}", host, port), weight: weight.max(1) });
+    }
+    if out.is_empty() {
+        return Err("MEMCACHED_HOST lists no server".into());
+    }
+    Ok(out)
+}
+
+/// The ketama ring: four points from each MD5, 40 hashes for each server of equal weight, the
+/// layout libketama and most clients use, so that a key lands where they would put it.
+fn build_ring(servers: &[Server]) -> BTreeMap<u32, usize> {
+    let mut ring = BTreeMap::new();
+    let total: u64 = servers.iter().map(|s| s.weight as u64).sum();
+    for (i, s) in servers.iter().enumerate() {
+        let groups = (40.0 * servers.len() as f64 * s.weight as f64 / total as f64).floor() as usize;
+        for g in 0..groups {
+            let d = Md5::digest(format!("{}-{}", s.addr, g).as_bytes());
+            for h in 0..4 {
+                let k = (d[3 + h * 4] as u32) << 24 | (d[2 + h * 4] as u32) << 16 | (d[1 + h * 4] as u32) << 8 | d[h * 4] as u32;
+                ring.insert(k, i);
+            }
+        }
+    }
+    ring
+}
+
+fn point_of(key: &str) -> u32 {
+    let d = Md5::digest(key.as_bytes());
+    (d[3] as u32) << 24 | (d[2] as u32) << 16 | (d[1] as u32) << 8 | d[0] as u32
+}
+
+fn ring_pick(ring: &BTreeMap<u32, usize>, key: &str) -> usize {
+    let p = point_of(key);
+    ring.range(p..).next().or_else(|| ring.iter().next()).map_or(0, |(_, i)| *i)
+}
+
+struct Pool {
+    list: String,
+    servers: Vec<Server>,
+    ring: BTreeMap<u32, usize>,
+    idle: HashMap<String, Vec<Conn>>,
+}
+
+struct Conn {
+    r: BufReader<TcpStream>,
+    w: TcpStream,
+}
+
+fn pool() -> &'static Mutex<Option<Pool>> {
+    static P: OnceLock<Mutex<Option<Pool>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(None))
+}
+
+fn lock() -> std::sync::MutexGuard<'static, Option<Pool>> {
+    pool().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn servers_list() -> String {
+    std::env::var("MEMCACHED_HOST").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "127.0.0.1:11211".into())
+}
+
+fn ensure() -> Result<(), String> {
+    let list = servers_list();
+    let mut g = lock();
+    if g.as_ref().map(|p| p.list != list).unwrap_or(true) {
+        let servers = parse_servers(&list)?;
+        let ring = build_ring(&servers);
+        *g = Some(Pool { list, servers, ring, idle: HashMap::new() });
+    }
+    Ok(())
+}
+
+fn addr_for(key: &str) -> Result<String, String> {
+    ensure()?;
+    let g = lock();
+    let p = g.as_ref().ok_or("no servers")?;
+    Ok(p.servers[ring_pick(&p.ring, key)].addr.clone())
+}
+
+fn dial(addr: &str) -> Result<Conn, String> {
+    let t = timeout();
+    let a = addr.to_socket_addrs().map_err(|e| format!("{}: {}", addr, e))?.next().ok_or(format!("{} has no address", addr))?;
+    let s = TcpStream::connect_timeout(&a, t).map_err(|e| format!("cannot reach memcached at {}: {}", addr, e))?;
+    s.set_read_timeout(Some(t)).ok();
+    s.set_write_timeout(Some(t)).ok();
+    s.set_nodelay(true).ok();
+    let w = s.try_clone().map_err(|e| e.to_string())?;
+    Ok(Conn { r: BufReader::new(s), w })
+}
+
+fn take(addr: &str) -> Result<(Conn, bool), String> {
+    let c = lock().as_mut().and_then(|p| p.idle.get_mut(addr).and_then(|v| v.pop()));
+    match c {
+        Some(c) => Ok((c, true)),
+        None => Ok((dial(addr)?, false)),
+    }
+}
+
+fn give(addr: &str, c: Conn) {
+    if let Some(p) = lock().as_mut() {
+        let v = p.idle.entry(addr.to_string()).or_default();
+        if v.len() < 8 {
+            v.push(c);
+        }
+    }
+}
+
+/// Runs one exchange. A pooled connection the server closed is replaced, once; a connection is
+/// only given back after a clean exchange, as a half-read answer would confuse the next one.
+fn with_conn<T>(addr: &str, f: &dyn Fn(&mut Conn) -> Result<T, Failure>) -> Result<T, String> {
+    let (mut c, pooled) = take(addr)?;
+    match f(&mut c) {
+        Ok(v) => {
+            give(addr, c);
+            Ok(v)
+        }
+        Err(Failure::Io(e)) if pooled => {
+            let _ = e;
+            let mut c = dial(addr)?;
+            match f(&mut c) {
+                Ok(v) => {
+                    give(addr, c);
+                    Ok(v)
+                }
+                Err(e) => Err(e.text(addr)),
+            }
+        }
+        Err(Failure::Refused(m)) => {
+            give(addr, c);
+            Err(Failure::Refused(m).text(addr))
+        }
+        Err(e) => Err(e.text(addr)),
+    }
+}
+
+enum Failure {
+    Io(String),
+    Refused(String),
+}
+
+impl Failure {
+    fn text(self, addr: &str) -> String {
+        match self {
+            Failure::Io(e) => format!("memcached at {}: {}", addr, e),
+            Failure::Refused(e) => format!("memcached at {} said: {}", addr, e),
+        }
+    }
+}
+
+fn read_line(c: &mut Conn) -> Result<String, Failure> {
+    let mut l = String::new();
+    match c.r.read_line(&mut l) {
+        Ok(0) => Err(Failure::Io("the connection closed".into())),
+        Ok(_) => Ok(l.trim_end().to_string()),
+        Err(e) => Err(Failure::Io(e.to_string())),
+    }
+}
+
+fn send(c: &mut Conn, b: &[u8]) -> Result<(), Failure> {
+    c.w.write_all(b).map_err(|e| Failure::Io(e.to_string()))
+}
+
+fn refused(line: &str) -> Failure {
+    Failure::Refused(line.to_string())
+}
+
+fn is_error(line: &str) -> bool {
+    line == "ERROR" || line.starts_with("CLIENT_ERROR") || line.starts_with("SERVER_ERROR")
+}
+
+/// Keys are at most 250 bytes with no spaces or control characters: anything else would break the line.
+fn check_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > 250 {
+        return Err(format!("a key is 1 to 250 bytes, not {}", key.len()));
+    }
+    if key.bytes().any(|b| b <= 32 || b == 127) {
+        return Err(format!("the key {:?} holds a space or a control character", key));
+    }
+    Ok(())
+}
+
+/// The protocol takes seconds up to 30 days; beyond that it reads the number as a Unix time. A
+/// lifetime of 31 days would otherwise be a date in 1970 and expire at once.
+fn exptime(ttl: i64) -> Result<i64, String> {
+    if ttl < 0 {
+        return Err("a lifetime is 0 (for no expiry) or a number of seconds".into());
+    }
+    if ttl > THIRTY_DAYS {
+        return Ok(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) + ttl);
+    }
+    Ok(ttl)
+}
+
+fn encode(v: &Value) -> (Vec<u8>, u32) {
+    match v {
+        Value::String(s) => (s.clone().into_bytes(), FLAG_TEXT),
+        o => (o.to_string().into_bytes(), FLAG_JSON),
+    }
+}
+
+fn decode(bytes: Vec<u8>, flags: u32) -> Value {
+    if flags & FLAG_JSON != 0 {
+        if let Ok(v) = serde_json::from_slice(&bytes) {
+            return v;
+        }
+    }
+    Value::String(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Sends a storage command: "set", "add", "replace", "append", "prepend" or "cas". Gives the server's word for it.
+fn store(cmd: &str, key: &str, value: &Value, ttl: i64, cas: Option<u64>) -> Result<String, String> {
+    check_key(key)?;
+    let (bytes, flags) = encode(value);
+    if bytes.len() > MAX_VALUE {
+        return Err(format!("the value is {} bytes; memcached keeps at most {} by default", bytes.len(), MAX_VALUE));
+    }
+    let e = exptime(ttl)?;
+    let head = match cas {
+        Some(u) => format!("{} {} {} {} {} {}\r\n", cmd, key, flags, e, bytes.len(), u),
+        None => format!("{} {} {} {} {}\r\n", cmd, key, flags, e, bytes.len()),
+    };
+    let mut msg = head.into_bytes();
+    msg.extend_from_slice(&bytes);
+    msg.extend_from_slice(b"\r\n");
+    let addr = addr_for(key)?;
+    with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        let line = read_line(c)?;
+        if is_error(&line) {
+            return Err(refused(&line));
+        }
+        Ok(line)
+    })
+}
+
+fn read_values(c: &mut Conn, with_cas: bool) -> Result<Vec<(String, Value, Option<u64>)>, Failure> {
+    let mut out = vec![];
+    loop {
+        let line = read_line(c)?;
+        if line == "END" {
+            return Ok(out);
+        }
+        if is_error(&line) {
+            return Err(refused(&line));
+        }
+        let p: Vec<&str> = line.split(' ').collect();
+        if p.len() < 4 || p[0] != "VALUE" {
+            return Err(Failure::Io(format!("unexpected line {:?}", line)));
+        }
+        let flags: u32 = p[2].parse().map_err(|_| Failure::Io("bad flags".into()))?;
+        let n: usize = p[3].parse().map_err(|_| Failure::Io("bad length".into()))?;
+        let cas = if with_cas { p.get(4).and_then(|s| s.parse().ok()) } else { None };
+        let mut buf = vec![0u8; n + 2];
+        std::io::Read::read_exact(&mut c.r, &mut buf).map_err(|e| Failure::Io(e.to_string()))?;
+        buf.truncate(n);
+        out.push((p[1].to_string(), decode(buf, flags), cas));
+    }
+}
+
+/// Stores a value for `ttl` seconds (0 for no expiry): a text is kept as it is, anything else as JSON and given back as it was. Lifetimes past 30 days work; the absolute time the protocol wants for them is worked out here.
+pub fn memcached_set(key: &str, value: serde_json::Value, ttl: i64) -> Result<bool, String> {
+    Ok(store("set", key, &value, ttl, None)? == "STORED")
+}
+
+/// Stores only if the key has no value; false when it has. This is what a lock or a once-only job needs.
+pub fn memcached_add(key: &str, value: serde_json::Value, ttl: i64) -> Result<bool, String> {
+    Ok(store("add", key, &value, ttl, None)? == "STORED")
+}
+
+/// Stores only if the key has a value; false when it has none.
+pub fn memcached_replace(key: &str, value: serde_json::Value, ttl: i64) -> Result<bool, String> {
+    Ok(store("replace", key, &value, ttl, None)? == "STORED")
+}
+
+/// Adds text to the end of a stored text; false when the key has no value.
+pub fn memcached_append(key: &str, text: &str) -> Result<bool, String> {
+    Ok(store("append", key, &json!(text), 0, None)? == "STORED")
+}
+
+/// A value, or null when there is none or it has expired.
+pub fn memcached_get(key: &str) -> Result<Value, String> {
+    check_key(key)?;
+    let addr = addr_for(key)?;
+    let msg = format!("get {}\r\n", key).into_bytes();
+    let got = with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        read_values(c, false)
+    })?;
+    Ok(got.into_iter().next().map_or(Value::Null, |x| x.1))
+}
+
+/// Several values at once, a request per server: a map of the keys that have one.
+pub fn memcached_get_many(keys: Vec<String>) -> Result<Value, String> {
+    let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for k in &keys {
+        check_key(k)?;
+        by_server.entry(addr_for(k)?).or_default().push(k.clone());
+    }
+    let mut out = serde_json::Map::new();
+    for (addr, ks) in by_server {
+        let msg = format!("get {}\r\n", ks.join(" ")).into_bytes();
+        let got = with_conn(&addr, &|c| {
+            send(c, &msg)?;
+            read_values(c, false)
+        })?;
+        for (k, v, _) in got {
+            out.insert(k, v);
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// A value with its compare-and-swap token: `{ value, cas }`, the token a text, or null when the key has no value. Keep the token for `memcached_cas`.
+pub fn memcached_gets(key: &str) -> Result<Value, String> {
+    check_key(key)?;
+    let addr = addr_for(key)?;
+    let msg = format!("gets {}\r\n", key).into_bytes();
+    let got = with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        read_values(c, true)
+    })?;
+    Ok(got.into_iter().next().map_or(Value::Null, |(_, v, cas)| json!({ "value": v, "cas": cas.map(|c| c.to_string()) })))
+}
+
+/// Stores only if the value has not changed since `memcached_gets` gave `cas`: "stored", "exists" when someone else wrote first (read again and retry), or "not_found" when it has gone.
+pub fn memcached_cas(key: &str, value: serde_json::Value, ttl: i64, cas: &str) -> Result<String, String> {
+    let token: u64 = cas.parse().map_err(|_| format!("{:?} is not a cas token: use the one memcached_gets gave", cas))?;
+    Ok(match store("cas", key, &value, ttl, Some(token))?.as_str() {
+        "STORED" => "stored",
+        "EXISTS" => "exists",
+        "NOT_FOUND" => "not_found",
+        other => return Err(format!("memcached answered {}", other)),
+    }.to_string())
+}
+
+fn counter(cmd: &str, key: &str, by: i64) -> Result<Value, String> {
+    check_key(key)?;
+    if by < 0 {
+        return Err("the amount is not negative: use memcached_decr to go down".into());
+    }
+    let addr = addr_for(key)?;
+    let msg = format!("{} {} {}\r\n", cmd, key, by).into_bytes();
+    with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        let line = read_line(c)?;
+        if line == "NOT_FOUND" {
+            return Ok(Value::Null);
+        }
+        if is_error(&line) {
+            return Err(refused(&line));
+        }
+        line.parse::<i64>().map(|n| json!(n)).map_err(|_| Failure::Io(format!("unexpected answer {:?}", line)))
+    })
+}
+
+/// Adds to a stored decimal number and gives the new one, or null when the key has no value (memcached makes none: `memcached_add` one first). A value that is not a number is an error.
+pub fn memcached_incr(key: &str, by: i64) -> Result<Value, String> {
+    counter("incr", key, by)
+}
+
+/// Takes from a stored number and gives the new one; memcached stops at 0, it never goes below.
+pub fn memcached_decr(key: &str, by: i64) -> Result<Value, String> {
+    counter("decr", key, by)
+}
+
+/// Removes a value; false when there was none.
+pub fn memcached_delete(key: &str) -> Result<bool, String> {
+    check_key(key)?;
+    let addr = addr_for(key)?;
+    let msg = format!("delete {}\r\n", key).into_bytes();
+    with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        let line = read_line(c)?;
+        if is_error(&line) {
+            return Err(refused(&line));
+        }
+        Ok(line == "DELETED")
+    })
+}
+
+/// Gives a value a new lifetime without reading it; false when there is none.
+pub fn memcached_touch(key: &str, ttl: i64) -> Result<bool, String> {
+    check_key(key)?;
+    let addr = addr_for(key)?;
+    let msg = format!("touch {} {}\r\n", key, exptime(ttl)?).into_bytes();
+    with_conn(&addr, &|c| {
+        send(c, &msg)?;
+        let line = read_line(c)?;
+        if is_error(&line) {
+            return Err(refused(&line));
+        }
+        Ok(line == "TOUCHED")
+    })
+}
+
+/// Empties every server. All keys go.
+pub fn memcached_flush_all() -> Result<i64, String> {
+    ensure()?;
+    let addrs: Vec<String> = lock().as_ref().map(|p| p.servers.iter().map(|s| s.addr.clone()).collect()).unwrap_or_default();
+    for a in &addrs {
+        with_conn(a, &|c| {
+            send(c, b"flush_all\r\n")?;
+            let line = read_line(c)?;
+            if line != "OK" {
+                return Err(refused(&line));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(addrs.len() as i64)
+}
+
+/// Each server's `stats`: a map of address to `{ curr_items, get_hits, ... }`, the numbers as the server gave them, in text.
+pub fn memcached_stats() -> Result<Value, String> {
+    ensure()?;
+    let addrs: Vec<String> = lock().as_ref().map(|p| p.servers.iter().map(|s| s.addr.clone()).collect()).unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for a in &addrs {
+        let m = with_conn(a, &|c| {
+            send(c, b"stats\r\n")?;
+            let mut m = serde_json::Map::new();
+            loop {
+                let line = read_line(c)?;
+                if line == "END" {
+                    return Ok(m);
+                }
+                if is_error(&line) {
+                    return Err(refused(&line));
+                }
+                let p: Vec<&str> = line.splitn(3, ' ').collect();
+                if p.len() == 3 {
+                    m.insert(p[1].to_string(), json!(p[2]));
+                }
+            }
+        })?;
+        out.insert(a.clone(), Value::Object(m));
+    }
+    Ok(Value::Object(out))
+}
+
+/// The server a key lives on among MEMCACHED_HOST's.
+pub fn memcached_server_for(key: &str) -> Result<String, String> {
+    check_key(key)?;
+    addr_for(key)
+}
+
+/// How many of `keys` would change server if the list `servers` (comma separated, as in MEMCACHED_HOST) became `next`: `{ moved, total, to_new }`, with `to_new` those that went to a server only in `next`. For planning a change to the cluster; no request is made.
+pub fn memcached_reshard_plan(servers: &str, next: &str, keys: Vec<String>) -> Result<Value, String> {
+    let (a, b) = (parse_servers(servers)?, parse_servers(next)?);
+    let (ra, rb) = (build_ring(&a), build_ring(&b));
+    let (mut moved, mut to_new) = (0, 0);
+    for k in &keys {
+        let (x, y) = (&a[ring_pick(&ra, k)].addr, &b[ring_pick(&rb, k)].addr);
+        if x != y {
+            moved += 1;
+            if !a.iter().any(|s| &s.addr == y) {
+                to_new += 1;
+            }
+        }
+    }
+    Ok(json!({ "moved": moved, "total": keys.len(), "to_new": to_new }))
+}
