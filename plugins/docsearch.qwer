@@ -1,0 +1,1268 @@
+//! Search for a site's own pages: it reads the sitemap, fetches each page and indexes its sections in memory, found by their words, stems, a word being typed and small typos, ranked by title, heading and text, with snippets as plain-text pieces.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! rust-stemmers = "1.2.0"
+//! unicode-normalization = "0.1"
+//! scraper = "0.20.0"
+//! ureq = "2.12.1"
+//! url = "2.5"
+//! ego-tree = "0.6.3"
+//! percent-encoding = "2.3"
+
+use rust_stemmers::{Algorithm, Stemmer};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
+
+// The fields a document is searched by, and how much a word counts in each.
+const TITLE: usize = 0;
+const HEADING: usize = 1;
+const TAGS: usize = 2;
+const TEXT: usize = 3;
+const FIELDS: usize = 4;
+const WEIGHT: [f64; FIELDS] = [4.0, 3.0, 2.0, 1.0];
+const K1: f64 = 1.2;
+const B: f64 = 0.75;
+
+const MAX_DOCS: usize = 200_000;
+const MAX_TEXT: usize = 2_000_000;
+const MAX_QUERY: usize = 1_000;
+const MAX_TERMS: usize = 12;
+const SNIPPET: usize = 180;
+
+struct Doc {
+    url: String,
+    page: String, // the url without its #anchor: results are grouped by it
+    title: String,
+    heading: String,
+    kind: String,
+    text: String, // plain, for snippets
+    folded_title: String,
+    folded_heading: String,
+    lens: [u32; FIELDS],
+    boost: f64,
+}
+
+struct Posting {
+    doc: u32,
+    tf: [u16; FIELDS],
+    pos: Vec<u32>, // positions in the text, for words found side by side
+}
+
+struct Index {
+    docs: Vec<Doc>,
+    terms: HashMap<String, Vec<Posting>>,
+    // Every word as written (folded, not stemmed), sorted, with the term it is indexed
+    // under: for a word being typed, and for typos.
+    surface: Vec<(String, String)>,
+    avg: [f64; FIELDS],
+}
+
+static INDEXES: RwLock<Option<HashMap<String, Arc<Index>>>> = RwLock::new(None);
+
+thread_local! {
+    static STEMMER: Stemmer = Stemmer::create(Algorithm::English);
+}
+
+// Lower case, with accents and other marks taken off: "Café" and "cafe" are one word.
+fn fold(s: &str) -> String {
+    s.nfkd().filter(|c| !is_combining_mark(*c)).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+fn stem(word: &str) -> String {
+    if word.chars().count() < 3 || !word.chars().all(|c| c.is_alphabetic()) {
+        return word.to_string();
+    }
+    STEMMER.with(|s| s.stem(word).into_owned())
+}
+
+/// A token: the term it is indexed under, the word as written (folded), its bytes in the
+/// text, and its position (an identifier's whole and its first part share one).
+struct Tok {
+    key: String,
+    surface: String,
+    start: usize,
+    end: usize,
+    pos: u32,
+}
+
+// The words of a text. `set_cookie` and `db.query` are a word each and their parts too,
+// so either finds them; a CJK character is a word of its own.
+fn tokens(text: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut pos = 0u32;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (start, c) = chars[i];
+        if is_cjk(c) {
+            let end = start + c.len_utf8();
+            let f = fold(&text[start..end]);
+            out.push(Tok { key: f.clone(), surface: f, start, end, pos });
+            pos += 1;
+            i += 1;
+            continue;
+        }
+        if !(c.is_alphanumeric() || c == '_') {
+            i += 1;
+            continue;
+        }
+        // A run of letters, digits and `_`, with `.` kept between two of them.
+        let mut j = i;
+        while j < chars.len() {
+            let (_, d) = chars[j];
+            if is_cjk(d) {
+                break;
+            }
+            if d.is_alphanumeric() || d == '_' {
+                j += 1;
+            } else if d == '.' && j + 1 < chars.len() && (chars[j + 1].1.is_alphanumeric() || chars[j + 1].1 == '_') && j > i {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let end = if j < chars.len() { chars[j].0 } else { text.len() };
+        let word = &text[start..end];
+        let parts: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut s = start;
+            for (k, ch) in word.char_indices() {
+                if ch == '_' || ch == '.' {
+                    if start + k > s {
+                        v.push((s, start + k));
+                    }
+                    s = start + k + ch.len_utf8();
+                }
+            }
+            if end > s {
+                v.push((s, end));
+            }
+            v
+        };
+        if parts.len() > 1 || (parts.len() == 1 && parts[0] != (start, end)) {
+            let f = fold(word);
+            out.push(Tok { key: f.clone(), surface: f, start, end, pos });
+        }
+        for (a, b) in parts {
+            let f = fold(&text[a..b]);
+            out.push(Tok { key: stem(&f), surface: f, start: a, end: b, pos });
+            pos += 1;
+        }
+        i = j;
+    }
+    out
+}
+
+// Markdown as the words a reader sees: no fences, heading or list marks, link targets,
+// backticks or bold marks; code stays, as it is searched too.
+fn plain(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut fence: Option<&str> = None;
+    for line in md.lines() {
+        let t = line.trim_start();
+        if let Some(f) = fence {
+            if t.starts_with(f) {
+                fence = None;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = Some(if t.starts_with("```") { "```" } else { "~~~" });
+            continue;
+        }
+        // A table's ruler, |---|:--|, says nothing.
+        if t.starts_with('|') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+            continue;
+        }
+        let mut s = t;
+        while let Some(r) = s.strip_prefix('#') {
+            s = r;
+        }
+        while let Some(r) = s.strip_prefix('>') {
+            s = r.trim_start();
+        }
+        for m in ["- ", "* ", "+ "] {
+            if let Some(r) = s.strip_prefix(m) {
+                s = r;
+                break;
+            }
+        }
+        out.push_str(&inline(s.trim_start()));
+        out.push('\n');
+    }
+    out
+}
+
+fn inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // [text](url) and ![alt](url): the text.
+        if c == '[' || (c == '!' && i + 1 < b.len() && b[i + 1] == '[') {
+            let open = if c == '!' { i + 1 } else { i };
+            if let Some(close) = (open + 1..b.len()).find(|&k| b[k] == ']') {
+                if close + 1 < b.len() && b[close + 1] == '(' {
+                    if let Some(end) = (close + 2..b.len()).find(|&k| b[k] == ')') {
+                        out.extend(&b[open + 1..close]);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if c == '`' || c == '|' {
+            out.push(if c == '|' { ' ' } else { '\u{0}' });
+            i += 1;
+            continue;
+        }
+        if (c == '*' || c == '_') && i + 1 < b.len() && b[i + 1] == c {
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out.replace('\u{0}', "")
+}
+
+fn field_str<'a>(d: &'a Map<String, Value>, k: &str, n: usize) -> Result<&'a str, String> {
+    match d.get(k) {
+        None | Some(Value::Null) => Ok(""),
+        Some(Value::String(s)) => Ok(s),
+        Some(_) => Err(format!("document {}: `{}` must be text", n, k)),
+    }
+}
+
+// A document to index, checked.
+struct Input {
+    url: String,
+    title: String,
+    heading: String,
+    text: String, // plain
+    kind: String,
+    tags: String,
+    boost: f64,
+}
+
+// A program's documents, checked, their markdown made plain.
+fn inputs(docs: &[Value]) -> Result<Vec<Input>, String> {
+    let mut out = Vec::with_capacity(docs.len());
+    for (n, d) in docs.iter().enumerate() {
+        let d = d.as_object().ok_or_else(|| format!("document {} must be a map", n))?;
+        for k in d.keys() {
+            if !matches!(k.as_str(), "url" | "title" | "heading" | "text" | "kind" | "tags" | "boost" | "markdown") {
+                return Err(format!("document {}: no field `{}` (url, title, heading, text, kind, tags, boost, markdown)", n, k));
+            }
+        }
+        let url = field_str(d, "url", n)?;
+        if url.is_empty() {
+            return Err(format!("document {} needs a url", n));
+        }
+        let title = field_str(d, "title", n)?;
+        if title.is_empty() {
+            return Err(format!("document {} ({}) needs a title", n, url));
+        }
+        let markdown = match d.get("markdown") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("document {}: `markdown` must be true or false", n)),
+        };
+        let raw = field_str(d, "text", n)?;
+        if raw.len() > MAX_TEXT {
+            return Err(format!("document {} ({}): text over {} bytes", n, url, MAX_TEXT));
+        }
+        let tags = match d.get("tags") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::Array(a)) => a.iter().map(|t| t.as_str().map(str::to_string).ok_or_else(|| format!("document {}: tags must be text", n))).collect::<Result<Vec<_>, _>>()?.join(" "),
+            Some(_) => return Err(format!("document {}: `tags` must be a list of text", n)),
+        };
+        let boost = match d.get("boost") {
+            None | Some(Value::Null) => 1.0,
+            Some(v) => v.as_f64().filter(|b| *b > 0.0 && b.is_finite()).ok_or_else(|| format!("document {}: `boost` must be a number above 0", n))?,
+        };
+        out.push(Input {
+            url: url.to_string(),
+            title: title.to_string(),
+            heading: field_str(d, "heading", n)?.to_string(),
+            text: if markdown { plain(raw) } else { raw.to_string() },
+            kind: field_str(d, "kind", n)?.to_string(),
+            tags,
+            boost,
+        });
+    }
+    Ok(out)
+}
+
+// The index of checked documents, and how many urls came twice.
+fn index_of(docs: Vec<Input>) -> (Index, usize) {
+    let mut out_docs = Vec::with_capacity(docs.len());
+    let mut terms: HashMap<String, Vec<Posting>> = HashMap::new();
+    let mut surface: HashMap<String, String> = HashMap::new();
+    let mut totals = [0f64; FIELDS];
+    let mut seen = HashSet::new();
+    let mut duplicates = 0;
+    for d in docs {
+        if !seen.insert(d.url.clone()) {
+            duplicates += 1;
+        }
+        let id = out_docs.len() as u32;
+        let mut per: HashMap<String, Posting> = HashMap::new();
+        let mut lens = [0u32; FIELDS];
+        for (f, src) in [(TITLE, d.title.as_str()), (HEADING, d.heading.as_str()), (TAGS, d.tags.as_str()), (TEXT, d.text.as_str())] {
+            for t in tokens(src) {
+                lens[f] += 1;
+                surface.entry(t.surface).or_insert_with(|| t.key.clone());
+                let p = per.entry(t.key).or_insert_with(|| Posting { doc: id, tf: [0; FIELDS], pos: Vec::new() });
+                p.tf[f] = p.tf[f].saturating_add(1);
+                if f == TEXT {
+                    p.pos.push(t.pos);
+                }
+            }
+        }
+        for f in 0..FIELDS {
+            totals[f] += lens[f] as f64;
+        }
+        for (k, p) in per {
+            terms.entry(k).or_default().push(p);
+        }
+        out_docs.push(Doc {
+            page: d.url.split('#').next().unwrap_or(&d.url).to_string(),
+            folded_title: squash(&fold(&d.title)),
+            folded_heading: squash(&fold(&d.heading)),
+            url: d.url,
+            title: d.title,
+            heading: d.heading,
+            kind: d.kind,
+            text: d.text,
+            lens,
+            boost: d.boost,
+        });
+    }
+    let count = out_docs.len().max(1) as f64;
+    let avg = [totals[0] / count, totals[1] / count, totals[2] / count, totals[3] / count];
+    for list in terms.values_mut() {
+        list.sort_by_key(|p| p.doc);
+    }
+    let mut surface: Vec<(String, String)> = surface.into_iter().collect();
+    surface.sort();
+    (Index { docs: out_docs, terms, surface, avg }, duplicates)
+}
+
+fn install(name: &str, index: Index) {
+    let mut all = INDEXES.write().unwrap_or_else(|e| e.into_inner());
+    all.get_or_insert_with(HashMap::new).insert(name.to_string(), Arc::new(index));
+}
+
+// Words joined by single spaces.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Builds the index `name` from `docs`, each a map `{ url, title, heading, text, kind, tags, boost, markdown }`: `url` (with its `#anchor` for a section) and `title` are needed; `text` is markdown unless `markdown: false`; `boost` (1 by default) multiplies its score. An index of that name is replaced whole once the new one is built, so searches go on meanwhile. Gives `{ docs, terms, duplicates, ms }`: `duplicates` counts urls given twice.
+pub fn docsearch_build(name: &str, docs: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    if name.is_empty() {
+        return Err("an index needs a name".into());
+    }
+    if docs.len() > MAX_DOCS {
+        return Err(format!("at most {} documents", MAX_DOCS));
+    }
+    let t0 = Instant::now();
+    let (index, duplicates) = index_of(inputs(&docs)?);
+    let stats = json!({
+        "docs": index.docs.len(),
+        "terms": index.terms.len(),
+        "duplicates": duplicates,
+        "ms": ms(t0),
+    });
+    install(name, index);
+    Ok(stats)
+}
+
+fn ms(t0: Instant) -> f64 {
+    (t0.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
+}
+
+fn get(name: &str) -> Result<Arc<Index>, String> {
+    let all = INDEXES.read().unwrap_or_else(|e| e.into_inner());
+    all.as_ref()
+        .and_then(|m| m.get(name).cloned())
+        .ok_or_else(|| format!("no index named \"{}\" yet: docsearch_crawl or docsearch_build makes it", name))
+}
+
+/// How many documents the index `name` holds.
+pub fn docsearch_count(name: &str) -> Result<i64, String> {
+    Ok(get(name)?.docs.len() as i64)
+}
+
+// Edits between two words, a swap of neighbours counting one, or None past `max`.
+fn distance(a: &[char], b: &[char], max: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > max {
+        return None;
+    }
+    let (n, m) = (a.len(), b.len());
+    let mut prev2 = vec![0usize; m + 1];
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        let mut best = cur[0];
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(prev2[j - 2] + 1);
+            }
+            cur[j] = v;
+            best = best.min(v);
+        }
+        if best > max {
+            return None;
+        }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Some(prev[m]).filter(|d| *d <= max)
+}
+
+// A word of the query: what it is indexed under, and what else may stand for it, with
+// how much each counts.
+struct Term {
+    variants: Vec<(String, f64)>,
+}
+
+fn df(index: &Index, key: &str) -> usize {
+    index.terms.get(key).map_or(0, |p| p.len())
+}
+
+fn terms_of(index: &Index, query: &str) -> Vec<Term> {
+    let toks = tokens(query);
+    let typing = !query.ends_with(char::is_whitespace);
+    // Group tokens by position: an identifier's whole comes before its parts.
+    let mut words: Vec<Vec<Tok>> = Vec::new();
+    for t in toks {
+        match words.last_mut() {
+            Some(w) if w[0].start <= t.start && t.end <= w[0].end && w[0].end - w[0].start > t.end - t.start => w.push(t),
+            _ => words.push(vec![t]),
+        }
+    }
+    let last = words.len().saturating_sub(1);
+    let mut out = Vec::new();
+    for (wi, w) in words.into_iter().enumerate() {
+        // `set_cookie` as itself when the index has it; else its parts, each a word.
+        let whole = w.len() > 1;
+        let pieces: Vec<&Tok> = if whole && df(index, &w[0].key) > 0 { vec![&w[0]] } else if whole { w[1..].iter().collect() } else { vec![&w[0]] };
+        let np = pieces.len();
+        for (pi, t) in pieces.into_iter().enumerate() {
+            let mut variants = vec![(t.key.clone(), 1.0)];
+            let found = df(index, &t.key) > 0;
+            // The word being typed: words that start with it.
+            if typing && wi == last && pi + 1 == np && t.surface.chars().count() >= 2 {
+                let from = index.surface.partition_point(|(s, _)| s.as_str() < t.surface.as_str());
+                let mut more: Vec<(String, usize)> = index.surface[from..]
+                    .iter()
+                    .take_while(|(s, _)| s.starts_with(t.surface.as_str()))
+                    .filter(|(s, _)| *s != t.surface)
+                    .map(|(_, k)| (k.clone(), df(index, k)))
+                    .collect();
+                more.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut kept = HashSet::new();
+                for (k, _) in more {
+                    if k != t.key && kept.insert(k.clone()) {
+                        variants.push((k, 0.7));
+                        if kept.len() == 40 {
+                            break;
+                        }
+                    }
+                }
+            }
+            // A word the index lacks: the words a typo or two away.
+            if !found && variants.len() == 1 {
+                let w: Vec<char> = t.surface.chars().collect();
+                let max = if w.len() >= 8 { 2 } else if w.len() >= 4 { 1 } else { 0 };
+                if max > 0 {
+                    let mut near: Vec<(String, usize, usize)> = index
+                        .surface
+                        .iter()
+                        .filter(|(s, _)| s.chars().next() == w.first().copied())
+                        .filter_map(|(s, k)| {
+                            let c: Vec<char> = s.chars().collect();
+                            distance(&w, &c, max).map(|d| (k.clone(), d, df(index, k)))
+                        })
+                        .collect();
+                    near.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
+                    let mut kept = HashSet::new();
+                    for (k, d, _) in near {
+                        if kept.insert(k.clone()) {
+                            variants.push((k, if d == 1 { 0.6 } else { 0.4 }));
+                            if kept.len() == 10 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(Term { variants });
+            if out.len() == MAX_TERMS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+// Whether two terms stand side by side somewhere in the text.
+fn adjacent(a: &[u32], b: &[u32]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] + 1 == b[j] {
+            return true;
+        }
+        if a[i] + 1 < b[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
+}
+
+// The part of the text around the most words of the query, as pieces marked as hits or
+// not; the page escapes them as it shows them.
+fn snippet(doc: &Doc, keys: &HashMap<String, usize>) -> Vec<Value> {
+    let toks = tokens(&doc.text);
+    let hits: Vec<&Tok> = toks.iter().filter(|t| keys.contains_key(&t.key)).collect();
+    let text = &doc.text;
+    let (from, to) = if hits.is_empty() {
+        (0, cut(text, SNIPPET))
+    } else {
+        // The window, starting at a hit, that holds the most different words of the query.
+        let mut best = (0usize, 0usize, 0usize);
+        for (i, h) in hits.iter().enumerate() {
+            let mut terms = HashSet::new();
+            let mut n = 0;
+            for g in &hits[i..] {
+                if g.end - h.start > SNIPPET {
+                    break;
+                }
+                terms.insert(keys[&g.key]);
+                n += 1;
+            }
+            if (terms.len(), n) > (best.1, best.2) {
+                best = (i, terms.len(), n);
+            }
+        }
+        let start = hits[best.0].start;
+        // A little before the first hit, from the start of a word.
+        let mut from = back(text, start, 40);
+        if from > 0 {
+            if let Some(sp) = text[from..start].find(char::is_whitespace) {
+                from += sp + 1;
+            }
+        }
+        (from, cut_from(text, from, SNIPPET))
+    };
+    let mut marks: Vec<(usize, usize)> = hits.iter().filter(|t| t.start >= from && t.end <= to).map(|t| (t.start, t.end)).collect();
+    marks.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in marks {
+        match merged.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    // Plain pieces keep one space at either end where the text had any, so the pieces
+    // read right when shown one after another.
+    let mut out: Vec<Value> = Vec::new();
+    let piece = |s: String, hit: bool, out: &mut Vec<Value>| {
+        if !s.is_empty() {
+            out.push(json!({ "text": s, "hit": hit }));
+        }
+    };
+    if from > 0 {
+        piece("… ".into(), false, &mut out);
+    }
+    let mut at = from;
+    for (a, b) in merged {
+        if a > at {
+            piece(spaced(&text[at..a]), false, &mut out);
+        }
+        piece(text[a..b].to_string(), true, &mut out);
+        at = b;
+    }
+    if to > at {
+        piece(spaced(&text[at..to]).trim_end().to_string(), false, &mut out);
+    }
+    if to < text.len() {
+        piece("…".into(), false, &mut out);
+    }
+    out
+}
+
+// Plain text between hits, its spaces at the ends kept as one, so "a <hit> b" reads so.
+fn spaced(s: &str) -> String {
+    let inner = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if inner.is_empty() {
+        return if s.is_empty() { String::new() } else { " ".into() };
+    }
+    let lead = if s.starts_with(char::is_whitespace) { " " } else { "" };
+    let trail = if s.ends_with(char::is_whitespace) { " " } else { "" };
+    format!("{}{}{}", lead, inner, trail)
+}
+
+// Byte positions on character boundaries.
+fn back(s: &str, at: usize, chars: usize) -> usize {
+    s[..at].char_indices().rev().nth(chars.saturating_sub(1)).map_or(0, |(i, _)| i)
+}
+
+fn cut(s: &str, chars: usize) -> usize {
+    cut_from(s, 0, chars)
+}
+
+fn cut_from(s: &str, from: usize, chars: usize) -> usize {
+    match s[from..].char_indices().nth(chars) {
+        None => s.len(),
+        Some((i, _)) => {
+            // Stop at the end of a word rather than inside one.
+            let end = from + i;
+            s[from..end].rfind(char::is_whitespace).map_or(end, |w| from + w)
+        }
+    }
+}
+
+/// Searches the index `name`, best first. `options` (or `null`) may hold `limit` (10; 1 to 100), `kind` (only documents of that kind) and `per_page` (how many sections of one page, its url before `#`; 2 by default, `null` for no limit). Gives `{ total, hits }`: `total` documents matched, and each hit `{ url, title, heading, kind, score, snippet }`, `snippet` a list of `{ text, hit }` to show with the words found marked. The last word, while it is typed (no space after it), also finds the words it starts.
+pub fn docsearch_query(name: &str, query: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let index = get(name)?;
+    let mut limit = 10usize;
+    let mut kind: Option<String> = None;
+    let mut per_page: Option<usize> = Some(2);
+    match &options {
+        Value::Null => {}
+        Value::Object(o) => {
+            for (k, v) in o {
+                match (k.as_str(), v) {
+                    ("limit", v) => limit = v.as_i64().filter(|n| (1..=100).contains(n)).ok_or("`limit` must be a whole number from 1 to 100")? as usize,
+                    ("kind", Value::Null) => kind = None,
+                    ("kind", Value::String(s)) => kind = Some(s.clone()),
+                    ("kind", _) => return Err("`kind` must be text or null".into()),
+                    ("per_page", Value::Null) => per_page = None,
+                    ("per_page", v) => per_page = Some(v.as_i64().filter(|n| (1..=100).contains(n)).ok_or("`per_page` must be a whole number from 1 to 100, or null")? as usize),
+                    (other, _) => return Err(format!("no option `{}` (limit, kind, per_page)", other)),
+                }
+            }
+        }
+        _ => return Err("options must be a map, or null".into()),
+    }
+    if query.chars().count() > MAX_QUERY {
+        return Err(format!("a query of at most {} characters", MAX_QUERY));
+    }
+    let terms = terms_of(&index, query);
+    if terms.is_empty() {
+        return Ok(json!({ "total": 0, "hits": [] }));
+    }
+    let n = index.docs.len() as f64;
+    let mut acc: HashMap<u32, (f64, u64)> = HashMap::new();
+    let idf_of = |len: usize| ((n - len as f64 + 0.5) / (len as f64 + 0.5) + 1.0).ln();
+    for (ti, term) in terms.iter().enumerate() {
+        // A word typed counts by its best match in a document: what it starts, or a typo
+        // away, never adds to the word itself, and never counts as rarer than it is.
+        let cap = index.terms.get(&term.variants[0].0).map(|l| idf_of(l.len()));
+        let mut best: HashMap<u32, f64> = HashMap::new();
+        for (vi, (key, w)) in term.variants.iter().enumerate() {
+            let Some(list) = index.terms.get(key) else { continue };
+            let idf = match cap {
+                Some(c) if vi > 0 => idf_of(list.len()).min(c),
+                _ => idf_of(list.len()),
+            };
+            for p in list {
+                let d = &index.docs[p.doc as usize];
+                let mut s = 0.0;
+                for f in 0..FIELDS {
+                    let tf = p.tf[f] as f64;
+                    if tf > 0.0 {
+                        let norm = if index.avg[f] > 0.0 { d.lens[f] as f64 / index.avg[f] } else { 1.0 };
+                        s += WEIGHT[f] * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * norm));
+                    }
+                }
+                let v = w * idf * s;
+                let e = best.entry(p.doc).or_insert(0.0);
+                if v > *e {
+                    *e = v;
+                }
+            }
+        }
+        for (doc, v) in best {
+            let e = acc.entry(doc).or_insert((0.0, 0));
+            e.0 += v;
+            e.1 |= 1 << ti;
+        }
+    }
+    let whole_query = squash(&fold(query));
+    let nt = terms.len();
+    let mut scored: Vec<(f64, u32)> = acc
+        .into_iter()
+        .filter(|(d, _)| kind.as_ref().map_or(true, |k| &index.docs[*d as usize].kind == k))
+        .map(|(d, (s, mask))| {
+            let doc = &index.docs[d as usize];
+            let coverage = mask.count_ones() as f64 / nt as f64;
+            let mut s = s * coverage * coverage * doc.boost;
+            if !whole_query.is_empty() {
+                if doc.folded_title == whole_query {
+                    // The page itself, before its sections.
+                    s *= if doc.url.contains('#') { 1.5 } else { 3.0 };
+                } else if doc.folded_heading == whole_query {
+                    s *= 2.0;
+                } else if doc.folded_title.starts_with(&whole_query) {
+                    s *= 1.5;
+                }
+            }
+            (s, d)
+        })
+        .collect();
+    let total = scored.len();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    // Words found side by side: a phrase counts more. Only the best few are looked at.
+    if nt > 1 {
+        let exact: Vec<&String> = terms.iter().map(|t| &t.variants[0].0).collect();
+        for (s, d) in scored.iter_mut().take(200) {
+            let pos = |k: &String| index.terms.get(k).and_then(|l| l.binary_search_by_key(d, |p| p.doc).ok().map(|i| &l[i].pos));
+            if exact.windows(2).any(|w| matches!((pos(w[0]), pos(w[1])), (Some(a), Some(b)) if adjacent(a, b))) {
+                *s *= 1.3;
+            }
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    }
+    let mut keys: HashMap<String, usize> = HashMap::new();
+    for (ti, t) in terms.iter().enumerate() {
+        for (k, _) in &t.variants {
+            keys.entry(k.clone()).or_insert(ti);
+        }
+    }
+    let mut per: HashMap<&str, usize> = HashMap::new();
+    let mut hits = Vec::new();
+    for (s, d) in scored {
+        let doc = &index.docs[d as usize];
+        if let Some(max) = per_page {
+            let c = per.entry(doc.page.as_str()).or_insert(0);
+            if *c == max {
+                continue;
+            }
+            *c += 1;
+        }
+        hits.push(json!({
+            "url": doc.url, "title": doc.title, "heading": doc.heading, "kind": doc.kind,
+            "score": (s * 1000.0).round() / 1000.0,
+            "snippet": snippet(doc, &keys),
+        }));
+        if hits.len() == limit {
+            break;
+        }
+    }
+    Ok(json!({ "total": total, "hits": hits }))
+}
+
+// ---- Reading a site: its sitemap, then each page -------------------------------------
+
+struct Crawl {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    kinds: Vec<(String, String)>, // path prefix, kind; the longest prefix wins
+    boost: HashMap<String, f64>,  // kind, boost
+    skip: Vec<String>,            // CSS selectors left out of every page
+    lines: Vec<String>,           // CSS selectors whose elements each end a line
+    content: Vec<String>,         // where a page's text is: the first that matches
+    max_pages: usize,
+    concurrency: usize,
+    timeout: Duration,
+    wait: Duration,
+    user_agent: String,
+    as_listed: bool,
+    block: bool,
+}
+
+#[derive(Default)]
+struct Status {
+    state: &'static str,
+    sitemap: String,
+    total: usize,
+    done: usize,
+    pages: usize,
+    sections: usize,
+    skipped: HashMap<String, usize>,
+    errors: Vec<(String, String)>,
+    started: u64,
+    finished: Option<u64>,
+    ms: f64,
+    message: String,
+}
+
+static STATUSES: Mutex<Option<HashMap<String, Arc<Mutex<Status>>>>> = Mutex::new(None);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn strings(v: &Value, what: &str) -> Result<Vec<String>, String> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("`{}` must be a list of text", what))).collect(),
+        _ => Err(format!("`{}` must be a list of text", what)),
+    }
+}
+
+fn whole(v: &Value, what: &str, lo: i64, hi: i64) -> Result<usize, String> {
+    v.as_i64().filter(|n| (lo..=hi).contains(n)).map(|n| n as usize).ok_or_else(|| format!("`{}` must be a whole number from {} to {}", what, lo, hi))
+}
+
+fn crawl_options(options: &Value) -> Result<Crawl, String> {
+    let mut c = Crawl {
+        include: Vec::new(),
+        exclude: Vec::new(),
+        kinds: Vec::new(),
+        boost: HashMap::new(),
+        skip: Vec::new(),
+        lines: Vec::new(),
+        content: vec!["main".into(), "article".into(), "body".into()],
+        max_pages: 10_000,
+        concurrency: 4,
+        timeout: Duration::from_secs(10),
+        wait: Duration::from_secs(30),
+        user_agent: "quillo-docsearch-crawler/1.0".into(),
+        as_listed: false,
+        block: false,
+    };
+    let o = match options {
+        Value::Null => return Ok(c),
+        Value::Object(o) => o,
+        _ => return Err("options must be a map, or null".into()),
+    };
+    for (k, v) in o {
+        match k.as_str() {
+            "include" => c.include = strings(v, k)?,
+            "exclude" => c.exclude = strings(v, k)?,
+            "skip" => c.skip = strings(v, k)?,
+            "lines" => c.lines = strings(v, k)?,
+            "content" => {
+                c.content = strings(v, k)?;
+                if c.content.is_empty() {
+                    return Err("`content` needs at least one selector".into());
+                }
+            }
+            "kinds" => {
+                let m = v.as_object().ok_or("`kinds` must be a map from a path prefix to a kind")?;
+                for (p, kind) in m {
+                    c.kinds.push((p.clone(), kind.as_str().ok_or("`kinds` must be a map from a path prefix to a kind")?.to_string()));
+                }
+                c.kinds.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            }
+            "boost" => {
+                let m = v.as_object().ok_or("`boost` must be a map from a kind to a number")?;
+                for (kind, b) in m {
+                    let b = b.as_f64().filter(|b| *b > 0.0 && b.is_finite()).ok_or("`boost` must give each kind a number above 0")?;
+                    c.boost.insert(kind.clone(), b);
+                }
+            }
+            "max_pages" => c.max_pages = whole(v, k, 1, 100_000)?,
+            "concurrency" => c.concurrency = whole(v, k, 1, 32)?,
+            "timeout_ms" => c.timeout = Duration::from_millis(whole(v, k, 100, 600_000)? as u64),
+            "wait_ms" => c.wait = Duration::from_millis(whole(v, k, 0, 600_000)? as u64),
+            "user_agent" => c.user_agent = v.as_str().filter(|s| !s.is_empty()).ok_or("`user_agent` must be text")?.to_string(),
+            "as_listed" => c.as_listed = v.as_bool().ok_or("`as_listed` must be true or false")?,
+            "wait" => c.block = v.as_bool().ok_or("`wait` must be true or false")?,
+            other => {
+                return Err(format!(
+                    "no option `{}` (include, exclude, kinds, boost, skip, lines, content, max_pages, concurrency, timeout_ms, wait_ms, user_agent, as_listed, wait)",
+                    other
+                ))
+            }
+        }
+    }
+    for s in c.skip.iter().chain(c.lines.iter()).chain(c.content.iter()) {
+        scraper::Selector::parse(s).map_err(|_| format!("`{}` is not a CSS selector", s))?;
+    }
+    Ok(c)
+}
+
+fn status_json(s: &Status) -> Value {
+    let mut skipped: Vec<(&String, &usize)> = s.skipped.iter().collect();
+    skipped.sort();
+    json!({
+        "state": s.state, "sitemap": s.sitemap, "total": s.total, "done": s.done,
+        "pages": s.pages, "sections": s.sections,
+        "skipped": skipped.into_iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<String, Value>>(),
+        "errors": s.errors.iter().map(|(u, e)| json!({ "url": u, "error": e })).collect::<Vec<_>>(),
+        "started": s.started, "finished": s.finished, "ms": s.ms, "message": s.message,
+    })
+}
+
+/// How the last crawl of `name` went: `{ state, sitemap, total, done, pages, sections, skipped, errors, started, finished, ms, message }`. `state` is `"none"` before any, then `"crawling"`, `"ready"` or `"failed"` (with `message`); `skipped` counts pages left out by reason, and `errors` holds the first 20 that could not be read.
+pub fn docsearch_status(name: &str) -> serde_json::Value {
+    let all = STATUSES.lock().unwrap_or_else(|e| e.into_inner());
+    match all.as_ref().and_then(|m| m.get(name)) {
+        None => json!({ "state": "none" }),
+        Some(s) => status_json(&s.lock().unwrap_or_else(|e| e.into_inner())),
+    }
+}
+
+/// Reads the sitemap at `sitemap` (one URL a line, or XML, a sitemap index too), fetches each page and makes the index `name` from them: a document for each section of a page's `<main>` that starts at an `h2` to `h4` with an `id`, its url the page's path with that `#anchor`, its title the page's `h1`. A page is fetched from where the sitemap was (unless `as_listed`), so a site can read its own pages while its sitemap names its public address. It runs in the background and gives `{ started }` at once (`wait: true`, from a request, gives the status once done); the index it replaces answers meanwhile. Options: `include` and `exclude` (path prefixes), `kinds` (a path prefix to a kind, the longest wins), `boost` (a kind to a number), `skip` (CSS selectors to leave out), `lines` (CSS selectors whose elements end a line, as code lines a stylesheet shows as blocks do), `content` (where the text is: `["main", "article", "body"]`), `max_pages` (10,000), `concurrency` (4), `timeout_ms` (10,000), `wait_ms` (30,000: how long the sitemap is asked for while the server starts), `user_agent`, `as_listed`, `wait`. Pages marked `noindex`, pages that are not HTML and answers that are not 200 are left out and counted in `docsearch_status`.
+pub fn docsearch_crawl(name: &str, sitemap: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if name.is_empty() {
+        return Err("an index needs a name".into());
+    }
+    let opts = crawl_options(&options)?;
+    let at = url::Url::parse(sitemap).map_err(|e| format!("{}: not a URL ({})", sitemap, e))?;
+    if at.scheme() != "http" && at.scheme() != "https" {
+        return Err(format!("{}: only http and https sitemaps are read", sitemap));
+    }
+    let status = {
+        let mut all = STATUSES.lock().unwrap_or_else(|e| e.into_inner());
+        let all = all.get_or_insert_with(HashMap::new);
+        if let Some(s) = all.get(name) {
+            let s = s.lock().unwrap_or_else(|e| e.into_inner());
+            if s.state == "crawling" {
+                return Ok(json!({ "started": false, "state": "crawling" }));
+            }
+        }
+        let s = Arc::new(Mutex::new(Status { state: "crawling", sitemap: sitemap.to_string(), started: now_ms(), ..Default::default() }));
+        all.insert(name.to_string(), s.clone());
+        s
+    };
+    let block = opts.block;
+    let (n, st) = (name.to_string(), status.clone());
+    let worker = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let st2 = st.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crawl(&n, at, &opts, &st2)));
+        let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
+        s.ms = ms(t0);
+        s.finished = Some(now_ms());
+        match result {
+            Ok(Ok(())) => s.state = "ready",
+            Ok(Err(e)) => {
+                s.state = "failed";
+                s.message = e;
+            }
+            Err(_) => {
+                s.state = "failed";
+                s.message = "the crawl stopped on an internal error".into();
+            }
+        }
+    });
+    if block {
+        let _ = worker.join();
+        let s = status.lock().unwrap_or_else(|e| e.into_inner());
+        return Ok(status_json(&s));
+    }
+    Ok(json!({ "started": true }))
+}
+
+fn agent(opts: &Crawl) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(opts.timeout).user_agent(&opts.user_agent).redirects(3).build()
+}
+
+fn read_body(r: ureq::Response, max: u64) -> Result<String, String> {
+    let mut buf = Vec::new();
+    r.into_reader().take(max + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > max {
+        return Err(format!("over {} MB", max / 1_000_000));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+// The sitemap, asked for again while the server is still starting: while nothing
+// answers, or a proxy in front answers 502, 503 or 504 for it.
+fn fetch_sitemap(agent: &ureq::Agent, at: &url::Url, opts: &Crawl) -> Result<String, String> {
+    let t0 = Instant::now();
+    loop {
+        let why = match agent.get(at.as_str()).call() {
+            Ok(r) => return read_body(r, 50_000_000).map_err(|e| format!("{}: {}", at, e)),
+            Err(ureq::Error::Status(code, _)) if !matches!(code, 502 | 503 | 504) => return Err(format!("{}: answered {}", at, code)),
+            Err(ureq::Error::Status(code, _)) => format!("answered {}", code),
+            Err(e) => e.to_string(),
+        };
+        if t0.elapsed() >= opts.wait {
+            return Err(format!("{}: {}", at, why));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn xml_text(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix("<![CDATA[").and_then(|x| x.strip_suffix("]]>")).unwrap_or(s);
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn locs(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<loc>") {
+        rest = &rest[i + 5..];
+        match rest.find("</loc>") {
+            Some(j) => {
+                out.push(xml_text(&rest[..j]));
+                rest = &rest[j + 6..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+// The pages a sitemap names: lines of text, or XML (a sitemap index's sitemaps read too).
+fn sitemap_urls(agent: &ureq::Agent, at: &url::Url, opts: &Crawl) -> Result<Vec<url::Url>, String> {
+    let body = fetch_sitemap(agent, at, opts)?;
+    let mut listed = Vec::new();
+    if body.contains("<sitemapindex") {
+        for child in locs(&body).into_iter().take(1_000) {
+            let u = at.join(&child).map_err(|e| format!("{}: {}", child, e))?;
+            let u = if opts.as_listed { u } else { from_origin(at, &u) };
+            listed.extend(locs(&fetch_sitemap(agent, &u, opts)?));
+        }
+    } else if body.contains("<urlset") {
+        listed = locs(&body);
+    } else {
+        listed = body.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect();
+    }
+    let mut out = Vec::new();
+    for l in listed {
+        if let Ok(mut u) = at.join(&l) {
+            u.set_fragment(None);
+            if u.scheme() == "http" || u.scheme() == "https" {
+                out.push(u);
+            }
+        }
+    }
+    Ok(out)
+}
+
+// `u`'s path and query at `base`'s scheme, host and port.
+fn from_origin(base: &url::Url, u: &url::Url) -> url::Url {
+    let mut out = base.clone();
+    out.set_path(u.path());
+    out.set_query(u.query());
+    out.set_fragment(None);
+    out
+}
+
+fn path_of(u: &url::Url) -> String {
+    match u.query() {
+        Some(q) => format!("{}?{}", u.path(), q),
+        None => u.path().to_string(),
+    }
+}
+
+// The elements left out of a page's text: they say nothing of what the page is about.
+const LEAVE_OUT: [&str; 16] = ["script", "style", "noscript", "template", "nav", "aside", "footer", "form", "button", "select", "textarea", "iframe", "svg", "canvas", "dialog", "head"];
+const BLOCKS: [&str; 28] = [
+    "p", "div", "section", "article", "main", "header", "li", "ul", "ol", "dl", "dt", "dd", "pre", "blockquote", "table", "tr", "td", "th", "h1", "h2", "h3", "h4",
+    "h5", "h6", "br", "hr", "figure", "figcaption",
+];
+
+struct Section {
+    anchor: String,
+    heading: String,
+    text: String,
+}
+
+// A page's title, description and sections, or why it is left out.
+fn page_sections(html: &str, opts: &Crawl) -> Result<(String, Vec<Section>), &'static str> {
+    let doc = scraper::Html::parse_document(html);
+    let meta = scraper::Selector::parse("meta").unwrap();
+    let mut description = String::new();
+    for m in doc.select(&meta) {
+        let name = m.value().attr("name").unwrap_or("").to_ascii_lowercase();
+        let content = m.value().attr("content").unwrap_or("");
+        if name == "robots" && content.to_ascii_lowercase().contains("noindex") {
+            return Err("noindex");
+        }
+        if name == "description" {
+            description = content.to_string();
+        }
+    }
+    let root = opts.content.iter().find_map(|c| doc.select(&scraper::Selector::parse(c).unwrap()).next());
+    let Some(root) = root else { return Err("no content") };
+    let ids = |sels: &[String]| -> HashSet<ego_tree::NodeId> { sels.iter().flat_map(|s| doc.select(&scraper::Selector::parse(s).unwrap()).map(|e| e.id()).collect::<Vec<_>>()).collect() };
+    let left_out = ids(&opts.skip);
+    let line_ends = ids(&opts.lines);
+    let h1 = scraper::Selector::parse("h1").unwrap();
+    let title_sel = scraper::Selector::parse("title").unwrap();
+    let title = root
+        .select(&h1)
+        .next()
+        .map(|e| squash(&e.text().collect::<String>()))
+        .filter(|t| !t.is_empty())
+        .or_else(|| doc.select(&title_sel).next().map(|e| squash(&e.text().collect::<String>())))
+        .unwrap_or_default();
+    if title.is_empty() {
+        return Err("no title");
+    }
+    let mut sections = vec![Section { anchor: String::new(), heading: String::new(), text: String::new() }];
+    fn walk(node: ego_tree::NodeRef<scraper::Node>, out: &mut Vec<Section>, left_out: &HashSet<ego_tree::NodeId>, line_ends: &HashSet<ego_tree::NodeId>) {
+        for child in node.children() {
+            match child.value() {
+                scraper::Node::Text(t) => out.last_mut().unwrap().text.push_str(&t.text),
+                scraper::Node::Element(e) => {
+                    let name = e.name();
+                    if LEAVE_OUT.contains(&name) || left_out.contains(&child.id()) || e.attr("hidden").is_some() || e.attr("aria-hidden") == Some("true") {
+                        continue;
+                    }
+                    if name == "h1" {
+                        continue; // the title
+                    }
+                    if matches!(name, "h2" | "h3" | "h4") {
+                        if let Some(id) = e.attr("id").filter(|id| !id.is_empty()) {
+                            let text: String = scraper::ElementRef::wrap(child).map(|el| el.text().collect()).unwrap_or_default();
+                            out.push(Section { anchor: id.to_string(), heading: squash(&text), text: String::new() });
+                            continue;
+                        }
+                    }
+                    let block = BLOCKS.contains(&name) || line_ends.contains(&child.id());
+                    if block {
+                        out.last_mut().unwrap().text.push('\n');
+                    }
+                    walk(child, out, left_out, line_ends);
+                    if block {
+                        out.last_mut().unwrap().text.push('\n');
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(*root, &mut sections, &left_out, &line_ends);
+    if !description.is_empty() && !squash(&sections[0].text).contains(&squash(&description)) {
+        let first = &mut sections[0].text;
+        *first = format!("{}\n{}", description, first);
+    }
+    // The first section stands for the page, so its title finds it, even with no text of its own.
+    let sections = sections
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (i, Section { text: squash(&s.text), ..s }))
+        .filter(|(i, s)| *i == 0 || !s.text.is_empty() || !s.heading.is_empty())
+        .map(|(_, s)| s)
+        .collect();
+    Ok((title, sections))
+}
+
+fn kind_of(path: &str, opts: &Crawl) -> String {
+    opts.kinds.iter().find(|(p, _)| path.starts_with(p.as_str())).map_or_else(String::new, |(_, k)| k.clone())
+}
+
+fn crawl(name: &str, at: url::Url, opts: &Crawl, status: &Arc<Mutex<Status>>) -> Result<(), String> {
+    let agent = agent(opts);
+    let mut seen = HashSet::new();
+    let mut listed: Vec<String> = Vec::new(); // the paths, in the sitemap's order
+    let mut jobs: Vec<(String, url::Url)> = Vec::new();
+    let mut over = 0;
+    let mut filtered = 0;
+    for u in sitemap_urls(&agent, &at, opts)? {
+        let path = path_of(&u);
+        let wanted = (opts.include.is_empty() || opts.include.iter().any(|p| path.starts_with(p.as_str()))) && !opts.exclude.iter().any(|p| path.starts_with(p.as_str()));
+        if !wanted {
+            filtered += 1;
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        listed.push(path.clone());
+        if jobs.len() == opts.max_pages {
+            over += 1;
+            continue;
+        }
+        let fetch = if opts.as_listed { u } else { from_origin(&at, &u) };
+        jobs.push((path, fetch));
+    }
+    {
+        let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+        s.total = jobs.len();
+        if filtered > 0 {
+            s.skipped.insert("not included".into(), filtered);
+        }
+        if over > 0 {
+            s.skipped.insert("over max_pages".into(), over);
+        }
+    }
+    let queue = Arc::new(Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>()));
+    let found: Arc<Mutex<Vec<Input>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut workers = Vec::new();
+    for _ in 0..opts.concurrency {
+        let (queue, found, status, agent) = (queue.clone(), found.clone(), status.clone(), agent.clone());
+        let opts = Crawl { kinds: opts.kinds.clone(), boost: opts.boost.clone(), skip: opts.skip.clone(), lines: opts.lines.clone(), content: opts.content.clone(), include: Vec::new(), exclude: Vec::new(), user_agent: String::new(), ..*opts };
+        workers.push(std::thread::spawn(move || loop {
+            let Some((path, fetch)) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
+            let outcome: Result<Vec<Input>, (String, bool)> = match agent.get(fetch.as_str()).call() {
+                Err(ureq::Error::Status(code, _)) => Err((format!("status {}", code), false)),
+                Err(e) => Err((e.to_string(), true)),
+                Ok(r) if !r.content_type().contains("html") => Err(("not HTML".into(), false)),
+                Ok(r) => match read_body(r, 5_000_000) {
+                    Err(e) => Err((e, true)),
+                    Ok(body) => match page_sections(&body, &opts) {
+                        Err(why) => Err((why.into(), false)),
+                        Ok((title, sections)) => {
+                            let kind = kind_of(&path, &opts);
+                            let boost = *opts.boost.get(&kind).unwrap_or(&1.0);
+                            // The path's words find the page too: /blog/pipelines/ for "pipelines".
+                            let words = fetch.path_segments().map_or_else(String::new, |segs| {
+                                segs.map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().replace(['-', '+'], " ")).collect::<Vec<_>>().join(" ")
+                            });
+                            Ok(sections
+                                .into_iter()
+                                .map(|s| Input {
+                                    tags: if s.anchor.is_empty() { words.clone() } else { String::new() },
+                                    url: if s.anchor.is_empty() { path.clone() } else { format!("{}#{}", path, s.anchor) },
+                                    title: title.clone(),
+                                    heading: s.heading,
+                                    text: s.text,
+                                    kind: kind.clone(),
+                                    boost,
+                                })
+                                .collect())
+                        }
+                    },
+                },
+            };
+            let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+            s.done += 1;
+            match outcome {
+                Ok(sections) => {
+                    s.pages += 1;
+                    s.sections += sections.len();
+                    found.lock().unwrap_or_else(|e| e.into_inner()).extend(sections);
+                }
+                Err((why, is_error)) => {
+                    if is_error && s.errors.len() < 20 {
+                        s.errors.push((path.clone(), why.clone()));
+                    }
+                    *s.skipped.entry(if is_error { "error".into() } else { why }).or_insert(0) += 1;
+                }
+            }
+        }));
+    }
+    for w in workers {
+        let _ = w.join();
+    }
+    let mut docs = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+    // In the sitemap's order, as the pages were fetched in no order.
+    let order: HashMap<String, usize> = listed.into_iter().zip(0..).collect();
+    docs.sort_by_key(|d| order.get(d.url.split('#').next().unwrap_or(&d.url)).copied().unwrap_or(usize::MAX));
+    let (index, _) = index_of(docs);
+    install(name, index);
+    Ok(())
+}
