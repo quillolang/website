@@ -6,8 +6,11 @@ group: Lists
 
 How many items there are, or, with a function, how many of them the function says
 yes to. The function takes one argument, the item, and its result is read for truth
-as `if` reads it: only `false`, `null` and an error value are no. `null` counts as an
+as `if` reads it: only `false` and `null` are no. `null` counts as an
 empty list and gives `0`.
+
+An error the function gives comes back as the result: it has said neither yes nor no, and a
+failed check must not look like nothing to see. So `count(xs, f)?` stops there.
 
 ### Examples
 
@@ -28,7 +31,7 @@ print(count(people, (p) => p.admin))
 
 - An empty list or `null` gives `0`, with or without a function.
 - Without a function, `count(xs)` is `len(xs)`.
-- With a function, a result of `false`, `null` or an error value does not count;
+- With a function, a result of `false` or `null` does not count, and an error comes back;
   anything else does, `0` and `""` included.
 - Nothing matching gives `0`, never `null`.
 
@@ -36,7 +39,7 @@ print(count(people, (p) => p.admin))
 print(count([]), count(null), count(null, (x) => true))
 print(count([1, 2, 3]) == len([1, 2, 3]))
 print(count([1, 0, "", null, false, "a"], (x) => x))
-print(count([int("1"), int("x")], (v) => v))
+print(count([int("1"), int("x")], (v) => !is_err(v)))
 print(count([1, 2], (x) => x > 5))
 ```
 

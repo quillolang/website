@@ -8,6 +8,9 @@ group: Lists
 takes one argument, the item, and is called in order; the check stops at the first no.
 `null` counts as an empty list.
 
+An error the function gives comes back as the result: it has said neither yes nor no, and a
+failed check must not look like nothing to see. So `all(xs, f)?` stops there.
+
 ### Examples
 
 ```quillo
@@ -30,8 +33,7 @@ true
 - An empty list or `null` gives `true`: there is no item to say no. Check `len` first
   when an empty list must not pass.
 - The function is not called past the first item that fails.
-- The result is read for truth as `if` reads it: only `false`, `null` and an error
-  value are no, so `all(xs, (x) => x)` is `true` when no item is null or false; `0`
+- The result is read for truth as `if` reads it: only `false` and `null` are no, so `all(xs, (x) => x)` is `true` when no item is null or false; `0`
   and `""` pass.
 
 ```quillo

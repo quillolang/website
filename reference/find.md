@@ -8,6 +8,9 @@ The first item for which the function gives a true value, or `null` when none do
 The function takes one argument, the item, and is called in order until it says yes;
 the rest of the list is not looked at. `null` counts as an empty list.
 
+An error the function gives comes back as the result: it has said neither yes nor no, and a
+failed check must not look like nothing to see. So `find(xs, f)?` stops there.
+
 ### Examples
 
 ```quillo

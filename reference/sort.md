@@ -71,12 +71,14 @@ print(sort([1, "a"]))
 line 1: `sort` cannot compare str with int
 ```
 
-```quillo error
-print(sort([[2], [1]]))
+Lists compare item by item:
+
+```quillo
+print(sort([[2, 1], [1, 9], [1, 2]]))
 ```
 
 ```output
-line 1: `sort` cannot compare list with list
+[[1, 2], [1, 9], [2, 1]]
 ```
 
 ```quillo error

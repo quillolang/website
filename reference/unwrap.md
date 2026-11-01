@@ -54,7 +54,7 @@ line 1: unwrap of an error: missing
 ```
 
 ```quillo error
-print(unwrap(err({ code: 404 })) ?? 0)
+print(unwrap(err({ code: 404 })))
 ```
 
 ```output

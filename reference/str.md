@@ -10,6 +10,9 @@ boolean `true` or `false`, `null` the word `null`, and a list or map as Quillo w
 it, strings inside them quoted. It never fails, so it is the safe way to put anything
 into a template or a message.
 
+On a server, an error Quillo made reads `err("internal error")` here, and its text goes to the
+log: it may hold an address with its password. `print` and `error(r)` have the text.
+
 ### Examples
 
 ```quillo

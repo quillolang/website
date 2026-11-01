@@ -8,6 +8,9 @@ group: Lists
 function takes one argument, the item, and is called in order; the search stops at the
 first yes. `null` counts as an empty list.
 
+An error the function gives comes back as the result: it has said neither yes nor no, and a
+failed check must not look like nothing to see. So `any(xs, f)?` stops there.
+
 ### Examples
 
 ```quillo
@@ -29,8 +32,7 @@ true
 
 - An empty list or `null` gives `false`: there is no item to say yes.
 - The function is not called past the first match.
-- The result is read for truth as `if` reads it: only `false`, `null` and an error
-  value are no, so `0` and `""` are yes. A function that returns the item gives
+- The result is read for truth as `if` reads it: only `false` and `null` are no, so `0` and `""` are yes. A function that returns the item gives
   `true` when some item is not null or false.
 - To ask whether a value is in a list, [contains](/docs/reference/contains/) needs no
   function.

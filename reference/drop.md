@@ -8,6 +8,8 @@ The list without its first `n` items, or the string without its first `n` charac
 as a new value. Dropping more than there is gives an empty one. `null` counts as an
 empty list and gives `[]`.
 
+A negative `n` counts as 0, unlike `slice`, so a count worked out by subtraction stays safe.
+
 ### Examples
 
 ```quillo

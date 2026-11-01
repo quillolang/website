@@ -9,6 +9,9 @@ the item, and gives its key: a number or a string. The sort is stable: items wit
 keys keep their order. There is no descending flag; negate a numeric key or
 [reverse](/docs/reference/reverse/) the result. `null` counts as an empty list.
 
+`f` may give a list, to sort by several keys: `sort_by(rows, (r) => [r.a, r.b])`. Lists compare
+item by item.
+
 ### Examples
 
 ```quillo

@@ -6,8 +6,11 @@ group: Lists
 
 The items for which the function gives a true value, in their original order, as a
 new list. The function takes one argument, the item. A result counts as true the way
-`if` reads it: only `false`, `null` and an error value drop the item; `0`, `""` and
+`if` reads it: only `false` and `null` drop the item; `0`, `""` and
 `[]` keep it. `null` counts as an empty list and gives `[]`.
+
+An error the function gives comes back as the result: it has said neither yes nor no, and a
+failed check must not look like nothing to see. So `filter(xs, f)?` stops there.
 
 ### Examples
 
@@ -29,7 +32,8 @@ print(filter(["a", "", "b"], (s) => s != ""))
 - An empty list or `null` gives `[]`.
 - Nothing matching gives `[]`, never `null`.
 - The function's result is read for truth, not compared with `true`: returning the
-  item itself drops only `null`, `false` and error values, and keeps `0` and `""`.
+  item itself drops only `null` and `false`, and keeps `0` and `""`. To leave out errors,
+  ask: `filter(xs, (x) => !is_err(x))`.
   Error values are falsy, so `filter(xs, (v) => v)` is one way to keep the good results
   of a conversion.
 - The list given is not changed; `filter` builds a new one.
@@ -38,7 +42,7 @@ print(filter(["a", "", "b"], (s) => s != ""))
 print(filter([], (x) => true), filter(null, (x) => true))
 print(filter([1, 2], (x) => x > 5))
 print(filter([0, 1, "", "a", null, [], {}, false], (x) => x))
-print(filter([int("1"), int("x"), int("3")], (v) => v))
+print(filter([int("1"), int("x"), int("3")], (v) => !is_err(v)))
 let xs = [1, 2, 3]
 let evens = filter(xs, (x) => x % 2 == 0)
 print(xs, evens)

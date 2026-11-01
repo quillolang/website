@@ -44,16 +44,16 @@ false
 
 ### Errors
 
-`is_err` never fails. Reading `.error` on a value that is not an error is a runtime
-error, which is what `is_err` is there to prevent.
+`is_err` never fails. Reading `.error` on a value that is not an error gives `null`,
+whatever the value is, and `error(x)` does the same.
 
-```quillo error
+```quillo
 let n = int("42")
 print(n.error)
 ```
 
 ```output
-line 2: int has no field `error`
+null
 ```
 
 ### Chaining
