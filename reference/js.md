@@ -51,10 +51,16 @@ component Share(link: str) {
   L.map is not defined on this page`; a value that is `undefined` reads as `null`.
 - A class called without `new` (`js("Chart", el)`) stops with `Chart is a class: make
   one with Chart.new(...) (or js_new("Chart", ...))`.
-- A function that gives a Promise (`fetch`, `navigator.mediaDevices.getUserMedia`) is
-  waited for in an event handler, in `@mount`, in a `state` initializer and in a
-  component's `let` functions that its markup does not call (`let locate = () => {...}`
-  used as `@click={locate}`); elsewhere it stays a promise, with `.then(...)`.
+- One rule for what waits: a call of the page's that gives a Promise is waited for in an
+  event handler, in `@mount`, in a `state` initializer and in a component's `let`
+  functions that its markup does not call (`let locate = () => {...}` used as
+  `@click={locate}`). That is `js(...)` (`fetch`, `navigator.mediaDevices.getUserMedia`),
+  a method of what the page gave (`img.decode()`, `audio.play()`), and a function given as
+  a prop. A call followed by `.then`, `.catch` or `.finally` keeps its promise, and so
+  does `js_new("Promise", ...)`, which is kept to be used later. Elsewhere, and in a
+  top-level `fn`, a promise stays a promise.
+- A function of the program's that the page calls with `undefined`, as `.then` does for a
+  Promise of nothing (`audio.play()`, `clipboard.writeText`), is given `null`.
 - A `state` initializer that reads the page (`state dark = js("localStorage.getItem",
   "theme") == "dark"`) gives `null` from `js` while the server renders the component,
   and runs again in the browser once the component is on the page, which sets the state.

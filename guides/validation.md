@@ -115,7 +115,8 @@ route GET / = <html><body><SignupForm/></body></html>
   what depends on the input with `let`, as `draft` is here.
 - **There is no debounce.** Rules run on every keystroke, in the browser, which is cheap.
   A check only the server can make (is the address taken?) waits for the submit, as
-  here, or for an `every` tick under a state flag: there is no `setTimeout`.
+  here, or for a pause in the typing: count the keystrokes in a state, and in
+  `run_after(400, ...)` check only if the count is still the one it started with.
 
 ### On the server: the same rules decide
 

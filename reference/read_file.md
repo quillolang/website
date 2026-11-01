@@ -29,7 +29,9 @@ eggs
 
 - A missing file is an error value that names the path and the system's reason.
 - A path with `..`, one starting at `/`, and the empty path are error values: the
-  program's folder is the limit.
+  program's folder is the limit, unless `quillo run --allow-path DIR` names another
+  folder, for a script used as a tool. Then a path into `DIR` is read, by its own path
+  or through `..`; where a link leads is what counts.
 - A folder is an error value too.
 - What comes back is always text: a number written with `write_file` is read as its
   digits. Parse it (`int`, `json.parse`) when a value is wanted.
@@ -98,4 +100,4 @@ print(["b.txt", "nope"] | map(read_file) | map((r) => r ?? "?"))
 
 ### See also
 
-[write_file](/docs/reference/write_file/), [delete_file](/docs/reference/delete_file/), [file](/docs/reference/file/), [json.parse](/docs/reference/json.parse/), [is_err](/docs/reference/is_err/)
+[write_file](/docs/reference/write_file/), [stdin](/docs/reference/stdin/), [delete_file](/docs/reference/delete_file/), [file](/docs/reference/file/), [json.parse](/docs/reference/json.parse/), [is_err](/docs/reference/is_err/)

@@ -34,7 +34,8 @@ null
 - Any value is written as its text: `42` becomes `42`, a map becomes `{ a: 1 }`, `null`
   becomes an empty file.
 - A path with `..`, one starting at `/`, and the empty path are error values, and nothing
-  is written.
+  is written, unless `quillo run --allow-path DIR` names the folder it leads into, for a
+  script used as a tool; folders are made there too.
 
 ```quillo
 print(write_file("a/b/c/d.txt", "deep"), read_file("a/b/c/d.txt"))

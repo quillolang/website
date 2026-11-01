@@ -17,3 +17,7 @@ print(args())
 ```output
 []
 ```
+
+### See also
+
+[stdin](/docs/reference/stdin/), [read_line](/docs/reference/read_line/), [exit](/docs/reference/exit/), [read_file](/docs/reference/read_file/)

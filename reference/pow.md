@@ -4,9 +4,10 @@ group: Math
 
 ### What it does
 
-`x` to the power `y`. With two ints and a `y` of zero or more, the answer is an int
-as long as it fits in 64 bits; otherwise it is a float. `pow(2, 10)` is `1024`,
-`pow(2, 0.5)` is `1.4142135623730951`, `pow(2, -1)` is `0.5`.
+`x` to the power `y`. With two ints and a `y` of zero or more, the answer is an int,
+exact: past 64 bits it is an overflow, as `*` gives, which `??` can catch. A float on
+either side, or a negative `y`, gives a float. `pow(2, 10)` is `1024`, `pow(2, 0.5)` is
+`1.4142135623730951`, `pow(2, -1)` is `0.5`.
 
 ### Examples
 
@@ -22,21 +23,24 @@ print(pow(10, 0), pow(-2, 3), pow(1.5, 2))
 
 ### Edge cases
 
-- An int answer past 64 bits is a float, not an overflow: `pow(2, 63)` is a float,
-  `pow(2, 62)` an int. `pow(-2, 63)` still fits.
+- An int answer past 64 bits is an overflow, not a float with digits that look exact:
+  `pow(2, 62)` is an int, `pow(2, 63)` stops, and `pow(-2, 63)` still fits. For the
+  float, give a float: `pow(2.0, 63)`.
 - A negative int exponent gives a float.
 - `pow(0, 0)` is `1`; `pow(0, -1)` is `inf`; a float answer past what a float holds is
   `inf`.
 - A negative base with a fractional exponent is `NaN`.
 
 ```quillo
-print(pow(2, 62), pow(2, 63), type_of(pow(2, 63)), pow(-2, 63))
-print(pow(0, 0), pow(0, -1), pow(2, 1024))
+print(pow(2, 62), pow(-2, 63), pow(2.0, 63))
+print(pow(2, 63) ?? "too big", pow(10, 30) ?? "too big")
+print(pow(0, 0), pow(0, -1), pow(2.0, 1024))
 print(pow(-8, 1.0 / 3.0), pow(-1, 0.5))
 ```
 
 ```output
-4611686018427387904 9223372036854776000 float -9223372036854775808
+4611686018427387904 -9223372036854775808 9223372036854776000
+too big too big
 1 inf inf
 NaN NaN
 ```
@@ -46,6 +50,14 @@ NaN NaN
 A string, `null` or a boolean as either argument is a runtime error, not an error
 value, and so is a decimal: convert it with `float` first. A missing exponent is a
 runtime error too.
+
+```quillo error
+print(pow(2, 64))
+```
+
+```output
+line 1: integer overflow
+```
 
 ```quillo error
 print(pow("2", 2))

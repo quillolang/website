@@ -40,12 +40,13 @@ component Saved() {
 
 ### Edge cases
 
-- It is the only clock: there is no `setTimeout`, so a delay, a debounce or a throttle
-  is an `every` under a state flag that the tick turns off, as above.
-- It is called from the component's code, a `let` or an `if` there, not from an event
-  handler: there it is an error in the browser (`` `every` works in a component ``,
-  in the console), which `quillo check` does not see. A handler sets the state that
-  the `if` reads.
+- For once, later, [run_after](/docs/reference/run_after/): there is no `setTimeout`. A
+  debounce or a throttle is an `every` under a state flag that the tick turns off, as
+  above.
+- It is called from the component's code, a `let` or an `if` there, or from one of its
+  event handlers or its `@mount`: started there, it runs until the component leaves the
+  page. Started after a handler's first wait (a `server fn`'s answer), it belongs to no
+  one, and is an error in the console (`` `every` works in a component ``).
 - What a statement starts, it stops: before the statement runs again, and when its
   component, row or branch leaves the page, the timer is cleared.
 - A tick's function may call a `server fn` or `notify`; an error in it is written to
@@ -105,4 +106,4 @@ if polling { every(5000, () => { status = check_status(id) }) }
 
 ### See also
 
-[listen](/docs/reference/listen/), [live](/docs/reference/live/), [schedule](/docs/reference/schedule/), [sleep](/docs/reference/sleep/), [now](/docs/reference/now/)
+[run_after](/docs/reference/run_after/), [listen](/docs/reference/listen/), [live](/docs/reference/live/), [schedule](/docs/reference/schedule/), [sleep](/docs/reference/sleep/), [now](/docs/reference/now/)
