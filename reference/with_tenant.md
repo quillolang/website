@@ -10,7 +10,7 @@ over the tenants. Its database is made and migrated if there is none, so to sign
 tenant up use [new_tenant](/docs/reference/new_tenant/), which refuses a name that is
 taken. The name must be a valid tenant's name: lowercase
 letters, digits, `-` and `_`, at most 63, starting with a letter or a digit. See
-[Many tenants](/docs/structure/#many-tenants).
+[Many tenants](/docs/standard-library/#many-tenants).
 
 ### Examples
 

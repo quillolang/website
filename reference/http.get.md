@@ -66,7 +66,8 @@ err("http: not an http(s) URL: not a url")
   that cannot be read, or holds no certificate, makes the call an error value that says
   so.
 - A policy limits where it may go, whatever the program asks (`/etc/quillo/policy.toml`,
-  `--policy FILE`, `quillo.policy` beside the program). `[http] hosts` lists the hosts
+  `quillo run main.qwe --policy FILE`, `quillo.policy` beside the program; see [the
+  options](/docs/)). `[http] hosts` lists the hosts
   allowed (`api.stripe.com`, `*.mapbox.com` for its subdomains, `*` for any), and
   `private = false` refuses this machine, private networks and the cloud's metadata
   address, the name looked up first. Each redirect is judged too, hop by hop, so an

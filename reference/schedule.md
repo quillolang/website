@@ -10,7 +10,7 @@ so that `"5m"` runs at :00, :05, ...), or at the times of a cron line (`minute h
 day month weekday`, in UTC, with `*`, `1-5`, `*/15` and lists, or `@hourly`, `@daily`,
 `@weekly`, `@monthly`, `@yearly`). Written at the top of a program, which `quillo run`
 then serves. A job is named after its function, or by `{ name }`; no two alike. It
-gives null. See [Scheduled jobs](/docs/operations/#scheduled-jobs).
+gives null. See [Scheduled jobs](/docs/concurrency-and-reloading/#scheduled-jobs).
 
 ### Examples
 
@@ -37,7 +37,8 @@ schedule(60, ping, { name: "ping-minute" })      // seconds
   * 1-5"`, not `mon-fri`. A duration must be more than 0.
 - Several servers on one database run each job once per due time; with a database per
   tenant, each server runs its jobs, and the job loops over the tenants with
-  `with_tenant`. `--no-jobs` turns them off on a server.
+  `with_tenant`. The `quillo run` option `--no-jobs` turns them off on a server
+  (`quillo run main.qwe --no-jobs`; see [the options](/docs/)).
 - A program with a `schedule` in it is a server: `quillo run` serves it and keeps
   running, which is why the examples here are not run.
 

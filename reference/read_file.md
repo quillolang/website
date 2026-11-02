@@ -29,8 +29,9 @@ eggs
 
 - A missing file is an error value that names the path and the system's reason.
 - A path with `..`, one starting at `/`, and the empty path are error values: the
-  program's folder is the limit, unless `quillo run --allow-path DIR` names another
-  folder, for a script used as a tool. Then a path into `DIR` is read, by its own path
+  program's folder is the limit, unless the `quillo run` option `--allow-path` names
+  another folder, for a script used as a tool (`quillo run tool.qwe --allow-path
+  /srv/shared`; see [the options](/docs/)). Then a path into `DIR` is read, by its own path
   or through `..`; where a link leads is what counts.
 - Links are followed, and where they lead is what counts: a link inside the folder
   that leads inside it works as its target would, and one that leads out of the

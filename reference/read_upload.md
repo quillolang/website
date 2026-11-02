@@ -12,7 +12,15 @@ garbled: save those with [save_upload](/docs/reference/save_upload/).
 
 ### Examples
 
+A page whose form sends a CSV, and the route that reads it without saving it:
+
 ```quillo noexec
+route GET /import =
+    <form method="post" action="/import" enctype="multipart/form-data">
+        <input type="file" name="sheet" accept=".csv,text/csv" required/>
+        <button>Import</button>
+    </form>
+
 route POST /import {
     let rows = read_upload(request.files.sheet)? | split("\n") | filter((l) => l != "")
     for r in rows {
@@ -28,8 +36,9 @@ route POST /import {
 - Outside a request, or in a request that uploaded nothing, the result is an error
   value: `read_upload: the current request has no files`. A record that is not one of
   this request's files is an error value too.
-- The text is the whole file in memory; the body's size is limited by `--max-body`
-  (10 MiB by default).
+- The text is the whole file in memory; the body's size is limited by the `quillo run`
+  option `--max-body` (10 MiB by default): `quillo run main.qwe --max-body 50MB` takes
+  larger uploads. See [the options](/docs/).
 - The file stays with the request: `read_upload` reads it as often as asked.
 
 ```quillo

@@ -29,6 +29,38 @@ udp.listen(514, (p) => db.exec("insert into syslog (host, line) values (?, ?)", 
 })
 ```
 
+A whole round: the listener keeps each reading in a global that a page follows with
+`live`, and answers the sender. A device, or a script with `udp.send`, is the other side:
+
+```quillo noexec
+let readings = []
+
+udp.listen(9000, (p) => {
+    let r = json.parse(p.text)
+    if is_err(r) { return udp.reply(p, "bad") }
+    readings = readings + [{ from: p.from.host, ...r }]
+    udp.reply(p, "ok")
+})
+
+server fn load_readings() = readings
+
+component Readings() {
+    state rows = live(load_readings)            // each new packet shows on every open page
+    <ul>{for r in rows => <li>{r.from}: {r.temp} C</li>}</ul>
+}
+
+route GET / = <Readings/>
+```
+
+```quillo noexec
+// sensor.qwe, run with `quillo run sensor.qwe` while the program above serves
+udp.send("127.0.0.1", 9000, { temp: 21.5 })
+```
+
+```sh
+echo '{"temp": 19}' | nc -u -w1 127.0.0.1 9000     # prints ok, the reply
+```
+
 ### Edge cases
 
 - The port is taken when the program runs, so one that is in use, or on an address
@@ -39,8 +71,11 @@ udp.listen(514, (p) => db.exec("insert into syslog (host, line) values (?, ?)", 
 - A full queue drops its oldest packet, as UDP would; where packets come in bursts,
   give `queue` room for the largest.
 - `f` written with no parameter is called with none.
-- One program on a machine listens on a port; with `--instances`, the instances share
-  the socket. With `--reload`, a port still listened on stays open across the reload.
+- One program on a machine listens on a port; with `--instances`, the `quillo run`
+  option that runs the program several times over (`quillo run main.qwe --instances 4`),
+  the instances share the socket. With `--reload` (`quillo run main.qwe --reload`,
+  reloading as the files change), a port still listened on stays open across the
+  reload. See [the options](/docs/).
 - There is no multicast, and packets are plain: no DTLS.
 - Opening a port is the `net` effect, as sending is: a function declared `with` without
   `net` cannot call it, and a policy whose `[effects]` leaves out `net` refuses it

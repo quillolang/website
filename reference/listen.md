@@ -30,7 +30,18 @@ component Progress(job: int) {
 }
 ```
 
+With named events, the function takes the name second. The route sends prices, then a
+`close` that the component answers by setting the state its `listen` stands on:
+
 ```quillo noexec
+route GET /prices/:symbol = events((send) => {
+    for _ in range(60) {                        // a minute of prices
+        send({ last: last_price(symbol) }, "price")
+        sleep(1000)
+    }
+    send({}, "close")
+})
+
 component Ticker(symbol: str) {
     state price = null
     state open = true

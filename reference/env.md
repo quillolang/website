@@ -31,8 +31,8 @@ null fallback
   not set.
 - A variable that is set to the empty string is `""`, not `null`, so its default is not
   used.
-- Under a policy whose `[env]` gives `names` (`/etc/quillo/policy.toml`, `--policy FILE`
-  or `quillo.policy` beside the program), a name not in the list reads as not set: `null`,
+- Under a policy whose `[env]` gives `names` (`/etc/quillo/policy.toml`, `quillo run main.qwe --policy FILE`
+  or `quillo.policy` beside the program; see [the options](/docs/)), a name not in the list reads as not set: `null`,
   or the default. Each policy file can only narrow the list.
 
 ```quillo

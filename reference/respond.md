@@ -54,7 +54,9 @@ route POST /items { json: { name: str } } {
   Reasons`).
 - A route's answer with an `etag` header gets a `304` with no body when a GET or HEAD
   asks with a matching `If-None-Match`, as files do. Such an answer, or one with a
-  `content-range`, goes out as it is: no prefetch or `--watch` script is added to it.
+  `content-range`, goes out as it is: no prefetch or `--watch` script is added to it
+  (`--watch` is the `quillo run` option that reloads open pages as the files change:
+  `quillo run main.qwe --watch`; see [the options](/docs/)).
 - `reply status respond(...)` from a helper keeps the body and headers with the new
   status, so a helper can answer with headers too.
 

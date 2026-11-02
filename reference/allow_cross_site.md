@@ -29,6 +29,21 @@ route POST /sso { form: { token: str } } {
 }
 ```
 
+The other side is the provider's page, on its own site, which sends the visitor back
+with a form posted to yours, such as:
+
+```html
+<form method="post" action="https://shop.example/payments/return">
+  <input type="hidden" name="order" value="42"/>
+  <input type="hidden" name="status" value="paid"/>
+</form>
+<script>document.forms[0].submit()</script>
+```
+
+With the line above, that post reaches the route (`303` to `/orders/42`). Without it,
+or on a path it does not name, the visitor sees `403` and the text `this site does not
+take form posts from other sites`, and the route never runs.
+
 ```quillo
 print(allow_cross_site("/sso"))
 ```

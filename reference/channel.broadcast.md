@@ -8,8 +8,8 @@ Sends a value to every page in a channel and gives how many took it. The value g
 JSON, up to 1 MiB. The options are `except` (a peer, or its id, that is left out:
 usually the one whose message is being passed on) and `reliable` (in order, over a
 stream; a page that cannot keep up is disconnected rather than miss it). It waits for
-nothing, needs the `net` effect, and reaches the pages connected to this server (and
-its `--instances`).
+nothing, needs the `net` effect, and reaches the pages connected to this server (and the
+copies of it that `quillo run main.qwe --instances 4` starts; see [the options](/docs/)).
 
 ### Examples
 

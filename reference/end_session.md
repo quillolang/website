@@ -7,13 +7,25 @@ group: Cookies and sessions
 Forgets the visitor's session: the session cookie is removed from the browser with the
 request's answer, and `session()` is `{}` from here on. Logging out. It gives null.
 `set_session(null)` does the same. See [Headers, cookies and
-sessions](/docs/guides/headers-cookies-sessions/#sessions).
+sessions](/docs/headers-cookies-sessions/#sessions).
 
 ### Examples
 
 ```quillo noexec
 route POST /logout { end_session(); redirect("/") }
+
+route GET / =
+    <header>
+        {session().user != null
+            ? <form method="post" action="/logout"><button>Log out</button></form>
+            : <a href="/login">Sign in</a>}
+    </header>
 ```
+
+Logging out is a form posting to the route, not a link: a `GET` would let any page log
+the visitor out with an `<img>`, and a post from another site is refused with 403.
+The answer carries `set-cookie: quillo_session=; Path=/; Max-Age=0` (in production the
+name is `__Host-quillo_session`), and the page it redirects to shows `Sign in`.
 
 ```quillo
 set_session({ user: 7 })

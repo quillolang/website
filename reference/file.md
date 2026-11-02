@@ -51,8 +51,9 @@ public, max-age=31536000, immutable
 - Links are followed, and where they lead is what counts: a link inside the folder
   that leads inside it works as its target would, and one that leads out of the
   folder, or leads nowhere, is the same `404`. The first such path is said once in the
-  log, with where it leads and `--allow-path FOLDER`, which lets the program reach
-  a folder outside on purpose.
+  log, with where it leads and `--allow-path FOLDER`, the option of `quillo run` that
+  lets the program reach a folder outside on purpose (`quillo run main.qwe --allow-path
+  /srv/media`; see [the options](/docs/)).
 - An extension the list does not know is sent as `application/octet-stream`. The list:
   `html htm css js mjs json map webmanifest xml xsl txt text md markdown csv tsv svg
   png jpg jpeg gif webp avif bmp tif tiff heic jxl ico mp4 m4v mov webm m4a aac flac

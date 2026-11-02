@@ -24,12 +24,32 @@ $argon2id 97
 true
 ```
 
+A sign-up page and the route its form posts to. The hash is what goes in the database,
+never the password; an email already taken fails the `unique` column, and the visitor
+gets a 409 with the text:
+
 ```quillo noexec
+db.open("app.db")
+db.exec("create table if not exists users (id integer primary key, email text unique not null, password_hash text not null)")
+
+route GET /signup =
+    <form method="post" action="/signup">
+        <input name="email" type="email" required/>
+        <input name="password" type="password" minlength="10" required/>
+        <button>Create account</button>
+    </form>
+
 route POST /signup { form: { email: str, password: str } } {
-    db.exec("insert into users (email, password_hash) values (?, ?)", email, crypto.hash_password(password))
-    redirect("/login")
+    if len(password) < 10 { reply 400 "Passwords are at least 10 characters" }   // minlength can be skipped
+    let r = db.exec("insert into users (email, password_hash) values (?, ?)", email, crypto.hash_password(password))
+    if is_err(r) { reply 409 "That email has an account" }
+    set_session({ user: r.last_id })
+    redirect("/")
 }
 ```
+
+Signing in again checks the password against the stored hash: see
+[crypto.verify_password](/docs/reference/crypto.verify_password/).
 
 ### Edge cases
 

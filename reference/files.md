@@ -56,7 +56,8 @@ public, max-age=3600, immutable
 - A path that leads out of the program's folder through a link, or through a link
   that leads nowhere, finds nothing too: the same `404`, whether a file or a folder is
   there or not, so a miss says nothing of the folder outside. The first such path is
-  said once in the log, naming `--allow-path FOLDER`. A link that stays inside the
+  said once in the log, naming `--allow-path FOLDER`, the option of `quillo run` that lets the
+  program reach a folder outside (`quillo run main.qwe --allow-path /srv/site`). A link that stays inside the
   folder works.
 - It is the `fs` effect, as `file` is: a function declared `with` without `fs` cannot
   call it.

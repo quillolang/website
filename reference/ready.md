@@ -37,7 +37,9 @@ null
 - Adding a check with the name of an earlier one replaces it.
 - `/_quillo/health` is not affected: it says only whether the process is up. Neither
   request is logged or counted.
-- Under a mount or `--base`, `/shop/_quillo/ready` asks the mounted program.
+- Under a mount or `--base` (the `quillo run` option that serves the program under a
+  path: `quillo run main.qwe --base /shop`; see [the options](/docs/)), `/shop/_quillo/ready` asks
+  the mounted program.
 - In a plain program the function is never called: nothing probes it.
 
 ```quillo

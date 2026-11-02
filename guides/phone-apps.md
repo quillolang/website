@@ -299,6 +299,20 @@ component Notes() {
 }
 ```
 
+The other side is an ordinary program on your server, whose `server fn` is the one
+called; nothing in it is for the app:
+
+```quillo noexec
+// shop.qwe, run at https://shop.example.com
+db.open("shop.db")
+db.exec("create table if not exists notes (id integer primary key, text text not null)")
+
+server fn notes(n: int) = db.query("select id, text from notes order by id desc limit ?", n)
+```
+
+Tried on one machine, with `quillo run shop.qwe --port 8081` and the app's program run as
+`SHOP_URL=http://127.0.0.1:8081 quillo run main.qwe`, its page lists the shop's notes.
+
 - **What a call gives.** `shop.notes(a, b)` gives the site's answer, or the site's error
   as an error value, or an error value when the site cannot be reached. Decimals and
   big ints cross as they do between a page and its program.
@@ -349,7 +363,7 @@ tasks, push notifications), which the runtime does not offer yet.
 | Compiled numbers | no JIT on phones: number-heavy functions run in the interpreter |
 | WebTransport and WebSockets | channels and live data go through the app's bridge |
 | `.qwer` plugins built at run time | a phone has no compiler |
-| Starting processes | `--instances`, `--split` and `--with`: the app is one process |
+| Starting processes | `quillo run`'s options `--instances`, `--split` and `--with` ([the options](/docs/)): the app is one process |
 
 ### An example: Fieldbook
 

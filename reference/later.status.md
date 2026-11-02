@@ -26,7 +26,19 @@ print(later.status("no such call"))
 null
 ```
 
+A route that makes the call later and gives its id, a route that says how it went, and
+the service whose `server fn` it calls:
+
 ```quillo noexec
+// payments.qwe
+server fn charge(ref: str) {
+    if ref == "" { return err("no reference") }   // done, with an error value as its result
+    { ref, paid: true }
+}
+```
+
+```quillo noexec
+// main.qwe
 service payments = "payments.qwe"
 
 route POST /charge = payments.later.charge(request.json.ref)
@@ -37,8 +49,13 @@ route GET /charge/:id {
         return respond(404, "no such charge")
     }
     if s.state == "done" && is_err(s.result) {
-        return `refused: ${s.result}`
+        return `refused: ${s.result.error}`
     }
     s.state
 }
+```
+
+```sh
+curl localhost:8080/charge --json '{"ref": "order-17"}'    # "a4a241a6cb58b5bd973075e6"
+curl localhost:8080/charge/a4a241a6cb58b5bd973075e6        # waiting, then done
 ```

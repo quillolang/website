@@ -44,7 +44,7 @@ fn withdraw(account: int, cents: int) with db =
     db.transaction({ isolation: "serializable", retries: 5 }, () => {
         let balance = db.one("select balance from accounts where id = ?", account).balance
         if balance < cents { return err("not enough money") }
-        db.exec("update accounts set balance = balance - ? where id = ?", cents, account)?
+        db.exec("update accounts set balance = balance - ? where id = ?", cents, account)
     })
 ```
 

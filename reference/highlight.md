@@ -79,9 +79,26 @@ print(".a { color: red }" | highlight("css") | str | len)
 69
 ```
 
+On a page, the classes need a stylesheet of the page's own, here in a `<style>`:
+
 ```quillo noexec
-view Snippet(code) = <pre class="hl">{highlight(code, "quillo")}</pre>
+let sheet = css`
+  .hl { background: #f6f8fa; padding: 1rem; overflow-x: auto }
+  .hl-k { color: #cf222e } .hl-s { color: #0a3069 } .hl-c { color: #6e7781; font-style: italic }
+  .hl-n { color: #0550ae } .hl-f { color: #8250df } .hl-t { color: #116329 } .hl-a { color: #953800 }
+`
+
+view Snippet(code: str, lang: str) = <pre class="hl"><code>{highlight(code, lang)}</code></pre>
+
+route GET /snippet =
+    <html><head><style>{sheet}</style></head><body>
+        <Snippet code={"let total = sum(prices) // dollars"} lang="quillo"/>
+        <Snippet code={read_file("schema.sql") ?? ""} lang="sql"/>
+    </body></html>
 ```
+
+The page carries the spans as they are, not escaped again:
+`<pre class="hl"><code><span class="hl-k">let</span> total = <span class="hl-f">sum</span>(prices) ...`.
 
 ### See also
 

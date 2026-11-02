@@ -77,12 +77,25 @@ print("2026-10-27T14:30:00Z" | date.valid("date"))
 false
 ```
 
+A form with date fields, and the route it posts to. A browser's `type="date"` sends
+`YYYY-MM-DD`, but anyone can post anything, so the route checks before counting:
+
 ```quillo noexec
-route POST /leave ? { from: str, to: str } {
-    if !date.valid(from, "date") || !date.valid(to, "date") { reply 400 "give dates as YYYY-MM-DD" }
-    date.days_between(from, to)
+route GET /leave =
+    <form method="post" action="/leave">
+        <input type="date" name="from" required/> to <input type="date" name="to" required/>
+        <button>Count the days</button>
+    </form>
+
+route POST /leave { form: { from: str, to: str } } {
+    if !date.valid(from, "date") || !date.valid(to, "date") { reply 400 "Give dates as YYYY-MM-DD" }
+    `${date.days_between(from, to)} days`
 }
 ```
+
+From `2026-11-02` to `2026-11-13` the answer is `11 days`; `to=next week` gets `400 Give
+dates as YYYY-MM-DD`. A form without `to` at all does not match the pattern, and gets
+`400 bad request: no route pattern matches this request` before the route runs.
 
 ### See also
 

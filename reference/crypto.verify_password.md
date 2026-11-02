@@ -24,7 +24,19 @@ true
 false
 ```
 
+A sign-in page and the route its form posts to, for users stored by the sign-up on
+[crypto.hash_password](/docs/reference/crypto.hash_password/). An unknown email makes
+`user` null, so `user.password_hash` is null and the check is false: a wrong password
+and an unknown email both answer `401 Wrong email or password`, in the same time.
+
 ```quillo noexec
+route GET /login =
+    <form method="post" action="/login">
+        <input name="email" type="email" required/>
+        <input name="password" type="password" required/>
+        <button>Sign in</button>
+    </form>
+
 route POST /login { form: { email: str, password: str } } {
     let user = db.one("select * from users where email = ?", email)
     if !crypto.verify_password(password, user.password_hash) { reply 401 "Wrong email or password" }

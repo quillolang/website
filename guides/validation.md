@@ -126,6 +126,9 @@ The browser's hints are a courtesy: anyone can call the server without the page.
 know.
 
 ```quillo
+db.open("app.db")
+db.exec("create table if not exists accounts (email text primary key, name text, plan text)")
+
 server fn sign_up(input: Signup) -> Signup ! list with db {
     let s = unwrap(Signup(input))           // only Signup's fields: anything else sent is dropped
     let problems = check_signup(s)
@@ -146,6 +149,9 @@ server fn sign_up(input: Signup) -> Signup ! list with db {
   not have are left out, so an `is_admin: true` sent by a script goes no further. The
   `unwrap(Signup(input))` above changes nothing, then; it is there for a function that
   is also called from the server's own code with a map.
+- **The table must be there.** Without the `create table`, `db.one` gives an error value
+  (`db: no such table: accounts`), which is not `null`, so every address would read as
+  taken.
 - **Errors come back in the shape the form reads.** `! list` declares that errors are a
   list of problems, so the component shows the server's under the right field, exactly as
   it shows its own. `quillo check` holds the function to it: a `?` that would pass on an

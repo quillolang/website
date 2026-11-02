@@ -23,6 +23,24 @@ route GET /log = stream((out) => { for line in tail_log() { out(line) } },
     { type: "text/plain", headers: { "cache-control": "no-store" } })
 ```
 
+A page reads a stream with [listen](/docs/reference/listen/) (or `receive`, from a
+click). With the type `application/x-ndjson`, each line is parsed as JSON and handed
+over as it comes; a stream that ends is not opened again:
+
+```quillo noexec
+route GET /orders.ndjson = stream((send) => {
+    for o in db.query("select id, total from orders") { send(json.stringify(o) + "\n") }
+}, { type: "application/x-ndjson" })
+
+component Orders() {
+    state rows = []
+    listen("/orders.ndjson", (o) => { rows = rows + [o] })     // one call per line
+    <ul>{for o in rows => <li key={o.id}>#{o.id}: {o.total}</li>}</ul>
+}
+
+route GET / = <Orders/>
+```
+
 The value itself can be made anywhere; its `status` and `headers` say what the head
 will be, and its `body` is null, since the function makes the body while it is sent:
 

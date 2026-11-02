@@ -77,8 +77,9 @@ in: the first example's page is what it looks like.
 ### Errors
 
 A function that is not a `server fn` is a runtime error, not an error value, on the
-server too (with `--no-check`); an argument the function's type does not take fails as
-the call would.
+server too (run with the `quillo run` option that skips the checks, `quillo run
+main.qwe --no-check`; see [the options](/docs/)); an argument the function's type does
+not take fails as the call would.
 
 ```quillo error
 fn load_notes() = ["milk", "bread"]

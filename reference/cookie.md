@@ -9,7 +9,7 @@ is none of that name. It works in any function the request runs (a route, a `ser
 fn`, a helper, a pipeline stage), so a helper that reads the visitor's time zone need
 not be handed `request`. `request.cookies` is all of them as a map. Outside a request
 (a job, a script) it is null. See [Headers, cookies and
-sessions](/docs/guides/headers-cookies-sessions/#cookies).
+sessions](/docs/headers-cookies-sessions/#cookies).
 
 ### Examples
 
@@ -19,6 +19,29 @@ route GET / = <Page theme={cookie("theme") ?? "light"}><Home/></Page>
 fn visitor_zone() = cookie("tz") ?? "UTC"
 
 route GET /agenda = <Agenda zone={visitor_zone()} items={today(visitor_zone())}/>
+```
+
+The whole round: a page whose form sets the cookie with
+[set_cookie](/docs/reference/set_cookie/), and reads it back on the next visit. After
+`Save` with `dark`, the answer carries `set-cookie: theme=dark; Path=/;
+Max-Age=31536000; HttpOnly; SameSite=Lax`, and the page comes back as `<body
+class="dark">` with `dark` selected:
+
+```quillo noexec
+route GET / {
+    let theme = cookie("theme") ?? "light"
+    <body class={theme}>
+        <form method="post" action="/theme">
+            <select name="theme">
+                <option selected={theme == "light"}>light</option>
+                <option selected={theme == "dark"}>dark</option>
+            </select>
+            <button>Save</button>
+        </form>
+    </body>
+}
+
+route POST /theme { form: { theme: str } } { set_cookie("theme", theme, { max_age: "1y" }); redirect("/") }
 ```
 
 ```quillo

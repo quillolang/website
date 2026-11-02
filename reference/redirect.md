@@ -86,7 +86,7 @@ line 1: `redirect` URL cannot contain line breaks or other control characters
 
 A redirect ends a request from inside a helper with `reply`: `reply 303 redirect(url)`
 sends it from wherever the helper is called, so one `me_or_login` serves every page
-that needs a visitor (see [Requiring a session](/docs/guides/headers-cookies-sessions/#requiring-a-session)).
+that needs a visitor (see [Requiring a session](/docs/headers-cookies-sessions/#sessions)).
 
 ```quillo noexec
 fn me_or_login(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)

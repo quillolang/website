@@ -22,7 +22,8 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
   `request.user`.
 - `client_cert: { header: "x-forwarded-client-cert" }`: the certificate a proxy checked
   (mutual TLS ended at the proxy), read from its header only when the request comes from
-  an address `--trust-proxy` names. The name is the SPIFFE id's last part, or the
+  an address `--trust-proxy` names (an option of `quillo run`: `quillo run billing.qwe
+  --trust-proxy 10.0.0.1`; see [the options](/docs/)). The name is the SPIFFE id's last part, or the
   subject's CN.
 - `check: (caller) => ...`: anything else, in Quillo, run before the arguments are read.
   `false` refuses the call with a 403, an error value refuses it with its text, a map
@@ -51,6 +52,40 @@ server fn refund(account: int, cents: int) for ["shop"] {
 
 server fn whoami() = { caller: request.caller, user: request.user, forwarded: request.forwarded }
 ```
+
+Both sides, with a key for one caller: billing takes calls signed with the shop's key
+and no others, and the shop declares the service with that key and calls it as a
+function of its own:
+
+```quillo noexec
+// billing.qwe
+accept_calls { keys: { shop: env("SHOP_KEY") }, shared: false }
+
+server fn refund(account: int, cents: int) for ["shop"] {
+    { refunded: cents, account, by: request.caller.name }
+}
+
+// shop.qwe
+service billing = "billing.qwe" { auth: { key: env("SHOP_KEY"), as: "shop" } }
+
+route POST /orders/:id/refund {
+    let r = billing.refund(int(id), 1200) ?? reply 502 "Billing refused the refund"
+    <p>Refunded {r.refunded} cents to account {r.account}, as {r.by}</p>
+}
+```
+
+```sh
+SHOP_KEY=... quillo run billing.qwe --port 8081
+SHOP_KEY=... quillo run shop.qwe --service-url billing=http://localhost:8081
+```
+
+A post to the shop's `/orders/42/refund` answers `Refunded 1200 cents to account 42, as
+shop`. A program that declares billing with no `auth`, and so signs with the shared
+secret, gets billing's 401 as an error value (`service billing: 401 this service takes
+no calls signed with the shared secret (accept_calls { shared: false })`), which its
+visitor sees as a 500 unless the route answers it. Run in one process (`quillo run
+shop.qwe` alone), the call is a function's call: nothing is checked, and
+`request.caller` is null.
 
 ```quillo
 print(accept_calls({ keys: { shop: "shop-key-0123456789abcdef0123456789" } }))

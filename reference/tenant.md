@@ -8,7 +8,7 @@ The name of the tenant the code runs for, or null. A request's tenant comes from
 rule `tenant_from` set (the subdomain, or a function of the request); code run with
 `with_tenant(name, f)` has that name. It works in any function the request runs. Outside
 a request, and in a program without tenants, it is null. See [Many
-tenants](/docs/structure/#many-tenants).
+tenants](/docs/standard-library/#many-tenants).
 
 ### Examples
 

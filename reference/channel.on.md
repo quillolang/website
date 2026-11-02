@@ -30,6 +30,29 @@ channel.on("chat", (msg, peer) => {
 })
 ```
 
+The other side of `"chat"` is a page whose component opens the channel with
+[channel.open](/docs/reference/channel.open/): its `send` reaches the handler above, and
+each broadcast reaches its function. The `join` lets in only a signed-in visitor, so
+the page is for them:
+
+```quillo noexec
+component Chat() {
+    state lines = []
+    state draft = ""
+    let chat = channel.open("chat", (m) => { lines = m.left != null ? lines : lines + [m] })
+    <form @submit={() => { chat.send({ text: draft }); draft = "" }}>
+        <ul>{for l in lines => <li><b>{l.who}</b> {l.text}</li>}</ul>
+        <input value={draft}/>
+    </form>
+}
+
+route GET /chat = session().user == null ? redirect("/login") : <html><body><Chat/></body></html>
+```
+
+A page turned away by `join` says so in its console: `quillo: the server did not let
+this page join channel chat`. See [Real time](/docs/realtime/#channels-the-server-and-its-pages)
+for the whole program.
+
 ### Edge cases
 
 - A name is letters, digits, `_`, `-`, `.` and `:`, at most 64 characters; two

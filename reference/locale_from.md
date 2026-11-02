@@ -13,14 +13,37 @@ Declare it at the top of the program, after `translations`.
 
 ### Examples
 
+A page in two languages, a link that switches, and the route that keeps the choice in
+the `locale` cookie, which is read when the rule gives nothing. `/?lang=fr` shows
+French whatever the cookie says, `/?lang=de` falls through to the cookie, then to
+`Accept-Language`:
+
 ```quillo noexec
-translations("locales")
-locale_from((request) => request.query.lang)
+translations({
+    en: { hello: "Hello", switch: "Français" },
+    fr: { hello: "Bonjour", switch: "English" },
+})
+locale_from((request) => request.query.lang)    // /?lang=fr, a link that shows French
+
+route GET / {
+    let other = locale() == "fr" ? "en" : "fr"
+    <main>
+        <h1>{t("hello")}</h1>
+        <a href={`/settings/lang/${other}`}>{t("switch")}</a>
+    </main>
+}
 
 route GET /settings/lang/:code {
-    set_cookie("locale", code)
+    set_cookie("locale", code, { max_age: "1y" })  // the choice, kept for the next visit
     redirect("/")
 }
+```
+
+A signed-in user's setting, from the database:
+
+```quillo noexec
+translations("locales")
+locale_from((request) => db.one("select lang from users where id = ?", session().user)?.lang)
 ```
 
 ```quillo

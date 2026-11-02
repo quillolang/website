@@ -10,7 +10,7 @@ Says how a request's tenant is found, at the top of a program. With a domain,
 tenant is what the function gives for the request (a header, a path segment, a
 lookup), a name or null. A name is lowercase letters, digits, `-` and `_`, at most 63,
 starting with a letter or a digit; anything else is no tenant. It gives null. See
-[Many tenants](/docs/structure/#many-tenants).
+[Many tenants](/docs/standard-library/#many-tenants).
 
 ### Examples
 

@@ -32,6 +32,50 @@ The client sends the key with the request, and again with the retry:
 curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bob", "amount": "12.50"}'
 ```
 
+A plain form, with no script to send a header: `idempotent` on the `<form>` writes a
+hidden `_idempotency_key` into it as the page is rendered, and the route reads that key
+where there is no header. However many times the form is sent, the row is inserted once:
+
+```quillo noexec
+db.open("app.db")
+db.exec("create table if not exists donations (id integer primary key, name text, cents integer)")
+
+route GET /donate =
+    <form method="post" action="/donate" idempotent>
+        <input name="name" required/>
+        <input name="cents" type="number" required/>
+        <button>Give</button>
+    </form>
+
+route POST /donate { form: { name: str, cents: int } } = idempotent(() => {
+    db.exec("insert into donations (name, cents) values (?, ?)", name, cents)?
+    let n = db.one("select count(*) as n from donations").n
+    `Thank you, ${name}: donation ${n} recorded`
+})
+```
+
+The page goes out as `<form method="post" action="/donate"><input type="hidden"
+name="_idempotency_key" value="7125baaf-...">...`. Sent twice with that key, the form
+inserts one row: both answers are `Thank you, Ann: donation 1 recorded`, the second
+with `Idempotent-Replayed: true`. The same key with the form edited (another amount)
+is another request, and runs. A post without the key runs every time.
+
+A script, or any client that can set headers, makes up a key and sends the same one
+when it sends the request again:
+
+```quillo noexec
+let headers = { "content-type": "application/x-www-form-urlencoded", "idempotency-key": uuid() }
+let first = http.post("http://localhost:8080/donate", "name=Dee&cents=250", headers)
+let retry = http.post("http://localhost:8080/donate", "name=Dee&cents=250", headers)
+print(first.body)                                     // Thank you, Dee: donation 2 recorded
+print(retry.body, retry.headers["idempotent-replayed"])   // the same answer, and true
+```
+
+With a header, the same key and another body is refused with `422 {"error":"this
+Idempotency-Key was used with another request"}`, and nothing runs. A page calling
+`transfer` above needs nothing more: a server fn whose body calls `idempotent` gets a
+key from the page with each call, and the page sends it again with a retry.
+
 Outside a request, and in a request without the header, the function simply runs and
 its value is the result:
 

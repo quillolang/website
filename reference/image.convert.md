@@ -24,6 +24,28 @@ image.convert("photos/a.jpg", "cache/a-800.jpg", {
 image.convert(path, "thumbs/42.webp", { width: 160, format: "webp" })
 ```
 
+A thumbnail of an upload: the form, then the route that saves the file, checks with
+`image.info` that it is an image at all, and writes a 400-pixel WebP beside it:
+
+```quillo noexec
+route GET /photos =
+    <form method="post" action="/photos" enctype="multipart/form-data">
+        <input type="file" name="photo" accept="image/*" required/>
+        <button>Upload</button>
+    </form>
+
+route POST /photos {
+    let f = request.files.photo ?? reply 400 "Choose a photo"
+    let id = uuid()
+    let original = save_upload(f, `uploads/${id}`)?
+    if is_err(image.info(original)) { delete_file(original); reply 415 "Not a JPEG, PNG, WebP or GIF" }
+    image.convert(original, `thumbs/${id}.webp`, { width: 400, format: "webp" })?
+    redirect(`/thumbs/${id}.webp`)
+}
+
+route GET /thumbs/:name = file(`thumbs/${name}`)
+```
+
 A source that cannot be decoded is an error value, and nothing is written:
 
 ```quillo

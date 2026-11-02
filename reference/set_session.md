@@ -8,11 +8,22 @@ Replaces the visitor's session with the map and sends it to the browser as a coo
 signed with HMAC-SHA256: the browser can read it but not change it. It lasts 30 days
 unless the option `max_age` says otherwise, in seconds or a duration (`"12h"`).
 `set_session(null)` ends the session, as `end_session` does. It gives null. See
-[Headers, cookies and sessions](/docs/guides/headers-cookies-sessions/#sessions).
+[Headers, cookies and sessions](/docs/headers-cookies-sessions/#sessions).
 
 ### Examples
 
+A login: the page with the form, the route it posts to, a page that reads the session,
+and a logout button. The `users` rows were made at signup, with
+`crypto.hash_password`:
+
 ```quillo noexec
+route GET /login =
+    <form method="post" action="/login">
+        <input type="email" name="email" required/>
+        <input type="password" name="password" required/>
+        <button>Log in</button>
+    </form>
+
 route POST /login { form: { email: str, password: str } } {
     let user = db.one("select * from users where email = ?", email)
     let hash = user.password_hash ?? crypto.hash_password("not anyone's")   // same work, user or not
@@ -21,10 +32,40 @@ route POST /login { form: { email: str, password: str } } {
     redirect("/")
 }
 
+route GET / {
+    let id = session().user ?? return redirect("/login")
+    let me = db.one("select name from users where id = ?", id)
+    <main>
+        <p>Hello, {me.name}</p>
+        <form method="post" action="/logout"><button>Log out</button></form>
+    </main>
+}
+
+route POST /logout { set_session(null); redirect("/login") }
+```
+
+From a component, a `server fn` sets it, and the answer to the call carries the cookie:
+
+```quillo noexec
 server fn sign_in(email: str, password: str) {
     let user = check_password(email, password) ?? return err("Wrong email or password")
     set_session({ user: user.id }, { max_age: "12h" })
     { name: user.name }
+}
+
+component SignIn() {
+    state email = ""
+    state password = ""
+    state problem = null
+    <form @submit={() => {
+        let r = sign_in(email, password)
+        if is_err(r) { problem = r.error } else { navigate("/") }
+    }}>
+        <input type="email" value={email}/>
+        <input type="password" value={password}/>
+        <button>Sign in</button>
+        {problem && <p class="error">{problem}</p>}
+    </form>
 }
 ```
 

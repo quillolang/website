@@ -13,14 +13,45 @@ received them.
 
 ### Examples
 
+A page with a form, and the route it posts to. The form needs `method="post"` and
+`enctype="multipart/form-data"` (without it the browser sends only the file's name), and
+the file input's `name` is its key in `request.files`:
+
 ```quillo noexec
+route GET /avatar =
+    <form method="post" action="/avatar" enctype="multipart/form-data">
+        <label>Your photo <input type="file" name="photo" accept="image/*" required/></label>
+        <button>Upload</button>
+    </form>
+
 route POST /avatar {
     let f = request.files.photo
+    if f == null { reply 400 "Choose a photo" }                 // `required` can be skipped
     if f.size > 2_000_000 { reply 413 "Photos up to 2 MB" }
-    save_upload(f, `uploads/${uuid()}.png`)?          // into the program's folder
-    redirect("/profile")
+    let path = save_upload(f, `uploads/${uuid()}.png`)?        // into the program's folder
+    redirect(`/${path}`)
+}
+
+route GET /uploads/:name = file(`uploads/${name}`)
+```
+
+Several files from one input with `multiple`, and a text field beside them:
+
+```quillo noexec
+route GET /docs =
+    <form method="post" action="/docs" enctype="multipart/form-data">
+        <input type="text" name="title"/>
+        <input type="file" name="docs" accept=".pdf" multiple/>
+        <button>Send</button>
+    </form>
+
+route POST /docs { files: { docs: [map] } } {
+    for d in docs { save_upload(d, `uploads/${uuid()}.pdf`)? }
+    `${request.form.title}: ${len(docs)} saved`
 }
 ```
+
+From a component, a file goes to a `server fn` as it is chosen, with no form:
 
 ```quillo noexec
 server fn add_photo(file: map) = save_upload(file, `photos/${uuid()}.jpg`)

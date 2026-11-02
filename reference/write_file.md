@@ -34,8 +34,9 @@ null
 - Any value is written as its text: `42` becomes `42`, a map becomes `{ a: 1 }`, `null`
   becomes an empty file.
 - A path with `..`, one starting at `/`, and the empty path are error values, and nothing
-  is written, unless `quillo run --allow-path DIR` names the folder it leads into, for a
-  script used as a tool; folders are made there too.
+  is written, unless the `quillo run` option `--allow-path` names the folder it leads
+  into, for a script used as a tool (`quillo run tool.qwe --allow-path /srv/shared`; see
+  [the options](/docs/)); folders are made there too.
 - Links are followed, and where they lead is what counts: a link inside the folder
   that leads inside it works as its target would, and one that leads out of the
   folder, or leads nowhere, is an error value, and nothing is written. A link that leads nowhere is

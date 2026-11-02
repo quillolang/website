@@ -47,8 +47,9 @@ null
 ### Edge cases
 
 - All the styles go through the command at once, as one sheet, and what it made is
-  kept while the CSS is the same: a reload under `--watch` runs it again only when a
-  `style` changed.
+  kept while the CSS is the same: a reload under `--watch` (the `quillo run` option
+  that reloads as the files change: `quillo run main.qwe --watch`; see [the
+  options](/docs/)) runs it again only when a `style` changed.
 - The command runs before scoping, so a rule it writes is still made to need the
   component's attribute: with `style_with("sed s/red/blue/")` and a component's `` style css`.x {
   color: red }` ``, the page's sheet holds `.x[data-q-eb88e73d] { color: blue }`.

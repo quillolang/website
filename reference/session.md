@@ -8,7 +8,7 @@ The visitor's session: the map `set_session` stored, read from the signed cookie
 browser sent back, or `{}` when there is none. It works in any function the request
 runs: a route, a `server fn` a component calls, a helper, a pipeline stage. Outside a
 request (a job, a script) it is `{}`. See [Headers, cookies and
-sessions](/docs/guides/headers-cookies-sessions/#sessions).
+sessions](/docs/headers-cookies-sessions/#sessions).
 
 ### Examples
 
