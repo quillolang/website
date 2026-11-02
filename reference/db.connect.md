@@ -84,7 +84,7 @@ err("db: no such table: sales") err("db: no such table: orders")
 true true
 err("no")
 [{ n: 0 }] [{ n: 0 }]
-["$db", "exec", "query", "one", "transaction", "migrate", "tenants", "tenant_exists", "sql_name"]
+["$db", "exec", "exec_many", "query", "one", "transaction", "migrate", "tenants", "tenant_exists", "sql_name"]
 ```
 
 ### Errors
