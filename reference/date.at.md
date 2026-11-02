@@ -1,5 +1,5 @@
 # date.at
-date.at(str, str | null=, str | null=) -> str
+date.at(str, str | null=, str | map | null=, map | null=) -> str
 group: Dates
 
 ### What it does
@@ -28,7 +28,11 @@ print(date.at("2026-10-27"), date.at("2026-10-27", null, "Europe/Paris"))
 
 - A time that the clocks skip when they go forward is moved on by the gap: `02:30` on
   the night Paris springs forward is `03:30`. A time that happens twice when they go
-  back is the first, the one still on summer time.
+  back is the first, the one still on summer time. Options last say otherwise:
+  `{ repeated: "later" }` takes the second of the two, and `{ skipped: "earlier" }`
+  moves a skipped time back, or `{ skipped: "error" }` gives an error value.
+- The date and the time may be one text, as `<input type="datetime-local">` gives
+  them: `date.at("2026-10-27T14:30", "America/New_York")`, the options third.
 - The result is in local form; `date.to_zone` it for UTC, or `date.ms` for a number.
 - The zone can be a fixed offset.
 
@@ -37,6 +41,8 @@ print(date.at("2026-03-29", "02:30", "Europe/Paris"), date.at("2026-10-25", "02:
 print(date.at("2026-03-08", "02:30", "America/New_York"), date.at("2026-11-01", "01:30", "America/New_York"))
 print(date.at("2026-10-27", "17:00", "Europe/Paris") | date.to_zone)
 print(date.at("2026-10-27", "23:59:59", "-10:00"))
+print(date.at("2026-11-01", "01:30", "America/New_York", { repeated: "later" }), date.at("2026-03-08", "02:30", "America/New_York", { skipped: "earlier" }))
+print(date.at("2026-10-27T14:30", "America/New_York"), date.at("2026-03-08T02:30", "America/New_York", { skipped: "error" }))
 ```
 
 ```output
@@ -44,6 +50,8 @@ print(date.at("2026-10-27", "23:59:59", "-10:00"))
 2026-03-08T03:30:00-04:00 2026-11-01T01:30:00-04:00
 2026-10-27T16:00:00Z
 2026-10-27T23:59:59-10:00
+2026-11-01T01:30:00-05:00 2026-03-08T01:30:00-05:00
+2026-10-27T14:30:00-04:00 err("date.at: 2026-03-08 02:30 is skipped in that zone, as its clocks move forward")
 ```
 
 ### Errors

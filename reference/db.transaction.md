@@ -52,11 +52,13 @@ fn withdraw(account: int, cents: int) with db =
 
 - The function's value is the transaction's: an error value (made with `err`, returned,
   or passed up with `?`) rolls back and is given back, so the caller sees why.
-- A `db.exec` that fails in the middle of the function, its error value dropped, does
-  not roll back by itself: the function goes on and commits. Put `?` after it, or
-  return it. As the last expression its error value is the function's, and rolls back.
-- Nested: an inner transaction that fails rolls back only its own part, and the outer
-  one goes on. Giving the inner one an isolation is a runtime error: options belong to
+- A `db.exec` that fails in the middle of the function, its error value dropped, rolls
+  the transaction back, and that error is the transaction's value: a transaction is
+  never committed past a failure nothing took. Put `?` after it to leave at once, or
+  `let _ = db.exec(...)` where a failure there does not matter.
+- Nested: an inner transaction that fails rolls back its own part and gives its error.
+  Taken (`let _ = db.transaction(...)`, `??`, `?`), the outer one goes on; dropped, it
+  rolls the outer one back too. Giving the inner one an isolation is a runtime error: options belong to
   the outermost.
 - On SQLite every transaction is serializable whatever is asked; with options it takes
   the write lock at once (`begin immediate`).
@@ -83,15 +85,15 @@ print(db.transaction(() => null))
 ```output
 err("changed my mind")
 []
-went on
-[{ x: 2 }]
 err("db: no such table: nope")
-[{ x: 2 }]
+[]
 err("db: no such table: nope")
-[{ x: 2 }]
-outer went on
-[{ x: 2 }]
-{ n: 1 }
+[]
+err("db: no such table: nope")
+[]
+err("inner")
+[]
+{ n: 0 }
 null
 ```
 

@@ -50,10 +50,24 @@ id = "org.quillolang.fieldbook"     # bundle id / application id; never changed 
 version = "1.0.0"                   # what people see in the store
 build = 1                           # a whole number, higher for each upload
 icon = "icon.png"                   # 1024 x 1024 PNG without transparency; Quillo's when left out
+site = "https://app.example.com"    # a site of yours the web view keeps (see below)
+env.SHOP_URL = "https://shop.example.com"   # what env("SHOP_URL") gives on the phone
 ```
 
 A bad value stops the build and says what is wrong. The icon becomes an asset catalog on
 iOS, and launcher and adaptive icons at every density on Android.
+
+**`env.NAME = "value"`** lines are what `env("NAME")` gives on the phone. A phone has no
+environment, and the program's `.env` is not read there (nor put in the app). Under
+`quillo run` the same code takes `NAME` from the `.env` as usual. These values are
+public: anyone can unzip an app and read everything in it, so put addresses here, never
+secrets.
+
+**`site`** is an https address with no path. Pages of that origin stay in the app's web
+view, and `window.quilloNative` answers them as it answers the program's pages. The
+bundled program still starts first, and can link or redirect there. An app that is only
+a website in a frame is turned down by Apple's App Review (guideline 4.2), so give the
+app something of its own.
 
 ### Building it
 
@@ -73,9 +87,14 @@ cargo install cargo-ndk
 mobile/android/build.sh path/to/program --run
 ```
 
-Each script builds the runtime for its system, copies the program's folder into the app
-(not its databases, nor subfolders that are programs of their own), builds the app, and
-with `--run` installs and opens it on a running simulator, emulator or connected phone.
+Each script builds the runtime for its system, copies the program's folder into the app,
+builds the app, and with `--run` installs and opens it on a running simulator, emulator
+or connected phone. The folder is copied the same way for both systems: everything but
+`.env` and `.env.*`, `.git/`, `.quillo/` and any other dotfile (`.well-known/` is kept),
+databases, `uploads/`, and a subfolder that is a program of its own. A folder whose name
+starts with `_` goes in on both. The build prints what it left out, and when that
+includes a `.env` it says so: "a .env is the server's: put public values in app.toml as
+env.NAME".
 The scripts are in [mobile/](https://github.com/quillolang/quillo/tree/main/mobile) in
 Quillo's repository; its README says how to install what they need.
 
@@ -168,7 +187,8 @@ share sheet through `navigator.share`, storage, speech. The app asks the person 
 with the system's own prompt, and then grants them to its own pages.
 
 For what a web view cannot reach, both apps put `window.quilloNative` on the program's
-pages, and only on them, and a component calls it with `js()`:
+pages (and on the `site` of `app.toml`), and only on them, and a component calls it with
+`js()`. An `<iframe>` of another site stays in the page, and gets no `quilloNative`:
 
 | Call | Gives |
 |---|---|
@@ -216,6 +236,60 @@ simulator refuses more than a phone does, so test on one:
 | `speechSynthesis` | there | not in the web view |
 | Bluetooth, USB, Serial, HID | not there | not there |
 | The clipboard | writing from a tap; reading is refused | only from a tap, in a focused page |
+
+### Calling your server
+
+The program on the phone can reach a server of yours. Do it from a `server fn`, which
+runs in the app's own runtime, not from the page: the page's origin is `127.0.0.1`,
+which a server cannot safely allow. A page's `http.*` to another site that fails says
+so:
+
+```
+http: no answer from api.example.com: it may not allow this page (CORS), or be plain http, or be unreachable; a server fn can call it from the server
+```
+
+When the server is a Quillo site, `site` declares it, and its `server fn`s are called as
+the program's own:
+
+```quillo noexec
+site shop = env("SHOP_URL", "https://shop.example.com")   // env.SHOP_URL in app.toml
+
+server fn latest(n: int) = shop.notes(n)                  // the site's `server fn notes`
+
+component Notes() {
+    state notes = latest(20)
+    <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
+}
+```
+
+- **What a call gives.** `shop.notes(a, b)` gives the site's answer, or the site's error
+  as an error value, or an error value when the site cannot be reached. Decimals and
+  big ints cross as they do between a page and its program.
+- **The address** is any expression: a string, or `env(...)` with a default.
+- **Signed in stays signed in.** In a phone app (and in `quillo app`, or with
+  `QUILLO_SITE_COOKIES=1`), the cookies the site sets are kept in
+  `.quillo/sites/<name>.json` in the program's folder, so whoever signed in to the site
+  stays signed in. On a server they are not kept, since one visitor's session would be
+  every visitor's; a line in the log says so once.
+- **Server side only.** `quillo check` refuses `shop.notes()` in a component: call it in
+  a `server fn`. Elsewhere `site` is an ordinary name, so `let site = ...` still works.
+- **The wire** is the one a site's own pages use, and it is stable:
+  `POST <url>/_quillo/rpc/<fn>` with the arguments as a JSON array, answered with
+  `{"ok": value}` or `{"err": error}`. A program needs no `Origin` header; a request
+  with another site's `Origin` is refused.
+- **Services.** On a phone a `service` always runs inside the app. To use one on your
+  server, call the server with `site`, not `service`.
+
+While you build the app, the server may be the computer it is built on:
+
+- **The iOS simulator** shares the Mac's network, so `http://127.0.0.1:8080` reaches a
+  server on the Mac. **A real iPhone** asks the person first before the app reaches a
+  computer on the local network (the app says why, in `NSLocalNetworkUsageDescription`).
+- **Certificates.** The runtime's own `http.*` and `site` calls trust the certificate
+  roots built into Quillo, not the phone's, so a company's certificate authority
+  installed on the phone is not trusted by them.
+- **Plain http.** App Transport Security does not cover the runtime's own connections,
+  so the program can reach plain `http://` addresses. Use https all the same.
 
 ### When the app leaves the screen
 

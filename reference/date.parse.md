@@ -33,7 +33,10 @@ print(date.parse("12/31/2026", "MM/DD/YYYY") ?? "no date")
 - The result is normalised: `+00:00` and `+0100` come back as `Z` and `+01:00`, a
   space becomes `T`, and spaces around the text are ignored.
 - A fraction of a second is kept as written (`.250`), after `.` or `,`.
-- Without a pattern a date-time needs its offset: `"2026-10-27 14:30"` is an error.
+- Without a pattern a date-time needs its offset: `"2026-10-27 14:30"`, what an
+  `<input type="datetime-local">` gives, is an error value that says to read it in its
+  zone with `date.at(v, zone)`. An HTTP date, `Tue, 27 Oct 2026 14:30:00 GMT`, is read
+  as UTC.
   With a pattern and a time but no `Z` token, the time is UTC.
 - Numbers must have their digits: `"2026-1-5"` is not ISO, and `DD` wants two digits
   where `D` takes one or two.
@@ -54,7 +57,7 @@ print(date.parse("2026-02-30"), date.parse("0000-01-01"))
 
 ```output
 2026-10-27T14:30:00Z 2026-10-27T14:30:00.250+01:00
-err("not a date or a date-time: \"2026-10-27 14:30\"") err("not a date or a date-time: \"2026-1-5\"")
+err("\"2026-10-27 14:30\" has no offset, so it is a wall-clock time and names no instant: read it in its zone with date.at(v, zone)") err("not a date or a date-time: \"2026-1-5\"")
 2026-10-27 2026-10-27T00:30:00Z
 2026-10-27 2026-10-27T14:30:00+01:00
 err("\"27/10/2026 14:30 +01\" is not a date in the form \"DD/MM/YYYY HH:mm Z\"")

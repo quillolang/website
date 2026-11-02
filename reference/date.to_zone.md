@@ -32,7 +32,9 @@ print(date.to_zone("2026-10-27T15:30:00+01:00"))
   December.
 - An offset of zero is written `Z`, never `+00:00`; `"utc"` in any case and `"Z"`
   name UTC.
-- A fraction of a second is kept as written.
+- A fraction of a second is kept as written, but one that is all zeros is dropped, so
+  `"...15:00:00.000Z"` (as JavaScript's `toISOString()` writes) and `"...15:00:00Z"`
+  become one text. `date.compare` orders date-times however they are written.
 - The result compares equal to a date-time of the same text, but not to the same
   instant written at another offset: compare instants with `date.ms`.
 - Far back, before standard time, a zone's offset is its local mean time, with seconds.

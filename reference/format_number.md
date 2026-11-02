@@ -1,12 +1,14 @@
 # format_number
-format_number(num | dec, str | null=, int=) -> str
+format_number(num | dec, str | null=, int | map | null=) -> str
 group: General
 
 ### What it does
 
 A number as a locale writes it: grouped digits, the locale's decimal mark and its
-minus sign. `format_number(x, locale, digits)` rounds to `digits` decimals first, half
-to even, and writes exactly that many; without `digits` the number's own decimals are
+minus sign. `format_number(x, locale, digits)` rounds to `digits` decimals first, a tie
+away from zero as `Intl.NumberFormat` does, and writes exactly that many; `digits` may
+also be `{ min, max }`, at least `min` and at most `max` decimals (`max` is 3 unless
+given); without `digits` the number's own decimals are
 written. The locale is a tag like `"en-US"` or `"de-DE"`; `null` or left out, the
 request's locale is used, `en-US` in a plain program. A locale that is not in the
 table is written as the first of its language (`de-LU` as de-DE, `de` as de-DE), and
@@ -28,8 +30,10 @@ print(format_number(dec("1234.5678"), "en-US", 2), format_number(-1234.5, "de-DE
 
 ### Edge cases
 
-- Rounding is half to even: `2.5` to 0 digits is `2`, `3.5` is `4`, and `1.005` to 2
-  digits is `1.00`.
+- A tie rounds away from zero, from the number's shortest decimal: `2.5` to 0 digits is
+  `3`, `3.5` is `4`, and `1.005` to 2 digits is `1.01`, as in the browser's `Intl`.
+- `{ max: 3 }` writes `10` as `10` and `8.875` as `8.875`; `{ min: 2, max: 3 }` writes
+  `8.8` as `8.80`.
 - `digits` is kept within 0 to 28: a larger count writes 28 decimals, a negative one
   none.
 - An int is written without decimals unless `digits` says otherwise; `0` with 2 digits
@@ -48,7 +52,7 @@ print(format_number(1234.5, null, 1), format_number(1234.5, "de"), format_number
 ```
 
 ```output
-2 4 1.00
+3 4 1.01
 1.5000000000000000000000000000 2
 1,234 0.00
 1000000000000000000000000000000 NaN inf

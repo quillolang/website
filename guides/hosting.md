@@ -9,7 +9,7 @@ page goes through each, with a checklist at the end.
 
 | | |
 |---|---|
-| **The `quillo` binary** | One file of 20 to 25 MB, nothing else: SQLite and the time zone database are built in, and TLS is rustls, not OpenSSL. Build it on (or for) the same system and CPU as the server: a Linux binary built on a newer distribution than the server's may not start there |
+| **The `quillo` binary** | One file of 20 to 25 MB, nothing else: SQLite and the time zone database are built in, and TLS is rustls, not OpenSSL. The Linux release builds need glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 or newer); on an older system, build it from source. There are no musl or static Linux builds yet. Build it on (or for) the same system and CPU as the server: a Linux binary built on a newer distribution than the server's may not start there |
 | **The program's files** | `main.qwe` and the files it uses, `migrations/`, `public/` |
 | **Rust files, built** | A program with [`.qwer` files](/docs/rust/) builds them the first time it starts, which needs Rust. Run `quillo build main.qwe` beforehand on the same kind of machine, and deploy `.quillo/native/` with the program: the server then needs no Rust |
 | **A long-running process** | Any VPS, cloud VM or container service. Shared hosting that runs only PHP cannot run it; see [static hosting](#static-hosting) |
@@ -24,14 +24,25 @@ quillo run main.qwe --port 8080 --log json
 
 | Option | In production |
 |---|---|
-| `--port N` | the port (default `$PORT`, then 8080) |
-| `--host H` | the address to listen on. The default, `127.0.0.1`, takes connections from this machine only, which is right behind a proxy on the same machine. `0.0.0.0` in a container |
+| `--port N` | the port, 0 to 65535 (default `$PORT`, then 8080); 0 takes any free port |
+| `--host H` | the address to listen on. The default, `127.0.0.1`, takes connections from this machine only, which is right behind a proxy on the same machine; `localhost` is 127.0.0.1 too. `0.0.0.0` in a container |
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)) |
 | `--max-body N` | the largest request body, in bytes (default 10 MiB): raise it for big uploads |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
 | `--metrics` | answer `/_quillo/metrics` (keep it private: see below) |
+
+A program learns where it listens from `platform().server`: `{ host, port, url, base }`,
+with the port it got under `--port 0`, and a `url` this machine can reach (`0.0.0.0`
+becomes `127.0.0.1`). It is null in a script and while the program loads.
+
+```quillo
+route GET /about {
+    let s = platform().server
+    <p>Listening at {s.url}{s.base}</p>
+}
+```
 
 Never `--watch` in production: it shows errors on pages, refreshes them, and leaves
 `Secure` off cookies, since it expects plain HTTP on your own machine.
@@ -125,6 +136,24 @@ server {
   visitor counts as one: only 256 pages then get live updates. `--trust-proxy 127.0.0.1`
   names the proxy, and `request.ip` and each client's limits are the visitor's, from the
   `X-Forwarded-For` it adds. It is read from no other address, as a client can write it.
+- **Caching at the proxy or a CDN.** A page made from who the visitor is (it called
+  `session()` or `cookie()`, or set a cookie) is sent with `Cache-Control: private` and
+  `Vary: Cookie`, unless the route set its own `cache-control`, so a shared cache does
+  not give one visitor's page to another. Every HTML page gets
+  `X-Frame-Options: SAMEORIGIN`, unless the route sets one, or a
+  `Content-Security-Policy` with `frame-ancestors`.
+- **Headers for the whole site.** `site_headers`, at the top of the program, sets
+  headers on every answer that does not set them itself, or on those under a path; a
+  longer path's rule wins, and a null takes away one Quillo sends:
+
+```quillo
+site_headers({ "content-security-policy": "default-src 'self'" })
+site_headers("/embed", { "x-frame-options": null })
+```
+
+- **What `site_headers` takes.** Names are checked and values are one line.
+  `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
+  are refused.
 - **WebTransport** (channels over HTTP/3) goes over UDP, which these proxies do not pass.
   Open the UDP port, the HTTP port's number unless `--wt-port` says another, to the
   server itself: Quillo presents a certificate of its own, which pages take by its hash,
@@ -230,11 +259,21 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
   orchestrator's readiness probe.
 - `--log json` writes a JSON line per request (time, method, path with its query, status,
   ms, ip, tenant, and `rid`, the request's id) on stderr, where systemd's journal or the
-  container's log collects it. Errors stay plain text lines (`quillo: ...`). `ip` is the
-  proxy's, behind one, unless `--trust-proxy` names it.
+  container's log collects it. A malformed request is an object of its own,
+  `{"time", "status", "error", "line"}`. `ip` is the proxy's, behind one, unless
+  `--trust-proxy` names it.
+- Quillo's own notices (`listening on`, warnings, `stopping`) and errors are text lines
+  on stderr (`quillo: ...`), with `--log json` or without. In a text line, line breaks
+  and control characters inside an error's text are written as `\n` and `\x1b`, so one
+  error is one line.
 - `--metrics` answers `GET /_quillo/metrics` in Prometheus's text format. Anyone who can
   reach it can read it, so keep it from the public at the proxy: in nginx,
   `location /_quillo/metrics { deny all; }`; in Caddy, `respond /_quillo/metrics 403`.
+- `--describe` answers `GET /_quillo/describe` with the program's API. It is public too:
+  it lists every route, those no page links to as well, each `server fn`'s signature,
+  the file and line of every route, and the version. Keep it private as
+  `/_quillo/metrics` is, with the same rules at the proxy, or leave it off in
+  production.
 
 ### Static hosting
 
@@ -253,6 +292,6 @@ writes them to a folder that is uploaded as it is.
 - `--host 127.0.0.1` behind a proxy on the same machine; not `--watch`
 - a service manager that restarts it, and waits 15 seconds when stopping it
 - `/_quillo/health` for the load balancer, `/_quillo/ready` for readiness;
-  `/_quillo/metrics` kept private
+  `/_quillo/metrics` and `/_quillo/describe` kept private, or off
 - `--max-compute 2s`, so one request that computes for ever cannot hold an instance, and
   limits of your own where you need them: Quillo has no rate limiting

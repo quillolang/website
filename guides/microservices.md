@@ -44,8 +44,9 @@ Services may use one another.
   served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
-  signed with one secret. They stop with the app. It is the quickest way to see an app
-  as it would run split, on one machine.
+  signed with one secret. They stop with the app. `--describe`, given to the app, is
+  given to each of them too. It is the quickest way to see an app as it would run split,
+  on one machine.
 
 ```sh
 # Everything in one process
@@ -143,6 +144,16 @@ or old signature or a call meant for another service, 404 for no such function, 
 when the contracts differ (the answer says both), 503 while the same call is still
 running. A call sent twice with the same id gets the same answer and runs once while
 the service stays up. Only an answer of 200 is remembered.
+
+A copy that [joins](#copies-that-join) the app does so at `POST <app>/_quillo/join`,
+with `{ "service": "billing", "port": 8081, "leave": false }` as the body, signed as a
+service call is: under `QUILLO_SERVICE_SECRET`, with a nonce in `x-quillo-call`, which
+is taken once. The answer is 200 with `{ "service", "at" }`, the address the copy is
+recorded at; otherwise 400 for a body without a port or an address that is not known,
+401 for a bad or old signature or no nonce, 403 when the app has no
+`QUILLO_SERVICE_SECRET`, 404 when the app declares no such service, 405 for a method
+other than POST, and 409 for a nonce sent before. Only copies call it, so a proxy in
+front of the app need not pass it from outside.
 
 ### A chain of calls
 
@@ -258,9 +269,48 @@ with:
 ```
 
 Run on the app, the document holds the routes of the services served under their
-prefixes (`/shop/buy`, `/billing`) and their `server fn`s keyed by prefix and name
-(`"/billing invoice"`); a service declared without a path, only called, is described
-by running `quillo docs` on its own file.
+prefixes (`/shop/buy`, `/billing`), and the `server fn`s of the app itself. A prefixed
+service's `server fn`s are not in it: they are called by other services, signed, not
+at `/billing/_quillo/rpc`. `quillo docs` and `--describe` give the same document. A
+service is described by itself at `/billing/_quillo/describe`, or by running
+`quillo docs` on its own file; a service declared without a path, only called, is
+described that way only.
+
+#### What the document holds
+
+- **Its title** is the program file's name (`main` for `main.qwe`), however the program
+  was started. Under `--base /shop` it says where it is served:
+  `"servers": [{ "url": "/shop" }]`.
+- **Several routes on one method and path shape are one operation.** Their bodies are a
+  `oneOf`, each literal field an `enum`; their query parameters are merged, required
+  only where every route requires them; the path template is named as the first route
+  names it (`/users/{id}`), its parameter a `oneOf` of the routes' types; and
+  `x-quillo-at` is a list of the places in the source.
+- **A rest parameter** (`/files/*path`) is `/files/{path}`, with
+  `"x-quillo-rest": true` and the description "the rest of the path, slashes
+  included". An OpenAPI template matches one segment, so a gateway that reads the
+  document routes the rest itself.
+- **Each operation has one response**, 200, with no content schema.
+- **Under `--split`** the app's document still holds the prefixed services' routes,
+  read from their source, and `/billing/_quillo/describe` answers the service's own
+  document, its paths without the prefix.
+
+```json
+"/users/{id}": {
+  "get": {
+    "parameters": [{ "name": "id", "in": "path", "required": true,
+                     "schema": { "oneOf": [{ "type": "integer" }, { "type": "string" }] } }],
+    "responses": { "200": { "description": "the route's answer" } },
+    "x-quillo-at": ["app.qwe:4", "app.qwe:8"]
+  }
+}
+```
+
+`/_quillo/describe`, when it is on, is public: it lists every route, those no page
+links to as well, each `server fn`'s signature, the file and line of every route, and
+the version of Quillo. Keep it private as `/_quillo/metrics` is, with a rule at the
+proxy (see [Hosting](/docs/hosting/#health-logs-and-metrics)), or do not turn it on in
+production.
 
 The `contract` line is what a call carries in `x-quillo-contract`, and what a service
 checks it against. A service deployed apart whose own differs refuses the call with
@@ -299,6 +349,40 @@ The same service can run on several servers, called in turn:
 ```sh
 quillo run app.qwe --service-url billing=http://10.0.0.5:8081,http://10.0.0.6:8081
 ```
+
+#### Copies that join
+
+A copy of a service can join an app while it runs:
+
+```sh
+QUILLO_SERVICE_SECRET=... quillo run billing.qwe --as-service --port 8081 --join http://10.0.0.2:8080
+```
+
+It says it is there every 5 seconds, signed with `QUILLO_SERVICE_SECRET` (set on both),
+and that it is leaving when it stops; the app drops a copy it has not heard from in 15
+seconds. It is recorded at the address it connects from, with its `--port`.
+
+- **When the service runs in the app's process**, the copies that joined take every
+  call, in turn, and the app runs a call itself only when no copy answers it. A
+  program in one process takes on copies as it gets busy, with no line of either
+  changed.
+- **When the app was given addresses** (`--service-url` or `QUILLO_SERVICE_<NAME>`),
+  the given addresses and the joined copies are all taken in turn.
+
+Each copy has a circuit of its own. With several app servers, a copy joins each.
+
+Join the app's own address, not its public one: through a proxy the app sees the
+proxy's address, unless it runs with `--trust-proxy` naming it. A copy behind NAT is
+recorded at an address the app cannot reach, so such a copy belongs behind a balancer
+instead.
+
+#### Discovery by registration
+
+Services are found by registering, in two ways: a copy joins the app (`--join`, above),
+and any server joins limer's pool (`--register`, with `LIMER_ADMIN_SECRET`). A caller
+does not look a service up by name, so a service the app does not run itself needs
+`--service-url` or `QUILLO_SERVICE_<NAME>`. `QUILLO_SERVICE_SECRET` is set on every
+machine by hand.
 
 #### Retries that run once
 
@@ -417,10 +501,6 @@ a working one. Five rules carry it:
   chain of calls commits step by step. Give each step a reference the caller makes up,
   and keep what was done, so a request sent again goes on from where it stopped instead
   of doing a step twice. To undo the steps before one that fails, see [Sagas](#sagas).
-- **No discovery.** Each caller is told where a service runs (`--service-url` or
-  `QUILLO_SERVICE_<NAME>`), and `QUILLO_SERVICE_SECRET` is set on every machine by hand.
-  A copy can join a running app with `--join`, but it is recorded at the address it
-  connects from, so a copy behind NAT or a proxy belongs behind a balancer instead.
 - **Variables are each copy's.** Copies of a service (`--scale`, `--join`, several
   addresses) share its database, not its global variables.
 - **A service's own publishing.** A topic a service publishes while answering a call
@@ -440,6 +520,10 @@ a working one. Five rules carry it:
   and its globals cannot be reached from outside.
 - A service's routes, under its prefix, are passed on to it, and are public as any route
   is: guard them as you would in one program.
+- `/_quillo/describe`, when on, is public and lists every route, each `server fn`'s
+  signature, the file and line of every route, and the version: keep it private at the
+  proxy, as `/_quillo/metrics` is, or leave `--describe` off in production.
+- `/_quillo/join` takes only joins signed under `QUILLO_SERVICE_SECRET`, each nonce once.
 
 ### The example
 
