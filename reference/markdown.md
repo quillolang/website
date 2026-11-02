@@ -11,6 +11,8 @@ value, which markup shows as it is (no escaping); `str(...)` gives its text, to 
 The options are `{ html: true }`, which keeps the HTML in the text, for text you wrote,
 and `{ inline: true }`, which keeps only what fits inside a line (bold, italic, code,
 links) for a headline or a caption: no paragraph around it, no headings or lists.
+The result is a fragment, with no doctype or `<head>`: as a route's whole answer, a
+browser shows it in quirks mode. `markdown_page` makes a whole page of it.
 
 ### Examples
 
@@ -116,4 +118,4 @@ component Editor() {
 
 ### See also
 
-[highlight](/docs/reference/highlight/), [raw](/docs/reference/raw/), [escape](/docs/reference/escape/), [str](/docs/reference/str/)
+[markdown_page](/docs/reference/markdown_page/), [highlight](/docs/reference/highlight/), [raw](/docs/reference/raw/), [escape](/docs/reference/escape/), [str](/docs/reference/str/)

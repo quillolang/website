@@ -24,7 +24,7 @@ const jwk = (k, kid, alg) => ({ ...k.publicKey.export({ format: "jwk" }), kid, a
 
 export async function start({ port }) {
     const issuer = `http://127.0.0.1:${port}`;
-    const stats = { discovery: 0, jwks: 0, codes: 0, exchanged: 0, userinfo: 0, refreshed: 0, pkce: 0, basic: 0, rotatedSeen: false };
+    const stats = { discovery: 0, jwks: 0, codes: 0, exchanged: 0, userinfo: 0, refreshed: 0, pkce: 0, basic: 0, machine: 0, rotatedSeen: false };
     const codes = new Map(), tokens = new Map(), refresh = new Map();
 
     function idToken(c, accessToken) {
@@ -105,7 +105,15 @@ export async function start({ port }) {
                     stats.refreshed++;
                     return send(200, issue(c));
                 }
-                if (f.get("grant_type") !== "authorization_code") return bad(400, "unsupported_grant_type", "Only authorization_code and refresh_token");
+                // A program calling an API as itself: an RS256 access token for the audience it names (RFC 9068).
+                if (f.get("grant_type") === "client_credentials") {
+                    const t = Math.floor(Date.now() / 1000);
+                    const claims = { iss: issuer, sub: CLIENT, client_id: CLIENT, aud: f.get("audience") ?? "api", scope: f.get("scope") ?? "", exp: t + 300, iat: t, jti: randomBytes(8).toString("hex") };
+                    const m = b64(JSON.stringify({ alg: "RS256", typ: "at+jwt", kid: "rsa-1" })) + "." + b64(JSON.stringify(claims));
+                    stats.machine++;
+                    return send(200, { access_token: m + "." + sign("sha256", Buffer.from(m), rsa.privateKey).toString("base64url"), token_type: "Bearer", expires_in: 300, scope: claims.scope });
+                }
+                if (f.get("grant_type") !== "authorization_code") return bad(400, "unsupported_grant_type", "Only authorization_code, refresh_token and client_credentials");
                 const c = codes.get(f.get("code"));
                 if (!c) return bad(400, "invalid_grant", "The code is unknown or was used already");
                 codes.delete(f.get("code"));

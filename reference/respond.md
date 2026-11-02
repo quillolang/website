@@ -9,7 +9,8 @@ the plain forms (html, a str, a map) are not enough: a status of its own, a head
 such as `content-type` or `cache-control`, a 204 with nothing. The body is sent as a
 plain return value would be (html as HTML, a str as text, a map or list as JSON,
 null as nothing); header names are made lower case and values become text. The
-status must be 100 to 599. The value's fields are `status`, `body` and `headers`.
+status must be 200 to 599: a 1xx is an interim answer, after which the client waits for
+the real one, so it is refused. The value's fields are `status`, `body` and `headers`.
 
 ### Examples
 
@@ -48,6 +49,12 @@ route POST /items { json: { name: str } } {
   `x-request-id`, `x-content-type-options`), and `content-length`,
   `transfer-encoding`, `connection` and `date` are the server's whatever is given.
 - The body is kept as it is: html stays html, an error value stays an error value.
+- A `205` goes out with no body, whatever is given, as HTTP asks; a `304` too. The
+  status line carries its reason phrase (`418 I'm a teapot`, `451 Unavailable For Legal
+  Reasons`).
+- A route's answer with an `etag` header gets a `304` with no body when a GET or HEAD
+  asks with a matching `If-None-Match`, as files do. Such an answer, or one with a
+  `content-range`, goes out as it is: no prefetch or `--watch` script is added to it.
 - `reply status respond(...)` from a helper keeps the body and headers with the new
   status, so a helper can answer with headers too.
 
@@ -73,7 +80,8 @@ route GET /checkout { open_for_business(); <CheckoutPage/> }
 
 ### Errors
 
-A status outside 100 to 599 is a runtime error. So is a header whose name has
+A status outside 200 to 599 is a runtime error, and `quillo check` refuses a 1xx
+written in the call. So is a header whose name has
 anything but letters, digits and `-`, or whose value has a line break: text from a
 request cannot add headers, or a whole response, of its own. Headers that are not a
 map, or a status that is not an int, are runtime errors too. None of these is an error
@@ -84,7 +92,15 @@ print(respond(600, "x"))
 ```
 
 ```output
-line 1: `respond` status must be 100-599, got 600
+line 1: `respond` status must be 200-599, got 600
+```
+
+```quillo error
+print(respond(103, "", { link: "</app.css>; rel=preload; as=style" }))
+```
+
+```output
+line 1: `respond` status must be 200-599, got 103: a 1xx is an interim answer, and the client would wait for the real one
 ```
 
 ```quillo error

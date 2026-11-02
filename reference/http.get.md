@@ -7,10 +7,15 @@ group: HTTP client
 Fetches a URL with GET and gives the answer as a map `{ status, ok, headers, body,
 json }`: `ok` is true for a 2xx status, `headers` has its names in lower case, `body`
 is the text (bytes that are not UTF-8 replaced, cut at 64 MiB) and `json` is the body
-parsed as JSON, or null. The second argument is a map of request headers, the third a
-map of options: `redirects` (0 to 20; 5 unless given), `public_only`, `cache`
-(seconds, up to a day) and `timeout` (seconds, up to 300). Every HTTP status is an
-answer; an answer that cannot be had at all is an error value.
+parsed as JSON, or null. A header the server sent more than once is one value, joined
+with `, `; `set-cookie`, which cannot be joined so, has its lines joined by a line break,
+and each one is also in `cookies`, a list. The second argument is a map of request
+headers, the third a map of options: `redirects` (0 to 20; 5 unless given),
+`public_only`, `cache` (seconds, up to a day), `timeout` (seconds, up to 300), `ca` (a
+PEM file of the certificate authorities to trust instead of the usual public ones, or
+`"system"` for the machine's own), and `cert` with `key` (PEM files: a client
+certificate to present, as some banks' and governments' APIs ask). Every HTTP status
+is an answer; an answer that cannot be had at all is an error value.
 
 ### Examples
 
@@ -47,6 +52,19 @@ err("http: not an http(s) URL: not a url")
 - The headers and the options may each be `null`, as leaving them out.
 - Requests say `User-Agent: quillo/<version>` unless the headers give another; some
   APIs refuse that one.
+- Interim answers (`100`, `103 Early Hints`) are passed over to the final one.
+- A redirect to the same host keeps `Authorization`; one to another origin drops it,
+  and `Cookie` too.
+- A body in `gzip`, `deflate` or `br` is decoded, and `content-encoding` is taken out
+  of the headers; another coding (`zstd`) is an error value that names it.
+- `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (in either case) send the call through
+  that proxy, unless `NO_PROXY` names its host (a name, `.domain` for it and below, an
+  address, or `*`). A call to this machine (`localhost`, `127.0.0.1`, `::1`) never goes
+  through one. With `public_only`, the host is looked up and checked before the call
+  goes to the proxy.
+- `ca`, `cert` and `key` are read from the program's folder, as `read_file` reads; one
+  that cannot be read, or holds no certificate, makes the call an error value that says
+  so.
 
 ```quillo
 print(http.get("ftp://example.com/x"))
@@ -68,7 +86,8 @@ Not reaching the server (refused, no such host, out of time, refused by `public_
 is an error value: check it with `is_err`, replace it with `??`, or pass it on with
 `?`. The arguments are checked at once as runtime errors: a URL that is not a string,
 headers that are not a map, an option that does not exist (`{ timout: 5 }` is not
-ignored) or is out of range, and `cache` on another method than GET.
+ignored) or is out of range, `cert` without `key`, `ca` that is not a path or
+`"system"`, and `cache` on another method than GET.
 
 ```quillo
 let r = http.get("http://127.0.0.1:9/")
@@ -86,7 +105,7 @@ print(http.get("http://127.0.0.1:9/", {}, { timout: 5 }))
 ```
 
 ```output
-line 1: `http.get`: unknown option `timout` (the options are redirects, public_only, cache, timeout)
+line 1: `http.get`: unknown option `timout` (the options are redirects, public_only, cache, timeout, ca, cert, key)
 ```
 
 ```quillo error
@@ -95,6 +114,14 @@ print(http.get("http://127.0.0.1:9/", {}, { redirects: 21 }))
 
 ```output
 line 1: `http.get`: `redirects` is a whole number from 0 to 20, got 21
+```
+
+```quillo error
+print(http.get("https://127.0.0.1:9/", {}, { cert: "client.pem" }))
+```
+
+```output
+line 1: `http.get`: `cert` and `key` go together: a certificate, and its key
 ```
 
 ### Chaining

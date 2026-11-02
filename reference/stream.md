@@ -53,6 +53,9 @@ print(stream((send) => send("x"), { type: "application/x-ndjson", status: 201 })
   next `send` ends the function; an error in it after the head was sent cuts the
   connection, so the client knows the answer is incomplete. A streamed answer is not
   gzipped and cannot be kept by `idempotent`.
+- The answer is chunked; to an HTTP/1.0 client, which cannot read chunks, it goes with
+  no length and the connection ends with it. In a phone app or `quillo app`, where the
+  program has no socket, the answer reaches the page whole, once the function ends.
 
 ```quillo
 let s = stream((send) => { print("sending"); send("x") }, { headers: { "x-accel-buffering": "yes", "content-type": "text/csv" } })

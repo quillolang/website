@@ -7,7 +7,10 @@ group: Requests and pages
 A response of Server-Sent Events, sent as the function makes them. The function gets
 `send`; each value given to it goes out as JSON in an event's `data`, with an event
 name when `send` is given a second argument, and `send(null)` is a comment, which
-keeps a quiet connection open. The `content-type` is `text/event-stream` with
+keeps a quiet connection open. The second argument may be a map, `send(value, { event,
+id, retry })`: the event's name, an id, which a browser sends back as `Last-Event-ID`
+when it connects again (`listen` does), and `retry`, how many milliseconds it waits
+before it does. `send(null, { id })` sends the id alone. The `content-type` is `text/event-stream` with
 `cache-control: no-cache`. The options are `status` (200 unless given, 200 to 599)
 and `headers`. A page follows the events with `listen` or `receive`. See
 [Streaming](/docs/routes/#streaming).
@@ -19,6 +22,14 @@ route GET /jobs/:id/progress = events((send) => {
     for step in range(10) {
         work(id, step)
         send({ done: step + 1, of: 10 }, "progress")   // a value, and an event name
+    }
+})
+
+// Goes on from where a dropped connection left off.
+route GET /feed = events((send) => {
+    let since = int(request.headers["last-event-id"] ?? "0") ?? 0
+    for item in items_after(since) {
+        send(item, { event: "item", id: str(item.id), retry: 2000 })
     }
 })
 
@@ -55,6 +66,11 @@ print(e.status, e.headers, e.body)
   holds one of its six connections to the site; for data every page follows, `live`
   shares one WebSocket instead.
 - An answer of events cannot be kept by `idempotent` and is not gzipped.
+- An HTTP/1.0 client, which cannot read chunks, gets the events with no length, and the
+  connection ends with the stream.
+- An option of `send` other than `event`, `id` and `retry`, or a `retry` that is not a
+  whole number of milliseconds, is a runtime error in the function: the stream ends
+  there. An id or a name is written on one line.
 
 ```quillo
 print(events((send) => send("x"), { type: "text/csv", status: 202 }).headers)

@@ -5,11 +5,13 @@ group: HTTP client
 ### What it does
 
 Sends a request with any method: the method first, then the URL, a body, a map of
-headers and a map of options (`redirects`, `public_only`, `cache` for GET, `timeout`).
+headers and a map of options (`redirects`, `public_only`, `cache` for GET, `timeout`,
+`ca`, `cert`, `key`).
 The answer is a map `{ status, ok, headers, body, json }`, as
 [http.get](/docs/reference/http.get/) gives. The method is upper-cased; the body is
 sent as [http.post](/docs/reference/http.post/) sends one: text as `text/plain`, HTML as
-`text/html`, other values as JSON, `null` nothing.
+`text/html`, other values as JSON, `null` nothing. A `307` or `308` after a method other
+than GET or HEAD is followed with the same method and body.
 
 ### Examples
 

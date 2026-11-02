@@ -11,7 +11,12 @@ with a current copy gets a `304` with no body. A file that is not there, a folde
 path with `..` or starting at `/` gives a `404` response, not an error. The options map
 takes `cache`: seconds, or a duration like `"10m"`, `"12h"`, `"30d"`, `"1y"`, which lets
 the browser keep the file that long without asking; without it the answer says
-`no-cache` (keep it, but ask each time).
+`no-cache` (keep it, but ask each time). It also takes `download`, a file name, and
+`type`, a content type in place of the extension's. The file goes out as it is on disk:
+an HTML file gets none of the scripts Quillo adds to the pages a route makes, so its
+`ETag` and a `Range` of it are of the file's own bytes. For a whole folder served as a
+static host serves it (`index.html`, `/about` for `about.html`, `404.html`), see
+[files](/docs/reference/files/).
 
 ### Examples
 
@@ -43,8 +48,18 @@ public, max-age=31536000, immutable
 - A missing file is a `404` response whose body is `not found`; so is a folder, a path
   with `..` or one starting at `/`. It is never an error value, so `??` and `is_err`
   do not see it.
-- An extension the list does not know (`html css js json svg png jpg webp mp4 pdf zip`
-  and the others in the guide) is sent as `application/octet-stream`.
+- An extension the list does not know is sent as `application/octet-stream`. The list:
+  `html htm css js mjs json map webmanifest xml xsl txt text md markdown csv tsv svg
+  png jpg jpeg gif webp avif bmp tif tiff heic jxl ico mp4 m4v mov webm m4a aac flac
+  opus mp3 ogg oga wav wasm woff2 woff ttf otf pdf zip`, and for feeds, calendars,
+  subtitles and streams `rss atom jsonld geojson yaml yml toml ics vtt srt m3u8 mpd ts
+  m4s`. A `.md` file is `text/markdown; charset=utf-8`.
+- A request's conditions are read as HTTP says: `If-None-Match`, else
+  `If-Modified-Since`, gives a `304` when the file has not changed since the date given,
+  a later date included, in any of HTTP's three date forms (`Sun, 06 Nov 1994 08:49:37
+  GMT`, `Sunday, 06-Nov-94 08:49:37 GMT`, `Sun Nov  6 08:49:37 1994`). `If-Match` that
+  names another version, or `If-Unmodified-Since` before the file changed, gives a
+  `412` with no body. A date that does not parse is not a condition.
 - `cache` can be a number of seconds; the header is then `public, max-age=N, immutable`.
 - Files up to 1 MiB are kept in memory and re-read when they change; larger ones are
   streamed from disk, and a `Range` request gets a `206` with those bytes.

@@ -118,3 +118,7 @@ A static copy of a site (as `export.sh` makes of this one) is served with a file
 headers whatever the request, so every page is sent with `cache-control: private,
 max-age=30`, and may be up to 30 seconds old after a change. This site is now served by
 `quillo run` itself, so it answers each kind of request as described above.
+
+HTML files served with `file()`, `files()` or `quillo serve` go out as they are on disk:
+the prefetch script is added only to pages a route makes, so a file's `ETag` and a
+`Range` of it are of its own bytes. Such pages do not prefetch.

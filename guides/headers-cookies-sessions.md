@@ -142,8 +142,10 @@ fn open_for_business() {
 route GET /checkout { open_for_business(); <CheckoutPage/> }
 ```
 
-**CORS.** Browsers ask with an `OPTIONS` request before a cross-site call; nothing
-answers it by itself. Declare the route and send the headers on the answers too:
+**CORS.** Browsers ask with an `OPTIONS` request before a cross-site call. Quillo
+answers an `OPTIONS` on a path a route has with `204` and `Allow`, but writes no
+`access-control-*` header, so the browser refuses the call. Declare the route and send
+the headers on the answers too:
 
 ```quillo
 let CORS = {

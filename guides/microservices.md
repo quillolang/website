@@ -61,8 +61,10 @@ QUILLO_SERVICE_SECRET=... quillo run app.qwe --service-url billing=http://10.0.0
 ```
 
 `--service-url billing=...` can also be given as `QUILLO_SERVICE_BILLING`. Every service
-and every caller needs the same `QUILLO_SERVICE_SECRET`; without it, a call to a service
-that runs elsewhere is an error value saying so, not an unsigned request.
+and every caller needs the same `QUILLO_SERVICE_SECRET`, unless the call proves who makes
+it another way (a key of the caller's own, a token, a certificate: see [Authentication
+between services](#authentication-between-services)); without either, a call to a
+service that runs elsewhere is an error value saying so, not an unsigned request.
 
 ### What crosses the wire
 
@@ -126,7 +128,7 @@ body and these headers:
 
 | Header | Carries |
 |---|---|
-| `x-quillo-service` | `t=<unix seconds>,sig=<hex>`: the time and the signature |
+| `x-quillo-service` | `v=3,kid=<caller>,t=<unix seconds>,sig=<hex>`: the signature's version, the caller's key id (empty under the shared secret), the time and the signature |
 | `x-quillo-to` | the service's name, as the caller knows it |
 | `x-quillo-call` | the call's id, up to 64 letters and digits, remembered by the service |
 | `x-quillo-caller` | the calling program's name |
@@ -134,10 +136,19 @@ body and these headers:
 | `x-quillo-contract` | the function's contract as the caller's copy declares it |
 | `x-quillo-tenant` | the tenant, when there is one |
 | `x-request-id` | the request's id, passed down the chain |
+| `authorization` | `Bearer <token>`, when the caller proves itself with a token |
+| `x-quillo-forward-<name>` | a header of the visitor's request the caller passes on (`forward`) |
 
-The signature is HMAC-SHA256 under `QUILLO_SERVICE_SECRET` of the text
-`quillo-service-2`, the time, the service, the function, the tenant and the call id,
-each followed by a line break, then the body. The time must be within five minutes.
+The signature is HMAC-SHA256, under `QUILLO_SERVICE_SECRET` or the caller's own key, of
+the text `quillo-service-3`, the time, the service, the function, the tenant, the call
+id, the key id, the caller, the deadline and the contract, each followed by a line
+break, then the body. The time must be within five minutes. Services still take
+version 2 (`t=...,sig=...`, over `quillo-service-2`, the time, the service, the
+function, the tenant and the call id), which does not sign the caller, the deadline or
+the contract; a caller of this version sends version 3, which an older service refuses,
+so upgrade the services before their callers. The answer comes back signed with the
+key the call was signed with: `x-quillo-answer: sig=<hex>`, HMAC-SHA256 of
+`quillo-answer-3`, the call id and the status, each on a line, then the body.
 The answer is `{"ok": value}` or `{"err": payload}`, with `"published": [...]` when the
 call published topics. Otherwise: 400 for an argument of the wrong type, 401 for a bad
 or old signature or a call meant for another service, 404 for no such function, 409
@@ -146,13 +157,17 @@ running. A call sent twice with the same id gets the same answer and runs once w
 the service stays up. Only an answer of 200 is remembered.
 
 A copy that [joins](#copies-that-join) the app does so at `POST <app>/_quillo/join`,
-with `{ "service": "billing", "port": 8081, "leave": false }` as the body, signed as a
-service call is: under `QUILLO_SERVICE_SECRET`, with a nonce in `x-quillo-call`, which
-is taken once. The answer is 200 with `{ "service", "at" }`, the address the copy is
-recorded at; otherwise 400 for a body without a port or an address that is not known,
-401 for a bad or old signature or no nonce, 403 when the app has no
-`QUILLO_SERVICE_SECRET`, 404 when the app declares no such service, 405 for a method
-other than POST, and 409 for a nonce sent before. Only copies call it, so a proxy in
+with `{ "service": "billing", "port": 8081, "leave": false }` as the body (and `"url"`,
+from `--join-as`), signed as a service call is, for the function `_join`, with a nonce
+in `x-quillo-call`, which is taken once: with the service's own key (`kid` its name)
+when the app has a key for that service in `accept_calls`, else under
+`QUILLO_SERVICE_SECRET`. The answer is 200 with `{ "service", "at" }`, the address the
+copy is recorded at; otherwise 400 for a body without a port, an address that is not
+known, or a `url` that does not lead to where the copy joined from, 401 for a bad or old
+signature, a key of another service's, a join under the shared secret where the app
+wants the service's key, or no nonce, 403 when the app takes no copies (`--no-join`,
+`--allow-join`) or has neither `QUILLO_SERVICE_SECRET` nor keys in `accept_calls`, 404 when the app declares no such
+service, 405 for a method other than POST, and 409 for a nonce sent before. Only copies call it, so a proxy in
 front of the app need not pass it from outside.
 
 ### A chain of calls
@@ -358,9 +373,30 @@ A copy of a service can join an app while it runs:
 QUILLO_SERVICE_SECRET=... quillo run billing.qwe --as-service --port 8081 --join http://10.0.0.2:8080
 ```
 
-It says it is there every 5 seconds, signed with `QUILLO_SERVICE_SECRET` (set on both),
-and that it is leaving when it stops; the app drops a copy it has not heard from in 15
-seconds. It is recorded at the address it connects from, with its `--port`.
+It says it is there every 5 seconds, and that it is leaving when it stops; the app drops
+a copy it has not heard from in 15 seconds. It is recorded at the address it connects
+from, with its `--port`, called over `http://`; `--join-as
+https://billing-3.internal:8443` gives the address the app calls it at instead, which
+must lead to where it joined from.
+
+The copy signs its joins with `QUILLO_SERVICE_KEY`, the service's own key, when it is
+set, and with `QUILLO_SERVICE_SECRET` otherwise. An app whose `accept_calls` has a key
+for `billing` takes copies of billing only when they are signed with that key, so a
+service that holds the shared secret cannot join as another one and take its calls:
+
+```quillo
+// app.qwe
+accept_calls { keys: { billing: env("BILLING_KEY") } }
+service billing = "billing.qwe"
+```
+
+```sh
+QUILLO_SERVICE_KEY=$BILLING_KEY quillo run billing.qwe --as-service --port 8081 \
+    --join http://10.0.0.2:8080 --join-as https://billing-3.internal:8443
+```
+
+An app that never wants copies runs with `--no-join`; `--allow-join billing,risk` takes
+copies of those services only.
 
 - **When the service runs in the app's process**, the copies that joined take every
   call, in turn, and the app runs a call itself only when no copy answers it. A
@@ -381,8 +417,8 @@ instead.
 Services are found by registering, in two ways: a copy joins the app (`--join`, above),
 and any server joins limer's pool (`--register`, with `LIMER_ADMIN_SECRET`). A caller
 does not look a service up by name, so a service the app does not run itself needs
-`--service-url` or `QUILLO_SERVICE_<NAME>`. `QUILLO_SERVICE_SECRET` is set on every
-machine by hand.
+`--service-url` or `QUILLO_SERVICE_<NAME>`. `QUILLO_SERVICE_SECRET` and the keys are
+set on every machine by hand.
 
 #### Retries that run once
 
@@ -510,12 +546,110 @@ a working one. Five rules carry it:
 [Services](/docs/routes/#services) in the reference has the rest: `--scale`, `--join`,
 `/_quillo/ready`, live data across services, and copies behind a balancer.
 
+### Authentication between services
+
+A call signed with `QUILLO_SERVICE_SECRET` proves that the caller is one of the system's
+services, and nothing more: every service that holds the secret can sign as any other.
+To say which service calls, and what it may call, each side says how.
+
+The caller says how it proves who it is, where it declares the service:
+
+```quillo
+service billing = "billing.qwe"                                                  // auth: "quillo", the shared secret
+service billing = "billing.qwe" { auth: { key: env("SHOP_KEY"), as: "shop" } }   // a key of its own, known as shop
+service billing = "billing.qwe" { auth: { bearer: () => env("BILLING_TOKEN") } } // any token the program makes
+service billing = "billing.qwe" { auth: { oauth: {                               // OAuth 2.0 client credentials
+    token_url: env("IDP_TOKEN_URL"), client_id: "shop", client_secret: env("SHOP_CLIENT_SECRET"),
+    scope: "billing", audience: "billing",
+} } }
+service billing = "billing.qwe" { auth: { key: env("SHOP_KEY"), as: "shop", mtls: { cert: "shop.crt", key: "shop.key", ca: "ca.pem" } } }
+service billing = "billing.qwe" { auth: { key: env("SHOP_KEY"), as: "shop" }, forward: ["authorization"] }
+```
+
+- `{ key, as }` signs each call with the caller's own key, under the name `as` (the
+  callee's `keys` names it).
+- `{ bearer: f }` calls `f` for each call and sends what it gives as `Authorization:
+  Bearer ...`.
+- `{ oauth: { token_url, client_id, client_secret, scope, audience, method } }` fetches
+  a token from the identity provider's token endpoint (RFC 6749's client credentials),
+  keeps it until 30 seconds before it expires, and fetches it again once when the
+  service answers 401. `method` is `"post"` (the client's id and secret in the form, the
+  default) or `"basic"` (in an `Authorization: Basic` header).
+- `{ mtls: { cert, key, ca } }` presents a client certificate on the connection, beside
+  one of the others; `ca` is the certificate authorities to trust for the service's own.
+- `forward: ["authorization"]` passes those headers of the visitor's request along, so
+  the service can see who the visitor is.
+
+`quillo check` warns of a `key` or `client_secret` written in the source, where every
+copy of the program has it: read it with `env(...)`.
+
+The service says what it takes, at its top level, and who may call each function:
+
+```quillo
+// billing.qwe
+accept_calls {
+    keys: { shop: [env("SHOP_KEY"), env("SHOP_KEY_OLD")], notify: env("NOTIFY_KEY") },
+    shared: false,                                                    // no calls under the shared secret
+    jwt: { issuer: env("IDP"), audience: "billing", jwks: env("IDP") + "/.well-known/jwks.json" },
+    client_cert: { header: "x-forwarded-client-cert" },              // from a proxy --trust-proxy names
+    check: (caller) => caller.name != "mallory",                     // anything else, in Quillo
+}
+
+server fn refund(account: int, cents: int) for ["shop"] {
+    { refunded: cents, by: request.caller.name }
+}
+
+server fn whoami() = { caller: request.caller, user: request.user, forwarded: request.forwarded }
+```
+
+- `keys` gives each caller's key by its name; a list takes any of them while one is
+  rotated.
+- `jwt` takes bearer tokens: their signature against the provider's keys (`jwks`, a URL;
+  RS256, ES256 and EdDSA) or a `secret` (HS256), with `exp` required and `iss` and `aud`
+  checked. `audience` is required.
+- `client_cert` takes the identity of a certificate a proxy checked, as Envoy and
+  Istio pass it on: Quillo does not end TLS itself. The header is believed only on a
+  request from an address `--trust-proxy` names.
+- `check` runs before the arguments are read. `false` refuses the call with 403, a map
+  becomes the caller, and `reply` answers the call.
+- `for ["shop"]` takes calls from those callers only; others get 403, before their
+  arguments are read.
+
+`request.caller` is who called: `{ name, by }`, with `by` one of `"quillo"`, `"key"`,
+`"jwt"` and `"mtls"`; a token adds its `scopes` and `claims`, a certificate its
+`subject` and `uri`. `request.forwarded` holds the visitor's headers the caller passed
+on, and `request.user` the claims of the visitor's token there, when `jwt`'s rules take
+it. `quillo docs` writes each function's callers as `x-quillo-callers`, for a gateway.
+
+**Rotating a secret.** `QUILLO_SERVICE_SECRET=new,old` (or `QUILLO_SERVICE_SECRET` and
+`QUILLO_SERVICE_SECRET_PREVIOUS`) signs with the first and takes any. Set both on every
+machine, one at a time, then drop the old one. A caller's key is rotated the same way,
+with a list in the service's `keys`.
+
+**Signed answers.** A service signs its answer with the key the call was signed with. A
+caller that signs with a key of its own refuses an answer without that signature, so a
+server that only says it is billing cannot answer for it.
+
+**Callers that are not Quillo services.** A gateway, or a service in another language,
+can sign Quillo's calls (the wire is above), send a token `jwt` takes, or call routes.
+For routes, check the token in a route's middleware with the catalog's `jwt.qwer`
+(2.0.0: `jwt_check` with `audience`, `issuer` and `require`, `exp` required, and
+`jwt_verify_jwks` for an identity provider's keys); `oidc.qwer` 1.1.0 adds
+`oidc_client_credentials`, to fetch a token for calling out, and `oidc_verify_access`.
+Routes give up what `service` brings (checked calls, contracts, retries run once,
+deadlines, `.later`), so prefer `accept_calls` where the caller can send a token.
+
 ### Security
 
-- A call is signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET`, together with the
-  time, the service it is for, the function, the tenant, the call's id and its
-  arguments; a call more than five minutes old, or signed for another service, is
-  refused. The tenant goes with it.
+- A call is signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` or the caller's own
+  key, together with the time, the service it is for, the function, the tenant, the
+  call's id, the caller, the deadline, the contract and its arguments; a call more than
+  five minutes old, or signed for another service, is refused. The tenant goes with it.
+  The answer is signed back.
+- The shared secret is all or nothing: every service that holds it can call any
+  function of any other, as any caller, in any tenant. Give each caller a key of its own
+  and name who may call what with `for [...]`; see [Authentication between
+  services](#authentication-between-services).
 - Only `server fn`s are offered at `/_quillo/service/<name>`: a service's other functions
   and its globals cannot be reached from outside.
 - A service's routes, under its prefix, are passed on to it, and are public as any route
@@ -523,7 +657,9 @@ a working one. Five rules carry it:
 - `/_quillo/describe`, when on, is public and lists every route, each `server fn`'s
   signature, the file and line of every route, and the version: keep it private at the
   proxy, as `/_quillo/metrics` is, or leave `--describe` off in production.
-- `/_quillo/join` takes only joins signed under `QUILLO_SERVICE_SECRET`, each nonce once.
+- `/_quillo/join` takes only signed joins, each nonce once: with the service's own key
+  where the app has one for it, else under `QUILLO_SERVICE_SECRET`. `--no-join` turns it
+  off.
 
 ### The example
 

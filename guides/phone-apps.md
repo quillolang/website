@@ -1,8 +1,8 @@
 # Phone apps
 
 A Quillo program can run inside an iOS or Android app. The runtime is linked into the
-app and serves the program on the phone itself, to the app's own web view, so the app
-works offline and keeps its SQLite database in its own storage. The program is the same
+app and runs the program on the phone itself, inside the app, for the app's own web
+view, so the app works offline and keeps its SQLite database in its own storage. The program is the same
 one you run as a server: routes, components, `server fn`s, migrations, uploads and jobs
 all work as they do there.
 
@@ -24,11 +24,48 @@ into the app's own storage and runs from there, so `db.open("app.db")`, uploads 
 the program writes stay on the phone, with the app. An app update brings new code; the
 program's databases are never overwritten by it.
 
-The program listens on `127.0.0.1` at a port the system picks, and only the app's web
-view gets in: the first address it opens carries a token that the server answers once,
-with a cookie, as `quillo app` does on a desktop. Another app on the phone reaching the
-port gets 403. Sessions are signed with a key the app makes once and keeps in its
-storage, so a person stays signed in from one launch to the next.
+The program runs in the app's process with no HTTP server: nothing listens, so no other
+app on the phone, and no page in the phone's browser, can reach it. The web view asks
+the app itself for each page, through an address of the app's own, and the app hands the
+request to the program:
+
+| | iOS | Android |
+|---|---|---|
+| The pages' origin | `quillo://app` | `https://quillo.localhost` |
+| How a request reaches the program | the app's `WKURLSchemeHandler` | the WebView's `shouldInterceptRequest` |
+
+The origin is the same at every launch, so what the pages keep in `localStorage` and
+IndexedDB stays from one launch to the next. An app installed before this kept them under
+its old address, `http://127.0.0.1:<port>`: its database is the program's and is kept,
+but what its pages kept in the browser stays with the old address and is not copied.
+
+What the scheme cannot carry goes through the app's message bridge: the connections live
+data and channels keep open, a body on Android (whose interceptor carries none), and on
+iOS a file or a `FormData` (WebKit gives the handler none of its bytes). The script the
+app runs before every page sends them that way, a page's own `fetch` with a body
+included; a form with a file (iOS) or any form that posts (Android) is sent through the
+bridge, and the page then goes to its answer, as after an ordinary post and redirect.
+The program sees none of this: routes, `request`, sessions, uploads, `server fn`s, live
+data and channels work as they do on a server.
+
+The web view keeps no cookies for the app's own address, so the app keeps them: the
+cookies the program sets are kept in `.quillo/cookies.json` in the app's storage and sent
+back with each request. Sessions are signed with a key the app makes once and keeps in
+its storage, so a person stays signed in from one launch to the next. `request.ip` is
+`"app"`. Jobs, ticks and calls made `later` reach the program with no connection.
+
+What differs from a browser, then:
+
+- `document.cookie` is empty: a page's own script cannot read or write the program's
+  cookies. The program's cookies still reach the program.
+- Service workers do not run on the app's address. Quillo does not use them; a program's
+  own one does not start.
+- A `stream` or `events` route's answer reaches the page whole, when it ends, not as it
+  is made. Live data and channels, which go through the bridge, are not affected.
+- The app needs no exception for plain HTTP: the iOS app has no App Transport Security
+  exception for local networking, and the Android app allows no cleartext traffic.
+- Safari's and Chrome's inspectors work as before; the page's address is
+  `quillo://app/...` or `https://quillo.localhost/...`.
 
 The runtime is the same code on both systems; only the app around it differs:
 
@@ -228,7 +265,7 @@ simulator refuses more than a phone does, so test on one:
 
 | | iOS | Android |
 |---|---|---|
-| `navigator.geolocation` | asks again, in the name of `127.0.0.1`: use the app's location | granted with the app's location permission |
+| `navigator.geolocation` | asks again, in the name of the page's address: use the app's location | granted with the app's location permission |
 | `capture` on a file input | the camera | the camera (the app opens it), else the photo picker |
 | Motion and orientation | after a tap of the person's own, then real events and the compass | events without asking |
 | `navigator.vibrate`, `getBattery`, `connection` | not there (the app's calls stand in) | there; vibration only after a tap |
@@ -240,8 +277,8 @@ simulator refuses more than a phone does, so test on one:
 ### Calling your server
 
 The program on the phone can reach a server of yours. Do it from a `server fn`, which
-runs in the app's own runtime, not from the page: the page's origin is `127.0.0.1`,
-which a server cannot safely allow. A page's `http.*` to another site that fails says
+runs in the app's own runtime, not from the page: the page's origin is the app's own
+(`quillo://app`, `https://quillo.localhost`), which a server cannot safely allow. A page's `http.*` to another site that fails says
 so:
 
 ```
@@ -293,11 +330,11 @@ While you build the app, the server may be the computer it is built on:
 
 ### When the app leaves the screen
 
-**iOS** suspends an app soon after it leaves the screen, and the program's server with
-it. A `schedule` job does not run while the app is away; when the app comes back, a job
+**iOS** suspends an app soon after it leaves the screen, and the program with it; the
+app keeps the cookie jar on disk as it leaves. A `schedule` job does not run while the app is away; when the app comes back, a job
 whose time passed runs once, not once per missed run, and then keeps its schedule.
 
-**Android** lets the app keep running behind the home screen: the server goes on
+**Android** lets the app keep running behind the home screen: the program goes on
 answering and a job every minute went on running while the app was away. The system can
 still stop the process later to save memory or battery; the program starts again from
 its database when the app is opened.
@@ -310,7 +347,7 @@ tasks, push notifications), which the runtime does not offer yet.
 | | |
 |---|---|
 | Compiled numbers | no JIT on phones: number-heavy functions run in the interpreter |
-| WebTransport | channels to pages use the WebSocket |
+| WebTransport and WebSockets | channels and live data go through the app's bridge |
 | `.qwer` plugins built at run time | a phone has no compiler |
 | Starting processes | `--instances`, `--split` and `--with`: the app is one process |
 

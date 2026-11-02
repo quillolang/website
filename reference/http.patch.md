@@ -7,7 +7,8 @@ group: HTTP client
 Sends a PATCH with a body, as [http.post](/docs/reference/http.post/) sends a POST,
 and gives the answer as a map `{ status, ok, headers, body, json }`. A map or a list
 goes as JSON, text as `text/plain`, HTML as `text/html`; `null` sends no body. Headers
-come third, options (`redirects`, `public_only`, `timeout`) fourth.
+come third, options (`redirects`, `public_only`, `timeout`, `ca`, `cert`, `key`)
+fourth. A `307` or `308` is followed with the same method and body.
 
 ### Examples
 

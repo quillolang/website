@@ -8,8 +8,10 @@ In a component's code, follows a stream the server sends (a route made with `eve
 or `stream`) for as long as the code that called it stands: `f` is called with each
 event's data (parsed as JSON when it is JSON, and the event's name as a second
 parameter when `f` declares one), each line of newline-delimited JSON, or each piece of
-text. A connection that drops is opened again (after a second, doubling up to 30 s); a
-stream that ends is not. It gives `null`.
+text. A connection that drops is opened again (after a second, doubling up to 30 s, or
+after the `retry` the server last sent); a stream that ends is not. Opened again, it
+sends the last event id it had as `Last-Event-ID`, so a route that reads it can go on
+from there. It gives `null`.
 
 ### Examples
 

@@ -8,7 +8,10 @@ Sends a POST with a body and gives the answer as a map `{ status, ok, headers, b
 json }`, as [http.get](/docs/reference/http.get/) does. The body is sent as it is when
 it is text (`text/plain`) or HTML (`text/html`), and as JSON otherwise (a map, a list,
 a number, a decimal); `null` sends no body. Headers come third and may give another
-`content-type`; the options (`redirects`, `public_only`, `timeout`) come fourth.
+`content-type`; the options (`redirects`, `public_only`, `timeout`, `ca`, `cert`,
+`key`) come fourth. A `307` or `308` answer is followed with the same method and body,
+as `fetch` does; a `301`, `302` or `303` is followed as a GET without the body, as
+browsers do. To another origin, `Authorization` and `Cookie` are not sent on.
 
 ### Examples
 

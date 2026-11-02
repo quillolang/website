@@ -1,22 +1,56 @@
-//! JSON Web Tokens: sign and verify HS256 tokens, and verify RS256 tokens from an identity provider.
-//! version: 1.0.0
+//! JSON Web Tokens: sign and verify HS256 tokens, check a token's audience and issuer, and verify RS256, ES256 and EdDSA tokens against a key or an identity provider's JWKS.
+//! version: 2.0.0
 //!
 //! [dependencies]
 //! jsonwebtoken = "9"
+//! ureq = "2"
 
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The checks every verifier makes: the signature, `exp` (which a token must have: one without
+/// is good for ever), `nbf`, and 30 s of leeway for clocks that differ. `aud` is checked only when
+/// one is asked for, so a token that names one is not refused for it.
 fn validation(alg: Algorithm) -> Validation {
     let mut v = Validation::new(alg);
-    // `exp` is checked when the token has one; 30 s of leeway for clocks that differ.
-    v.required_spec_claims.clear();
+    v.required_spec_claims = ["exp".to_string()].into_iter().collect();
+    v.validate_nbf = true;
+    v.validate_aud = false;
     v.leeway = 30;
     v
+}
+
+/// `options` of `jwt_check` and `jwt_verify_jwks`: `audience`, `issuer`, `require` (claims a token
+/// must have, `exp` by default; `[]` for none) and `leeway`.
+fn apply(v: &mut Validation, options: &Value) -> Result<(), String> {
+    if let Value::Object(o) = options {
+        for k in o.keys() {
+            if !["audience", "issuer", "require", "leeway", "jwks_url", "algorithms"].contains(&k.as_str()) {
+                return Err(format!("no option `{}` (audience, issuer, require, leeway)", k));
+            }
+        }
+    }
+    if let Some(a) = options["audience"].as_str() {
+        v.set_audience(&[a]);
+        v.validate_aud = true;
+    }
+    if let Some(i) = options["issuer"].as_str() {
+        v.set_issuer(&[i]);
+    }
+    if let Some(r) = options["require"].as_array() {
+        v.required_spec_claims = r.iter().filter_map(|c| c.as_str().map(str::to_string)).collect();
+    }
+    if let Some(l) = options["leeway"].as_u64() {
+        v.leeway = l;
+    }
+    Ok(())
 }
 
 /// A token for `claims`, signed with HMAC-SHA256: `iat` is added, and `exp` when `expires_in` (seconds) is above 0.
@@ -29,9 +63,16 @@ pub fn jwt_sign(claims: serde_json::Value, secret: &str, expires_in: i64) -> Res
     encode(&Header::default(), &Value::Object(c), &EncodingKey::from_secret(secret.as_bytes())).map_err(|e| e.to_string())
 }
 
-/// The claims of an HS256 token signed with `secret`, or an error: a bad signature, an expired token, another algorithm.
+/// The claims of an HS256 token signed with `secret`, or an error: a bad signature, an expired token, one with no `exp`, another algorithm.
 pub fn jwt_verify(token: &str, secret: &str) -> Result<Value, String> {
     decode::<Value>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation(Algorithm::HS256)).map(|d| d.claims).map_err(|e| e.to_string())
+}
+
+/// `jwt_verify`, with `options`: `audience` (`aud` must name it), `issuer` (`iss` must be it), `require` (the claims it must have, `["exp"]` unless given) and `leeway` (seconds).
+pub fn jwt_check(token: &str, secret: &str, options: serde_json::Value) -> Result<Value, String> {
+    let mut v = validation(Algorithm::HS256);
+    apply(&mut v, &options)?;
+    decode::<Value>(token, &DecodingKey::from_secret(secret.as_bytes()), &v).map(|d| d.claims).map_err(|e| e.to_string())
 }
 
 /// The claims of an RS256 token, checked with the issuer's public key (PEM) and its audience (`aud`, empty for none).
@@ -40,7 +81,59 @@ pub fn jwt_verify_rs256(token: &str, public_key_pem: &str, audience: &str) -> Re
     let mut v = validation(Algorithm::RS256);
     if !audience.is_empty() {
         v.set_audience(&[audience]);
+        v.validate_aud = true;
     }
+    decode::<Value>(token, &key, &v).map(|d| d.claims).map_err(|e| e.to_string())
+}
+
+/// Each JWKS fetched: its keys, when, and when a token with a new `kid` last fetched it again.
+static JWKS: Mutex<Option<HashMap<String, (jsonwebtoken::jwk::JwkSet, Instant, Option<Instant>)>>> = Mutex::new(None);
+
+fn jwks(url: &str, again: bool) -> Result<jsonwebtoken::jwk::JwkSet, String> {
+    let held = JWKS.lock().unwrap().as_ref().and_then(|c| c.get(url).cloned());
+    if let Some((set, at, forced)) = &held {
+        // A `kid` nobody knows fetches the keys again, at most every 30 s, so a forged token cannot make us flood the provider.
+        let keep = if again { forced.is_some_and(|f| f.elapsed() < Duration::from_secs(30)) } else { at.elapsed() < Duration::from_secs(600) };
+        if keep {
+            return Ok(set.clone());
+        }
+    }
+    let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| url.starts_with(p));
+    if !url.starts_with("https://") && !local {
+        return Err(format!("the JWKS `{}` is not https", url));
+    }
+    let text = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build().get(url).call().map_err(|e| format!("{}: {}", url, e))?.into_string().map_err(|e| e.to_string())?;
+    let set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(&text).map_err(|e| format!("{} is not a JWKS: {}", url, e))?;
+    let forced = if again { Some(Instant::now()) } else { held.and_then(|h| h.2) };
+    JWKS.lock().unwrap().get_or_insert_with(HashMap::new).insert(url.to_string(), (set.clone(), Instant::now(), forced));
+    Ok(set)
+}
+
+/// The claims of an access token from an identity provider, checked against its JWKS: `options` has `jwks_url`, and `audience`, `issuer`, `require`, `leeway` as `jwt_check` takes them, and `algorithms` (RS256, ES256 and EdDSA by default; never HS256 or `none`). A `kid` the keys do not have fetches them again.
+pub fn jwt_verify_jwks(token: &str, options: serde_json::Value) -> Result<Value, String> {
+    let url = options["jwks_url"].as_str().ok_or("options: jwks_url, the identity provider's keys")?;
+    let header = decode_header(token).map_err(|e| e.to_string())?;
+    let allowed: Vec<String> = match options["algorithms"].as_array() {
+        Some(l) => l.iter().filter_map(|a| a.as_str().map(str::to_string)).collect(),
+        None => vec!["RS256".into(), "ES256".into(), "EdDSA".into()],
+    };
+    let name = format!("{:?}", header.alg);
+    if name.starts_with("HS") || !allowed.iter().any(|a| *a == name) {
+        return Err(format!("algorithm `{}` is refused: {} are taken", name, allowed.join(", ")));
+    }
+    let kid = header.kid.clone();
+    let find = |set: &jsonwebtoken::jwk::JwkSet| match &kid {
+        Some(k) => set.find(k).cloned(),
+        None if set.keys.len() == 1 => set.keys.first().cloned(),
+        None => None,
+    };
+    let key = match find(&jwks(url, false)?) {
+        Some(k) => k,
+        None => find(&jwks(url, true)?).ok_or_else(|| format!("no key in {} for kid {}", url, kid.as_deref().unwrap_or("(none)")))?,
+    };
+    let mut v = validation(header.alg);
+    apply(&mut v, &options)?;
+    let key = DecodingKey::from_jwk(&key).map_err(|e| e.to_string())?;
     decode::<Value>(token, &key, &v).map(|d| d.claims).map_err(|e| e.to_string())
 }
 
@@ -50,6 +143,7 @@ pub fn jwt_peek(token: &str) -> Result<Value, String> {
     v.insecure_disable_signature_validation();
     v.required_spec_claims.clear();
     v.validate_exp = false;
+    v.validate_aud = false;
     v.algorithms = vec![Algorithm::HS256, Algorithm::HS384, Algorithm::HS512, Algorithm::RS256, Algorithm::RS384, Algorithm::RS512, Algorithm::ES256, Algorithm::ES384, Algorithm::PS256, Algorithm::EdDSA];
     decode::<Value>(token, &DecodingKey::from_secret(&[]), &v).map(|d| d.claims).map_err(|e| e.to_string())
 }

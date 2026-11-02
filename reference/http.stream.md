@@ -9,9 +9,10 @@ Server-Sent Event (its data, parsed as JSON when it is, and its name), each line
 newline-delimited JSON, or each piece of plain text, by the answer's `content-type`.
 `f` may stop the stream by returning `false`. The options map holds the request's
 `method`, `body` and `headers` (POST when a body is given, GET otherwise) and
-`redirects`, `public_only` and `timeout`. Once the answer has ended it gives `{ status,
-ok, headers }`, with the `body` as well when the status is not a success; an answer
-that cannot be had is an error value.
+`redirects`, `public_only`, `timeout`, `ca`, `cert` and `key`, as
+[http.get](/docs/reference/http.get/) takes them. Once the answer has ended it gives
+`{ status, ok, headers, cookies }`, with the `body` as well when the status is not a
+success; an answer that cannot be had is an error value.
 
 ### Examples
 
@@ -44,7 +45,11 @@ err("http: not an http(s) URL: not a url")
 ### Edge cases
 
 - `f` is called with as many arguments as it declares: `(data)` gets each event's data
-  alone, `(data, name)` its name too.
+  alone, `(data, name)` its name too, and `(data, name, id, retry)` the event's id (the
+  last one the stream gave, kept for the events after it, as a browser's `EventSource`
+  keeps it) and its `retry` in milliseconds, or `null`.
+- Repeated headers, `Set-Cookie`, interim answers, redirects, codings and proxies are
+  taken as `http.get` takes them.
 - A `body` makes the request a POST unless `method` says otherwise; `method` is
   upper-cased.
 - An answer that is not a success (a 401, a 500) is read whole and given with its

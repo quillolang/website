@@ -29,7 +29,7 @@ quillo run main.qwe --port 8080 --log json
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)) |
-| `--max-body N` | the largest request body, in bytes (default 10 MiB): raise it for big uploads |
+| `--max-body N` | the largest request body, in bytes (default 10 MiB): raise it for big uploads. A body may take as long as it keeps coming; one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
 | `--metrics` | answer `/_quillo/metrics` (keep it private: see below) |
 
@@ -56,7 +56,8 @@ Never `--watch` in production: it shows errors on pages, refreshes them, and lea
 | `DATABASE_URL`, or any name | read with `env("DATABASE_URL")` in the program |
 | `QUILLO_DB` | the database when the program does not call `db.open` |
 | `QUILLO_SYSTEM_DB` | where Quillo keeps its own tables when each tenant has a database |
-| `QUILLO_SERVICE_SECRET` | signs calls between [services](/docs/microservices/) split across servers: the same on all of them |
+| `QUILLO_SERVICE_SECRET` | signs calls between [services](/docs/microservices/) split across servers: the same on all of them; `new,old` (or `QUILLO_SERVICE_SECRET_PREVIOUS`) while it is rotated: the first signs, any is taken |
+| `QUILLO_SERVICE_KEY` | a service's own key, which a copy joins the app with and which proves it is that service (see [authentication between services](/docs/microservices/#authentication-between-services)) |
 | `QUILLO_SERVICE_<NAME>` | where service NAME runs, as `--service-url` says |
 | `LIMER_ADMIN_SECRET` | for `--register`, joining limer's pool |
 | `PUBLIC_...` | variables components may read, written into the pages' scripts |
@@ -254,6 +255,10 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 
 - `GET /_quillo/health` answers `200` while the server takes requests, and `503` while it
   stops or when its program failed to load: give it to the load balancer.
+- A health check that sends `OPTIONS / HTTP/1.0`, as HAProxy's `option httpchk` does
+  unless told otherwise, gets `204` with `Allow` on any path a route has; `/_quillo/health`
+  is still the one to name. HTTP/1.0 clients (`ab`, some monitors) get no chunked
+  answers and no `100 Continue`.
 - `GET /_quillo/ready` also says whether what the program needs is there (its database,
   its services, checks of its own), 200 or 503 with each part as JSON: give it to an
   orchestrator's readiness probe.
@@ -277,7 +282,19 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 
 ### Static hosting
 
-A site whose components call nothing on the server (no `server fn`, database, sessions or
+Quillo can be the static host too. `quillo serve site` serves a folder of files as they
+are, with the options of `quillo run` (`--port`, `--host`, `--log`): a folder's
+`index.html` for `/` and `/docs/`, `/about` for `about.html`, `/docs` redirected to
+`/docs/`, the folder's `404.html` for a miss, and no file whose name starts with a dot
+(but `.well-known/`). Inside a program, `route GET /*path = files("site", path)` does the
+same beside its other routes. Each file goes out as it is on disk, with its `ETag`,
+`Last-Modified`, ranges and gzip.
+
+```sh
+quillo serve dist --port 8080 --host 0.0.0.0
+```
+
+The other way round, a site whose components call nothing on the server (no `server fn`, database, sessions or
 live data) can be rendered to files and put on any static host, shared hosting included.
 This site is one: its [export script](https://github.com/quillolang/website/blob/main/export.sh)
 runs it, fetches every page its sitemap lists and the component bundles they load, and
