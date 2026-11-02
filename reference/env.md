@@ -31,6 +31,9 @@ null fallback
   not set.
 - A variable that is set to the empty string is `""`, not `null`, so its default is not
   used.
+- Under a policy whose `[env]` gives `names` (`/etc/quillo/policy.toml`, `--policy FILE`
+  or `quillo.policy` beside the program), a name not in the list reads as not set: `null`,
+  or the default. Each policy file can only narrow the list.
 
 ```quillo
 let port = int(env("PORT") ?? "3000")

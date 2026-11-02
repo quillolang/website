@@ -34,6 +34,11 @@ insert into posts ("title", "body") values (:title, :body)
 - Only ASCII letters count: `é` is refused.
 - The quotes are double quotes for SQLite and PostgreSQL; a program whose database
   is MySQL gets backticks, since MySQL reads `"x"` as text.
+- It quotes for the program's database only. For SQL sent to another database, call
+  the connection's own: `shop.sql_name(col)` on a `db.connect` connection quotes as that
+  database reads names (see [db.sql_name](/docs/reference/db.sql_name/)). With the
+  program on SQLite and `shop` on MySQL, `sql_name("title")` in `shop.query(...)` is
+  `"title"`, which MySQL takes as text: every row would hold the word `title`.
 
 ```quillo
 print(sql_name("_x1"), sql_name("obj_42"))
@@ -98,4 +103,4 @@ let rows = db.query(`select * from ${table_of(id)} order by id`)
 
 ### See also
 
-[sql_param](/docs/reference/sql_param/), [sql](/docs/reference/sql/), [keys](/docs/reference/keys/), [db.query](/docs/reference/db.query/)
+[db.sql_name](/docs/reference/db.sql_name/), [sql_param](/docs/reference/sql_param/), [sql](/docs/reference/sql/), [keys](/docs/reference/keys/), [db.query](/docs/reference/db.query/)

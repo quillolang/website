@@ -9,10 +9,10 @@ page goes through each, with a checklist at the end.
 
 | | |
 |---|---|
-| **The `quillo` binary** | One file of 20 to 25 MB, nothing else: SQLite and the time zone database are built in, and TLS is rustls, not OpenSSL. The Linux release builds need glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 or newer); on an older system, build it from source. There are no musl or static Linux builds yet. Build it on (or for) the same system and CPU as the server: a Linux binary built on a newer distribution than the server's may not start there |
+| **The `quillo` binary** | One file of 20 to 25 MB, nothing else: SQLite and the time zone database are built in, and TLS is rustls, not OpenSSL. The Linux release builds from the next tag on are linked against glibc 2.17, so they start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and anything newer (0.6.0's need glibc 2.35). They are glibc builds, not static ones, since a plugin is a library the binary loads. Build it on (or for) the same system and CPU as the server: a Linux binary built on a newer distribution than the server's may not start there |
 | **The program's files** | `main.qwe` and the files it uses, `migrations/`, `public/` |
-| **Rust files, built** | A program with [`.qwer` files](/docs/rust/) builds them the first time it starts, which needs Rust. Run `quillo build main.qwe` beforehand on the same kind of machine, and deploy `.quillo/native/` with the program: the server then needs no Rust |
-| **A long-running process** | Any VPS, cloud VM or container service. Shared hosting that runs only PHP cannot run it; see [static hosting](#static-hosting) |
+| **Rust files, built** | A program with [`.qwer` files](/docs/rust/) builds them the first time it starts, which needs Rust. Run `quillo build main.qwe` beforehand on the same kind of machine, and deploy `.quillo/` with the program: `.quillo/native/` and `.quillo/plugins.lock`, each library's SHA-256. The server then needs no Rust. With `--no-build` it never builds: a library the lock does not name is refused rather than built again |
+| **A long-running process** | Any VPS, cloud VM or container service. On shared hosting with `mod_fcgid` (cPanel), the web server starts it: see [Shared hosting](/docs/shared-hosting/). Hosting that runs only PHP cannot run it; see [static hosting](#static-hosting) |
 
 Quillo needs no Node, no package install and no build step on the server.
 
@@ -25,6 +25,9 @@ quillo run main.qwe --port 8080 --log json
 | Option | In production |
 |---|---|
 | `--port N` | the port, 0 to 65535 (default `$PORT`, then 8080); 0 takes any free port |
+| `--listen unix:PATH` | a Unix socket instead of a TCP port, for a web server on the same machine: mode 0600 (`--socket-mode 660` for the web server's group), removed when the server stops, at most 100 bytes. Give `--trust-proxy 127.0.0.1` with it |
+| `--no-build` | never build a `.qwer` file on the server: load only what `quillo build` made |
+| `--policy FILE` | narrow what the program may do (see [the policy](/docs/concurrency-and-reloading/#the-policy)) |
 | `--host H` | the address to listen on. The default, `127.0.0.1`, takes connections from this machine only, which is right behind a proxy on the same machine; `localhost` is 127.0.0.1 too. `0.0.0.0` in a container |
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
@@ -65,8 +68,10 @@ Never `--watch` in production: it shows errors on pages, refreshes them, and lea
 Keep them out of the program's files: in the service manager's environment file, or the
 container platform's secrets. `quillo run` also reads a `.env` beside the program (or
 `--env-file`), handy on your own machine; a variable the environment has wins over it,
-so a `.env` left on a server cannot override production's. There is no other
-configuration file.
+so a `.env` left on a server cannot override production's. The one other
+configuration is a policy, which only takes away: `/etc/quillo/policy.toml`,
+`--policy FILE` and `quillo.policy` beside the program (see [the
+policy](/docs/concurrency-and-reloading/#the-policy)).
 
 ### The database
 
@@ -302,7 +307,8 @@ writes them to a folder that is uploaded as it is.
 
 ### Before going live
 
-- `quillo` built for the server's system; `.qwer` files built with `quillo build`
+- `quillo` built for the server's system; `.qwer` files built with `quillo build`, and
+  `.quillo/plugins.lock` deployed with them (and `--no-build`)
 - `QUILLO_SECRET` set, the same on every server
 - `db.open(...) | unwrap`, and SQLite's folder on a disk that lasts, with backups
 - HTTPS from a proxy, which passes WebSockets and the `Host` header

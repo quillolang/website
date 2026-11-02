@@ -40,6 +40,9 @@ err("http: not an http(s) URL: not a url")
   none.
 - A method the server does not know is answered with a 405 or 501, an answer with
   `ok` false.
+- Under a policy with `[http] hosts` or `private = false`, the address and each
+  redirect are judged as for [http.get](/docs/reference/http.get/); a 303, or a 301 or
+  302 after a POST, goes on as a GET with no body, as a browser does.
 
 ```quillo
 print(http.request("delete", "http://127.0.0.1:9/items/1", { reason: "spam" }))

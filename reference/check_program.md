@@ -31,7 +31,8 @@ print(check_program("plugins/greet.qwe", { "plugins/greet.qwe": "fn greet(n: str
 - A file that does not exist is not an error value: it is a list with one error at
   line 0 saying the file cannot be read.
 - A `use` in the checked code with `..` or starting at `/` is reported as an error on
-  that line, not followed.
+  that line, not followed. So is a `use` of a plain path that leads out of the folder
+  through a link: nothing is read there.
 - The path itself, or a key of the map, that leaves the folder is an error value.
 - `null` as the map checks what is on disk; an empty override checks an empty program,
   which is fine.

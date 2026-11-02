@@ -17,8 +17,10 @@ Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built
 | macOS, Intel | `quillo-<version>-x86_64-apple-darwin.tar.gz` |
 | Windows | `quillo-<version>-x86_64-pc-windows-msvc.zip` |
 
-Unpack it and put `quillo` on your `PATH`. The Linux builds need glibc 2.35 or later
-(Ubuntu 22.04, Debian 12, Fedora 36 and since). They are built without `quillo app`
+Unpack it and put `quillo` on your `PATH`. The Linux builds of 0.6.0 need glibc 2.35 or
+later (Ubuntu 22.04, Debian 12, Fedora 36 and since); from the next tag on they are linked
+against glibc 2.17, and start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and anything
+newer (see [Shared hosting](/docs/shared-hosting/)). They are built without `quillo app`
 (desktop windows): build from source with `--features app` for that. Beside each
 archive is a `.sha256` that checks the download:
 

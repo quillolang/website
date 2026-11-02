@@ -42,6 +42,9 @@ udp.listen(514, (p) => db.exec("insert into syslog (host, line) values (?, ?)", 
 - One program on a machine listens on a port; with `--instances`, the instances share
   the socket. With `--reload`, a port still listened on stays open across the reload.
 - There is no multicast, and packets are plain: no DTLS.
+- Opening a port is the `net` effect, as sending is: a function declared `with` without
+  `net` cannot call it, and a policy whose `[effects]` leaves out `net` refuses it
+  (`` `udp.listen` needs the net effect, which quillo.policy does not allow ``).
 
 ```quillo noexec
 udp.listen(9000, () => print("a packet"))

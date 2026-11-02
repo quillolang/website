@@ -6,7 +6,7 @@ group: Database
 
 Opens another database beside the program's own and gives it as a map of the same
 functions, called on it: `analytics.query(...)`, `analytics.exec(...)`, `one`,
-`transaction`, `migrate`, `tenants` and `tenant_exists`. Any kind works, a SQLite file
+`transaction`, `migrate`, `tenants`, `tenant_exists` and `sql_name`. Any kind works, a SQLite file
 or a server URL, with `replicas` in the options as for `db.open`. It has its own
 transactions and migrations. The same target again is the same connection, not a new
 pool, so a route may call it; a failure to open is an error value.
@@ -45,8 +45,19 @@ db.transaction(() => {
 
 - The databases are apart: `db` does not see the connection's tables, nor the
   connection `db`'s. To join their rows, fetch both and use `join_on`.
-- The same target twice gives the same connection (they compare equal); another
-  spelling of the path is another connection.
+- The same target twice gives the same connection (they compare equal), and so does
+  another spelling of the same SQLite file (`"./analytics.db"`, `"sub/../analytics.db"`,
+  its full path): one file is one connection, and one set of live topics, so a write
+  through one refreshes a page that reads through another.
+- A server URL with another user, password or options (`?application_name=...`) is
+  another pool, but its tables are the same live topics: they are named by the scheme,
+  host, port and database alone, so changing a password while servers run keeps their
+  pages in step.
+- Inside a function declared `with`, the connection's calls need `db`, as `db.query`
+  does: `fn f() with http = analytics.query(...)` is an error in `quillo check` and when
+  it runs. On a parameter with no type (`fn f(c) with http = c.query(...)`) the check
+  warns, as it cannot tell whether `c` is a connection. `sql_name` asks the database
+  nothing and needs no effect.
 - A transaction on the connection commits or rolls back on its own, even inside one
   of `db`'s.
 - The map has no `error_kind`, `connect`, `system`, `shards` or `atomic`: those are
@@ -70,10 +81,10 @@ print(analytics | keys)
 
 ```output
 err("db: no such table: sales") err("db: no such table: orders")
-true false
+true true
 err("no")
 [{ n: 0 }] [{ n: 0 }]
-["$db", "exec", "query", "one", "transaction", "migrate", "tenants", "tenant_exists"]
+["$db", "exec", "query", "one", "transaction", "migrate", "tenants", "tenant_exists", "sql_name"]
 ```
 
 ### Errors
@@ -101,6 +112,20 @@ print(db.connect(42))
 line 1: `db.connect` expects a path, a URL, or a function giving one for each tenant, got int
 ```
 
+A connection's call in a function whose `with` leaves out `db` is a runtime error, as
+`db.query`'s is:
+
+```quillo error
+let analytics = db.connect("analytics.db")
+fn totals() with http = analytics.query("select 1 as x")
+print(totals())
+```
+
+```output
+line 2: `db.query` needs the db effect, but `totals` is declared `with http`
+  in totals, called at main.qwe:3
+```
+
 ### Chaining
 
 The SQL comes first in a pipeline into the connection's functions:
@@ -120,4 +145,4 @@ print("select total from sales" | analytics.query | map((r) => r.total))
 
 ### See also
 
-[db.open](/docs/reference/db.open/), [db.atomic](/docs/reference/db.atomic/), [db.shards](/docs/reference/db.shards/), [db.migrate](/docs/reference/db.migrate/), [join_on](/docs/reference/join_on/)
+[db.open](/docs/reference/db.open/), [db.sql_name](/docs/reference/db.sql_name/), [db.atomic](/docs/reference/db.atomic/), [db.shards](/docs/reference/db.shards/), [db.migrate](/docs/reference/db.migrate/), [join_on](/docs/reference/join_on/)

@@ -66,7 +66,8 @@ udp.send("10.0.0.7", 9000, [104, 105])                     // numbers, as bytes
   that port's handler.
 - Both give `null`, or an error value when the host has no address or the system refuses
   the packet: `err("cannot find the address of no-such-host.invalid")`. A function that
-  declares its effects needs `net` for them (see [Effects](/docs/language-tour/#effects)).
+  declares its effects needs `net` for them, as for `udp.listen`, which opens a port (see
+  [Effects](/docs/language-tour/#effects)).
 
 ### Channels: the server and its pages
 

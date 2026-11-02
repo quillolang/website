@@ -43,6 +43,11 @@ component Photo() {
   them is not a file (`expects a file from request.files`).
 - The bytes are written as they are, so an image stays an image; `read_file` of the
   saved path reads them as text.
+- It is the `fs` effect, as `write_file` is: a function declared `with` without `fs`
+  cannot call it, in `quillo check` and when it runs.
+- Links are followed: a path that leads out of the program's folder through a link, or
+  through a link that leads nowhere, is refused, and nothing is written. A link that
+  stays inside the folder works.
 
 ```quillo
 let photo = { field: "photo", filename: "me.png", type: "image/png", size: 3 }
@@ -69,6 +74,16 @@ print(save_upload({}, "../a.png"))
 
 ```output
 line 1: `save_upload` needs a path inside the program's folder, got "../a.png"
+```
+
+```quillo error
+fn keep(u) with time = save_upload(u, "uploads/a.txt")
+print(keep({ field: "f", filename: "a.txt", type: "text/plain", size: 1 }))
+```
+
+```output
+line 1: `save_upload` needs the fs effect, but `keep` is declared `with time`
+  in keep, called at main.qwe:2
 ```
 
 ### Chaining

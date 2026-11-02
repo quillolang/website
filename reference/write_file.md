@@ -36,6 +36,12 @@ null
 - A path with `..`, one starting at `/`, and the empty path are error values, and nothing
   is written, unless `quillo run --allow-path DIR` names the folder it leads into, for a
   script used as a tool; folders are made there too.
+- Links are followed, and where they lead is what counts: a link inside the folder
+  that leads inside it works as its target would, and one that leads out of the
+  folder, or leads nowhere, is an error value, and nothing is written. A link that leads nowhere is
+  refused because writing through it would make its target, wherever that is. The first such path is said once in the
+  log, with where it leads and `--allow-path FOLDER`, which lets the program reach
+  a folder outside on purpose.
 
 ```quillo
 print(write_file("a/b/c/d.txt", "deep"), read_file("a/b/c/d.txt"))
