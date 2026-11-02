@@ -27,6 +27,12 @@ gone
 - A folder is removed with everything in it.
 - `"."`, `""`, `".."` and a path starting at `/` are error values: the program's own
   folder is never removed, and nothing outside it is touched.
+- Links are followed, and where they lead is what counts: a link inside the folder
+  that leads inside it works as its target would, and one that leads out of the
+  folder, or leads nowhere, is an error value, and nothing is deleted: a path is judged where it leads, so
+  `delete_file("data")` on a link out of the folder is refused too. The first such path is said once in the
+  log, with where it leads and `--allow-path FOLDER`, which lets the program reach
+  a folder outside on purpose.
 
 ```quillo
 print(delete_file("nope.txt"), delete_file("nope.txt"))

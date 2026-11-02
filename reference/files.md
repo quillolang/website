@@ -53,6 +53,13 @@ public, max-age=3600, immutable
   name does (`.env`, `.git/`), except `.well-known/` at the top of the folder. Nor are
   the program's own files: `.qwe`, `.qwer` and `.rs`.
 - A path with `..` finds nothing, and gets the `404` page.
+- A path that leads out of the program's folder through a link, or through a link
+  that leads nowhere, finds nothing too: the same `404`, whether a file or a folder is
+  there or not, so a miss says nothing of the folder outside. The first such path is
+  said once in the log, naming `--allow-path FOLDER`. A link that stays inside the
+  folder works.
+- It is the `fs` effect, as `file` is: a function declared `with` without `fs` cannot
+  call it.
 - The `404.html` page goes out without the validators of its own file (`ETag`,
   `Last-Modified`), as they would name another URL's answer.
 - `extensions: []` turns clean URLs off; `not_found: null` answers a miss with the plain

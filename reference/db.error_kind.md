@@ -11,6 +11,13 @@ column has the value already), `"foreign_key"`, `"not_null"`, `"check"`, or
 failure). Any other failure, and anything that is not a database error, is `null`. It
 needs no effect, so it can be called from any function.
 
+A PostgreSQL error's message ends in its SQLSTATE, in brackets: `db: duplicate key value
+violates unique constraint "seats_pkey" (Key (k)=(1) already exists.) [23505]`. The code
+is read first, so the kind is found whatever language the server writes its messages in:
+`23505` is `unique`, `23503` `foreign_key`, `23502` `not_null`, `23514` `check`, and
+`40001`, `40P01` and `55P03` `conflict`. MySQL's messages carry their code too
+(`(1062)`), and SQLite's words are always English.
+
 ### Examples
 
 ```quillo
@@ -34,6 +41,10 @@ Someone has just taken that seat
   a number or `null` is `null`.
 - A failure the list does not cover (a missing table, bad syntax) is `null`, though
   the value is still an error: check `is_err` for that.
+- A PostgreSQL server set to another language (`lc_messages = 'de_DE.UTF-8'`) gives
+  the same kinds: `... verletzt Unique-Constraint »seats_pkey« ... [23505]` is
+  `unique`. A program that compared PostgreSQL's whole message text should compare the
+  kind, or allow for the ` [code]` at the end.
 
 ```quillo
 db.open("app.db")

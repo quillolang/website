@@ -93,6 +93,10 @@ let r = db.exec("insert into seats (show, seat) values (?, ?)", show, seat)
 if db.error_kind(r) == "unique" { return err("Someone has just taken that seat") }
 ```
 
+On PostgreSQL, the error's text ends in its SQLSTATE, as ` [23505]`, and `db.error_kind`
+reads that code first. So it gives the same word on a server whose messages are in
+another language.
+
 `` sql`...` `` writes a query over several lines and tells editors to highlight it as
 SQL. It is a template string like any other, so it should hold no `${...}` values:
 those go in as parameters.
@@ -121,6 +125,11 @@ fn sorted(by: "text" | "id") with db = db.query(`select id, text from todos orde
 
 SQL built only from text as written, `sql_name` and `sql_param`, and choices between
 those, is not warned about.
+
+`sql_name` quotes for the program's database: `"title"`, or `` `title` `` on MySQL. For
+SQL sent to another database, quote with that connection's own:
+`analytics.sql_name(col)`. MySQL reads `"title"` as text, so a name quoted for SQLite
+gives the word `title` in every row there.
 
 ### Rows as records
 
@@ -250,11 +259,18 @@ let sales = analytics.query("select day, sum(total) as total from sales group by
 
 - Call its functions on it (`analytics.query(...)`): that is how they know which
   database. Connect at the top of the program; the same target again is the same
-  connection, not a new pool.
+  connection, not a new pool. A SQLite file is the same by any spelling:
+  `"analytics.db"` and `"./analytics.db"` are one connection.
+- Its calls need the `db` effect, as `db`'s do: `analytics.query(...)` in a function
+  declared `with http` is an error.
 - A transaction belongs to its database: one inside another on a different database
   commits or rolls back on its own.
 - Live updates tell the databases apart, and a connection never reaches the browser
-  (its URL may hold a password).
+  (its URL may hold a password). A server's live topics leave out the user, the password
+  and the options, so servers on one database agree on them, during a password's
+  rotation too.
+- `db.open` called again while the program runs replaces its database, and open pages
+  showing the old one's rows are told, every tenant's.
 - Mounted programs and services have their own `db`, so one Quillo can serve programs
   on different databases side by side.
 
@@ -475,11 +491,13 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
 | `db.tenants()` | The tenants that have a database |
 | `db.tenant_exists(name)` | Whether a tenant has a database, without making one |
 | `sql_name(name)` | A table or column name, safe to put into SQL |
+| `conn.sql_name(name)`, `db.sql_name(name)` | The same, quoted for that database |
 | `sql_param(name)` | A `:name` placeholder, safe to put into SQL |
 | `join_on(rows, others, key, other_key, as)` | Each row with its first match from another list of rows |
 
 A function declared with effects may use the database only if `db` is among them: one
-declared `with http` cannot query, and `quillo check` says so before the program runs.
+declared `with http` cannot query, on `db` or on a connection, and `quillo check` says so
+before the program runs.
 Functions without `with` may do anything.
 
 ### What it does not do

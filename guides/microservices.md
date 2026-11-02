@@ -44,9 +44,15 @@ Services may use one another.
   served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
-  signed with one secret. They stop with the app. `--describe`, given to the app, is
-  given to each of them too. It is the quickest way to see an app as it would run split,
-  on one machine.
+  signed with one secret. They stop with the app. `--describe`, `--no-build` and the
+  `--policy` files, given to the app, are given to each of them too. It is the quickest
+  way to see an app as it would run split, on one machine.
+- **Checked once.** Before `--split` starts any service, the app checks the whole tree,
+  its own files and every service's, and says each warning once. An error in a service
+  stops it there, before anything waits. A service that ends as it starts is said at
+  once: `service billing stopped at start (exit status: 1; see its lines above)`.
+- **`--split --watch`** watches the services' files too: a function added to
+  `billing.qwe` reloads billing's process and the app, and the app calls it at once.
 
 ```sh
 # Everything in one process
@@ -337,14 +343,38 @@ service ledger: 409 `total` here is `total() -> int`; the caller's copy of this 
 
 So a caller's `.qwe` copy of a service is its client stub: keep the `server fn`
 signatures in it in step with the service, and `quillo check` plus the contract check
-catch the rest. For a service written in another language, that copy is what
-`quillo check` reads, and the server must answer `/_quillo/service/<fn>` as
-[The payload](#the-payload) describes and `GET /_quillo/ready`.
+catch the rest. As the app loads, it reads only the copy's `server fn` headers, so a
+mistake in one of its routes or bodies does not stop an app run with `--no-check`.
+
+The app may also go without the copy. With no file and an address (`--service-url` or
+`QUILLO_SERVICE_<NAME>`), it asks the running service for its functions as it starts.
+That is a call like any other, named `_contracts`, signed and tried at each address in
+turn. The answer gives each function's header and contract, and only those this caller
+may call. A service that cannot be reached then stops the app with `billing.qwe is not
+here, and service billing did not give its functions`. `quillo check` warns instead:
+
+```
+main.qwe:1: warning: service billing: billing.qwe is not here, so its calls are not checked; it must run elsewhere (QUILLO_SERVICE_BILLING or --service-url)
+```
+
+```sh
+# on 10.0.0.5, with billing.qwe
+QUILLO_SERVICE_SECRET=... quillo run billing.qwe --port 8081 --as-service
+# elsewhere, with main.qwe and no billing.qwe
+QUILLO_SERVICE_SECRET=... quillo run main.qwe --service-url billing=http://10.0.0.5:8081
+```
+
+For a service written in another language, the copy is what `quillo check` reads, or
+the server answers `_contracts` with `{"ok": [{"header": "server fn add(a: int, b: int)
+-> int = null", "contract": "add(a: int, b: int) -> int"}]}`. Either way it must answer
+`/_quillo/service/<fn>` as [The payload](#the-payload) describes, and `GET
+/_quillo/ready`.
 
 ### Checked before it runs
 
 `quillo check` checks each call against the service's `server fn`s: their names, the
-number and types of their arguments, and that the result may be an error. A call needs
+number and types of their arguments, and that the result may be an error. A service
+whose file is not here is warned of, and its calls are taken as written. A call needs
 the `http` effect, so a function declared `with db` cannot quietly reach another
 server. The browser cannot call a service: components call the program's own
 `server fn`s, which may call services.

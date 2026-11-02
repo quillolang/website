@@ -48,6 +48,11 @@ public, max-age=31536000, immutable
 - A missing file is a `404` response whose body is `not found`; so is a folder, a path
   with `..` or one starting at `/`. It is never an error value, so `??` and `is_err`
   do not see it.
+- Links are followed, and where they lead is what counts: a link inside the folder
+  that leads inside it works as its target would, and one that leads out of the
+  folder, or leads nowhere, is the same `404`. The first such path is said once in the
+  log, with where it leads and `--allow-path FOLDER`, which lets the program reach
+  a folder outside on purpose.
 - An extension the list does not know is sent as `application/octet-stream`. The list:
   `html htm css js mjs json map webmanifest xml xsl txt text md markdown csv tsv svg
   png jpg jpeg gif webp avif bmp tif tiff heic jxl ico mp4 m4v mov webm m4a aac flac

@@ -25,6 +25,10 @@ null true
 ### Edge cases
 
 - Zero is fine and returns at once; a float is allowed, cut to whole milliseconds.
+- It takes milliseconds, not seconds as Python's `time.sleep` does. `quillo check` warns
+  of a number literal between 0 and 1, which waits less than a millisecond: `sleep(0.2)`
+  gives ``warning: `sleep` takes milliseconds: `sleep(0.2)` waits 0.2 ms; for 0.2
+  seconds write `sleep(200)` ``. `sleep(0)`, `sleep(1)` and a variable are not warned of.
 - It returns `null`, so it ends an expression-bodied function with `null`; put it before
   the value you mean.
 - In a job or a tick a server stopping or a reload ends the job there with a 503, as a

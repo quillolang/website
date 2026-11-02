@@ -38,6 +38,10 @@ db.open("data/{tenant}.db")                        // a SQLite file per tenant
 
 - A second `db.open` switches the program to the other database; the tables of the
   first are not there.
+- Switching is announced to live pages: every page showing the program's database's
+  rows (every tenant's, whichever tenant's request switched it) asks again, and a live
+  call is not answered with rows shared from the old database. It is said at once, so a
+  transaction rolled back does not undo it.
 - `":memory:"` is a fresh, empty database each time the program starts.
 - A path that cannot be opened (a folder that does not exist, a wrong password) is an
   error value, and the program goes on with the database it had: write

@@ -65,6 +65,23 @@ err("http: not an http(s) URL: not a url")
 - `ca`, `cert` and `key` are read from the program's folder, as `read_file` reads; one
   that cannot be read, or holds no certificate, makes the call an error value that says
   so.
+- A policy limits where it may go, whatever the program asks (`/etc/quillo/policy.toml`,
+  `--policy FILE`, `quillo.policy` beside the program). `[http] hosts` lists the hosts
+  allowed (`api.stripe.com`, `*.mapbox.com` for its subdomains, `*` for any), and
+  `private = false` refuses this machine, private networks and the cloud's metadata
+  address, the name looked up first. Each redirect is judged too, hop by hop, so an
+  allowed host cannot send the call somewhere else. What is refused is an error value
+  that names the file: `http: 127.0.0.1 is an address of this machine or its network,
+  which quillo.policy does not let a program reach`, or `http: example.net is not among
+  the hosts quillo.policy allows: api.example.com`.
+
+```quillo noexec
+// quillo.policy beside the program:
+//   [http]
+//   private = false
+//   hosts = ["api.example.com"]
+print(http.get("http://127.0.0.1:9/"))     // err("http: 127.0.0.1 is not among the hosts quillo.policy allows: api.example.com")
+```
 
 ```quillo
 print(http.get("ftp://example.com/x"))

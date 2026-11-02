@@ -53,6 +53,9 @@ true
   that starts watching shows a picture at once; a page that falls behind, or a lost
   packet of video, skips to the next keyframe.
 - A late packet is waited for 50 ms, or 256 packets.
+- It opens UDP ports, so it is the `net` effect, as `udp.listen` is: a function declared
+  `with` without `net` cannot call it, nor can a program under a policy that leaves `net`
+  out.
 
 ```quillo
 print(media.rtp("mic", { audio: { port: 45008, codec: "opus" }, host: "127.0.0.1" }))

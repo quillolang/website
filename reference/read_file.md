@@ -32,6 +32,12 @@ eggs
   program's folder is the limit, unless `quillo run --allow-path DIR` names another
   folder, for a script used as a tool. Then a path into `DIR` is read, by its own path
   or through `..`; where a link leads is what counts.
+- Links are followed, and where they lead is what counts: a link inside the folder
+  that leads inside it works as its target would, and one that leads out of the
+  folder, or leads nowhere, is an error value as a path with `..` is (`path must stay inside the program's
+  folder`). The first such path is said once in the
+  log, with where it leads and `--allow-path FOLDER`, which lets the program reach
+  a folder outside on purpose.
 - A folder is an error value too.
 - What comes back is always text: a number written with `write_file` is read as its
   digits. Parse it (`int`, `json.parse`) when a value is wanted.
