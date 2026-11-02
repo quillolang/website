@@ -30,7 +30,7 @@ component Checkout(items: list) {
 component Search() {
     state q = ""
     <form @submit={() => navigate(`/results?q=${url_encode(q)}`)}>
-        <input bind:value={q}/>
+        <input value={q}/>
     </form>
 }
 ```

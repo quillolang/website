@@ -29,7 +29,7 @@ component Editor() {
             notify("Draft saved", { tone: "success" })
         }
     }}>
-        <textarea bind:value={draft}></textarea>
+        <textarea value={draft}></textarea>
         <button>Save</button>
     </form>
 }

@@ -24,7 +24,7 @@ component Chat() {
     state answer = ""
     state problem = null
     <div>
-        <input bind:value={prompt}/>
+        <input value={prompt}/>
         <button @click={() => {
             answer = ""
             let r = receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt } })

@@ -28,7 +28,7 @@ component Notes() {
     <div>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
         <form @submit={() => { add_note(draft); draft = "" }}>
-            <input bind:value={draft}/>
+            <input value={draft}/>
         </form>
     </div>
 }
