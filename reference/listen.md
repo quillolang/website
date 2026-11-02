@@ -68,8 +68,8 @@ component Ticker(symbol: str) {
   HTTP/1.1; for data every page follows, `live` shares one WebSocket.
 - While the server renders the component it opens nothing and gives `null`; a component
   that calls it loads its bundle as soon as the page is idle.
-- `quillo check` wants both arguments: `listen("/x")` is `` missing argument `arg2` in
-  call to `listen` ``.
+- `quillo check` wants both arguments: `listen("/x")` is `` missing argument `f`, a
+  function, in call to `listen`: listen(url, f) ``.
 
 ```quillo
 print(listen("/progress", (p) => p))

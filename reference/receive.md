@@ -53,8 +53,8 @@ component Chat() {
   or to set state: state x = receive(...) ``. A stream the component should follow by
   itself is `listen`.
 - On the server it sends nothing and gives `null`.
-- `quillo check` wants the function: `receive("/x")` is `` missing argument `arg2` in
-  call to `receive` ``.
+- `quillo check` wants the function: `receive("/x")` is `` missing argument `f`, a
+  function, in call to `receive`: receive(url, f, options) ``.
 
 ```quillo
 print(receive("/ask", (part) => part, { body: { prompt: "hi" } }))

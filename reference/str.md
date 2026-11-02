@@ -1,5 +1,5 @@
 # str
-str(any=) -> str
+str(any) -> str
 group: General
 
 ### What it does
@@ -34,12 +34,14 @@ print(len(str(12345)))
   `0.30000000000000004`.
 - An error value is written as `err("...")`, with its payload; `type_of` of the result
   is `str`, so this is a way to show an error, not to unwrap it.
-- A string is given back unchanged, and `str()` without an argument is `"null"`.
+- A string is given back unchanged. `str()` with nothing to make text of is an error in
+  `quillo check`: `missing argument `x` in call to `str`: str(x)` (since 0.7; it gave
+  `"null"`).
 
 ```quillo
 print(str(1e16), str(0.1 + 0.2), str(-0.0), str(1e-7))
 print(str(err("boom")), type_of(str(err("boom"))))
-print(str("already"), str())
+print(str("already"), str(null))
 ```
 
 ```output

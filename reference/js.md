@@ -71,7 +71,7 @@ component Share(link: str) {
   as soon as the page is idle, since it runs by itself.
 - On the server, rendering a component or in a plain program, `js` gives `null`,
   whatever the name, so a `??` default reads naturally there.
-- `quillo check` wants the name: `js()` is `` missing argument `arg1` in call to `js` ``.
+- `quillo check` wants the name: `js()` is `` missing argument `name` in call to `js`: js(name, args) ``.
 
 ```quillo
 print(js("window.innerWidth"), js("Chart.register", 1))

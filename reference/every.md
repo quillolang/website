@@ -60,8 +60,8 @@ component Saved() {
   with the server and on a reload; a program with one is a server. Two ticks cannot
   share a name, and a name is letters, digits, `_`, `-` and `.`.
 - `quillo check` wants a number and a function: `every("fast", f)` is `` argument 1 of
-  `every` must be num, got str `` and `every(100)` is `` missing argument `arg2` in call
-  to `every` ``.
+  `every` must be num, got str `` and `every(100)` is `` missing argument `f`, a
+  function, in call to `every`: every(ms, f, options) ``.
 
 ```quillo error
 fn tick() { print("tick") }
