@@ -39,6 +39,8 @@ schedule(60, ping, { name: "ping-minute" })      // seconds
   tenant, each server runs its jobs, and the job loops over the tenants with
   `with_tenant`. The `quillo run` option `--no-jobs` turns them off on a server
   (`quillo run main.qwe --no-jobs`; see [the options](/docs/)).
+- A job may say what it does as any function does, and is held to it each time it runs:
+  `fn nightly() with db, time { ... }`, then `schedule("0 3 * * *", nightly)`.
 - A program with a `schedule` in it is a server: `quillo run` serves it and keeps
   running, which is why the examples here are not run.
 
