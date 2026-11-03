@@ -8,14 +8,16 @@ What kind of failure a database's error value is, in one word that is the same f
 SQLite, PostgreSQL and MySQL, whose own messages differ: `"unique"` (a key or unique
 column has the value already), `"foreign_key"`, `"not_null"`, `"check"`, or
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
-failure). Any other failure, and anything that is not a database error, is `null`. It
+failure), or `"connection"` (the server ended the connection, or it could not be made)
+*(since 0.7)*. Any other failure, and anything that is not a database error, is `null`. It
 needs no effect, so it can be called from any function.
 
 A PostgreSQL error's message ends in its SQLSTATE, in brackets: `db: duplicate key value
 violates unique constraint "seats_pkey" (Key (k)=(1) already exists.) [23505]`. The code
 is read first, so the kind is found whatever language the server writes its messages in:
 `23505` is `unique`, `23503` `foreign_key`, `23502` `not_null`, `23514` `check`, and
-`40001`, `40P01` and `55P03` `conflict`. MySQL's messages carry their code too
+`40001`, `40P01` and `55P03` `conflict`, and `57P01` to `57P03` and class `08`
+`connection`. MySQL's messages carry their code too
 (`(1062)`), and SQLite's words are always English.
 
 ### Examples

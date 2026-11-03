@@ -82,7 +82,7 @@ print(is_err(r), db.error_kind(r))
 ```
 
 ```output
-true null
+true connection
 ```
 
 ```quillo error
