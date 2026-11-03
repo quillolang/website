@@ -29,7 +29,7 @@ null
 ```
 
 ```quillo noexec
-db.open(env("DATABASE_URL")) | unwrap              // stops the program if it cannot open
+db.open(env("DATABASE_URL"))                       // stops the program if it cannot open
 db.open("postgres://user:pass@host:5432/app", { replicas: [env("REPLICA_1")] })
 db.open("data/{tenant}.db")                        // a SQLite file per tenant
 ```
@@ -44,8 +44,9 @@ db.open("data/{tenant}.db")                        // a SQLite file per tenant
   transaction rolled back does not undo it.
 - `":memory:"` is a fresh, empty database each time the program starts.
 - A path that cannot be opened (a folder that does not exist, a wrong password) is an
-  error value, and the program goes on with the database it had: write
-  `db.open(...) | unwrap` to stop instead.
+  error value, and the program goes on with the database it had. As the program starts, a
+  `db.open` whose error nothing takes (alone on a line) stops it, with the reason *(since
+  0.7)*: take the error, `let r = db.open(...)`, to go on without it.
 - Only `postgres://`, `postgresql://`, `mysql://` and `mariadb://` are servers; any
   other text is a SQLite file's path.
 - Without `db.open` the database is SQLite in memory, so `db.query` works in any
