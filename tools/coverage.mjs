@@ -17,7 +17,7 @@ const from = quillo.endsWith(".json") ? quillo : join(quillo, "target/coverage/c
 const run = JSON.parse(readFileSync(from, "utf8"));
 const file = join(import.meta.dirname, "../coverage.json");
 const old = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { history: [] };
-const total = (p) => ({ lines: p.lines, run: p.run, percent: p.percent });
+const total = (p) => ({ lines: p.lines, run: p.run, percent: p.percent, ...(p.regions ? { regions: p.regions } : {}) });
 const line = {
   date: run.date,
   commit: run.commit,
