@@ -197,7 +197,7 @@ the memory, the locale and the app's own name and version. It runs on the server
 component asks for it through a `server fn`:
 
 ```quillo noexec
-server fn device() = platform()
+server fn device() -> map = platform()
 
 component About() {
     state p = device()
@@ -253,7 +253,7 @@ component Spot() {
         if is_err(p) { note = p.error } else { place = p; js("quilloNative.haptic", "success") }
     }
     <div>
-        <button @click={locate}>Where am I?</button>
+        <button onclick={locate}>Where am I?</button>
         {place != null && <p>{place.lat}, {place.lon} ±{place.accuracy} m</p>}
         {note != null && <p class="note">{note}</p>}
     </div>
@@ -307,7 +307,7 @@ called; nothing in it is for the app:
 db.open("shop.db")
 db.exec("create table if not exists notes (id integer primary key, text text not null)")
 
-server fn notes(n: int) = db.query("select id, text from notes order by id desc limit ?", n)
+server fn notes(n: int) -> list = db.query("select id, text from notes order by id desc limit ?", n)
 ```
 
 Tried on one machine, with `quillo run shop.qwe --port 8081` and the app's program run as
