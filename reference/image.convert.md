@@ -10,8 +10,11 @@ what was written. `crop` is in the image's pixels; `width` shrinks to that width
 keeping the shape, and never enlarges; `format` is `jpeg` (the default), `png` or
 `webp` (lossless); `quality` is the JPEG's, 82 unless given. The file is written whole
 or not at all, folders on the way are made, and both paths stay inside the program's
-folder. At most four conversions run at once; past 64 waiting, it gives an error value
-at once. It needs the `fs` effect.
+folder. It does not write over the program's own files: its `.qwe` and `.qwer` files,
+`.env` and the database it has open *(since 0.7)*. An image of more than 40 megapixels,
+or one whose conversion would take more than about 640 MiB, is an error value *(since
+0.7)*. At most four conversions run at once, and those running share about 1 GiB; past
+64 waiting, it gives an error value at once. It needs the `fs` effect.
 
 ### Examples
 
@@ -43,7 +46,7 @@ route POST /photos {
     redirect(`/thumbs/${id}.webp`)
 }
 
-route GET /thumbs/:name = file(`thumbs/${name}`)
+route GET /thumbs/:name = files("thumbs", name)
 ```
 
 A source that cannot be decoded is an error value, and nothing is written:
@@ -66,6 +69,13 @@ err("image: not a JPEG, PNG, WebP or GIF image")
 - The format is what `format` says, whatever the destination's name ends in.
 - A file that reads as an image but cannot be decoded (a GIF with no colour table,
   here) is an error value from the decoder.
+- A target that is one of the program's own files is an error value before the source
+  is read, as `write_file` refuses it: `main.qwe`, `.env`, the database.
+- The size is read from the file's header before it is decoded: a small file can be a
+  large image. Past 40 megapixels the error value says `` image: the image is
+  12000×12000, more than the 40 megapixels converted ``; a crop or a `width` that needs
+  too much memory, `` image: converting the 7000×5600 image so would take about ... MiB,
+  more than the 640 converted at once ``.
 
 ```quillo
 write_file("tiny.gif", "GIF89a\u0001\u0000\u0001\u0000\u0000\u0000\u0000,\u0000\u0000\u0000\u0000\u0001\u0000\u0001\u0000\u0000\u0002\u0002D\u0001\u0000;")
@@ -81,9 +91,20 @@ err("image: Format error decoding Gif: no color table available for current fram
 err("image: No such file or directory (os error 2)")
 ```
 
+```quillo
+print(image.convert("photo.png", "main.qwe", { format: "png" }))
+print(image.convert("photo.png", ".env", { format: "png" }))
+```
+
+```output
+err("image: will not write main.qwe: it is one of the program's own files")
+err("image: will not write .env: it is the program's settings (.env)")
+```
+
 ### Errors
 
-A source that is missing or cannot be decoded, a crop outside the image, and too many
+A source that is missing or cannot be decoded, a crop outside the image, a target that
+is one of the program's own files, an image too large to convert, and too many
 conversions waiting are error values. The options are checked at once as runtime
 errors: a `width` outside 1 to 12,000, a `format` other than jpeg, png or webp, a
 `crop` without whole pixels or with `w` or `h` of 0, and a path outside the program's

@@ -36,6 +36,10 @@ Ann a 4
 - A key given twice keeps the last value. Keys keep the order they were written in.
 - Only one value: text after it is an error, but spaces around it are fine.
 - Any valid JSON value is accepted at the top, not only an object or an array.
+- A text holds at most a value for each 8 bytes of it, or a million, whichever is more:
+  past that it is an error value, `` invalid JSON: more values than JSON of its length
+  may have `` and where *(since 0.7)*. Eight megabytes of `0,` took 633 MB as values. A
+  request's `json` and `http.*`'s are read so too.
 
 ```quillo
 print(json.parse("3.0"), type_of(json.parse("3.0")), json.parse("1e3"), json.parse("3"))

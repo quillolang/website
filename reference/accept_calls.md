@@ -17,7 +17,9 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
 - `jwt`: bearer tokens, as an identity provider issues them for services (OAuth 2.0's
   client credentials). `{ issuer, audience, jwks }` checks the token's signature
   against the provider's keys (RS256, ES256, EdDSA; a URL, kept ten minutes), or
-  `secret` for HS256. `audience` is required, and so is `exp` in the token. The same
+  `secret` for HS256. `audience` is required, and so is `exp` in the token. A token a
+  user signed in for, whose `sub` is the user and not the client, is refused *(since
+  0.7)*: a service calls with its own, from the client-credentials grant. The same
   rules check a visitor's token that a caller passes on with `forward`, as
   `request.user`.
 - `client_cert: { header: "x-forwarded-client-cert" }`: the certificate a proxy checked
@@ -26,13 +28,17 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
   --trust-proxy 10.0.0.1`; see [the options](/docs/)). The name is the SPIFFE id's last part, or the
   subject's CN.
 - `check: (caller) => ...`: anything else, in Quillo, run before the arguments are read.
-  `false` refuses the call with a 403, an error value refuses it with its text, a map
-  becomes the caller from then on, and `reply` answers the call itself.
+  Only `true` or a map accepts the call, and a map becomes the caller from then on.
+  Anything else refuses it with a 403, `false` and null among them *(since 0.7: null, an
+  `if` with no `else`, refused no one)*; an error value refuses it with its text, and
+  `reply` answers the call itself.
 
 Who called is `request.caller` in the `server fn`: `{ name, by }`, `by` being
 `"quillo"`, `"key"`, `"jwt"` or `"mtls"`, with `scopes` and `claims` for a token and
 `subject` and `uri` for a certificate. `server fn refund(...) for ["shop"]` takes calls
-from those callers only (403 otherwise). It gives `null`.
+from those callers only (403 otherwise), and none from pages: `/_quillo/rpc/refund`
+answers 404, and a page's script has no `server.refund` *(since 0.7: anyone could call
+it there)*. It gives `null`.
 
 ### Examples
 
@@ -104,6 +110,10 @@ null
 - A token without `exp`, for another audience or issuer, expired, or not good yet
   (`nbf`) is refused with a 401 that says which.
 - The header named in `client_cert` sent by anyone else is refused, not believed.
+- A `check` written as an allow-list with no `else` refuses everyone it does not name:
+  `(c) => { if c.name == "shop" { return true } }` gives null for the rest.
+- A call sent again is answered as it was only when it is the same caller's, to the same
+  function, for the same tenant, with the same arguments *(since 0.7: by its id alone)*.
 
 ```quillo
 print(accept_calls({ shared: false }))

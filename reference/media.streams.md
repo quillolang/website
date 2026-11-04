@@ -8,7 +8,10 @@ Every stream, by name: a list of `{ name, viewers, video: { frames, fps, kbps, l
 audio: { frames, fps, kbps, lost } }`, sorted by name. `viewers` is this server's
 pages watching; `fps` and `kbps` are the rate over the last while, and 0 after 3 s
 without frames; `lost` counts packets that never came. A stream is one
-[media.rtp](/docs/reference/media.rtp/) made, or one a page has sent a frame of.
+[media.rtp](/docs/reference/media.rtp/) made, or one a page has sent a frame of. Code
+run for a page or a request lists its tenant's streams and the program's RTP ones; a
+job, a tick and the top level list every tenant's *(since 0.7: every stream, to
+anyone)*.
 
 ### Examples
 
@@ -34,6 +37,8 @@ route GET /admin/streams = <table>
 - A closed stream is gone from the list at once.
 - A stream with only an audio port has a `video` entry too, all zeros.
 - The order is by name, however the streams were made.
+- Each tenant has its own streams of a name, so a job may list `call:42` twice: acme's
+  and evil's.
 
 ```quillo
 print(media.streams())

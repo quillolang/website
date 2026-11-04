@@ -9,7 +9,9 @@ channel's function gets, or its id), the value, and options. It gives whether th
 was there to take it. The value goes as JSON, up to 1 MiB; `{ reliable: true }` makes
 sure it arrives in order (over a stream rather than a datagram), and closes a page's
 connection that cannot keep up rather than drop it. It waits for nothing and needs the
-`net` effect.
+`net` effect. It reaches only a page in a room the code reaches *(since 0.7)*: code run
+for a page or a request, its tenant's room; a job, a tick and the top level, every
+tenant's.
 
 ### Examples
 
@@ -37,6 +39,8 @@ false
 
 - A peer that has gone, or that is in another channel, gives false; nothing is kept
   for a page that is away.
+- A peer in another tenant's room gives false too, even by its id: one tenant's handler
+  cannot write to another tenant's page.
 - A page that is being let in (its `join` said yes but the yes has not reached it)
   gets the message right after its yes.
 - The value may be `null`, text, a number, a map or a list; bytes go as a list of

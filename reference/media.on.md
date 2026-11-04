@@ -4,19 +4,24 @@ group: Media
 
 ### What it does
 
-Lets pages send a stream: after `media.on(name, { publish })`, a page's
-`<quillo-media publish="name">` sends its camera and microphone (or another
+Lets pages send and watch a stream: after `media.on(name, { publish, watch })`, a
+page's `<quillo-media publish="name">` sends its camera and microphone (or another
 MediaStream as its `source`) to the server, which passes the frames on to every
 `<quillo-media stream="name">`, decoding nothing. A name ending in `*` takes every
-stream it starts (`"call:*"`). `publish(peer)` says which pages may, as a channel's
-`join` does: with the page's session in `peer.session`, anything but `null`, `false` or
-an error says yes; without it, any page may. It is written at the top of a program,
-once for a name, and the program then serves.
+stream it starts (`"call:*"`). `publish(peer)` says which pages may send, and
+`watch(peer)` which may watch, as a channel's `join` does: with the page's session in
+`peer.session`, anything but `null`, `false` or an error says yes. Without `publish`, no
+page sends; without `watch`, no page watches *(since 0.7: any page could)*. Each tenant
+has its own streams of a name; `tenants: "shared"` makes one for every tenant. It is
+written at the top of a program, once for a name, and the program then serves.
 
 ### Examples
 
 ```quillo noexec
-media.on("call:*", { publish: (peer) => peer.session.user != null })
+media.on("call:*", {
+    publish: (peer) => peer.session.user != null,
+    watch: (peer) => peer.session.user != null,
+})
 
 component Call(room: str, me: str, others: list) {
     <div>
@@ -39,17 +44,38 @@ component Call(room: str, me: str, others: list) {
   frame has come, and [media.close](/docs/reference/media.close/) ends it.
 - The element's `data-state` is `starting`, `sending`, `refused` (no camera, or
   `publish` said no), `ended` or `unsupported`.
+- A stream no `watch` names is watched by no page, an RTP stream of
+  [media.rtp](/docs/reference/media.rtp/) too: `media.on("cam", { watch })` lets pages
+  watch the camera.
+- Pages on `acme.example.com` and `evil.example.com` sending `call:42` send two streams:
+  acme's is not evil's. A tenant's page that watches a name it has no stream of watches
+  the program's own RTP stream of that name. `tenants: "shared"` makes one stream for
+  all; `"own"` is as with none.
+- Pages make at most 1,024 streams, 256 a tenant, and a page watches at most 32 at once;
+  a stream no page sends or watches any more goes.
+- A stream keeps at most 32 MiB of video since its last keyframe, and all of them 256
+  MiB; past that a stream keeps none, and a page that starts watching it waits for its
+  next keyframe.
 
 ```quillo noexec
-media.on("lobby")                                           // anyone may send "lobby"
-media.on("desk:*", { publish: (peer) => peer.session.role == "agent" })
+media.on("lobby")                                           // no page may send or watch "lobby"
+media.on("desk:*", {
+    publish: (peer) => peer.session.role == "agent",
+    watch: (peer) => peer.session.user != null,
+})
+media.on("town-hall", {                                     // one stream for every tenant
+    publish: (peer) => peer.session.role == "host",
+    watch: (peer) => peer.session.user != null,
+    tenants: "shared",
+})
 ```
 
 ### Errors
 
 A name that is not a string or not a stream name (letters, digits, `_`, `-`, `.` and
-`:`, with `*` at the end allowed), a `publish` that is not a function, an option that
-does not exist and a name taken twice are runtime errors when the program starts.
+`:`, with `*` at the end allowed), a `publish` or `watch` that is not a function, a
+`tenants` other than `"shared"` or `"own"`, an option that does not exist and a name
+taken twice are runtime errors when the program starts.
 
 ```quillo error
 media.on("call:*", { publish: true })
@@ -57,6 +83,30 @@ media.on("call:*", { publish: true })
 
 ```output
 line 1: `media.on`: `publish` is a function of the page that wants to send
+```
+
+```quillo error
+media.on("call:*", { watch: true })
+```
+
+```output
+line 1: `media.on`: `watch` is a function of the page that wants to watch
+```
+
+```quillo error
+media.on("call:*", { join: (peer) => true })
+```
+
+```output
+line 1: `media.on` has no option `join` (it takes publish, watch and tenants)
+```
+
+```quillo error
+media.on("call:*", { tenants: "all" })
+```
+
+```output
+line 1: `media.on`: `tenants` is "shared" (one room for every tenant) or "own", got "all"
 ```
 
 ```quillo error
@@ -83,7 +133,11 @@ camera's side and `media.on` for the pages', one page shows both.
 
 ```quillo noexec
 media.rtp("hall", { video: 5004, audio: 5006 })
-media.on("questions:*", { publish: (peer) => peer.session.ticket != null })
+media.on("hall", { watch: (peer) => peer.session.ticket != null })
+media.on("questions:*", {
+    publish: (peer) => peer.session.ticket != null,
+    watch: (peer) => peer.session.ticket != null,
+})
 ```
 
 ### See also

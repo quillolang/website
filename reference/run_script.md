@@ -6,10 +6,13 @@ group: Files and processes
 
 Runs Quillo code written by the program's users (a rule on a form's field, who may see a
 record) on the server, in a sandbox, and gives its last expression's value, or an error
-value saying what went wrong. The script sees the values in the map and the builtins
-that only compute (`len`, `upper`, `map`, `filter`, `date.parse`, ...); it cannot read
-files, the environment or the database, define functions, routes or state, `use` files,
-or reply. It stops after 20,000 steps, and a value it makes may be up to 1 MB.
+value saying what went wrong. The script sees the values in the map and Quillo's own
+builtins that only compute (`len`, `upper`, `map`, `filter`, `date.parse`, ...), never
+the program's functions of those names *(since 0.7: a program's `fn upper` was the
+script's `upper`, run with the program's effects)*. It cannot read files, the
+environment or the database, define functions, routes or state, `use` files, or reply,
+and it gives back no function it made *(since 0.7)*. It stops after 20,000 steps, and a
+value it makes may be up to 1 MB.
 
 ### Examples
 
@@ -37,6 +40,9 @@ ANN
   program may do: that is how a script asks for more.
 - A runaway script is an error value, not a hang: too many steps, or a value over 1 MB.
 - `return` ends the script with that value. A lambda `(x) => ...` is allowed; `fn` is not.
+- A lambda the script gives back, alone or in a list or map, is an error value: it would
+  run after the script, without its limits on steps. Builtins and error values in what
+  it gives are given back as they are.
 
 ```quillo
 print(run_script("1 + 2"), run_script("1 + 2", null), run_script(""))
@@ -62,6 +68,20 @@ err("line 2: the script made a value larger than 1 MB")
 5 20
 err("a script cannot define functions (use `(x) => ...`)")
 err("a script cannot define routes") err("a script cannot reply") err("a script gives values, not markup")
+```
+
+A program's function of a builtin's name is not the script's, and what a script gives
+back is a value, not a function:
+
+```quillo
+fn upper(s) = "the program's"
+print(run_script("upper(s)", { s: "ann" }), upper("ann"))
+print(run_script("(n) => n + 1"))
+```
+
+```output
+ANN the program's
+err("a script gives back no function (it would run without the script's limits): give back what it computes")
 ```
 
 ### Errors

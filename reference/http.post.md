@@ -11,7 +11,8 @@ a number, a decimal); `null` sends no body. Headers come third and may give anot
 `content-type`; the options (`redirects`, `public_only`, `timeout`, `ca`, `cert`,
 `key`) come fourth. A `307` or `308` answer is followed with the same method and body,
 as `fetch` does; a `301`, `302` or `303` is followed as a GET without the body, as
-browsers do. To another origin, `Authorization` and `Cookie` are not sent on.
+browsers do. To another origin (scheme, host and port), only the `accept`,
+`accept-language`, `content-type` and `user-agent` headers are sent on *(since 0.7)*.
 
 ### Examples
 

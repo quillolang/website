@@ -7,7 +7,9 @@ group: Media
 Ends a stream by name: it stops taking RTP, lets its ports go (waiting up to a second
 for that, so another stream can take them at once), stops taking frames from pages
 sending it, and tells the pages watching, whose `<quillo-media>` turns `data-state`
-`ended`. It gives true if there was such a stream, false otherwise.
+`ended`. It gives true if there was such a stream, false otherwise. Code run for a
+page or a request ends its tenant's stream of that name; a job, a tick and the top level
+end every tenant's *(since 0.7)*.
 
 ### Examples
 
@@ -38,6 +40,8 @@ route POST /rooms/:id/end {
   name is made again.
 - The stream's name is not checked for its letters: any string asks, and an unknown one
   is false.
+- A tenant's request cannot end another tenant's stream, nor the program's RTP stream
+  its pages watch for want of one of their own: it gives false.
 
 ```quillo
 print(media.close("never-made"))

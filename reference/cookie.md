@@ -7,8 +7,10 @@ group: Cookies and sessions
 The value of a cookie the browser sent with the request, decoded, or null when there
 is none of that name. It works in any function the request runs (a route, a `server
 fn`, a helper, a pipeline stage), so a helper that reads the visitor's time zone need
-not be handed `request`. `request.cookies` is all of them as a map. Outside a request
-(a job, a script) it is null. See [Headers, cookies and
+not be handed `request`. `request.cookies` is all of them as a map. A page that reads
+either is the visitor's, sent with `Cache-Control: private` and `Vary: Cookie` *(since
+0.7: one that read `request.cookies` was not)*. Outside a request (a job, a script) it
+is null. See [Headers, cookies and
 sessions](/docs/headers-cookies-sessions/#cookies).
 
 ### Examples

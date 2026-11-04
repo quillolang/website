@@ -16,8 +16,8 @@ query, and `quillo check` does not warn about SQL built with it.
 ```quillo
 print(sql_name("title"))
 print(sql_name(["title", "body"]))
-let row = { title: "Hello", body: "..." }
-print(`insert into posts (${sql_name(keys(row))}) values (${sql_param(keys(row))})`)
+let cols = ["title", "body"]                       // the program's list, not the visitor's
+print(`insert into posts (${sql_name(cols)}) values (${sql_param(cols)})`)
 ```
 
 ```output
@@ -32,6 +32,10 @@ insert into posts ("title", "body") values (:title, :body)
 - An empty list gives the empty string.
 - Exactly 64 characters is the longest name taken.
 - Only ASCII letters count: `é` is refused.
+- Take the columns from the program, never from what the visitor sent:
+  `keys(request.form)` names `is_admin` and `id` as well as `email`, and they are names,
+  so it takes them. A sign-up form with `is_admin=1` made an admin. A record type,
+  `{ form: Signup }`, keeps its fields only.
 - The quotes are double quotes for SQLite and PostgreSQL; a program whose database
   is MySQL gets backticks, since MySQL reads `"x"` as text.
 - It quotes for the program's database only. For SQL sent to another database, call

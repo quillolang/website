@@ -299,6 +299,11 @@ component Notes() {
 }
 ```
 
+A call is a request to the site, so it needs the `http` effect: `quillo check` says so of
+a function `with time` that calls `shop.notes` (`` `shop.notes` needs the http effect ``).
+Only what a `site` declaration made is a site *(since 0.7)*: a map with the same keys,
+from JSON or a script, is a map, so a visitor cannot point a call elsewhere.
+
 The other side is an ordinary program on your server, whose `server fn` is the one
 called; nothing in it is for the app:
 

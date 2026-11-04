@@ -9,9 +9,12 @@ it makes `f(msg, peer)` the function that gets each message a page sends on that
 channel. `peer` is `{ id, session }`: twelve hex characters made for the page's
 connection, and the page's session as it was when it connected. The options map takes
 `join(peer)`, which decides whether a page may join (anything but `null`, `false` or an
-error says yes), and `leave(peer)`, which hears that a page left. Each of the three is
-called with as many arguments as it declares. The program then serves: a plain program
-with `channel.on` in it does not end.
+error says yes), `leave(peer)`, which hears that a page left, and `tenants`. Each of the
+three functions is called with as many arguments as it declares. Each tenant has its own
+room of a channel *(since 0.7: one room for all)*: pages on `acme.example.com` and
+`evil.example.com` joining `lobby` are in two rooms, and `tenants: "shared"` makes one
+room for every tenant. The program then serves: a plain program with `channel.on` in it
+does not end.
 
 ### Examples
 
@@ -68,17 +71,24 @@ for the whole program.
   visitor who signs in afterwards is seen so once the page reconnects.
 - What `join` broadcasts, or sends to the page that is joining, reaches that page right
   after its yes.
+- `f`, `join` and `leave` run for the page's tenant: what they broadcast, send or list
+  is that tenant's room's. A page with no tenant (the bare domain) is in the room of no
+  tenant. Under `--split`, a service's channel is per tenant whatever it says.
+- Pages may ask of 4,096 channel names in all; past that, a page asking to join a new
+  name is told no.
 
 ```quillo noexec
 channel.on("room:7.lobby", (msg, peer) => channel.send("room:7.lobby", peer, { echo: msg }))
 channel.on("ticks", (msg) => print(msg))        // f declared with one parameter gets one
+channel.on("news", (msg) => msg, { tenants: "shared" })   // one room for every tenant
 ```
 
 ### Errors
 
 A bad name, a second argument that is not a function, a `join` or `leave` that is not
-one, an option that does not exist, and a name handled twice are runtime errors when
-the program starts, so the program does not serve. There are no error values.
+one, a `tenants` other than `"shared"` or `"own"`, an option that does not exist, and a
+name handled twice are runtime errors when the program starts, so the program does not
+serve. There are no error values.
 
 ```quillo error
 channel.on("bad name!", (msg) => msg)
@@ -103,6 +113,22 @@ channel.on("game", (msg) => msg, { join: true })
 
 ```output
 line 1: `channel.on`: `join` is a function of the page
+```
+
+```quillo error
+channel.on("game", (msg) => msg, { tenant: "shared" })
+```
+
+```output
+line 1: `channel.on` has no option `tenant` (it takes join, leave and tenants)
+```
+
+```quillo error
+channel.on("game", (msg) => msg, { tenants: true })
+```
+
+```output
+line 1: `channel.on`: `tenants` is "shared" (one room for every tenant) or "own", got true
 ```
 
 ### Chaining

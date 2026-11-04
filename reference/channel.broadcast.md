@@ -10,6 +10,9 @@ usually the one whose message is being passed on) and `reliable` (in order, over
 stream; a page that cannot keep up is disconnected rather than miss it). It waits for
 nothing, needs the `net` effect, and reaches the pages connected to this server (and the
 copies of it that `quillo run main.qwe --instances 4` starts; see [the options](/docs/)).
+Each tenant has its own room *(since 0.7)*: code run for a page or a request reaches its
+tenant's room (a page with no tenant, the room of no tenant), and a job, a tick and the
+top level reach every tenant's. `with_tenant(name, f)` reaches one tenant's.
 
 ### Examples
 
@@ -43,6 +46,8 @@ print(channel.broadcast("game", "text", { reliable: true, except: "0123456789ab"
 - `null` is a message like any other.
 - A page that joins later hears nothing of what went before: a roster or a state is
   sent again on `join`.
+- A channel made with `tenants: "shared"` (see [channel.on](/docs/reference/channel.on/))
+  has one room, which every tenant's code reaches.
 
 ```quillo
 print(channel.broadcast("nobody-here", null))
@@ -82,9 +87,14 @@ The name comes first in a pipeline. The count can be logged or compared with
 
 ```quillo noexec
 route POST /notice { form: { text: str } } {
-    let n = channel.broadcast("notices", { text }, { reliable: true })
+    let n = channel.broadcast("notices", { text }, { reliable: true })   // this tenant's pages
     `sent to ${n} pages`
 }
+
+schedule("0 9 * * *", () => {
+    channel.broadcast("notices", { text: "good morning" })                // every tenant's
+    with_tenant("acme", () => channel.broadcast("notices", { text: "acme only" }))
+})
 ```
 
 ```quillo
@@ -97,4 +107,4 @@ print("game" | channel.broadcast({ tick: 1 }))
 
 ### See also
 
-[channel.send](/docs/reference/channel.send/), [channel.peers](/docs/reference/channel.peers/), [channel.on](/docs/reference/channel.on/), [channel.open](/docs/reference/channel.open/), [schedule](/docs/reference/schedule/)
+[channel.send](/docs/reference/channel.send/), [channel.peers](/docs/reference/channel.peers/), [channel.on](/docs/reference/channel.on/), [channel.open](/docs/reference/channel.open/), [schedule](/docs/reference/schedule/), [with_tenant](/docs/reference/with_tenant/)

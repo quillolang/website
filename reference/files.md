@@ -51,7 +51,14 @@ public, max-age=3600, immutable
 
 - Files whose names start with a dot are not served, nor anything inside a folder whose
   name does (`.env`, `.git/`), except `.well-known/` at the top of the folder. Nor are
-  the program's own files: `.qwe`, `.qwer` and `.rs`.
+  the program's own files, `.qwe`, `.qwer` and `.rs`, however the name is written for
+  the file system: `lib.QWE` on macOS and Windows, `lib.qwe.` and `lib.qwe::$DATA` on
+  Windows *(since 0.7)*.
+- So a path from the visitor goes here, not to `file()`: `file("public/" + path)`
+  serves `.env` and `main.qwe` when they are asked for, and `quillo check` warns about
+  it (see [file](/docs/reference/file/)).
+- A folder's redirect stays on the host: `//docs` goes to `/docs/`, never to another
+  host *(since 0.7)*.
 - A path with `..` finds nothing, and gets the `404` page.
 - A path that leads out of the program's folder through a link, or through a link
   that leads nowhere, finds nothing too: the same `404`, whether a file or a folder is

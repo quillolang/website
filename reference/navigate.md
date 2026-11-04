@@ -9,7 +9,9 @@ page where a component has called `url()`, the address changes without a reload:
 history gets an entry, the page scrolls to the top, and what read `url()` is worked
 out again. On a page where none has, the browser loads the page. `"#spot"` goes to an
 element of the same page, and `"/page#spot"` to the spot once the new page shows it.
-It gives `null`; on the server it does nothing, since there is no page to move.
+A `javascript:` or `vbscript:` URL is an error, in the browser and on the server
+*(since 0.7)*. It gives `null`; on the server it does nothing, since there is no page to
+move.
 
 ### Examples
 
@@ -54,6 +56,10 @@ component Search() {
   `navigate` there gives `null` and the response goes on as written.
 - `quillo check` refuses a path that is not a string: `navigate(42)` is `` argument 1
   of `navigate` must be str, got int ``.
+- A `javascript:` or `vbscript:` URL is refused however it is written (`"  JaVaScRiPt:"`,
+  with tabs or line breaks inside): `navigate(next)` after a sign-in, with
+  `?next=javascript:...`, would have run as the page. Another host's address is not
+  refused; keep `next` to your own paths with [local_path](/docs/reference/local_path/).
 
 ```quillo
 print(navigate("/orders/7"))
@@ -67,8 +73,8 @@ null null
 
 ### Errors
 
-A path that is not a string is a runtime error, not an error value, on the server as in
-the browser.
+A path that is not a string, and a `javascript:` URL, are runtime errors, not error
+values, on the server as in the browser.
 
 ```quillo error
 print(navigate(42))
@@ -76,6 +82,14 @@ print(navigate(42))
 
 ```output
 line 1: `navigate` expects a str as argument 1, got int
+```
+
+```quillo error
+print(navigate("javascript:alert(1)"))
+```
+
+```output
+line 1: `navigate` is not given a javascript: URL
 ```
 
 ### Chaining

@@ -14,8 +14,8 @@ come from a map. `quillo check` does not warn about SQL built with it.
 ```quillo
 print(sql_param("title"))
 print(sql_param(["title", "body"]))
-let row = { title: "Hello", body: "..." }
-print(`insert into posts (${sql_name(keys(row))}) values (${sql_param(keys(row))})`)
+let cols = ["title", "body"]                       // the program's list, not the visitor's
+print(`insert into posts (${sql_name(cols)}) values (${sql_param(cols)})`)
 ```
 
 ```output
@@ -31,6 +31,10 @@ insert into posts ("title", "body") values (:title, :body)
 - A name is not checked against the map of values: a parameter the map does not
   hold is the database's error, when the query runs.
 - Digits are fine inside a name, and a name may start with `_`.
+- Take the columns from the program, never from what the visitor sent:
+  `keys(request.form)` names `is_admin` and `id` as well as `email`, and they are names,
+  so `sql_name` and `sql_param` take them. A sign-up form with `is_admin=1` made an
+  admin. A record type, `{ form: Signup }`, keeps its fields only.
 
 ```quillo
 print(sql_param("_x1"), sql_param("A9"))

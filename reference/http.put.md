@@ -8,7 +8,9 @@ Sends a PUT with a body, as [http.post](/docs/reference/http.post/) sends a POST
 gives the answer as a map `{ status, ok, headers, body, json }`. Text goes as
 `text/plain`, HTML as `text/html`, any other value as JSON; `null` sends no body.
 Headers come third, options (`redirects`, `public_only`, `timeout`, `ca`, `cert`, `key`)
-fourth. A `307` or `308` is followed with the same method and body.
+fourth. A `307` or `308` is followed with the same method and body; to another origin,
+only the `accept`, `accept-language`, `content-type` and `user-agent` headers go on, as
+for [http.get](/docs/reference/http.get/).
 
 ### Examples
 

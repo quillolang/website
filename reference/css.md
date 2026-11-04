@@ -8,7 +8,9 @@ The text as it is. Written as a tag on a template, `` css`...` ``, it tells edit
 highlight the text as CSS, and `quillo check` reads the classes it styles, so a class
 a page uses that no sheet styles gets a warning. It is the way to write a component's
 `style` and the sheet in `<style>{sheet}</style>`. Braces in the template are plain
-text; `${...}` fills in values.
+text; `${...}` fills in values, each with its `{`, `}`, `;` and `\` written as CSS's
+escapes (`\7b `, `\7d `, `\3b `, `\5c `), so a value is one value and adds no declaration
+or rule of its own *(since 0.7)*.
 
 ### Examples
 
@@ -33,7 +35,12 @@ print(css`.title { color: ${accent} }`)
 ### Edge cases
 
 - The result is a plain string, equal to the text written: nothing is parsed or
-  minified, and nothing is escaped.
+  minified. Only the values of `${...}` are escaped, and only those four characters, so
+  `a > b` and `url(...)` in a value stay as they are.
+- A value from a visitor cannot end its rule: `?color=red} input[value^=a]{...}` added a
+  rule that read the page's fields. A value that is meant to hold declarations of its
+  own, `"color: red; margin: 0"`, is one value too: join such text with `+`, outside the
+  template.
 - Called as a function, `css("...")`, it gives the same string; only the tag form is
   highlighted and read by `quillo check`.
 - An empty template gives the empty string.
@@ -48,6 +55,15 @@ print(len(css``))
 true
 .b { margin: 0 }
 0
+```
+
+```quillo
+let q = "red} input{background:url(//evil/a)"
+print(css`.title { color: ${q} }`)
+```
+
+```output
+.title { color: red\7d  input\7b background:url(//evil/a) }
 ```
 
 ### Errors
@@ -65,7 +81,9 @@ line 1: `css` expects a str as argument 1, got int
 ### Chaining
 
 A component's `style` comes first in its body, before its markup; `<style>` takes the
-sheet as it is, so `a > b` works. A pipeline rarely needs it: `` css`...` `` is already
+sheet as it is, so `a > b` works, but for each `<`, written as CSS's `\3c ` (the same
+character to CSS), so the text cannot end the element, nor start one inside `<svg>` or
+`<math>` *(since 0.7)*. A pipeline rarely needs it: `` css`...` `` is already
 the string.
 
 ```quillo noexec

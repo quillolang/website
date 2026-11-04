@@ -7,8 +7,11 @@ group: Requests and pages
 Adds a check of the program's own to `GET /_quillo/ready`, which answers 200 when
 everything the program needs is there and 503 when not, with each part as JSON: its
 database (`select 1`), each service it declares, and the checks added here. The
-function is called for each probe and holds when it gives `true`. For an
-orchestrator's readiness probe. It gives null.
+function is called for each probe and holds when it gives `true`. Each part is said
+only to a request with the health token (`Authorization: Bearer` and
+`QUILLO_HEALTH_TOKEN`, 16 characters at least); anyone else gets `{"ready": true}` or
+`{"ready": false}` *(since 0.7: each part, services' addresses among them, to anyone)*.
+For an orchestrator's readiness probe. It gives null.
 
 ### Examples
 
@@ -19,6 +22,8 @@ ready("uploads", () => len(read_file("uploads/.ok") ?? "") > 0)
 
 ```sh
 curl -i localhost:8080/_quillo/ready
+# {"ready": false}
+curl -i localhost:8080/_quillo/ready -H "Authorization: Bearer $QUILLO_HEALTH_TOKEN"
 # {"ready": false, "checks": {"database": "ready", "ledger": "ready", "uploads": "not ready"}}
 ```
 

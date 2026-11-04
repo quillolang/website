@@ -7,8 +7,9 @@ group: Requests and pages
 A response that sends the browser to another address: a status of 303 unless one is
 given, and a `location` header with the URL. A route returns it as its answer, usually
 after a form has been handled, so that a reload of the page does not post the form
-again. The status must be 300 to 399. The value can be looked at: `status`, `headers`
-and `body` (always null) are its fields.
+again. The status must be 300 to 399, and the URL no `javascript:` or `vbscript:` one
+*(since 0.7)*. The value can be looked at: `status`, `headers` and `body` (always null)
+are its fields.
 
 ### Examples
 
@@ -47,6 +48,11 @@ route GET /old-page = redirect("/new-page", 301)
 - The body is null: the redirect carries nothing but its headers. Cookies set in the
   request with `set_cookie` or `set_session` go out with it.
 - Every call makes a new response value; two redirects to one address are not equal.
+- A `javascript:` or `vbscript:` URL is refused however it is written (`"  JaVaScRiPt:"`,
+  with tabs or line breaks inside), as a browser would read it: `redirect(next)` after a
+  sign-in, with `?next=javascript:...`, would have run as the page. Any other URL, to
+  another host too, is sent as given; keep `next` to your own paths with
+  [local_path](/docs/reference/local_path/).
 
 ```quillo
 print(redirect("next").headers, redirect("").headers)
@@ -63,8 +69,8 @@ false
 ### Errors
 
 A status outside 300 to 399 is a runtime error, as is a URL with a line break or
-another control character (text from a request cannot add headers of its own), or a
-URL that is not a string. None of these is an error value.
+another control character (text from a request cannot add headers of its own), a
+`javascript:` URL, or a URL that is not a string. None of these is an error value.
 
 ```quillo error
 print(redirect("/", 200))
@@ -80,6 +86,14 @@ print(redirect("/a\nb"))
 
 ```output
 line 1: `redirect` URL cannot contain line breaks or other control characters
+```
+
+```quillo error
+print(redirect("JavaScript:alert(1)"))
+```
+
+```output
+line 1: `redirect` is not given a javascript: URL
 ```
 
 ### Chaining

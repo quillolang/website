@@ -7,7 +7,9 @@ group: Channels
 The ids of the pages in a channel, as a list of twelve-character hex strings, in a
 fixed order. An id names a page's connection (a page that reconnects has a new one)
 and is what [channel.send](/docs/reference/channel.send/) takes. This is the only list of
-who is present: what a `join` or `leave` handler records is the rest.
+who is present: what a `join` or `leave` handler records is the rest. Code run for a page
+or a request lists its tenant's room (a page with no tenant, the room of no tenant); a
+job, a tick and the top level list every tenant's *(since 0.7: every page, to anyone)*.
 
 ### Examples
 
@@ -38,6 +40,7 @@ print(len(channel.peers("game")))
   reconnected page a new one.
 - The list is of this server's pages: behind a balancer, another server's pages are
   not in it.
+- `with_tenant(name, () => channel.peers("chat"))` lists one tenant's room from a job.
 
 ```quillo
 print(channel.peers("nobody-here"))

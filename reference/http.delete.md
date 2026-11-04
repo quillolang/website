@@ -8,7 +8,9 @@ Sends a DELETE to a URL, with no body, and gives the answer as a map `{ status, 
 headers, body, json }`, as [http.get](/docs/reference/http.get/) does. The second
 argument is a map of request headers, the third a map of options: `redirects`,
 `public_only`, `timeout`, `ca`, `cert` and `key`. A `307` or `308` is followed with
-the same method. Every HTTP status is an answer; failing to reach the
+the same method; to another origin, only the `accept`, `accept-language`,
+`content-type` and `user-agent` headers go on, as for
+[http.get](/docs/reference/http.get/). Every HTTP status is an answer; failing to reach the
 server is an error value.
 
 ### Examples

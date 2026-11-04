@@ -9,14 +9,16 @@ play with `<quillo-media stream="name">`: `{ video: port, audio: port, host }`, 
 both tracks, each on a port of its own. Video is H.264 and audio Opus, the only codecs
 taken (`{ port: 5004, codec: "h264" }` says so in full). The server puts the packets
 in order, makes frames of them and passes each on to every page watching, decoding
-nothing; Quillo code never sees the packets. It is written at the top of a program or
-while it runs (a stream for each room), once for a name: asked again, it is the same
-stream.
+nothing; Quillo code never sees the packets. Pages watch it only as
+`media.on(name, { watch })` says: with no `watch`, no page does *(since 0.7: any page
+could)*. It is written at the top of a program or while it runs (a stream for each
+room), once for a name: asked again, it is the same stream.
 
 ### Examples
 
 ```quillo noexec
 media.rtp("cam", { video: 5004, audio: 5006 })
+media.on("cam", { watch: (peer) => peer.session.user != null })
 
 route GET / = <html><body><quillo-media stream="cam" controls muted/></body></html>
 ```
@@ -49,9 +51,12 @@ true
   machine does not have is a runtime error.
 - Any sender that reaches the port is taken (the payload type and SSRC are not
   checked), and there is no RTCP and no SRTP: keep the ports to the camera's network.
-- The server keeps the video since the last keyframe (at most 600 frames), so a page
-  that starts watching shows a picture at once; a page that falls behind, or a lost
-  packet of video, skips to the next keyframe.
+- The server keeps the video since the last keyframe (at most 600 frames, and 32 MiB;
+  256 MiB for all streams), so a page that starts watching shows a picture at once; a
+  page that falls behind, or a lost packet of video, skips to the next keyframe.
+- A stream made for no tenant (at the top level, in a job) is the program's; one made
+  for a tenant (in its request, or in `with_tenant`) is that tenant's. A tenant's page
+  watching a name its tenant has no stream of watches the program's.
 - A late packet is waited for 50 ms, or 256 packets.
 - It opens UDP ports, so it is the `net` effect, as `udp.listen` is: a function declared
   `with` without `net` cannot call it, nor can a program under a policy that leaves `net`
@@ -107,6 +112,8 @@ It gives null and is not piped. [media.streams](/docs/reference/media.streams/) 
 what it made, and [media.close](/docs/reference/media.close/) ends it.
 
 ```quillo noexec
+media.on("room:*", { watch: (peer) => peer.session.user != null })
+
 route POST /rooms { form: { name: str } } {
     let id = db.exec("insert into rooms (name) values (?)", name).last_id
     media.rtp(`room:${id}`, { video: 5000 + id * 2, audio: 5001 + id * 2 })

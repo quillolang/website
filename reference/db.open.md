@@ -43,6 +43,9 @@ db.open("data/{tenant}.db")                        // a SQLite file per tenant
   call is not answered with rows shared from the old database. It is said at once, so a
   transaction rolled back does not undo it.
 - `":memory:"` is a fresh, empty database each time the program starts.
+- A SQLite file it makes is its owner's alone (mode 0600), and so are its `-wal` and
+  `-shm` *(since 0.7: every user of the machine could read sessions and password
+  hashes)*. A file there already keeps its own mode.
 - A path that cannot be opened (a folder that does not exist, a wrong password) is an
   error value, and the program goes on with the database it had. As the program starts, a
   `db.open` whose error nothing takes (alone on a line) stops it, with the reason *(since

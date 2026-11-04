@@ -5,7 +5,10 @@ group: Files and processes
 ### What it does
 
 A response that sends a file from the program's folder, for a route to answer with:
-`route GET /assets/*path = file("public/" + path)`. The content type comes from the
+`route GET /report = file("exports/report.pdf")`. It serves the one file it is given,
+whatever its name, so a path from the visitor goes to [files](/docs/reference/files/)
+instead, which does not serve `.env`, `.git/` or the program's own files:
+`route GET /assets/*path = files("public", path)`. The content type comes from the
 extension, the response carries an `ETag` and `Last-Modified`, and a browser that asks
 with a current copy gets a `304` with no body. A file that is not there, a folder, or a
 path with `..` or starting at `/` gives a `404` response, not an error. The options map
@@ -21,8 +24,10 @@ static host serves it (`index.html`, `/about` for `about.html`, `404.html`), see
 ### Examples
 
 ```quillo noexec
-route GET /assets/*path = file("public/" + path)
-route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that change with content
+route GET /report = file("exports/report.pdf")
+route GET /favicon.svg = file("public/favicon.svg", { cache: "30d" })
+route GET /assets/*path = files("public", path)                  // a path from the visitor
+route GET /build/*path = files("dist", path, { cache: "1y" })     // names that change with content
 ```
 
 The value can be looked at like any response: its status, headers and body.
@@ -45,6 +50,11 @@ public, max-age=31536000, immutable
 
 ### Edge cases
 
+- `file("public/" + path)` with the visitor's `path` gives `/assets/.env` and
+  `/assets/main.qwe` away *(the guide's example until 0.7)*. `quillo check` warns about
+  a `file()` whose path is made from a route's `:name` or `*path`: `` `file` serves the
+  one file it is given, whatever its name: with a path from the request,
+  `files("public", path)` keeps `.env`, `.git` and the program's own files back ``.
 - A missing file is a `404` response whose body is `not found`; so is a folder, a path
   with `..` or one starting at `/`. It is never an error value, so `??` and `is_err`
   do not see it.

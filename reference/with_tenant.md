@@ -4,9 +4,9 @@ group: Tenants
 
 ### What it does
 
-Runs the function for a tenant, with its database and its live updates, and gives what
-the function gives. For code outside a request: a script, a scheduled job that loops
-over the tenants. Its database is made and migrated if there is none, so to sign a
+Runs the function for a tenant, with its database, its live updates, and its rooms of
+channels and its media streams, and gives what the function gives. For code outside a
+request: a script, a scheduled job that loops over the tenants. Its database is made and migrated if there is none, so to sign a
 tenant up use [new_tenant](/docs/reference/new_tenant/), which refuses a name that is
 taken. The name must be a valid tenant's name: lowercase
 letters, digits, `-` and `_`, at most 63, starting with a letter or a digit. See
@@ -41,6 +41,8 @@ acme
   checked here before it can become a file or database name.
 - Global variables are the same for every tenant: the function sees them as any code
   does.
+- In a job, `channel.broadcast` and `media.close` reach every tenant's rooms and
+  streams; inside `with_tenant` they reach that tenant's alone *(since 0.7)*.
 
 ```quillo
 print(with_tenant("acme", () => err("no such plan")) ?? "defaulted")

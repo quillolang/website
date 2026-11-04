@@ -45,23 +45,30 @@ err("http: not an http(s) URL: not a url")
   is connected to.
 - A 404 or a 500 is an answer with `ok` false, not an error value; only failing to reach
   the server is one.
-- `redirects: 0` makes a redirect the answer (its status and `location` header), not
-  an error.
+- Quillo follows each redirect itself, and judges each address it is sent to *(since
+  0.7)*. `redirects: 0` makes a redirect the answer (its status and `location` header),
+  not an error; `redirects: N` follows N *(since 0.7: N - 1)*, and one more is an error
+  value, `` http: <url>: more than N redirects ``. A redirect to anything but `http:` or
+  `https:` (`file:///etc/passwd`) is not followed: it is the answer.
 - `public_only: true` refuses this machine, private networks and a cloud's metadata
-  address before connecting, so a URL someone else chose cannot reach inside.
+  address before connecting, so a URL someone else chose cannot reach inside. Each
+  redirect is checked the same way, through a proxy too *(since 0.7: a proxy's was
+  checked for the first address only)*.
 - The headers and the options may each be `null`, as leaving them out.
 - Requests say `User-Agent: quillo/<version>` unless the headers give another; some
   APIs refuse that one.
 - Interim answers (`100`, `103 Early Hints`) are passed over to the final one.
-- A redirect to the same host keeps `Authorization`; one to another origin drops it,
-  and `Cookie` too.
+- A redirect to the same origin (scheme, host and port) keeps the headers. To another
+  origin only `accept`, `accept-language`, `content-type` and `user-agent` go on
+  *(since 0.7)*: `authorization`, `cookie`, `x-api-key` and the rest stay behind. A
+  port of the same host is another origin.
 - A body in `gzip`, `deflate` or `br` is decoded, and `content-encoding` is taken out
   of the headers; another coding (`zstd`) is an error value that names it.
 - `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (in either case) send the call through
   that proxy, unless `NO_PROXY` names its host (a name, `.domain` for it and below, an
   address, or `*`). A call to this machine (`localhost`, `127.0.0.1`, `::1`) never goes
   through one. With `public_only`, the host is looked up and checked before the call
-  goes to the proxy.
+  goes to the proxy, and each redirect's host before it is followed.
 - `ca`, `cert` and `key` are read from the program's folder, as `read_file` reads; one
   that cannot be read, or holds no certificate, makes the call an error value that says
   so.
