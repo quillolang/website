@@ -23,7 +23,9 @@ true false
 
 ### Edge cases
 
-- A map made by hand counts: an amount of `"0.000"`, `0` or `"-0.00"` is zero.
+- A map made by hand counts, read as `money.of` reads an amount: `"0.000"`, `0` or
+  `"-0.00"` is zero, since zeros at the end are not decimals the currency lacks. An
+  amount such as `"0.001"` dollars is a runtime error, not zero and not money.
 - A product that rounds to nothing is zero: `0.01 × 0.5` half to even is `0.00`.
 
 ```quillo
@@ -39,7 +41,8 @@ true
 ### Errors
 
 A value that is not money is a runtime error, not an error value: `money.is_zero(0)`
-stops the request, since `0` is a number, not an amount.
+stops the request, since `0` is a number, not an amount. So does a map with more
+decimals than its currency has.
 
 ```quillo error
 print(money.is_zero(0))
@@ -47,6 +50,14 @@ print(money.is_zero(0))
 
 ```output
 line 1: `money.is_zero` expects money ({ amount, currency }) as argument 1, got int 0
+```
+
+```quillo error
+print(money.is_zero({ amount: "0.001", currency: "USD" }))
+```
+
+```output
+line 1: `money.is_zero`: 0.001 has more decimals than USD has (2): round it first with money.round(m, mode)
 ```
 
 ### Chaining

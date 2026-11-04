@@ -23,8 +23,9 @@ print(money.minor_units("EUR"), money.minor_units("BHD"))
 ### Edge cases
 
 - The code's case and spaces around it do not matter.
-- A code that is not active money, such as XAU (gold), is unknown, as a made-up code
-  is: both are error values, not 0.
+- A withdrawn currency still has its units (BGN 2, BYR 0), so old amounts read. A code
+  with no minor units, such as XAU (gold), is unknown, as a made-up code is: both are
+  error values, not 0.
 
 ```quillo
 print(money.minor_units("eur"), money.minor_units(" usd "))

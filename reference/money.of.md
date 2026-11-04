@@ -6,7 +6,9 @@ group: Decimals and money
 
 An amount of money: a plain map `{ amount: dec, currency: "USD" }`, the amount with
 exactly the currency's minor units (ISO 4217: USD 2, JPY 0, KWD 3). The amount is a
-decimal, an int or text as people write one, the currency a code. An amount with more
+decimal, an int or text as a program writes one (`"1234.50"`), the currency a code;
+text as a person writes it in a locale, `"1.234,50 €"`, is for
+[money.parse](/docs/reference/money.parse/). An amount with more
 decimals than the currency has is an error value, unless a rounding mode (those of
 [round](/docs/reference/round/)) says how to round it. Bad text, an unknown currency
 and an amount too large to count in minor units are error values too, so text from a
@@ -36,8 +38,10 @@ err("12.345 has more decimals than USD has (2); give a rounding mode to round it
   error value, even `1.5` for a currency with no minor units.
 - Text is trimmed and may have a sign, but not an exponent: `"1e3"` is not an amount,
   though `dec("1e3")` is a decimal.
-- The code's case does not matter; the result carries it in upper case. A code that is
-  not active money, such as XAU (gold), is unknown.
+- The code is trimmed and its case does not matter; the result carries it in upper
+  case. Codes are ISO 4217's, and withdrawn ones still read, so an old invoice in leva
+  is money: BGN, HRK, ANG and the others withdrawn since 2007. A code without minor
+  units, such as XAU (gold), is unknown.
 - The minor units must fit an int: USD goes up to `92233720368547758.07`, and past it
   the result is an error value, not a runtime error.
 - Negative amounts and zero are amounts.
@@ -46,6 +50,7 @@ err("12.345 has more decimals than USD has (2); give a rounding mode to round it
 print(money.of(dec("1.5"), "JPY"), money.of(dec("2.5"), "JPY", "half_even"), money.of(dec("2.5"), "JPY", "half_up"))
 print(money.of(" 12.5 ", "usd"), money.of("1e3", "USD"), money.of("abc", "USD"))
 print(money.of(10, "XYZ"), money.of(10, "XAU"))
+print(money.of("12.5", "BGN"), money.of(3, " hrk "))
 print(money.of("92233720368547758.07", "USD").amount, money.of("92233720368547758.08", "USD"))
 print(money.of("-5.5", "USD"), money.of(0, "EUR"))
 ```
@@ -54,6 +59,7 @@ print(money.of("-5.5", "USD"), money.of(0, "EUR"))
 err("1.5 has more decimals than JPY has (0); give a rounding mode to round it") { amount: 2m, currency: "JPY" } { amount: 3m, currency: "JPY" }
 { amount: 12.50m, currency: "USD" } err("not an amount: \"1e3\"") err("not an amount: \"abc\"")
 err("unknown currency \"XYZ\"") err("unknown currency \"XAU\"")
+{ amount: 12.50m, currency: "BGN" } { amount: 3.00m, currency: "HRK" }
 92233720368547758.07 err("92233720368547758.08 USD is too large an amount")
 { amount: -5.50m, currency: "USD" } { amount: 0.00m, currency: "EUR" }
 ```
@@ -116,4 +122,4 @@ $19.99
 
 ### See also
 
-[money.from_minor](/docs/reference/money.from_minor/), [money.zero](/docs/reference/money.zero/), [money.round](/docs/reference/money.round/), [money.minor_units](/docs/reference/money.minor_units/), [money.format](/docs/reference/money.format/), [dec](/docs/reference/dec/), [is_err](/docs/reference/is_err/)
+[money.from_minor](/docs/reference/money.from_minor/), [money.zero](/docs/reference/money.zero/), [money.round](/docs/reference/money.round/), [money.minor_units](/docs/reference/money.minor_units/), [money.parse](/docs/reference/money.parse/), [money.format](/docs/reference/money.format/), [dec](/docs/reference/dec/), [is_err](/docs/reference/is_err/)

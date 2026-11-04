@@ -1,5 +1,5 @@
 # money.mul
-money.mul(map, dec | int, str=) -> map
+money.mul(map, dec | int, str=) -> map | error(str)
 group: Decimals and money
 
 ### What it does
@@ -8,7 +8,7 @@ An amount times a factor, a decimal or an int, rounded to the currency's decimal
 half to even unless a rounding mode (those of [round](/docs/reference/round/)) says
 otherwise. This is the place for a quantity, a VAT rate or a discount. A float factor
 is a runtime error: make it a decimal with `dec` first, so the product is exact before
-it is rounded.
+it is rounded. A product too large to count in minor units is an error value.
 
 ### Examples
 
@@ -35,23 +35,30 @@ print(money.mul(price, -1), money.mul(price, 0))
   three keeps three.
 - The modes are `half_even`, `half_up`, `half_down`, `up`, `down`, `ceiling` and
   `floor`; `null` as the mode means `half_even`.
+- The amount is read as `money.of` reads one: a map made by hand with more decimals
+  than its currency has is a runtime error, not rounded. The rounding is for the
+  product only.
+- A product past what `money.of` takes is an error value, so `??` can catch it.
 
 ```quillo
 print(money.mul(money.of("0.01", "USD"), dec("0.5")), money.mul(money.of("0.01", "USD"), dec("0.5"), "half_up"))
 print(money.mul(money.of(100, "JPY"), dec("0.5")), money.mul(money.of(1, "KWD"), dec("0.3333")))
 print(money.mul(money.of("10.25", "USD"), dec("1.5"), null).amount)
+print(money.mul(money.of("92233720368547758.07", "USD"), 2))
 ```
 
 ```output
 { amount: 0.00m, currency: "USD" } { amount: 0.01m, currency: "USD" }
 { amount: 50m, currency: "JPY" } { amount: 0.333m, currency: "KWD" }
 15.38
+err("184467440737095516.14 USD is too large an amount")
 ```
 
 ### Errors
 
 A float factor, a factor that is text, a mode that is not one of the seven, or a first
-argument that is not money are runtime errors, not error values.
+argument that is not money (with more decimals than its currency has, too) are runtime
+errors, not error values. Only a product too large is an error value.
 
 ```quillo error
 print(money.mul(money.of(1, "USD"), 1.5))

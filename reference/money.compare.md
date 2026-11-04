@@ -26,8 +26,10 @@ true -1
 ### Edge cases
 
 - Zeros at the end do not count: `10.25` and `10.250` compare equal.
-- A map made by hand or read from JSON compares too, its amount an int or numeric
-  text, its code in any case.
+- A map made by hand or read from JSON compares too, read as `money.of` reads an
+  amount: an int or numeric text, the code trimmed and in any case. More decimals than
+  the currency has is a runtime error, so `1.005` dollars is never more than `1.00`:
+  round it first with `money.round`.
 - For a sort, `sort_by` on the `amount` is simpler; `money.compare` is for one
   decision.
 
@@ -47,7 +49,8 @@ true
 
 ### Errors
 
-Two currencies, or a value that is not money, are runtime errors, not error values.
+Two currencies, or a value that is not money (a map with more decimals than its
+currency has, too), are runtime errors, not error values.
 
 ```quillo error
 print(money.compare(money.of(1, "USD"), money.of(1, "EUR")))
@@ -55,6 +58,14 @@ print(money.compare(money.of(1, "USD"), money.of(1, "EUR")))
 
 ```output
 line 1: cannot compare USD and EUR: convert one currency to the other first
+```
+
+```quillo error
+print(money.compare(money.of(1, "USD"), { amount: "1.005", currency: "USD" }))
+```
+
+```output
+line 1: `money.compare`: 1.005 has more decimals than USD has (2): round it first with money.round(m, mode)
 ```
 
 ### Chaining
