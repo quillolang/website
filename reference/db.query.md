@@ -34,7 +34,12 @@ print(db.query("select * from todos where id > ?", 10))
 - Two columns of one name (`select a.id, b.id`) leave the last in the map: name them
   apart with `as`.
 - A different number of values than `?` marks, or a `:name` the map lacks, is an error
-  value; extra keys in the map are ignored.
+  value; extra keys in the map are ignored. A map given to SQL that has no names is no
+  value, so a query put together from optional parts can always pass the same map; for
+  a lone `?` it is that value, as JSON text.
+- A value is what it is on every database: NaN and the infinities are refused, `-0.0`
+  is `0.0`, and an error value given as a value is given back as the error it was.
+- SQL with no statement in it (`""`, only comments) is an error value.
 - A list given for one `?` is one value, JSON text, not several: write one `?` per
   value for `in (?, ?)`.
 - `where x = ?` with `null` matches nothing, as in SQL; write `is null`.

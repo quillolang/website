@@ -6,8 +6,9 @@ group: Regular expressions
 
 Whether a pattern matches anywhere in the text: `true` or `false`, nothing about
 where. The pattern is a string (in a string a backslash is written twice: `"\\d+"`),
-and the flags come last: `"i"` for any case, `"m"` for `^` and `$` at each line, `"s"`
-for `.` matching line breaks too. Patterns take only what the server and the browser
+and the flags come last: `"i"` for any case, `"m"` for `^` and `$` at each line (a line
+ending at `\n` or `\r`, `\r\n` as one end, in the browser too), `"s"` for `.` matching
+line breaks too. Patterns take only what the server and the browser
 read alike, so a component gets the same answer.
 
 ### Examples

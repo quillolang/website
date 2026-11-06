@@ -6,7 +6,10 @@ group: Media
 
 The size and kind of an image file, from its header alone: `{ width, height, format,
 alpha }`, with `format` one of `jpeg`, `png`, `webp` and `gif`. The pixels are not
-decoded, so it is a cheap check that an upload is an image at all. The path is inside
+decoded, so it is a cheap check that an upload is an image at all. `width` and `height`
+are the image as it is shown: a photo's EXIF orientation is applied, so a portrait
+taken on a phone and stored sideways reports its upright size, as `image.convert`
+turns it. The path is inside
 the program's folder. A file that is missing or not an image is an error value. It
 needs the `fs` effect.
 

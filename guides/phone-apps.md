@@ -50,7 +50,9 @@ data and channels work as they do on a server.
 
 The web view keeps no cookies for the app's own address, so the app keeps them: the
 cookies the program sets are kept in `.quillo/cookies.json` in the app's storage and sent
-back with each request. Sessions are signed with a key the app makes once and keeps in
+back with each request. It keeps them as a browser does, by name, path and domain (the
+longer path sent first), and one set with no `Path` at the folder of the request that
+set it. Sessions are signed with a key the app makes once and keeps in
 its storage, so a person stays signed in from one launch to the next. `request.ip` is
 `"app"`. Jobs, ticks and calls made `later` reach the program with no connection.
 
@@ -58,6 +60,8 @@ What differs from a browser, then:
 
 - `document.cookie` is empty: a page's own script cannot read or write the program's
   cookies. The program's cookies still reach the program.
+- The app goes only to `http(s)` addresses and its own pages: a `location` of another
+  scheme is not followed.
 - Service workers do not run on the app's address. Quillo does not use them; a program's
   own one does not start.
 - A `stream` or `events` route's answer reaches the page whole, when it ends, not as it

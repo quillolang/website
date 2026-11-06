@@ -41,7 +41,10 @@ print(db.query("select name from _quillo_migrations order by name") | map((r) =>
 - Files sort by name as text, so `10_x.sql` comes before `2_x.sql`: pad the numbers.
 - The name is the key: a renamed file runs again. A recorded file whose text changed
   later is not run again; a warning is printed on the server's log instead.
-- A file may hold several statements, and no `begin` or `commit` of its own.
+- A file may hold several statements, and no `begin` or `commit` of its own. A
+  trigger's, function's or procedure's body (`begin ... end`, `$$ ... $$`), a `do` block
+  and `begin atomic` are one statement with the rest, not a transaction begun by hand.
+- On MariaDB a `||` in a file joins text, as on the other two.
 
 ```quillo
 db.open("app.db")
@@ -71,8 +74,9 @@ print(db.query("select name from sqlite_master where type = 'table' order by nam
 A file that fails is rolled back and is a runtime error naming the file and the
 database's message: the program does not start with a half-applied schema. A folder
 that does not exist is a runtime error too, as is a folder name that is not a string.
-On MySQL a statement that changes the schema commits at once, so a failing file keeps
-what it did before: put one change in each file there.
+On MySQL a statement that changes the schema commits at once (a migration may hold one,
+which `db.transaction` refuses), so a failing file keeps what it did before: put one
+change in each file there.
 
 ```quillo error
 db.open("app.db")

@@ -24,7 +24,9 @@ print(abs(-12.50m), abs(3 - 10))
 - The type is the argument's: `abs(-5)` is the int `5`, `abs(-5.0)` the float `5.0`.
 - A decimal keeps its trailing zeros: `abs(-12.50m)` is `12.50m`.
 - `NaN` stays `NaN`; `-inf` becomes `inf`; `-0.0` is `0.0`.
-- The smallest int has no positive twin: `abs` of it is an integer overflow.
+- The smallest int has no positive twin: `abs` of it is an integer overflow. It is
+  written `-9223372036854775808`; as a method, `(-9223372036854775808).abs()`, since
+  `-9223372036854775808.abs()` reads as the minus of `9223372036854775808.abs()`.
 
 ```quillo
 print(type_of(abs(-5)), type_of(abs(-2.5)), type_of(abs(-1m)))
@@ -50,7 +52,7 @@ line 1: `abs` expects a number as argument 1, got str
 ```
 
 ```quillo error
-print(abs(-9223372036854775807 - 1))
+print(abs(-9223372036854775808))
 ```
 
 ```output

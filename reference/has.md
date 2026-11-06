@@ -26,18 +26,21 @@ true false
 - Keys are text: `has(m, 5)` finds `"5"`.
 - `null` as the map is an empty map: `has(null, k)` is `false`.
 - `contains(m, k)` on a map asks the same question.
+- An error value as the key is given back, neither `true` nor `false`.
 
 ```quillo
 let m = { "5": "five" }
 print(has(m, 5), has(m, "5"), has(m, 6))
 print(has(null, "a"), has({}, ""))
 print(contains(m, "5"))
+print(has(m, int("q")))
 ```
 
 ```output
 true true false
 false false
 true
+err("not an int: \"q\"")
 ```
 
 ### Errors

@@ -25,7 +25,7 @@ print(analytics.one("select sum(total) as t from sales"))
 ```
 
 ```output
-{ changes: 0, last_id: 0 }
+{ changes: 0, last_id: null }
 { changes: 1, last_id: 1 }
 [{ day: "2026-10-29", total: 30 }]
 { t: 30 }

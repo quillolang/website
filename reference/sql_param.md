@@ -4,8 +4,9 @@ group: Database
 
 ### What it does
 
-A named SQL parameter, `:title`, checked: the name is letters, digits and `_`, not
-starting with a digit and at most 64 characters long. A list of names gives them
+A named SQL parameter, `:title`, checked: the name is letters, digits and `_` (of any
+script, as [sql_name](/docs/reference/sql_name/) takes them), not starting with a digit
+and at most 63 bytes long. A list of names gives them
 separated by commas, `:title, :body`, for an `insert ... values (...)` whose values
 come from a map. `quillo check` does not warn about SQL built with it.
 
@@ -51,7 +52,7 @@ print(sql_param(keys({ b: 1, a: 2 })))
 ### Errors
 
 A name with anything but letters, digits and `_`, an empty one, one starting with a
-digit, one over 64 characters, or a value that is not a string (or a list of strings)
+digit, one over 63 bytes, or a value that is not a string (or a list of strings)
 is a runtime error, not an error value.
 
 ```quillo error
@@ -74,16 +75,24 @@ line 1: `sql_param` takes a name (a str) or a list of them, got null
 
 ```quillo
 let cols = ["title", "body"]
-print(`update posts set (${cols | sql_name}) = (${cols | sql_param}) where id = :id`)
+let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ")
+print(`update posts set ${set} where id = :id`)
 ```
 
 ```output
-update posts set ("title", "body") = (:title, :body) where id = :id
+update posts set "title" = :title, "body" = :body where id = :id
 ```
+
+An update takes the pairs, which every database takes; a column list, `set (a, b) =
+(...)`, is not MySQL's, nor PostgreSQL's for one column. `quillo check` follows `map`
+and `join` over `sql_name` and `sql_param`, through every value the function can give,
+so the `db.exec` below gets no warning; a raw `${c}` in that function still does. It
+trusts only the builtins: a function or a parameter of the program's own named
+`sql_name`, `map` or `join` is not taken for them.
 
 ```quillo noexec
 let row = { title: "Hello", body: "...", id: 7 }
-db.exec(`update posts set (${sql_name(cols)}) = (${sql_param(cols)}) where id = :id`, row)
+db.exec(`update posts set ${set} where id = :id`, row)
 ```
 
 ### See also

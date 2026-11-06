@@ -31,26 +31,37 @@ print(sum(map(orders, (o) => o.total)))
 - Floats add as floats do: `0.1 + 0.2` is `0.30000000000000004`. Decimals do not
   drift, and an int with a decimal gives a decimal.
 - A total of ints that passes what an int holds is a runtime error, not a float.
-- The items are added with `+`, so strings join rather than add: `sum(["a", "b"])` is
-  the text `"0ab"`, the start value in front. Use [join](/docs/reference/join/) for text.
+- Text is not a number, even when it holds one: amounts read from a form, a CSV or the
+  session are text, and `sum` refuses them at the first, rather than join them. Make
+  them numbers first, `map(dec)` for money or `map(float)`; use
+  [join](/docs/reference/join/) for text.
 
 ```quillo
 print(sum([]), sum(null), type_of(sum([])))
 print(sum([0.1, 0.2]), sum([dec("0.1"), dec("0.2")]), sum([dec("1.5"), 2]))
-print(sum(["a", "b"]))
+print(["12.50", "5.00"] | map(dec) | sum)
 ```
 
 ```output
 0 0 int
 0.30000000000000004 0.3 3.5
-0ab
+17.50
 ```
 
 ### Errors
 
-An argument that is not a list or `null` is a runtime error, not an error value. An
-item that `+` cannot add to the total so far (`null`, a boolean, a list, a map) is a
-runtime error, and so is a decimal met with a float, or an int overflow.
+An argument that is not a list or `null` is a runtime error, not an error value. A
+string among the items is a runtime error naming it and its place, and saying what to
+write. An item that `+` cannot add to the total so far (`null`, a boolean, a list, a
+map) is a runtime error, and so is a decimal met with a float, or an int overflow.
+
+```quillo error
+print(sum([1, 2, "3"]))
+```
+
+```output
+line 1: `sum` adds numbers; got the str "3" at item 2: use `float(...)` or `dec(...)` first
+```
 
 ```quillo error
 print(sum([1, null, 2]))

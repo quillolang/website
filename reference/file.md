@@ -7,7 +7,7 @@ group: Files and processes
 A response that sends a file from the program's folder, for a route to answer with:
 `route GET /report = file("exports/report.pdf")`. It serves the one file it is given,
 whatever its name, so a path from the visitor goes to [files](/docs/reference/files/)
-instead, which does not serve `.env`, `.git/` or the program's own files:
+instead, which does not serve `.env`, `.git/`, the program's own files or a database:
 `route GET /assets/*path = files("public", path)`. The content type comes from the
 extension, the response carries an `ETag` and `Last-Modified`, and a browser that asks
 with a current copy gets a `304` with no body. A file that is not there, a folder, or a
@@ -70,15 +70,31 @@ public, max-age=31536000, immutable
   opus mp3 ogg oga wav wasm woff2 woff ttf otf pdf zip`, and for feeds, calendars,
   subtitles and streams `rss atom jsonld geojson yaml yml toml ics vtt srt m3u8 mpd ts
   m4s`. A `.md` file is `text/markdown; charset=utf-8`.
-- A request's conditions are read as HTTP says: `If-None-Match`, else
-  `If-Modified-Since`, gives a `304` when the file has not changed since the date given,
-  a later date included, in any of HTTP's three date forms (`Sun, 06 Nov 1994 08:49:37
-  GMT`, `Sunday, 06-Nov-94 08:49:37 GMT`, `Sun Nov  6 08:49:37 1994`). `If-Match` that
+- A request's conditions are read as RFC 9110 has them: `If-None-Match`, else
+  `If-Modified-Since`, gives a `304` to a `GET` or `HEAD` when the file has not changed
+  since the date given, a later date included, in any of HTTP's three date forms (`Sun,
+  06 Nov 1994 08:49:37 GMT`, `Sunday, 06-Nov-94 08:49:37 GMT`, `Sun Nov  6 08:49:37
+  1994`); another method whose `If-None-Match` matches gets a `412`. `If-Match` that
   names another version, or `If-Unmodified-Since` before the file changed, gives a
-  `412` with no body. A date that does not parse is not a condition.
+  `412` with no body. The file's own weak tag, with its `W/` or without, passes
+  `If-Match` and `If-Range`, as nginx has it, so a download resumed or a video sought
+  gets its part. A date that does not parse is not a condition.
+- `Range: bytes=...` gets a `206` with those bytes: the unit in any case (`Bytes=0-1`),
+  the numbers digits only (`bytes=+2-4` is no range, and gets the whole file), an end
+  past the file read as the file's end. A range that starts past the end gets a `416`,
+  and several ranges at once the whole file.
 - `cache` can be a number of seconds; the header is then `public, max-age=N, immutable`.
 - Files up to 1 MiB are kept in memory and re-read when they change; larger ones are
-  streamed from disk, and a `Range` request gets a `206` with those bytes.
+  streamed from disk. A file changed in the last moment (50 ms, or 2 s where the file
+  system keeps whole seconds) is read but not kept, so one being written is never kept
+  half written. A file rewritten in place while it is read is sent as it was read; only
+  a large one replaced at every try is answered `503` with `Retry-After`. A busy file
+  is never a `404`.
+- A text file gzipped for browsers that take it says `Vary: accept-encoding` in its
+  plain copy too, so a shared cache keeps both; a `HEAD` answers as a `GET` would, gzip
+  included.
+- A SQLite database is sent when it is named here on purpose (`file("backup.db")`),
+  ranges included; `files()` and `quillo serve` never send one.
 
 ```quillo
 write_file("data.bin", "x")
@@ -99,9 +115,12 @@ public, max-age=60, immutable
 
 ### Errors
 
-A path that is not a string, options that are not a map, or a `cache` that is neither
-seconds nor a duration are runtime errors, not error values. The options are only
+A path that is not a string, options that are not a map, a `cache` that is neither
+seconds nor a duration, an empty `type` or `download`, and a `type` with a line break or
+another control character are runtime errors, not error values. The options are only
 looked at for a file that exists: `file("nope", { cache: "soon" })` is a plain `404`.
+A `download` name is written so a name in any script arrives whole; its control
+characters are not sent as they are.
 
 ```quillo error
 write_file("a.txt", "a")
@@ -110,6 +129,15 @@ print(file("a.txt", { cache: "soon" }))
 
 ```output
 line 2: `file`'s cache is seconds or a duration like "30d", got "soon"
+```
+
+```quillo error
+write_file("a.txt", "a")
+print(file("a.txt", { type: "" }))
+```
+
+```output
+line 2: `file`'s type is empty: give a content type, like "text/csv", or leave it out
 ```
 
 ### Chaining

@@ -42,6 +42,8 @@ null
   one `publish(7)` names.
 - Inside `unwatched(f)`, a `watch` in `f` is not recorded either; call `watch` outside
   it, as in the example above.
+- A topic is 1 to 256 bytes, of any characters, a comma included: an empty or a longer
+  one is a runtime error, as for `publish`.
 - A page may follow at most 256 topics; past that, the rest hear nothing. With
   tenants, the topic watched is the tenant's own.
 
@@ -55,7 +57,8 @@ null null null
 
 ### Errors
 
-It never fails: any number of topics, of any type, is taken.
+Any number of topics, of any type, is taken, each as its text. An empty topic, or one
+past 256 bytes, is a runtime error, not an error value.
 
 ```quillo
 print(watch(null, { thread: 7 }))
@@ -63,6 +66,14 @@ print(watch(null, { thread: 7 }))
 
 ```output
 null
+```
+
+```quillo error
+print(watch(""))
+```
+
+```output
+line 1: `watch`: a topic is a name, and this one is empty
 ```
 
 ### Chaining

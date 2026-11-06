@@ -26,17 +26,22 @@ true int
 - For a positive number it is [math.floor](/docs/reference/math.floor/); for a
   negative one it is [math.ceil](/docs/reference/math.ceil/): `math.trunc(-0.5)` is `0`.
 - `-7 / 2` is `-3.5`, and truncates to `-3`.
-- A float past what an int holds (about 9.2 × 10¹⁸) is a runtime error, `integer
-  overflow`.
+- A float past what an int holds (2^63, about 9.22 × 10¹⁸) is a runtime error,
+  `integer overflow`; up to it, an int (`math.trunc(9.2e18)`).
+- `math.trunc(a / b)` of two ints divides in ints, so it is exact past 2^53, however
+  the call is written (a pipe, a method, the function kept in a variable). A quotient
+  kept in a variable first is a float.
 
 ```quillo
 print(math.trunc(-0.5), math.trunc(-7 / 2))
 print(math.trunc(0.999), math.trunc(-0.999))
+print(math.trunc(9.2e18), math.trunc(9223372036854775807 / 10))
 ```
 
 ```output
 0 -3
 0 0
+9200000000000000000 922337203685477580
 ```
 
 ```quillo error

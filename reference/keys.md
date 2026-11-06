@@ -23,7 +23,9 @@ print(keys({ "x y": 1, "2": 2 }))
 
 ### Edge cases
 
-- Order is insertion order, not sorted: sort the list when an order is wanted.
+- Order is insertion order, not sorted: sort the list when an order is wanted. It is
+  the same in the browser, keys that look like numbers included: `keys({ b: 1, "1": 2
+  })` is `["b", "1"]` on both sides, where a JavaScript object lists `"1"` first.
 - `set` on a key that is already there keeps its place; `remove` and `set` again
   puts it at the end.
 - An empty map and `null` both give `[]`.
@@ -35,6 +37,7 @@ print(keys(m), keys(m) | sort)
 print(keys(set(m, "a", 10)), keys(set(remove(m, "a"), "a", 10)))
 print(keys({}), keys(null))
 print(len(keys(m)), len(m))
+print(keys({ b: 1, "1": 2, a: 3, "0": 4 }))
 ```
 
 ```output
@@ -42,6 +45,7 @@ print(len(keys(m)), len(m))
 ["b", "a", "c"] ["b", "c", "a"]
 [] []
 3 3
+["b", "1", "a", "0"]
 ```
 
 ### Errors

@@ -30,18 +30,19 @@ print(remove([1, 2, 1, 3], 1))
 - On a list, every equal item goes, not only the first; a value not in the list
   changes nothing.
 - `null` as the map is an empty map and gives `{}`.
+- On a map, an error value as the key is given back, and nothing is removed.
 
 ```quillo
 let m = { "5": "five", a: 1 }
 print(remove(m, "zz"), remove(m, 5))
 print(remove(["a", "b", "a"], "a"), remove([1, 2], 9))
-print(remove(null, "a"))
+print(remove(null, "a"), remove(m, int("q")))
 ```
 
 ```output
 { "5": "five", a: 1 } { a: 1 }
 ["b"] [1, 2]
-{}
+{} err("not an int: \"q\"")
 ```
 
 ### Errors

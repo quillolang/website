@@ -10,8 +10,9 @@ what was written. `crop` is in the image's pixels; `width` shrinks to that width
 keeping the shape, and never enlarges; `format` is `jpeg` (the default), `png` or
 `webp` (lossless); `quality` is the JPEG's, 82 unless given. The file is written whole
 or not at all, folders on the way are made, and both paths stay inside the program's
-folder. It does not write over the program's own files: its `.qwe` and `.qwer` files,
-`.env` and the database it has open *(since 0.7)*. An image of more than 40 megapixels,
+folder. It does not write over the program's own files, as `write_file` does not: its
+`.qwe` and `.qwer` files, `.env` and the databases it has open *(since 0.7)*, whatever
+the case of the name or a Windows form of it (`.ENV`, `main.qwe.`). An image of more than 40 megapixels,
 or one whose conversion would take more than about 640 MiB, is an error value *(since
 0.7)*. At most four conversions run at once, and those running share about 1 GiB; past
 64 waiting, it gives an error value at once. It needs the `fs` effect.
@@ -63,6 +64,12 @@ err("image: not a JPEG, PNG, WebP or GIF image")
 
 ### Edge cases
 
+- A photo is read as it is shown: its EXIF orientation is applied, so a `crop` is in
+  the turned image's pixels (those `image.info` reports), and the copy is upright.
+- JPEG has no transparency, so transparent pixels are laid on white in a JPEG; there is
+  no option for another colour. A PNG keeps them.
+- Each conversion writes to a temporary file of its own and moves it in place, so two
+  at once to one target both finish, the last one's file kept.
 - A `width` larger than the image leaves the size as it is.
 - A crop that reaches outside the image is an error value naming both sizes.
 - The destination's folder is made when missing; an existing file is replaced.

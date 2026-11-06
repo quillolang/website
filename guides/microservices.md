@@ -59,7 +59,12 @@ service /billing = "billing.qwe"
 ```
 
 A program with `server fn`s and no routes is served as well: a service may be only that.
-Services may use one another.
+Services may use one another. A service's file is found as a `use`d file is: from the
+main file's folder (beside the real file when the main file is a link), and its own
+`use` paths by the same rules, a path without an extension being the `.qwe`, `.qwer` or
+`.rs` file there (an error when two match). A Rust file a service's file uses is the
+service's: the service builds it, and the app passes over it when it reads the
+service's functions.
 
 ### One process or many
 
@@ -76,9 +81,13 @@ options](/docs/) lists them all.
   (`quillo run billing.qwe --base /billing`) is the path it is served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
-  signed with one secret. They stop with the app. `--describe`, `--no-build` and the
-  `--policy` files, given to the app (`quillo run app.qwe --split --no-build --policy
-  prod.toml`), are given to each of them too. It is the quickest
+  signed with one secret. They stop with the app, whatever way it ends (Ctrl-C, a
+  SIGTERM, a SIGKILL, a crash): each holds a pipe from the app, which closes then, so no
+  service is left serving with its port taken. A service started on its own, by hand or
+  by systemd, serves on whatever its input is. `--describe`, `--no-build`,
+  `--reload` and the `--policy` files, given to the app (`quillo run app.qwe --split
+  --no-build --policy prod.toml`), are given to each of them too, and with `--port 0`
+  the services are told the port the app was given. It is the quickest
   way to see an app as it would run split, on one machine.
 - **Checked once.** Before `--split` starts any service, the app checks the whole tree,
   its own files and every service's, and says each warning once. An error in a service
@@ -528,7 +537,10 @@ service billing = "billing.qwe" { timeout: "2s", retries: 1, failures: 5, cooldo
 | `cooldown` | `"5s"` | How long it is left alone the first time |
 
 Durations are `"500ms"`, `"2s"`, `"1m"` (`ms`, `s` and `m` only), or a number of
-milliseconds. They apply when a service runs elsewhere; in one process a call is a
+milliseconds. A duration past a century counts as a century; one no duration can hold
+(past about 1.8e19 s, infinite, NaN or negative) is refused as the program loads, as
+`"1.5h"` is: `` service work: `timeout` is a duration ("2s", "500ms", or milliseconds),
+not "1.5h" ``. They apply when a service runs elsewhere; in one process a call is a
 function's, which runs to its end.
 
 ### Following a request across services

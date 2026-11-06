@@ -6,7 +6,8 @@ group: General
 
 The kind of a value as text: one of `null`, `bool`, `int`, `float`, `dec`, `str`,
 `list`, `map`, `fn`, `html`, `response` and `error`. In the browser a JavaScript
-Promise is `promise`. It is the way to tell an int from a float, a decimal from a
+Promise is `promise`, and a whole float is a `float`, as on the server: `type_of(2.0)`
+is `float` on both sides. It is the way to tell an int from a float, a decimal from a
 float, and an error value from anything else.
 
 ### Examples

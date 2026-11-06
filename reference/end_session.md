@@ -47,7 +47,9 @@ null
   live ids, delete from the table, then `end_session()`.
 - Other cookies stay; `delete_cookie` removes those.
 - A session set again later in the same request replaces the removal: the last
-  `set_session` or `end_session` wins.
+  `set_session` or `end_session` wins. Inside `parallel`'s functions it works too, the
+  functions taken in their order: `parallel(() => end_session(), ...)` signs the visitor
+  out (it was dropped, and the visitor stayed signed in).
 
 ```quillo
 print(end_session(), session())

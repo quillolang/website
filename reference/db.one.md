@@ -37,8 +37,13 @@ null
 - Of several rows the first is given, in the order the query says; `order by` makes
   that definite.
 - A different number of values than `?` marks, or a `:name` the map lacks, is an error
-  value.
+  value, as are values given to SQL with no placeholder and SQL with no statement in it;
+  a map given to SQL that has no names is no value.
 - Several statements in one text: the first one's first row is given.
+- `insert ... returning id` gives the new row's id where the database has `returning`
+  (SQLite, PostgreSQL, MariaDB): the way to get it on PostgreSQL, whose `db.exec` has no
+  `last_id`, and for an `insert` of several rows, whose `last_id` is null (`db.query`
+  gives every row's).
 
 ```quillo
 db.open("app.db")

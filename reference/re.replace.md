@@ -36,7 +36,8 @@ HELLO WORLD
   written. `$$` is the way to write one before a digit.
 - A group that did not take part puts in nothing.
 - The function's result is written as `print` would write it: an int as its digits,
-  `null` as `null`, a list as a list. Give it text.
+  `null` as `null`, a list as a list. Give it text. An error value it gives (an `err`,
+  a `?` inside it) is given back as `re.replace`'s answer, not written into the text.
 - An empty match is replaced too: an empty pattern puts the replacement between every
   two characters and at both ends, as JavaScript does.
 - Positions in the match given to the function count characters.
@@ -47,6 +48,7 @@ print(re.replace("a b", " ", "$x"), re.replace("a b", " ", "$"), re.replace("ab"
 print(re.replace("a1", "\\d", (m) => 42), re.replace("a1", "\\d", (m) => null))
 print(re.replace("hello", "", "-"), re.replace("abc", "x*", "-"))
 print(re.replace("añob", "o", (m) => str(m.start)), re.replace("Hello", "h", "J", "i"))
+print(re.replace("ab", "a", (m) => err("bad")))
 ```
 
 ```output
@@ -55,6 +57,7 @@ a$xb a$b []
 a42 anull
 -h-e-l-l-o- -a-b-c-
 añ2b Jello
+err("bad")
 ```
 
 ### Errors

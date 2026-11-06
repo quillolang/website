@@ -90,6 +90,12 @@ null
   program.
 - The cookie holds the whole session as JSON, signed: keep an id in it and the rest
   in the database. Keep secrets out, since the browser can read it.
+- Two requests of one visitor that set the session at once each start from the cookie
+  they came with, and the last answer's cookie wins: 20 adds to a cart in the session,
+  sent at once, kept one. Keep data that must not be lost (a cart, a draft) in a table
+  keyed by an id in the session.
+- In `parallel`'s functions it works as anywhere in the request, the sets made in the
+  functions' order.
 - A session set in a `server fn` is on the answer to that call, and the pages the
   visitor opens next carry it.
 - Outside a request the call still signs the map and `session()` gives it back for
@@ -116,7 +122,8 @@ print(session())
 A first argument that is not a map or null, a `max_age` that is not seconds or a
 duration or is 0 or less, and options that are not a map are runtime errors, not
 error values. So is a session over about 3,900 bytes once signed, more than a cookie
-holds: keep an id in it and the rest in the database.
+holds: keep an id in it and the rest in the database; and one nested deeper than 128
+levels, as deep as its JSON is read back.
 
 ```quillo error
 set_session("user 7")

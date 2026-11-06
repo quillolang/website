@@ -28,7 +28,7 @@ abc
 - Matches do not overlap: in `"aaa"`, `"aa"` is found once, and the result can be
   longer than the text, since each `"a"` can become `"aa"`.
 - The empty piece matches between every character and at both ends, so
-  `replace("hello", "", "-")` is `-h-e-l-l-o-`.
+  `replace("hello", "", "-")` is `-h-e-l-l-o-`, in the browser too.
 - Replacing the whole text with `""` gives the empty string, and the empty text stays
   empty.
 

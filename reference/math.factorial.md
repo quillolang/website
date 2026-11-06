@@ -25,7 +25,8 @@ print(math.factorial(10) / (math.factorial(3) * math.factorial(7)))
 ### Edge cases
 
 - `21!` does not fit in an int: it is a runtime error, `integer overflow`, not a
-  float and not a wrapped value. For the size of a large factorial use
+  float and not a wrapped value, in the browser as on the server, where `20!` is exact
+  too, past 2^53. For the size of a large factorial use
   [math.lgamma](/docs/reference/math.lgamma/) (`lgamma(n + 1)` is `log(n!)`), or
   [math.gamma](/docs/reference/math.gamma/) up to `170!` as a float.
 - A float that is a whole number is accepted: `math.factorial(5.0)` is `120`. A float

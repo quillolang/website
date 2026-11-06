@@ -9,7 +9,7 @@ maps, `severity` being `"error"` or `"warning"`; an empty list means the program
 fine. The path is from the program's folder. The map gives some files' text in place of
 what is on disk, keyed by path, so a tool that writes Quillo code (a plugin editor, a
 form's rule) can check it before saving it. The code checked may come from users, so it
-reads nothing outside the program's folder.
+reads nothing outside the program's folder, and inside it only Quillo's files.
 
 ### Examples
 
@@ -33,7 +33,12 @@ print(check_program("plugins/greet.qwe", { "plugins/greet.qwe": "fn greet(n: str
 - A `use` in the checked code with `..` or starting at `/` is reported as an error on
   that line, not followed. So is a `use` of a plain path that leads out of the folder
   through a link: nothing is read there.
-- The path itself, or a key of the map, that leaves the folder is an error value.
+- It reads only `.qwe` files (and the signatures of `.qwer` and `.rs` files for a
+  `use`), none with a dot folder or file in its path, and a link is judged by where it
+  leads: `use ".env"` or `use ".git/config"` is an error on that line, and reads
+  nothing. Its messages never show a file's text.
+- The path itself, or a key of the map, that leaves the folder, or is not a Quillo
+  file, is an error value.
 - `null` as the map checks what is on disk; an empty override checks an empty program,
   which is fine.
 
@@ -46,6 +51,7 @@ print(check_program("plugins/p.qwe", { "plugins/p.qwe": "use \"../secret.qwe\"\n
 print(check_program("../main.qwe"))
 print(check_program("plugins/p.qwe", { "../y.qwe": "" }))
 print(check_program("plugins/p.qwe", null) | len, check_program("plugins/p.qwe", { "plugins/p.qwe": "" }))
+print(check_program("p.qwe", { "p.qwe": "use \".env\"\n" }) | map((d) => d.message))
 ```
 
 ```output
@@ -56,12 +62,13 @@ print(check_program("plugins/p.qwe", null) | len, check_program("plugins/p.qwe",
 err("check_program: path must stay inside the program's folder: ../main.qwe")
 err("check_program: path must stay inside the program's folder: ../y.qwe")
 3 []
+["only Quillo files are read (.qwe, and a plugin's .qwer or .rs for `use`), none whose name or folder starts with a dot: .env"]
 ```
 
 ### Errors
 
-A path outside the folder is an error value; what the checker finds is never one, it is
-the list. A path that is not a string is a runtime error.
+A path outside the folder, or of a file that is not Quillo's, is an error value; what
+the checker finds is never one, it is the list. A path that is not a string is a runtime error.
 
 ```quillo error
 print(check_program(1))

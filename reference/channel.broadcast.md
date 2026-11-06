@@ -42,8 +42,15 @@ print(channel.broadcast("game", "text", { reliable: true, except: "0123456789ab"
   page may join such a channel only to listen.
 - The count is of pages that took the message; one whose queue (4096) is full is not
   counted.
+- Over a WebSocket, a page that keeps up gets every message, in order, a burst of
+  thousands too; one that falls 4,096 behind loses plain messages, as above, and a
+  `reliable` one closes its connection. The text of a broadcast is made once, for all
+  its pages.
 - Pages that are being let in get the message right after their yes.
 - `null` is a message like any other.
+- An error value in a message reaches the pages as an error value; one Quillo made (a
+  builtin's) reaches them as `err("internal error")` in production, as a page shows it,
+  and whole under `--watch`.
 - A page that joins later hears nothing of what went before: a roster or a state is
   sent again on `join`.
 - A channel made with `tenants: "shared"` (see [channel.on](/docs/reference/channel.on/))

@@ -10,8 +10,8 @@ away from zero as `Intl.NumberFormat` does, and writes exactly that many; a four
 argument, a rounding mode (those of [round](/docs/reference/round/)), rounds as it says
 instead: `"half_even"` rounds as money does. `digits` may
 also be `{ min, max }`, at least `min` and at most `max` decimals (`max` is 3 unless
-given); without `digits` the number's own decimals are
-written. The locale is a tag like `"en-US"` or `"de-DE"`; `null` or left out, the
+given); without `digits` every decimal of the number is written (where `Intl` stops at
+three), on the server and in the browser. The locale is a tag like `"en-US"` or `"de-DE"`; `null` or left out, the
 request's locale is used, `en-US` in a plain program. A locale that is not in the
 table is written as the first of its language (`de-LU` as de-DE, `de` as de-DE), and
 an unknown language as en-US.
@@ -46,7 +46,10 @@ print(format_number(dec("1234.5678"), "en-US", 2), format_number(-1234.5, "de-DE
 - An int is written without decimals unless `digits` says otherwise; `0` with 2 digits
   is `0.00`.
 - A float too large for a decimal (past about 7.9e28), `NaN` or an infinity is written
-  plainly, without grouping.
+  plainly, without grouping. A whole float past 2^53 is written by its decimal digits
+  in the browser too, from Quillo or from the page's JavaScript.
+- A negative number rounded to zero keeps its minus, as `Intl` writes it: `-0.001` to 2
+  digits is `-0.00`, and `-0.0` is `-0`.
 - `null` as the locale means the request's locale, `en-US` here; `"de"` is de-DE,
   `"xx-YY"` is en-US.
 
@@ -57,6 +60,7 @@ print(format_number(1.5, "en-US", 40), format_number(1.5, "en-US", -3))
 print(format_number(1234, "en-US"), format_number(0, "en-US", 2))
 print(format_number(1e30, "en-US"), format_number(float("nan"), "en-US"), format_number(float("inf"), "de-DE"))
 print(format_number(1234.5, null, 1), format_number(1234.5, "de"), format_number(1234.5, "xx-YY"))
+print(format_number(-0.001, "en-US", 2), format_number(-0.0, "en-US"), format_number(0.123456789, "en-US"))
 ```
 
 ```output
@@ -66,6 +70,7 @@ print(format_number(1234.5, null, 1), format_number(1234.5, "de"), format_number
 1,234 0.00
 1000000000000000000000000000000 NaN inf
 1,234.5 1.234,5 1,234.5
+-0.00 -0 0.123456789
 ```
 
 ### Errors

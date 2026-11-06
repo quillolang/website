@@ -68,8 +68,9 @@ err("unknown currency \"XYZ\"") err("unknown currency \"XAU\"")
 
 What comes from data is an error value: bad text, too many decimals, an unknown
 currency, too large an amount. What is the program's mistake is a runtime error: a
-float amount (convert it with `dec`), a currency that is not text, a rounding mode that
-is not one of the seven.
+float amount (convert it with `dec`), a whole float such as `2.0` too, in the browser
+as on the server, so an amount never goes through a float; a currency that is not text;
+a rounding mode that is not one of the seven.
 
 ```quillo
 let m = money.of("x", "USD")

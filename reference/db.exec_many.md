@@ -39,6 +39,9 @@ print(db.query("select sku, price from products order by sku"))
 - Rows are lists, not maps: `:name` values are for `db.exec`.
 - An insert with something after its values (`on conflict ...`, `returning id`) runs a row
   at a time, so it behaves exactly as `db.exec` would for each row.
+- On MySQL and MariaDB a statement that commits by itself (`truncate`, `create table`,
+  `alter`, `drop`) is refused before it runs, as in `db.transaction`, since it would
+  commit the rows before it whatever came after.
 
 ```quillo
 db.open("app.db")

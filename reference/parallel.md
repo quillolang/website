@@ -44,7 +44,14 @@ component Account(id: int) {
 
 - Results come back in the order given, whichever finished first.
 - An error value a function returns, or passes on with `?`, is its result like any
-  other; a runtime error in one function stops the whole call.
+  other, and stops nothing. A runtime error in one function stops the others on the
+  server at their next step (a call, a loop's round, a builtin, a `sleep`, which ends at
+  once), a `parallel` inside them too, and the call fails with that error. What they
+  did before the stop stays done (a row written is written).
+- `set_cookie`, `set_session`, `end_session`, `session()` and `publish` work inside the
+  functions, and what they set is merged into the request in the functions' order; a
+  write is seen by the reads after it, as outside. A function that reads the visitor
+  (`session()`, a cookie) makes the answer the visitor's own, as anywhere.
 - No functions gives `[]`.
 - Inside `db.transaction` the functions run one after another, so their SQL is part of
   the transaction.
@@ -73,7 +80,8 @@ print(parallel())
 ### Errors
 
 An argument that is not a function is a runtime error, not an error value, with the
-argument's number. A function that fails with a runtime error fails the call.
+argument's number. A function that fails with a runtime error fails the call with
+that error, after stopping the others.
 
 ```quillo error
 print(parallel(1, () => 2))

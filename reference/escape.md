@@ -27,7 +27,9 @@ print(escape(42), escape(true), escape("plain"))
 - Escaping twice doubles the entities: `&lt;` becomes `&amp;lt;`.
 - `null` gives the text `null`, not the empty string.
 - A list or a map gives its printed form, escaped.
-- Letters outside ASCII, newlines and spaces stay as they are.
+- Letters outside ASCII, `\n` and spaces stay as they are. A CR is written `&#13;` and a
+  NUL U+FFFD, here and in markup, on the server and in the browser, so a note typed in a
+  `<textarea>` and posted with CRLF is taken up as written.
 
 ```quillo
 print(escape(markdown("*a*")))

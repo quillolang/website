@@ -29,19 +29,17 @@ true
 - Each call is a new id: a thousand in a row are a thousand different strings.
 - Lower case: `u == lower(u)`; upper-case it for a display that wants that.
 - Without its dashes it is 32 hex characters.
-- `uuid()` takes no arguments; one given is ignored.
+- `uuid()` takes no arguments; one given is a runtime error (below).
 
 ```quillo
 print(range(1000) | map((i) => uuid()) | unique | len)
 let u = uuid()
 print(u == lower(u), len(replace(u, "-", "")), slice(u, 14, 15))
-print(len(uuid(1)))
 ```
 
 ```output
 1000
 true 32 4
-36
 ```
 
 ### Errors
@@ -55,6 +53,17 @@ print(is_err(uuid()))
 
 ```output
 false
+```
+
+An argument is a runtime error, and so is one for `quillo check` when the call is
+written out.
+
+```quillo error
+print(uuid(1))
+```
+
+```output
+line 1: `uuid` takes 0 arguments, got 1: uuid()
 ```
 
 ### Chaining

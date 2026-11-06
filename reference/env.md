@@ -30,7 +30,14 @@ null fallback
 - The default can be any value, not only a string: `env("X", 42)` is `42` when `X` is
   not set.
 - A variable that is set to the empty string is `""`, not `null`, so its default is not
-  used.
+  used. In the `.env`, ` #` ends a bare value, so `KEY= # set me` is `""` while
+  `KEY=#fff` is `#fff`.
+- Only a `.env` that is not there is nothing. One that cannot be read, is not UTF-8, or
+  is a link to nothing stops the start with exit 2, saying where and the ways out
+  (``quillo: cannot read .env: it is not UTF-8 text: byte 0xE9 at line 1, column 9 (save
+  it as UTF-8); to start without it, remove it or give `--env-file /dev/null` ``). A line
+  that is not `KEY=value`, or whose value holds a NUL byte, is skipped and said at the
+  start; a quote never closed skips its own line only.
 - Under a policy whose `[env]` gives `names` (`/etc/quillo/policy.toml`, `quillo run main.qwe --policy FILE`
   or `quillo.policy` beside the program; see [the options](/docs/)), a name not in the list reads as not set: `null`,
   or the default. Each policy file can only narrow the list.

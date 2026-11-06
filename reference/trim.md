@@ -5,7 +5,8 @@ group: Strings
 ### What it does
 
 The text without the whitespace at its start and end: spaces, tabs, newlines and
-carriage returns, and the Unicode spaces as well. Whitespace inside the text stays.
+carriage returns, and the rest of Unicode's White_Space as well (U+0085 too, but not
+U+FEFF, a byte-order mark), the same in the browser. Whitespace inside the text stays.
 
 ### Examples
 
@@ -26,7 +27,8 @@ a b
 - The empty string, and a string of only whitespace, give the empty string.
 - Inner runs of spaces are kept: `trim` is not a squeeze.
 - A no-break space and an em space are whitespace too, and trimmed.
-- Only whitespace: a dash or a quote at the edge stays.
+- Only whitespace: a dash or a quote at the edge stays, and so does a byte-order mark
+  (`len(trim("\uFEFFa"))` is 2).
 
 ```quillo
 print(trim(""), trim("   "), len(trim("   ")))

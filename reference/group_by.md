@@ -39,7 +39,10 @@ open 1
   `1.50m` and `1.5m` share a key.
 - A group that has no items is not there: reading it gives `null`. Use `get` with a
   default when `[]` is wanted.
-- The order of keys is the order of first appearance; sort `keys` for another order.
+- The order of keys is the order of first appearance, in the browser too (keys that
+  look like numbers included); sort `keys` for another order.
+- A function that gives an error value has said no key: `group_by` gives that error
+  back, as `filter` does, where its text was a key.
 
 ```quillo
 print(group_by([], (x) => x), group_by(null, (x) => x))
@@ -49,6 +52,7 @@ print(group_by([dec("1.50"), dec("1.5")], (x) => x))
 let g = group_by(["a"], (x) => x)
 print(g.b, get(g, "b", []))
 print(group_by(["b", "a", "b"], (x) => x) | keys | sort)
+print(group_by(["1", "x"], (s) => int(s)))
 ```
 
 ```output
@@ -58,12 +62,14 @@ print(group_by(["b", "a", "b"], (x) => x) | keys | sort)
 { "1.5": [1.50m, 1.5m] }
 null []
 ["a", "b"]
+err("not an int: \"x\"")
 ```
 
 ### Errors
 
 A first argument that is not a list or `null`, or a second that is not a function, is
-a runtime error, not an error value. An error inside the function stops the request.
+a runtime error, not an error value. A runtime error inside the function stops the
+request; an error value it gives is given back (above).
 
 ```quillo error
 print(group_by("ab", (c) => c))

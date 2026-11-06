@@ -8,9 +8,9 @@ Adds a `Set-Cookie` header to the request's answer, whatever the route returns, 
 anywhere in the request: a route, a `server fn`, a helper. The value is percent-encoded
 on the way out and decoded by `cookie`, so any text fits; a value that is not a string
 is written as text, and none as the empty string. The options are `max_age`, `path`,
-`domain`, `http_only`, `secure` and `same_site`; without them a cookie is `HttpOnly`,
-`Secure`, `SameSite=Lax`, for `Path=/`, and lasts until the browser closes. It gives
-null. The guide [Headers, cookies and
+`domain`, `http_only`, `secure` and `same_site`, and another is an error; without them a
+cookie is `HttpOnly`, `Secure`, `SameSite=Lax`, for `Path=/`, and lasts until the
+browser closes. It gives null. The guide [Headers, cookies and
 sessions](/docs/headers-cookies-sessions/#cookies) has the options' table.
 
 ### Examples
@@ -63,8 +63,24 @@ null
   it no other way. `Secure` is left out with the `quillo run` options `--watch` and
   `--plain-http` (`quillo run main.qwe --watch`; see [the options](/docs/)) and in
   desktop apps, where the site is served over plain HTTP.
-- A cookie set twice in one request is sent once, the last. An option that is not
-  known is ignored.
+- A cookie replaces another set in the same request only at the same name, path and
+  domain (a domain in any case, with or without its leading `.`), as browsers keep
+  them: `set_cookie("t", "1", { path: "/a" })` and `set_cookie("t", "2", { path: "/b" })`
+  send both.
+- Inside `parallel`'s functions it works as anywhere in the request: their cookies go
+  out with the answer, taken in the functions' order (they were dropped).
+- An option it does not take is an error, when the program runs and in `quillo check`
+  for one written out. Express's and the header's spellings (`sameSite`, `maxAge`,
+  `httpOnly`, `Max-Age`) are told the name here; `expires` is told that `max_age` is how
+  long it lasts.
+- A name starting `__Host-` or `__Secure-`, in any case, keeps its prefix's rules, or
+  browsers drop the cookie: it is `Secure`, under `--watch` and `--plain-http` too
+  (browsers take it from `localhost`), and a `__Host-` one is at `Path=/` with no
+  `Domain`. Asking otherwise is an error.
+- A cookie of more than 3,900 bytes as sent, its value percent-encoded, is an error:
+  browsers drop it with its attributes.
+- A `path` holds no space, `;`, control character or letter past ASCII:
+  percent-encode them.
 - A name is letters, digits and ``-_.!#$%&'*+^`|~``; a value that is not a string is
   written as text (`42`), and a missing or null value as the empty string.
 - Under `--base` (`quillo run main.qwe --base /shop`) or in a mounted program, the
@@ -75,20 +91,21 @@ null
 
 ```quillo
 print(set_cookie("n", 42), set_cookie("n"), set_cookie("n", null))
-print(set_cookie("a", "b", { same_site: "None", colour: "ignored" }))
+print(set_cookie("__Host-cart", "7", { max_age: "7d" }), set_cookie("a", "b", { same_site: "None", secure: false }))
 ```
 
 ```output
 null null null
-null
+null null
 ```
 
 ### Errors
 
 A bad cookie name, a `max_age` that is not seconds or a duration, a `path` not starting
-with `/`, a `domain` that is not a host name, a `same_site` other than `"Lax"`,
-`"Strict"` or `"None"`, and options that are not a map are runtime errors, not error
-values.
+with `/` or holding a space, a `domain` that is not a host name, a `same_site` other
+than `"Lax"`, `"Strict"` or `"None"`, an option it does not take, a prefixed cookie
+that breaks its prefix's rules, a cookie of more than 3,900 bytes, and options that are
+not a map are runtime errors, not error values.
 
 ```quillo error
 set_cookie("bad name", "x")
@@ -104,6 +121,22 @@ set_cookie("a", "b", { same_site: "nope" })
 
 ```output
 line 1: `set_cookie`'s same_site is "Lax", "Strict" or "None", got "nope"
+```
+
+```quillo error
+set_cookie("theme", "dark", { sameSite: "Strict" })
+```
+
+```output
+line 1: `set_cookie` has no option `sameSite`: write it `same_site`
+```
+
+```quillo error
+set_cookie("__Host-cart", "7", { domain: "example.com" })
+```
+
+```output
+line 1: `set_cookie`: a `__Host-` cookie has no domain, as browsers take it only from the host that sets it; leave `domain` out
 ```
 
 ### Chaining

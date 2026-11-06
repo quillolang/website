@@ -32,9 +32,9 @@ print(raw(42), raw(true))
 - Inside `<script>{...}</script>`, an `html` value goes in as it is except that `</`
   becomes `<\/` and `<!--` becomes `<\!--`, so it cannot end the element early.
 - HTML a visitor wrote, even cleaned by a sanitizer, must not keep the attributes
-  Quillo's islands are made of, `data-qi`, `data-c`, `data-p`, `data-s`, `data-l` and
-  `data-v`, nor `<quillo-island>` elements: the page takes such an element up as one of
-  its components, with the props and state it says. DOMPurify keeps `data-*` unless told
+  Quillo's islands are made of, `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`,
+  `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>` elements: the page
+  takes such an element up as one of its components, with the props and state it says. DOMPurify keeps `data-*` unless told
   not to (`ALLOW_DATA_ATTR: false`).
 
 ```quillo

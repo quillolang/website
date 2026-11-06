@@ -32,6 +32,8 @@ print(set([1, 2, 3], 1, "b"), set([1, 2, 3], -1, "z"))
 - Any key becomes text: `5` sets `"5"`, `true` sets `"true"`, a decimal drops its
   trailing zeros (`1.50m` sets `"1.5"`), a list sets its text.
 - Without a value, the entry is set to `null` and `has` still finds it.
+- An error value as the key is given back, and nothing is set: its text was taken for a
+  key. The same in a loop that changes the map in place.
 - `null` as the map is an empty map.
 - Built up in a loop or in `reduce`, a map no one else holds is changed in place, so a
   map of thousands of entries costs milliseconds.
@@ -42,6 +44,7 @@ print(set(m, "a", 10), set(m, 5, "five"), set(m, 1.50m, "x"))
 print(set(m, "c"), has(set(m, "c"), "c"))
 print(set(null, "a", 1))
 print(range(5) | reduce({}, (acc, i) => set(acc, i, i * i)))
+print(set(m, int("q"), 1))
 ```
 
 ```output
@@ -49,6 +52,7 @@ print(range(5) | reduce({}, (acc, i) => set(acc, i, i * i)))
 { b: 2, a: 1, c: null } true
 { a: 1 }
 { "0": 0, "1": 1, "2": 4, "3": 9, "4": 16 }
+err("not an int: \"q\"")
 ```
 
 ### Errors

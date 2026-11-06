@@ -7,7 +7,7 @@ group: Database
 A table's or a column's name, checked and quoted, for SQL that cannot take it as a
 `?` parameter: `"title"`, or `` `title` `` when the program's database is MySQL. A
 list of names gives them separated by commas. A name is letters, digits and `_`,
-not starting with a digit and at most 64 characters long; anything else is refused,
+not starting with a digit and at most 63 bytes long; anything else is refused,
 so a name made from data (`` sql_name(`obj_${id}`) ``) cannot carry SQL into the
 query, and `quillo check` does not warn about SQL built with it.
 
@@ -30,8 +30,12 @@ insert into posts ("title", "body") values (:title, :body)
 
 - Underscores and digits are fine inside a name, and a name may start with `_`.
 - An empty list gives the empty string.
-- Exactly 64 characters is the longest name taken.
-- Only ASCII letters count: `é` is refused.
+- 63 bytes is the longest name taken, on every database (PostgreSQL keeps no more of a
+  name), so two names are never one there: 63 ASCII letters, 31 `é`s.
+- Letters and digits of any script count, and the marks written on a letter (Hindi's
+  vowel signs, an accent written apart): `sql_name("名前")` is `"名前"`. A character past
+  U+FFFF (an emoji, which MySQL takes in no name) is refused, and so is a name starting
+  with a digit of any script.
 - Take the columns from the program, never from what the visitor sent:
   `keys(request.form)` names `is_admin` and `id` as well as `email`, and they are names,
   so it takes them. A sign-up form with `is_admin=1` made an admin. A record type,
@@ -47,20 +51,22 @@ insert into posts ("title", "body") values (:title, :body)
 ```quillo
 print(sql_name("_x1"), sql_name("obj_42"))
 print(len(sql_name([])))
-let long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl"
+let long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijk"
 print(len(long), len(sql_name(long)))
+print(sql_name("名前"), sql_name("prénom"), sql_name("नाम"))
 ```
 
 ```output
 "_x1" "obj_42"
 0
-64 66
+63 65
+"名前" "prénom" "नाम"
 ```
 
 ### Errors
 
 A name with anything but letters, digits and `_`, an empty one, one starting with a
-digit, one over 64 characters, or a value that is not a string (or a list of strings)
+digit, one over 63 bytes, or a value that is not a string (or a list of strings)
 is a runtime error, not an error value: the request stops instead of running the SQL.
 
 ```quillo error
@@ -80,6 +86,14 @@ line 1: `sql_name`: "1abc" is not a name SQL can take (letters, digits and _)
 ```
 
 ```quillo error
+print(sql_name(repeat("a", 64)))
+```
+
+```output
+line 1: `sql_name`: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is not a name SQL can take (at most 63 bytes)
+```
+
+```quillo error
 print(sql_name(42))
 ```
 
@@ -92,12 +106,13 @@ line 1: `sql_name` takes a name (a str) or a list of them, got int
 ```quillo
 print(["id", "name"] | sql_name)
 let cols = ["title", "body"]
-print(`update posts set (${cols | sql_name}) = (${cols | sql_param}) where id = :id`)
+let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ")
+print(`update posts set ${set} where id = :id`)
 ```
 
 ```output
 "id", "name"
-update posts set ("title", "body") = (:title, :body) where id = :id
+update posts set "title" = :title, "body" = :body where id = :id
 ```
 
 ```quillo noexec

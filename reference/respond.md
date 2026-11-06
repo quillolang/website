@@ -8,7 +8,8 @@ A response with exactly the status, body and headers given. A route returns it w
 the plain forms (html, a str, a map) are not enough: a status of its own, a header
 such as `content-type` or `cache-control`, a 204 with nothing. The body is sent as a
 plain return value would be (html as HTML, a str as text, a map or list as JSON,
-null as nothing); header names are made lower case and values become text. The
+null as nothing); header names are made lower case and values become text, but a
+null one, which means no such header. The
 status must be 200 to 599: a 1xx is an interim answer, after which the client waits for
 the real one, so it is refused. The value's fields are `status`, `body` and `headers`.
 
@@ -43,8 +44,17 @@ route POST /items { json: { name: str } } {
 
 ### Edge cases
 
-- Header names are lower-cased; a value that is not a string is written as text, and
-  null becomes the text `null`, so leave a header out rather than set it to null.
+- Header names are lower-cased; a value is text or a number, written as text. `null`
+  means no such header: none is sent, not even the one Quillo would send itself, so
+  `{ "cache-control": null }` leaves out the `private` a page with a session gets, and
+  `{ server: null }` the `server: Quillo`. A header the route does not name keeps
+  Quillo's. `.headers` shows such a header as null.
+- A list is one header per item for `set-cookie` alone (`{ "set-cookie": ["a=1",
+  "b=2"] }` sends two, `[]` none); for another header a list is an error, as a map is.
+- A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in any
+  form a browser reads (`JavaScript:`, a tab inside), as `redirect` refuses it, naming
+  the scheme given: `` `respond` header `location` is not given a data: URL, got
+  "data:..." ``.
 - Without headers the map is empty: the server adds its own (`date`, `server`,
   `x-request-id`, `x-content-type-options`), and `content-length`,
   `transfer-encoding`, `connection` and `date` are the server's whatever is given.
@@ -56,7 +66,8 @@ route POST /items { json: { name: str } } {
   asks with a matching `If-None-Match`, as files do. Such an answer, or one with a
   `content-range`, goes out as it is: no prefetch or `--watch` script is added to it
   (`--watch` is the `quillo run` option that reloads open pages as the files change:
-  `quillo run main.qwe --watch`; see [the options](/docs/)).
+  `quillo run main.qwe --watch`; see [the options](/docs/)). A header set to `null`
+  is none, so `{ etag: null }` keeps them.
 - `reply status respond(...)` from a helper keeps the body and headers with the new
   status, so a helper can answer with headers too.
 
@@ -64,12 +75,14 @@ route POST /items { json: { name: str } } {
 print(respond(200, "x", { "X-Count": 42, "X-None": null }).headers)
 print(respond(200).headers)
 print(respond(200, <p>hi</p>).body)
+print(respond(200, "x", { "set-cookie": ["a=1", "b=2"] }).headers)
 ```
 
 ```output
-{ "x-count": "42", "x-none": "null" }
+{ "x-count": "42", "x-none": null }
 {}
 <p>hi</p>
+{ "set-cookie": ["a=1", "b=2"] }
 ```
 
 ```quillo noexec
@@ -86,8 +99,9 @@ A status outside 200 to 599 is a runtime error, and `quillo check` refuses a 1xx
 written in the call. So is a header whose name has
 anything but letters, digits and `-`, or whose value has a line break: text from a
 request cannot add headers, or a whole response, of its own. Headers that are not a
-map, or a status that is not an int, are runtime errors too. None of these is an error
-value.
+map, a header's list or map (but a `set-cookie` list), a `location` that runs code or
+carries a page, or a status that is not an int, are runtime errors too. None of these
+is an error value.
 
 ```quillo error
 print(respond(600, "x"))
@@ -111,6 +125,14 @@ print(respond(200, "x", { "x-note": "a\r\nb" }))
 
 ```output
 line 1: `respond` header `x-note`: names are letters, digits and -, values cannot contain line breaks
+```
+
+```quillo error
+print(respond(200, "x", { "x-tags": ["a", "b"] }))
+```
+
+```output
+line 1: `respond` header `x-tags` is a str, got list: only `set-cookie` takes a list, one header an item; join the values with ", "
 ```
 
 ### Chaining

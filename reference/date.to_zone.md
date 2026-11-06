@@ -5,8 +5,9 @@ group: Dates
 ### What it does
 
 The same instant written at a time zone's offset: `"2026-10-27T14:30:00Z"` in
-`"Europe/Paris"` is `"2026-10-27T15:30:00+01:00"`. The zone is an IANA name, `"UTC"`,
-or a fixed offset like `"+05:30"`; left out, it is UTC, which turns any date-time into
+`"Europe/Paris"` is `"2026-10-27T15:30:00+01:00"`. The zone is an IANA name, in any
+case, `"UTC"`, or a fixed offset like `"+05:30"`, `"+0530"` or `"+05"` (see
+[date.valid_zone](/docs/reference/date.valid_zone/)); left out, it is UTC, which turns any date-time into
 its UTC form. A named zone's offset follows daylight saving on that day. It takes a
 date-time; a date has no instant to move.
 

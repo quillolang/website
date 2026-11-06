@@ -5,7 +5,8 @@ group: Dates
 ### What it does
 
 The calendar date now, as ISO text `"YYYY-MM-DD"`, in UTC. With a time zone (an IANA
-name like `"Europe/Paris"`, `"UTC"`, or an offset like `"+05:30"`) it is the date in
+name like `"Europe/Paris"`, `"UTC"`, or an offset like `"+05:30"` or `"+0530"`) it is the
+date in
 that zone, which can be a day before or after UTC's. It reads the clock, so it is the
 `time` effect; a script run with `run_script` has the rest of `date` but not this.
 

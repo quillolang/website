@@ -8,9 +8,9 @@ The text as it is. Written as a tag on a template, `` css`...` ``, it tells edit
 highlight the text as CSS, and `quillo check` reads the classes it styles, so a class
 a page uses that no sheet styles gets a warning. It is the way to write a component's
 `style` and the sheet in `<style>{sheet}</style>`. Braces in the template are plain
-text; `${...}` fills in values, each with its `{`, `}`, `;` and `\` written as CSS's
-escapes (`\7b `, `\7d `, `\3b `, `\5c `), so a value is one value and adds no declaration
-or rule of its own *(since 0.7)*.
+text; `${...}` fills in values, each with its `{`, `}`, `;`, `\` and `&` written as
+CSS's escapes (`\7b `, `\7d `, `\3b `, `\5c `, `\26 `), so a value is one value and adds
+no declaration or rule of its own *(since 0.7)*.
 
 ### Examples
 
@@ -35,8 +35,9 @@ print(css`.title { color: ${accent} }`)
 ### Edge cases
 
 - The result is a plain string, equal to the text written: nothing is parsed or
-  minified. Only the values of `${...}` are escaped, and only those four characters, so
-  `a > b` and `url(...)` in a value stay as they are.
+  minified. Only the values of `${...}` are escaped, and only those five characters, so
+  `a > b` and `url(...)` in a value stay as they are. The `&` is among them because
+  inside `<svg>` and `<math>` a browser reads a `<style>`'s `&#125` as a `}`.
 - A value from a visitor cannot end its rule: `?color=red} input[value^=a]{...}` added a
   rule that read the page's fields. A value that is meant to hold declarations of its
   own, `"color: red; margin: 0"`, is one value too: join such text with `+`, outside the
@@ -60,10 +61,12 @@ true
 ```quillo
 let q = "red} input{background:url(//evil/a)"
 print(css`.title { color: ${q} }`)
+print(css`.title { color: ${"red&#125 rect{fill:red"} }`)
 ```
 
 ```output
 .title { color: red\7d  input\7b background:url(//evil/a) }
+.title { color: red\26 #125 rect\7b fill:red }
 ```
 
 ### Errors

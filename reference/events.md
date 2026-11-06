@@ -11,8 +11,10 @@ keeps a quiet connection open. The second argument may be a map, `send(value, { 
 id, retry })`: the event's name, an id, which a browser sends back as `Last-Event-ID`
 when it connects again (`listen` does), and `retry`, how many milliseconds it waits
 before it does. `send(null, { id })` sends the id alone. The `content-type` is `text/event-stream` with
-`cache-control: no-cache`. The options are `status` (200 unless given, 200 to 599)
-and `headers`. A page follows the events with `listen` or `receive`. See
+`cache-control: no-cache`. The options are `status` (200 unless given, 200 to 599,
+but not 204, 205 or 304, which have no body) and `headers`, taken as
+[respond](/docs/reference/respond/) takes them. A page follows the events with `listen`
+or `receive`. See
 [Streaming](/docs/routes/#streaming).
 
 ### Examples
@@ -57,8 +59,11 @@ print(e.status, e.headers, e.body)
 ### Edge cases
 
 - There is no `type` option: an event stream is always `text/event-stream`, and a
-  `type` given is ignored. `headers` can still replace any header, `content-type`
-  included.
+  `type` given as text is ignored; one that is not text is an error, as for `stream`.
+  `headers` can still replace any header, `content-type` included, and a header's
+  `null` leaves it out (`{ "cache-control": null }` sends none).
+- A status with no body (204, 205, 304), given as the option or by `reply`, is an error
+  before anything is sent, as for `stream`.
 - `x-accel-buffering: no` is set, so proxies pass events on as they come.
 - The function runs when the answer is sent, not when `events` is called.
 - When the client goes away, the next `send` ends the function, so a function that
@@ -84,8 +89,9 @@ print(events((send) => send("x"), { headers: { "x-accel-buffering": "yes" } }).h
 
 ### Errors
 
-A first argument that is not a function, options that are not a map, and a `status`
-outside 200 to 599 are runtime errors, not error values.
+A first argument that is not a function, options that are not a map, a `type` that is
+not text, and a `status` outside 200 to 599 or with no body are runtime errors, not
+error values.
 
 ```quillo error
 print(events({ done: 1 }))

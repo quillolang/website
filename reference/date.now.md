@@ -5,7 +5,8 @@ group: Dates
 ### What it does
 
 The date and time now, to the second, as RFC 3339 text: `"2026-10-27T14:30:00Z"` in
-UTC. With a time zone (an IANA name, `"UTC"`, or an offset like `"+05:30"`) it is the
+UTC. With a time zone (an IANA name, `"UTC"`, or an offset like `"+05:30"` or `"+0530"`;
+see [date.valid_zone](/docs/reference/date.valid_zone/)) it is the
 same instant written at that zone's offset, `"2026-10-27T15:30:00+01:00"`. It reads the
 clock, so it is the `time` effect, and a script run with `run_script` does without it.
 For milliseconds as an int, use [now](/docs/reference/now/).

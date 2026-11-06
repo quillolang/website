@@ -12,7 +12,9 @@ is not, in which case the database stays as it was: without any `db.open` that i
 `$QUILLO_DB`, or else SQLite in memory. A target with `{tenant}` in it, or a function
 giving a target for each tenant, is a database per tenant (see
 [db.tenants](/docs/reference/db.tenants/)). The options map takes `replicas`, a list of
-URLs that take a PostgreSQL or MySQL database's reads.
+URLs that take a PostgreSQL or MySQL database's pure reads: a `select` that calls a
+function that may write (`nextval`, or one made with `create function`) goes to the
+primary.
 
 ### Examples
 
@@ -51,7 +53,15 @@ db.open("data/{tenant}.db")                        // a SQLite file per tenant
   `db.open` whose error nothing takes (alone on a line) stops it, with the reason *(since
   0.7)*: take the error, `let r = db.open(...)`, to go on without it.
 - Only `postgres://`, `postgresql://`, `mysql://` and `mariadb://` are servers; any
-  other text is a SQLite file's path.
+  other text is a SQLite file's path. A host may be an IPv6 address,
+  `mysql://app@[::1]:3306/app`.
+- A MySQL or MariaDB database that is not there is an error value (`Unknown database
+  'shop'`), as on PostgreSQL, so a typo in a URL makes no empty database; a tenant's is
+  made by the driver when the program makes the tenant.
+- `files()` and `quillo serve` never send a SQLite file, whatever its name or folder;
+  `file("app.db")` sends one on purpose. The program's `write_file`, `delete_file` and
+  `save_upload` refuse the databases it has open, with their `-wal`, `-shm` and
+  `-journal` files and the folder holding them.
 - Without `db.open` the database is SQLite in memory, so `db.query` works in any
   program, and its data is gone at restart.
 
@@ -66,7 +76,7 @@ print(db.open(":memory:"), db.query("select * from t"))
 
 ```output
 [{ x: 1 }]
-null { changes: 0, last_id: 0 } { changes: 1, last_id: 1 }
+null { changes: 0, last_id: null } { changes: 1, last_id: 1 }
 null err("db: no such table: t")
 null [{ n: 1 }]
 true [{ n: 1 }]

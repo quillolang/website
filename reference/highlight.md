@@ -10,7 +10,9 @@ spans: `hl-k` keywords, `hl-s` strings, `hl-c` comments, `hl-n` numbers and cons
 keys. The languages are Quillo (`quillo`, `qwe`), JavaScript and TypeScript (`js`,
 `ts`, `jsx`, `tsx`, `mjs`), Python, Rust, shell (`sh`, `bash`, `zsh`, `console`), SQL,
 CSS, HTML and XML (`html`, `xml`, `svg`) and JSON. The result is an `html` value, shown
-in markup as it is. No stylesheet comes with it: the page styles the classes.
+in markup as it is, the same on the server and in the browser. It reads each line once,
+so it takes time in proportion to the text. No stylesheet comes with it: the page
+styles the classes.
 
 ### Examples
 
@@ -33,6 +35,18 @@ print(highlight("<div class=\"x\">hi</div>", "html"))
 - The language's name is matched without regard to case: `"PYTHON"` is Python.
 - Empty code gives an empty `html` value.
 - Lines are kept as they are; put the result in `<pre>` to show them.
+- Strings are coloured as each language reads them: Python's triple-quoted and Rust's
+  strings run over lines, Rust's raw strings `r#"..."#` have no escapes, a Rust
+  character such as `'"'` is a string and a lifetime `'a` is not, a JavaScript regex
+  literal is one token, a shell's `it's` or a `#` inside a word starts nothing, and a
+  range's `..` ends the number before it (`0..10` is two numbers). A word is Unicode
+  letters and digits on both sides.
+- Under `--max-compute` (`quillo run main.qwe --max-compute 2s`; see [the
+  options](/docs/)), or a policy's `max_compute`, a highlight of a long text ends there
+  as a loop does: the request is a 500, not an error value a `??` takes
+  (`highlight(x) ?? x` too).
+- In the browser, `str(highlight(...))` is the markup, as on the server, and only its
+  own languages are known: `"constructor"` and `"__proto__"` are escaped text.
 
 ```quillo
 print(highlight("a < b & c", "cobol"))
@@ -40,6 +54,9 @@ print(highlight("a < b"))
 print(highlight("x = 1", "PYTHON"))
 print(len(str(highlight("", "js"))))
 print(highlight("def f():\n    return 1", "python"))
+print(highlight("for i in 0..10 {}", "rust"))
+print(highlight("let c = '\"'; let s = r#\"a\\\"#;", "rust"))
+print(highlight("echo it's # done", "sh"))
 ```
 
 ```output
@@ -49,6 +66,9 @@ x = <span class="hl-n">1</span>
 0
 <span class="hl-k">def</span> <span class="hl-f">f</span>():
     <span class="hl-k">return</span> <span class="hl-n">1</span>
+<span class="hl-k">for</span> i <span class="hl-k">in</span> <span class="hl-n">0</span>..<span class="hl-n">10</span> {}
+<span class="hl-k">let</span> c = <span class="hl-s">'&quot;'</span>; <span class="hl-k">let</span> s = <span class="hl-s">r#&quot;a\&quot;#</span>;
+<span class="hl-k">echo</span> it's <span class="hl-c"># done</span>
 ```
 
 ### Errors

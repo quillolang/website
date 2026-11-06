@@ -42,7 +42,11 @@ translations("locales", { default: "fr" })
 - Calling it again replaces the translations; the last call counts.
 - A plural map needs `other`; a map with `one` alone is nested keys (`n.one`), not a
   plural entry.
-- A folder path is relative to the program's folder and must stay inside it.
+- A folder path is relative to the program's folder and must stay inside it. A file
+  named with `_` (`fr_FR.json`) is read as `fr-FR`, and a byte-order mark at a file's
+  start, as Windows editors save one, is skipped.
+- Plural forms are picked by CLDR 47's rules for the number as `{count}` shows it, the
+  same on the server and in the browser (see [t](/docs/reference/t/)).
 - It gives `null`.
 
 ```quillo

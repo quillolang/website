@@ -43,11 +43,14 @@ null null
   line.
 - `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
   belong to each answer, and are refused here.
+- A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in any
+  form a browser reads, as `redirect` and `respond` refuse it, naming the scheme given.
 
 ### Errors
 
 A path that does not start with `/`, a name that is not a header's, a value over two
-lines, or an answer's own header, is a runtime error.
+lines, a `location` that runs code or carries a page, or an answer's own header, is a
+runtime error.
 
 ```quillo error
 site_headers({ "set-cookie": "a=1" })

@@ -10,7 +10,7 @@ SQL that cannot take it as a `?` parameter. On a connection from `db.connect`,
 the program's database, as `sql_name` does. MySQL gets backticks (`` `title` ``), since it
 reads `"title"` as text; SQLite and PostgreSQL get double quotes. A list of names gives
 them separated by commas. The names it takes are those `sql_name` takes: letters, digits
-and `_`, not starting with a digit, at most 64 characters. It asks the database nothing,
+(of any script) and `_`, not starting with a digit, at most 63 bytes. It asks the database nothing,
 so it needs no effect, and `quillo check` does not warn about SQL built with it.
 
 ### Examples
@@ -62,7 +62,7 @@ print(cols())
 ### Errors
 
 A name with anything but letters, digits and `_`, an empty one, one starting with a
-digit, one over 64 characters, or a value that is not a string (or a list of strings)
+digit, one over 63 bytes, or a value that is not a string (or a list of strings)
 is a runtime error, not an error value: the request stops instead of running the SQL.
 
 ```quillo error

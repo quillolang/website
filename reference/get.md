@@ -29,18 +29,22 @@ Ann null none
 - Keys are text: `get(m, 5)` and `get(m, "5")` read the same entry; a decimal key is
   read without its trailing zeros, so `1.50m` finds `"1.5"`.
 - A `null` map is an empty map: `get(null, k, d)` is `d`, not an error.
+- An error value as the key is given back, not the default: it is no key (its text was
+  taken for one), so `int(id)` that failed is not looked up as `err(...)`.
 
 ```quillo
 let m = { a: null, "5": "five", "1.5": "x" }
 print(get(m, "a", 0), get(m, "a") ?? 0)
 print(get(m, 5), get(m, 1.50m))
 print(get(null, "a"), get(null, "a", "dflt"))
+print(get(m, int("q"), "dflt"))
 ```
 
 ```output
 null 0
 five x
 null dflt
+err("not an int: \"q\"")
 ```
 
 ### Errors

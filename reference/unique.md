@@ -28,17 +28,22 @@ print(unique(map(orders, (o) => o.user)))
 
 - An empty list or `null` gives `[]`.
 - Numbers equal across types: `[1, 1.0, dec("1.00")]` keeps only the first, `1`. The
-  string `"1"` is a different value.
+  string `"1"` is a different value. An int and a float are compared exactly, as `==`
+  does: `9007199254740993` and `9007199254740992.0` are two items. `NaN` equals
+  nothing, so each `NaN` is kept.
 - Strings compare exactly: `"a"` and `"A"` are two items.
 - `null` is a value: several nulls become one.
-- Lists and maps are compared by contents, so two equal maps become one. Each item is
-  compared with every item kept so far, which is fine for hundreds, slow for a million.
+- Lists and maps are compared by contents, so two equal maps become one.
+- It takes time in proportion to the list, whatever it holds (200,000 items in
+  under a second, deep lists too), and keeps exactly what comparing each item with `==`
+  against those kept would keep, on the server and in the browser.
 
 ```quillo
 print(unique([]), unique(null))
 print(unique([1, 1.0, dec("1.00"), "1"]))
 print(unique(["a", "A", "a"]), unique([null, null, 1]))
 print(unique([[1, 2], [1, 2], { a: 1 }, { a: 1 }]))
+print(unique([9007199254740993, 9007199254740992.0, 9007199254740992]))
 ```
 
 ```output
@@ -46,6 +51,7 @@ print(unique([[1, 2], [1, 2], { a: 1 }, { a: 1 }]))
 [1, "1"]
 ["a", "A"] [null, 1]
 [[1, 2], { a: 1 }]
+[9007199254740993, 9007199254740992.0]
 ```
 
 ### Errors

@@ -44,9 +44,12 @@ false
 - A page that is being let in (its `join` said yes but the yes has not reached it)
   gets the message right after its yes.
 - The value may be `null`, text, a number, a map or a list; bytes go as a list of
-  numbers.
-- Over 4096 messages waiting for one page, a plain message is dropped and counted; a
-  `reliable` one closes the connection, so the page comes back and joins again.
+  numbers. An error value reaches the page as an error value; one Quillo made (a
+  builtin's) reaches it as `err("internal error")` in production, and whole under
+  `--watch`.
+- Over a WebSocket, a page that keeps up gets every message, in order. Over 4096
+  messages waiting for one page, a plain message is dropped and counted; a `reliable`
+  one closes the connection, so the page comes back and joins again.
 - `except` is an option of `channel.broadcast`, not of `channel.send`.
 
 ```quillo

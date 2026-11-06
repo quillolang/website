@@ -8,8 +8,8 @@ Runs a function on the server on a timetable: every so often, given as a duratio
 (seconds, or `"30s"`, `"5m"`, `"1h"`, `"1d"`, `"2w"`, `"1y"`, counted from 1970 in UTC
 so that `"5m"` runs at :00, :05, ...), or at the times of a cron line (`minute hour
 day month weekday`, in UTC, with `*`, `1-5`, `*/15` and lists, or `@hourly`, `@daily`,
-`@weekly`, `@monthly`, `@yearly`). Written at the top of a program, which `quillo run`
-then serves. A job is named after its function, or by `{ name }`; no two alike. It
+`@weekly`, `@monthly`, `@yearly`). Written at the top of a program (or in a function
+the top level calls as it starts), which `quillo run` then serves. A job is named after its function, or by `{ name }`; no two alike. It
 gives null. See [Scheduled jobs](/docs/concurrency-and-reloading/#scheduled-jobs).
 
 ### Examples
@@ -26,15 +26,25 @@ schedule(60, ping, { name: "ping-minute" })      // seconds
 
 ### Edge cases
 
-- A job first seen (at start, or after a reload) waits for its next time; it never
-  runs at once. The clock is looked at once a second.
+- A job first seen (at start, or after a reload) waits for its next time, counted from
+  when the server first looks: started at 04:01, `"2 * * * *"` first runs at 04:02, and
+  a nightly job of a server deployed each day runs that night. It never runs at once.
+  The clock is looked at once a second.
+- Only as the program starts: called in a route, a `server fn`, a job or a tick, it is
+  a runtime error (a 500 in a route), where the job was said to be added and never ran.
+  `quillo check` says so too, and reads the arguments written out as the start does.
 - A job runs like a request: waiting on the database holds up no request, its errors
   are printed, and it is logged (`POST /_quillo/job/clean_sessions?at=... -> 200`). One
   still running when it is due again is skipped that time.
 - Names are letters, digits, `_`, `-` and `.`, at most 64: a lambda is `job-<line>`
   unless `{ name }` says, and the same function twice needs a name for the second.
 - Weekdays in a cron line are numbers 0 to 7 (0 and 7 are Sunday), not names: `"0 9 *
-  * 1-5"`, not `mon-fri`. A duration must be more than 0.
+  * 1-5"`, not `mon-fri`. The fields may be separated by spaces or tabs. A duration
+  must be more than 0.
+- One name twice is refused by `quillo check` only where both calls surely run (the
+  top level's own statements, or those of a function it calls); where both may run,
+  in two arms of an `if` or a `match`, after `&&`, or in a loop, it is a warning, and
+  the start refuses the second only if it really comes.
 - Several servers on one database run each job once per due time; with a database per
   tenant, each server runs its jobs, and the job loops over the tenants with
   `with_tenant`. The `quillo run` option `--no-jobs` turns them off on a server
@@ -49,7 +59,7 @@ schedule(60, ping, { name: "ping-minute" })      // seconds
 A first argument that is neither a duration nor a cron line (a wrong unit, 0, a cron
 line without 5 fields, a field out of range, an unknown `@name`), a second that is not
 a function, a bad or repeated name, and options that are not a map are runtime errors
-when the program loads, not error values.
+when the program loads, not error values; so is a call once the program has started.
 
 ```quillo error
 schedule("soon", () => 1)
@@ -75,6 +85,13 @@ schedule("1h", clean)
 
 ```output
 line 3: `schedule`: there is already a job named "clean"; give this one another with { name: ... }
+```
+
+```quillo noexec
+fn clean() = 1
+route POST /admin/jobs = { schedule("5m", clean); "added" }
+// `schedule` adds a job as the program starts, at its top level: called here, once it
+// has started (in a route, a server fn, a job or a tick), the job would never run
 ```
 
 ### Chaining

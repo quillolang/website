@@ -31,7 +31,8 @@ print(re.find_all("hello", "\\d+"))
   `matchAll` does, so the empty pattern matches at every position, the end included.
 - Positions count characters, not bytes, and `start`/`end` of each match are
   positions in the whole text.
-- With `"m"`, `^` and `$` match at each line.
+- With `"m"`, `^` and `$` match at each line: a line ends at `\n` or `\r`, and `\r\n` is
+  one end (U+2028 is none), on both sides.
 
 ```quillo
 print(re.find_all("aaa", "aa") | map((m) => [m.start, m.end]))

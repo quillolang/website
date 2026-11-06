@@ -29,22 +29,24 @@ print(defaults)
 - Order: keys of the first map in their order, then the new keys of the second;
   a key in both keeps the first map's position.
 - `null` on either side is an empty map; `merge(null, null)` is `{}`.
-- Only two maps: a third argument is ignored. Fold more with `reduce`.
+- Only two maps: a third argument is a runtime error (below). Fold more with `reduce`.
+- The order is the same in the browser, keys that look like numbers included:
+  `merge({ b: 1 }, { "2": 2 })` is `{ b: 1, "2": 2 }` on both sides.
 
 ```quillo
 print(merge({ a: 1, b: 2 }, { b: null }))
 print(merge({ a: 1, b: 2 }, { c: 3, a: 0 }) | keys)
 print(merge({ a: 1 }, null), merge(null, { a: 1 }), merge(null, null))
-print(merge({ a: 1 }, { b: 2 }, { c: 3 }))
 print([{ a: 1 }, { b: 2 }, { c: 3 }] | reduce({}, merge))
+print(merge({ b: 1 }, { "2": 2 }) | keys)
 ```
 
 ```output
 { a: 1, b: null }
 ["a", "b", "c"]
 { a: 1 } { a: 1 } {}
-{ a: 1, b: 2 }
 { a: 1, b: 2, c: 3 }
+["b", "2"]
 ```
 
 ### Errors
@@ -58,6 +60,17 @@ print(merge({ a: 1 }, [1]))
 
 ```output
 line 1: `merge` expects a map as argument 2, got list
+```
+
+A third map is a runtime error, and one for `quillo check` when the call is written
+out:
+
+```quillo error
+print(merge({ a: 1 }, { b: 2 }, { c: 3 }))
+```
+
+```output
+line 1: `merge` takes 2 arguments, got 3: merge(a, b)
 ```
 
 ### Chaining

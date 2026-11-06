@@ -73,8 +73,9 @@ null null
 
 ### Errors
 
-A path that is not a string, and a `javascript:` URL, are runtime errors, not error
-values, on the server as in the browser.
+A path that is not a string, and a `javascript:` or `vbscript:` URL, are runtime
+errors, not error values, on the server as in the browser; the refusal names the scheme
+it was given.
 
 ```quillo error
 print(navigate(42))

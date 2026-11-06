@@ -30,8 +30,9 @@ print(reverse(sort([3, 1, 2])))
 
 - An empty list or `null` gives `[]`. The list given is not changed.
 - Strings order by code point, not alphabetically: every capital comes before every
-  lower-case letter, letters outside ASCII after them, and `"10"` before `"9"`. Sort
-  by `lower` for a case-blind order, and numbers as numbers, not as text.
+  lower-case letter, letters outside ASCII after them, and `"10"` before `"9"`, in the
+  browser too. Sort by `lower` for a case-blind order, and numbers as numbers, not as
+  text.
 - Stable: `sort([1, 1.0])` keeps `1` first and `sort([1.0, 1])` keeps `1.0` first.
 - Duplicates stay; [unique](/docs/reference/unique/) removes them.
 - Ints with decimals sort exactly; a float with a decimal does not compare (see Errors).
@@ -60,8 +61,9 @@ print(sort([2, dec("1.75"), 1]))
 
 An argument that is not a list or `null` is a runtime error, not an error value. Two
 items that do not order are a runtime error too: a string with a number, `null`,
-booleans, lists, maps, `NaN`, or a decimal with a float (convert one side first). A
-list of one item is never compared, so `sort([null])` is `[null]`.
+booleans, lists, maps, `NaN`, or a decimal with a float (convert one side first), in
+the browser as on the server; `vec.argsort` puts NaN last. A list of one item is never
+compared, so `sort([null])` is `[null]`.
 
 ```quillo error
 print(sort([1, "a"]))

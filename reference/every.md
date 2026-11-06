@@ -58,7 +58,12 @@ component Saved() {
 - At the top of a program it is a server tick: counted from 1970 so each tick falls on
   a multiple of `ms`; a tick still running when the next is due skips it; ticks stop
   with the server and on a reload; a program with one is a server. Two ticks cannot
-  share a name, and a name is letters, digits, `_`, `-` and `.`.
+  share a name, and a name is letters, digits, `_`, `-` and `.`. `quillo check` refuses a
+  name twice only where both calls surely run, and warns where both may (two arms of
+  an `if`, a loop); the start refuses the second only if it really comes.
+- On the server, only as the program starts: called in a route, a `server fn`, a job or
+  a tick, it is a runtime error (a 500 in a route), where the tick was said to be added
+  and never ran. `quillo check` reads its written-out arguments as the start does.
 - `quillo check` wants a number and a function: `every("fast", f)` is `` argument 1 of
   `every` must be num, got str `` and `every(100)` is `` missing argument `f`, a
   function, in call to `every`: every(ms, f, options) ``.
@@ -76,7 +81,8 @@ line 3: `every`: there is already a tick named "tick"; give this one another wit
 ### Errors
 
 On the server a tick needs at least one millisecond and a function: anything else is a
-runtime error, not an error value, as the program loads.
+runtime error, not an error value, as the program loads; so is a call once the program
+has started.
 
 ```quillo error
 fn tick() { print("tick") }

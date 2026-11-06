@@ -6,7 +6,7 @@ group: Dates
 
 Milliseconds since 1970, as `now()` or [date.ms](/docs/reference/date.ms/) give them, as
 a date-time to the second: `"2026-11-01T14:30:00Z"`. With a time zone (an IANA name,
-`"UTC"` or an offset like `"+05:30"`) it is written at that zone's offset at that
+`"UTC"` or an offset like `"+05:30"`, `"+0530"` or `"+05"`; see [date.valid_zone](/docs/reference/date.valid_zone/)) it is written at that zone's offset at that
 instant; left out, in UTC. `date.from_ms(now(), "Europe/Lisbon")` is the time now in
 Lisbon.
 

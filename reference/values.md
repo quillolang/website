@@ -23,7 +23,8 @@ print(values(prices) | sum)
 
 ### Edge cases
 
-- Order follows `keys`: `values(m)[i]` belongs to `keys(m)[i]`.
+- Order follows `keys`: `values(m)[i]` belongs to `keys(m)[i]`, in the browser too,
+  keys that look like numbers included.
 - A `null` value stays in the list; nothing is dropped.
 - An empty map and `null` both give `[]`.
 

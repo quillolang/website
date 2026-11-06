@@ -43,7 +43,12 @@ A <strong>headline</strong>
 - A `javascript:` or `vbscript:` link or image becomes `about:blank#blocked`; other
   schemes pass as written.
 - A fenced code block that names a language comes out highlighted, as
-  [highlight](/docs/reference/highlight/) does it, in `<pre class="hl">`.
+  [highlight](/docs/reference/highlight/) does it, in `<pre class="hl">`. The language
+  is the fence's first word, to a space or a comma: ```` ```rust,ignore ```` is Rust.
+- It takes time in proportion to the text, whatever marks it holds (a megabyte of
+  `*a_` is 0.03 s), and under `--max-compute` (`quillo run main.qwe --max-compute 2s`)
+  or a policy's `max_compute` a long text ends there as a loop does: the request is a
+  500, not an error value a `??` takes.
 - With `inline`, lines and paragraphs are joined by `<br>`, and a list's items keep
   their marks as text (`• `, `1. `); a heading is its text.
 - An `html` value is not equal to a string with the same text; compare `str(...)`.
@@ -52,6 +57,7 @@ A <strong>headline</strong>
 print(len(str(markdown(""))))
 print(markdown("[click](javascript:alert(1))"))
 print(markdown("```js\nlet x = 1\n```"))
+print(markdown("```rust,ignore\nfn x() {}\n```"))
 print(markdown("# Big\n\n- one\n- two", { inline: true }))
 print(markdown("para one\n\npara two", { inline: true }))
 let h = markdown("*a*")
@@ -63,6 +69,9 @@ print(h == "<p><em>a</em></p>\n", str(h) == "<p><em>a</em></p>\n")
 <p><a href="about:blank#blocked">click</a></p>
 
 <pre class="hl"><code class="language-js"><span class="hl-k">let</span> x = <span class="hl-n">1</span>
+</code></pre>
+
+<pre class="hl"><code class="language-rust"><span class="hl-k">fn</span> <span class="hl-f">x</span>() {}
 </code></pre>
 
 Big<br>• one<br>• two
@@ -95,7 +104,9 @@ line 1: `markdown` expects options as a map, got str
 
 In a pipeline the text comes first, so the options are the only argument written. In
 a component the server makes it (a request to `/_quillo/markdown`), awaited like a
-`server fn`: call it in an event handler and keep the text in state.
+`server fn`: call it in an event handler and keep the text in state. That request takes
+at most 1 MB of text: a larger one is answered 413, and `markdown` in the component
+gives an error value; one that computes past `--max-compute` is a 500.
 
 ```quillo
 print("the *caption*" | markdown({ inline: true }))

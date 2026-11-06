@@ -34,7 +34,9 @@ print(date.at("2026-10-27"), date.at("2026-10-27", null, "Europe/Paris"))
 - The date and the time may be one text, as `<input type="datetime-local">` gives
   them: `date.at("2026-10-27T14:30", "America/New_York")`, the options third.
 - The result is in local form; `date.to_zone` it for UTC, or `date.ms` for a number.
-- The zone can be a fixed offset.
+- The zone can be a fixed offset, written `+05:30`, `+0530` or `+05`; a name is the
+  IANA database's in any case, the same on the server and in the browser (see
+  [date.valid_zone](/docs/reference/date.valid_zone/)).
 
 ```quillo
 print(date.at("2026-03-29", "02:30", "Europe/Paris"), date.at("2026-10-25", "02:30", "Europe/Paris"))

@@ -5,8 +5,8 @@ group: Dates
 ### What it does
 
 The calendar date of a date-time in a time zone: what day it is there at that instant,
-as ISO text `"YYYY-MM-DD"`. The zone is an IANA name, `"UTC"` or an offset like
-`"+05:30"`; left out, it is UTC. It is also the way from a date-time to a date for the
+as ISO text `"YYYY-MM-DD"`. The zone is an IANA name (see [date.valid_zone](/docs/reference/date.valid_zone/)), `"UTC"` or
+an offset like `"+05:30"` or `"+0530"`; left out, it is UTC. It is also the way from a date-time to a date for the
 functions that take only dates (`date.add_days`, `date.days_between` and the rest).
 
 ### Examples

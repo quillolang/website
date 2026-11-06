@@ -64,6 +64,17 @@ component Share(link: str) {
 - A `state` initializer that reads the page (`state dark = js("localStorage.getItem",
   "theme") == "dark"`) gives `null` from `js` while the server renders the component,
   and runs again in the browser once the component is on the page, which sets the state.
+- The page's JavaScript gets plain numbers: a whole float such as `2.0`, a float in
+  Quillo's code, reaches it as the number `2`, inside lists and maps too, given to
+  `js(...)`, to a function the page gave, or set on the page's object.
+- A map reaches the page's code as a plain object. A Quillo map keeps the order its
+  keys were set, where a JavaScript object lists keys that are array indexes (`"0"`,
+  `"7"`) first: a map holding such a key out of that order reaches the page as a plain
+  copy in JavaScript's order, so `URLSearchParams`, `Headers` and deep-equality libraries
+  take it, and what the page changes in that copy does not show in Quillo. A map
+  without such keys is the map itself, as before, and a change the page makes to it
+  shows. What a function of the program's gives back to page code that called it is
+  given the same way.
 - What comes back from the page keeps its properties and methods: `el.value`,
   `chart.update()`, and its fields can be set (`el.scrollTop += 100`). `innerHTML`,
   `on...` handlers and `javascript:` URLs are not set.

@@ -28,19 +28,23 @@ print(math.floor(7 / 2))
 - A negative number rounds away from zero: `math.floor(-0.5)` is `-1`; for rounding
   toward zero use [math.trunc](/docs/reference/math.trunc/).
 - `-0.0` gives `0`, an int, with no sign.
-- A float past what an int holds (about 9.2 × 10¹⁸) is a runtime error, `integer
-  overflow`, not a clamped value.
+- A float past what an int holds (2^63, about 9.22 × 10¹⁸) is a runtime error,
+  `integer overflow`, not a clamped value; up to it, an int.
+- `math.floor(a / b)` of two ints is integer division, done in ints, so it is exact past
+  2^53, however the call is written. A quotient kept in a variable first is a float.
 - A float whose fraction was lost to rounding floors as it is: `math.floor(0.1 + 0.2)`
   is `0`.
 
 ```quillo
 print(math.floor(-0.5), math.floor(-0.0), math.floor(0.1 + 0.2))
-print(math.floor(9.1e18))
+print(math.floor(9.1e18), math.floor(9.22e18))
+print(math.floor(9007199254740995 / 2), math.floor(-7 / 2))
 ```
 
 ```output
 -1 0 0
-9100000000000000000
+9100000000000000000 9220000000000000000
+4503599627370497 -4
 ```
 
 ```quillo error

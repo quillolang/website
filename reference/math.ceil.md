@@ -28,17 +28,20 @@ print(math.ceil(7 / 2))
 - A negative number rounds toward zero: `math.ceil(-0.5)` is `0`, the same as
   [math.trunc](/docs/reference/math.trunc/) gives there.
 - Any positive fraction, however small, rounds up: `math.ceil(0.3)` is `1`.
-- A float past what an int holds (about 9.2 × 10¹⁸) is a runtime error, `integer
-  overflow`.
-- Pages of ten for 21 items: `math.ceil(21 / 10)` is `3`. Division of ints that does
-  not come out even is a float, which is why this works.
+- A float past what an int holds (2^63, about 9.22 × 10¹⁸) is a runtime error,
+  `integer overflow`; up to it, an int.
+- Pages of ten for 21 items: `math.ceil(21 / 10)` is `3`. Of two ints written in the
+  call, the division is done in ints, so it is exact past 2^53 too; a quotient kept in a
+  variable first is a float.
 
 ```quillo
 print(math.ceil(-0.5), math.ceil(0.3), math.ceil(21 / 10))
+print(math.ceil(9007199254740995 / 2))
 ```
 
 ```output
 0 1 3
+4503599627370498
 ```
 
 ```quillo error

@@ -71,6 +71,10 @@ for the whole program.
   visitor who signs in afterwards is seen so once the page reconnects.
 - What `join` broadcasts, or sends to the page that is joining, reaches that page right
   after its yes.
+- `join` and `leave` pair: a page asks to join a room once at a time (a second ask while
+  one runs is not a second `join`), a refused page has no `leave`, and each `join` that
+  said yes gets exactly one `leave`, also when the page left or closed while its `join`
+  was still running. A count kept in `join` and `leave` stays right.
 - `f`, `join` and `leave` run for the page's tenant: what they broadcast, send or list
   is that tenant's room's. A page with no tenant (the bare domain) is in the room of no
   tenant. Under `--split`, a service's channel is per tenant whatever it says.

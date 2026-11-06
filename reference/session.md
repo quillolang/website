@@ -46,7 +46,10 @@ nobody
 - Reading it never renews it: a session ends when its time is up however often the
   visitor comes. Call `set_session` again on the requests that count as use.
 - After `set_session` in the same run, `session()` gives the new map at once; after
-  `end_session`, `{}` again.
+  `end_session`, `{}` again. So it is in `parallel`'s functions.
+- Each request reads the cookie it came with: two requests of one visitor that change
+  the session at once do not see each other's change, and the last cookie wins. Keep
+  what must not be lost in a table keyed by an id in the session.
 - Inside a `live` loader it is the viewer's session, since the loader runs as a call
   from the page. `unwatched(() => session())` reads it without following anything.
 

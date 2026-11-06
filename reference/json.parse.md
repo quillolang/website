@@ -28,12 +28,22 @@ Ann a 4
 ### Edge cases
 
 - A number with a point or an exponent is a float even when it is whole: `3.0` and
-  `1e3` are floats, `3` is an int.
+  `1e3` are floats, `3` is an int, in the browser too, where
+  `json.stringify(json.parse("1.0"))` is `1.0`.
 - No decimals are made: `12.50` becomes the float `12.5`. Keep amounts as strings in
   JSON and convert with `dec`.
 - An int past 64 bits becomes a float, and loses digits; a number past what a float
-  holds (`1e400`) is an error.
-- A key given twice keeps the last value. Keys keep the order they were written in.
+  holds (`1e400`) is an error, and so is half of a character (a lone `\ud83d`), on both
+  sides.
+- A key given twice keeps the last value. Keys keep the order they were written in, in
+  the browser too, keys that look like numbers included: `{"b": 1, "1": 2}` lists `b`
+  first on both sides, where a JavaScript object puts `"1"` first.
+- Arrays and objects nest at most 128 deep, on both sides: deeper is an error value,
+  `invalid JSON: it nests more than 128 deep`. A request's `json` and `http.*`'s
+  `.json` take as many levels, and are `null` past them, as for text that is not JSON;
+  a stream's line past them is its text, and a database's JSON cell that error. Every
+  other reader (sessions, channels, a `server fn`'s arguments, a service's body) takes
+  the same depth.
 - Only one value: text after it is an error, but spaces around it are fine.
 - Any valid JSON value is accepted at the top, not only an object or an array.
 - A text holds at most a value for each 8 bytes of it, or a million, whichever is more:
@@ -47,6 +57,7 @@ print(json.parse("12.50"), dec(json.parse(`{"amount": "12.50"}`).amount))
 print(json.parse("9223372036854775807"), json.parse("9223372036854775808"), json.parse("1e400"))
 print(json.parse(`{"a": 1, "a": 2}`), json.parse(`{"b": 1, "a": 2}`) | keys)
 print(json.parse("  [1]  "), json.parse("1 2"))
+print(json.parse(`{"b": 1, "1": 2}`) | keys, json.parse(repeat("[", 129) + repeat("]", 129)))
 ```
 
 ```output
@@ -55,6 +66,7 @@ print(json.parse("  [1]  "), json.parse("1 2"))
 9223372036854775807 9223372036854776000 err("invalid JSON: number out of range at line 1 column 5")
 { a: 2 } ["b", "a"]
 [1] err("invalid JSON: trailing characters at line 1 column 3")
+["b", "1"] err("invalid JSON: it nests more than 128 deep")
 ```
 
 ### Errors

@@ -42,25 +42,35 @@ null
 - A topic that is not a string is written as text: `publish(7)` is the topic `7`.
   Make topics strings with a prefix, `thread:7`, so they cannot collide with a table's
   `db:` or a global's `var:`.
+- A topic is 1 to 256 bytes, of any characters, a comma included (`"search:a,b"` is one
+  topic): an empty or a longer one is a runtime error.
+- A topic ending in `:*` is a wildcard: `publish("room:*")` wakes every page following
+  a topic that starts with `room:`, and `publish("db:*")` every table's. So a topic
+  built from a visitor's text must not end in `:*`, or a visitor wakes everything under
+  it: keep such text away from the end (`room:${id}:msgs`), or check it.
 - With tenants, a topic belongs to the tenant it is published for, so it wakes only
   that tenant's pages; in a mounted program it belongs to the mount. A `publish` made
   for no tenant (a job, a script) wakes no tenant's page.
 - Inside `db.transaction` the announcement waits for the commit and is dropped on
-  rollback.
+  rollback. A global's own (`var:todos`) is not dropped, as the global keeps its value:
+  it is made when the outermost transaction ends, whatever its outcome.
+- It works inside `parallel`'s functions too, their topics taken in the functions'
+  order.
 - A page that is prefetched does not call `publish`: a route that publishes is made
   when the link is followed.
 
 ```quillo
-print(publish(), publish(7), publish("a", "b", "c"))
+print(publish(), publish(7), publish("a", "b", "c"), publish("search:a,b"))
 ```
 
 ```output
-null null null
+null null null null
 ```
 
 ### Errors
 
-It never fails: any number of topics, of any type, is taken.
+Any number of topics, of any type, is taken, each as its text. An empty topic, or one
+past 256 bytes, is a runtime error, not an error value.
 
 ```quillo
 print(publish(null, true, { thread: 7 }))
@@ -68,6 +78,22 @@ print(publish(null, true, { thread: 7 }))
 
 ```output
 null
+```
+
+```quillo error
+print(publish(""))
+```
+
+```output
+line 1: `publish`: a topic is a name, and this one is empty
+```
+
+```quillo error
+print(publish(repeat("x", 300)))
+```
+
+```output
+line 1: `publish`: a topic is at most 256 bytes, and this one is 300
 ```
 
 ### Chaining

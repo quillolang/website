@@ -26,19 +26,33 @@ print(floor(7 / 2))
 - Negative numbers go down, away from zero: `floor(-0.5)` is `-1`. `int` cuts
   toward zero instead.
 - The result of a float is an int; of a decimal a decimal: `floor(2.50m)` is `2m`.
-- A float too large for an int (about 9 × 10¹⁵ and up), `NaN` and infinities stay
-  floats.
+- A float gives an int up to 2^63 (about 9.22 × 10¹⁸): `type_of(floor(1e16))` is `int`.
+  Past that, and `NaN` and infinities, it stays a float.
+- An int is itself, past 2^53 too, as it never goes through a float:
+  `floor(9007199254740993)` is `9007199254740993`, on the server and in the browser.
+
+- `floor(a / b)` of two ints is integer division, done in ints, so it is exact past
+  2^53 (Python's `a // b`), however the call is written: `floor(a / b)`, `a / b |
+  floor`, `(a / b).floor()`, `math.floor(a / b)`, or `floor` kept in a variable. A
+  quotient kept in a variable first is a float, which has only 53 bits of digits. A
+  division by 0 is a runtime error.
 
 ```quillo
 print(floor(-0.5), int(-0.5))
 print(type_of(floor(2.7)), type_of(floor(2.7m)), floor(2.50m))
 print(floor(1e16), type_of(floor(1e16)), floor(float("inf")))
+let a = 9007199254740995
+print(floor(a / 2), a / 2 | floor, floor(-7 / 2))
+let q = a / 2
+print(floor(q), type_of(q))
 ```
 
 ```output
 -1 0
 int dec 2
-10000000000000000 float inf
+10000000000000000 int inf
+4503599627370497 4503599627370497 -4
+4503599627370498 float
 ```
 
 ### Errors

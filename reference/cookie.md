@@ -63,6 +63,10 @@ light
 - A cookie set with `set_cookie` earlier in the same request is not read back by
   `cookie`: it reads what the browser sent. Keep the value in a variable for the rest
   of the route.
+- The `Cookie` header is read as browsers send it: a name sent twice gives the first
+  (`a=admin; a=root` is `admin`, since a browser sends the cookie of the longer path
+  first), spaces around `=` belong to neither side, and one pair of quotes around a
+  value is taken off. `request.cookies` and the session's cookie are read the same way.
 - Cookies belong to the host they were set on, so each subdomain (each tenant) has its
   own.
 - A cookie that the page's script set, or one from another program, is text like any

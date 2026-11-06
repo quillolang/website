@@ -7,8 +7,9 @@ group: Markup
 Markdown text as a whole HTML page, for a route to answer with: what `markdown` makes,
 inside a doctype, an `<html>`, and a `<head>` with `<meta charset="utf-8">`, a viewport
 and a `<title>`. A fragment from `markdown` has none of these, so a browser shows it in
-quirks mode. The title is the `title` option, or else the text of the first `# ` heading,
-or else empty. The options are `title`, `lang` (a language tag, written on `<html>`) and
+quirks mode. The title is the `title` option, or else the text of the first level-one
+heading (`# Title`, or a line underlined with `=`), as it shows, without its marks, or
+else empty. The options are `title`, `lang` (a language tag, written on `<html>`) and
 `html`, which keeps HTML written in the text, as `markdown`'s does.
 
 ### Examples
@@ -38,14 +39,22 @@ print(markdown_page("no heading", { title: "Notes", lang: "en" }))
 - The page links no style sheet. For one, put `markdown(...)` inside a view of your own
   with its `<head>`.
 - The result is an `html` value: a route answers it as `text/html`.
+- Only a level-one heading gives the title: a `## ` heading is passed over, and a `#`
+  line in a code block or in HTML is no heading. `# Real *one*` gives `Real one`.
+- It takes time in proportion to the text, as `markdown` does, and ends at
+  `--max-compute` (`quillo run main.qwe --max-compute 2s`) as a loop does: the request
+  is a 500.
 
 ```quillo
+let title = (s) => re.find(str(markdown_page(s)), "<title>(.*)</title>").groups[0]
+print(title("Notes\n=====\n\ntext"), "|", title("```\n# not this\n```\n\n# Real *one*"), "|", title("## Second\n\n# First"))
 print(markdown_page("<b>x</b>"))
 print(markdown_page("<b>x</b>", { html: true, title: "<b>" }))
 print(type_of(markdown_page("")))
 ```
 
 ```output
+Notes | Real one | First
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title></title></head><body><p>&lt;b&gt;x&lt;/b&gt;</p>
 </body></html>
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>&lt;b&gt;</title></head><body><p><b>x</b></p>

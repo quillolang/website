@@ -33,6 +33,10 @@ null true
   the value you mean.
 - In a job or a tick a server stopping or a reload ends the job there with a 503, as a
   `reply` would, instead of letting it run on old code.
+- A request's sleep of 5 ms or more waits on a timer and holds no thread, so a hundred
+  streams sleeping in their loops hold up no other request; a shorter one waits on a
+  thread, for its accuracy (a timer's are whole milliseconds).
+- In a `parallel` function, a sleep ends at once when another of the functions fails.
 
 ```quillo
 print(sleep(0), sleep(1.5))

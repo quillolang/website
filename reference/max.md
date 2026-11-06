@@ -54,7 +54,8 @@ b 9
 
 An argument that is not a list or `null` is a runtime error, not an error value. Two
 items that do not order are a runtime error too: a string with a number, `null`,
-booleans, lists, maps, `NaN`, or a decimal with a float (convert one side first).
+booleans, lists, maps, `NaN`, or a decimal with a float (convert one side first), in
+the browser as on the server.
 
 ```quillo error
 print(max([null, 1]))

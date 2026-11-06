@@ -66,7 +66,11 @@ component Photo() {
 
 - The path is yours to choose: `filename` is what the browser sent, stripped of folders,
   and is not safe as a path. Name the file with `uuid()` and keep the original name in
-  the database if it matters.
+  the database if it matters. Clients other than browsers are read too: a `\"` in a
+  quoted name (Go, curl) is a `"`, and `filename*=UTF-8''...` gives the name when no
+  plain `filename` is there.
+- A form of more than 1,000 parts, fields and files together, is answered `413` before
+  the route runs.
 - Outside a request, or in a request that uploaded nothing, the result is an error
   value: `save_upload: the current request has no files`. So is a record that is not one
   of this request's files.
@@ -79,6 +83,11 @@ component Photo() {
 - Links are followed: a path that leads out of the program's folder through a link, or
   through a link that leads nowhere, is refused, and nothing is written. A link that
   stays inside the folder works.
+- The program's own files are refused with an error value, as `write_file` refuses
+  them: its `.qwe` and Rust files, `.env` and `.env.*`, the `--env-file` and
+  `--tls-key`, the databases it has open and a tenant's database not made yet. Names are
+  compared in any case and as Windows reads them, so an upload saved as `.ENV` or
+  `Main.QWE` is refused too.
 
 ```quillo
 let photo = { field: "photo", filename: "me.png", type: "image/png", size: 3 }

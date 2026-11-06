@@ -61,7 +61,7 @@ print(db.shards(["s1.db", "nope/dir/s2.db"]) | is_err)
 true true
 [true, false, false, false, true, false]
 [{ one: 1 }, { one: 1 }]
-{ changes: 0, last_id: 0 } err("db: shard 2: no such table: t")
+{ changes: 0, last_id: null } err("db: shard 2: no such table: t")
 err("db: these are shards: `.on(key)` is the one for a key, `.all(sql)` asks every one")
 true
 ```

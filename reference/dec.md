@@ -7,7 +7,9 @@ group: Decimals and money
 The value as a decimal: an exact number with a fixed count of decimals, for money and
 whatever else is counted in cents. Text is read exactly and keeps its digits
 (`dec("1.50")` is `1.50`, not `1.5`); an int is itself; a float goes through its
-shortest text, so `dec(0.1)` is `0.1`, not `0.1000000000000000055…`. What cannot be a
+shortest text, so `dec(0.1)` is `0.1`, not `0.1000000000000000055…`, a tie taking the
+even digit as JavaScript does, so money from a float agrees on the server and in the
+browser. What cannot be a
 decimal is an error value, not a runtime error, so the result can be checked with
 `is_err` or given a default with `??`. Arithmetic between decimals and ints is exact;
 a float next to a decimal is a runtime error.

@@ -6,7 +6,8 @@ group: Translations
 
 The locale the code runs in, as named in `translations`: `"en"`, `"pt-BR"`. In a
 request it is what `locale_from` gives, else the `locale` cookie, else the best match
-of `Accept-Language` (`fr-CA` is served by `fr`, `pt` by `pt-BR`), else the default
+of `Accept-Language` (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count,
+written `q=` or `Q=`, `*` does not), else the default
 locale; inside `with_locale` it is that locale. Outside a request it is the default.
 Without `translations` it is `null`.
 

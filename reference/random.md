@@ -28,23 +28,22 @@ true
   an int, or use [random_int](/docs/reference/random_int/), which includes both ends.
 - Two calls in one expression are two different numbers; a list made with `map` has a
   fresh one per item.
-- `random()` takes no arguments; one given is ignored.
+- `random()` takes no arguments; one given is a runtime error (below).
 
 ```quillo
 print(type_of(floor(random() * 10)), int(random() * 10) >= 0)
 print(range(5) | map((i) => random()) | unique | len)
-print(random(1) < 1.0)
 ```
 
 ```output
 int true
 5
-true
 ```
 
 ### Errors
 
-`random` never fails and never gives an error value.
+`random` never fails and never gives an error value. An argument is a runtime error,
+and so is one for `quillo check` when the call is written out.
 
 ```quillo
 print(is_err(random()))
@@ -52,6 +51,14 @@ print(is_err(random()))
 
 ```output
 false
+```
+
+```quillo error
+print(random(1))
+```
+
+```output
+line 1: `random` takes 0 arguments, got 1: random()
 ```
 
 ### Chaining

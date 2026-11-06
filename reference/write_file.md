@@ -43,6 +43,14 @@ null
   refused because writing through it would make its target, wherever that is. The first such path is said once in the
   log, with where it leads and `--allow-path FOLDER`, which lets the program reach
   a folder outside on purpose.
+- The program's own files are refused, with an error value saying so: the `.qwe` and
+  Rust (`.qwer`, `.rs`) files it loaded (or a folder holding one), `.env` and `.env.*`,
+  the paths given to `--env-file` and `--tls-key` (while nothing is there too), the
+  SQLite databases it has open with their `-wal`, `-shm` and `-journal` files, a
+  tenant's database not made yet, and anything in `migrations/`. Names are compared as
+  the file system may take them, on every system: in any case and Unicode form (`.ENV`,
+  `Main.QWE`), and as Windows reads them (cut at `:`, trailing dots and spaces dropped),
+  so `.ENV` is not written to be read as the settings at the next start.
 
 ```quillo
 print(write_file("a/b/c/d.txt", "deep"), read_file("a/b/c/d.txt"))
@@ -51,6 +59,8 @@ print(write_file("n.txt", 42), read_file("n.txt"))
 print(write_file("m.txt", { a: 1, b: [1, 2] }), read_file("m.txt"))
 print(write_file("e.txt", null), len(read_file("e.txt")))
 print(write_file("../x.txt", "x"), write_file("", "x"))
+print(write_file(".ENV", "ADMIN=1"))
+print(write_file("MAIN.QWE", "x"), write_file("main.qwe.", "x"))
 ```
 
 ```output
@@ -60,12 +70,14 @@ null 42
 null { a: 1, b: [1, 2] }
 null 4
 err("write_file: path must stay inside the program's folder: ../x.txt") err("write_file: path must stay inside the program's folder: ")
+err("write_file: will not write .ENV: it is the program's settings (.env)")
+err("write_file: will not write MAIN.QWE: it is one of the program's own files") err("write_file: will not write main.qwe.: it is one of the program's own files")
 ```
 
 ### Errors
 
-A path that leaves the folder, or a file the system refuses to write, is an error value;
-`?` passes it on. A path that is not a string is a runtime error.
+A path that leaves the folder, one of the program's own files, or a file the system
+refuses to write, is an error value; `?` passes it on. A path that is not a string is a runtime error.
 
 ```quillo
 let r = write_file("/tmp/x.txt", "x")

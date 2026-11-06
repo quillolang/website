@@ -31,7 +31,8 @@ q=a%20b&page=2
 - Text outside ASCII is encoded byte by byte as UTF-8.
 - `!'()*` are encoded, unlike in JavaScript; `-_.~` are kept.
 - In a map, a null value drops its key; `false` and `""` stay. Keys are encoded too.
-  An empty map gives the empty string.
+  An empty map gives the empty string. The keys go in the order they were set, in the
+  browser too, keys that look like numbers included (`{ b: 1, "1": 2 }` is `b=1&1=2`).
 - A list or a map inside a map is its printed form, encoded; `null` on its own gives
   `null`.
 
@@ -53,15 +54,18 @@ a%20b=c%26d true
 
 ### Errors
 
-None: every value has a text, so `url_encode` never fails and never gives an error
-value. A number, a boolean or a decimal is its text.
+`url_encode` never fails: a number, a boolean or a decimal is its text. An error value
+given, or one among a map's values, is given back rather than put in the URL as its
+text.
 
 ```quillo
 print(url_encode(42), url_encode(dec("1.50")), url_encode(true))
+print(url_encode(err("no page")), url_encode({ q: "x", page: int("two") }))
 ```
 
 ```output
 42 1.50 true
+err("no page") err("not an int: \"two\"")
 ```
 
 ### Chaining

@@ -10,7 +10,8 @@ rolled back; otherwise it is committed and the function's value is given. An opt
 map before the function sets `isolation` (`"serializable"`, `"repeatable_read"` or
 `"read_committed"`) and `retries` (0 to 20), how many times to run the function again
 when another transaction made the database give up on it (a deadlock, a serialization
-failure, a busy SQLite file). One inside another is a savepoint.
+failure, a busy SQLite file); another option is an error, when it runs and in `quillo
+check`. One inside another is a savepoint.
 
 ### Examples
 
@@ -62,6 +63,15 @@ fn withdraw(account: int, cents: int) with db =
   the outermost.
 - On SQLite every transaction is serializable whatever is asked; with options it takes
   the write lock at once (`begin immediate`).
+- On MySQL and MariaDB a statement that commits by itself (`truncate`, `create table`,
+  `alter`, `drop`, ...) is refused inside it before it runs, so what ran before can
+  still be rolled back: run it before or after the transaction. One that cannot be seen
+  beforehand (a procedure's, `execute immediate`, a `begin not atomic` block) ends the
+  transaction with the same error. PostgreSQL and SQLite roll their schema statements
+  back, and take them in a transaction.
+- On PostgreSQL the connection is reset as the transaction ends (`reset all`, `discard
+  temp`, advisory locks let go, ...), before it goes back to the pool, so a `set` inside
+  it does not reach the next request.
 - A function that may run again (`retries`) should do nothing that cannot be taken
   back: no `http.*` calls inside it; global variables it changes are not rolled back.
 
@@ -99,9 +109,9 @@ null
 
 ### Errors
 
-A runtime error inside the function stops the request, after the rollback. Options
-with an unknown isolation, `retries` outside 0 to 20, an isolation on a nested
-transaction, or an argument that is not a function are runtime errors. Out of retries,
+A runtime error inside the function stops the request, after the rollback. An option
+it does not take, an unknown isolation, `retries` outside 0 to 20, an isolation on a
+nested transaction, or an argument that is not a function are runtime errors. Out of retries,
 the transaction gives the database's error value.
 
 ```quillo error
@@ -113,6 +123,14 @@ print(db.transaction(() => db.transaction({ isolation: "serializable" }, () => 1
 ```output
 line 3: a transaction inside another cannot change its isolation: give it to the outermost one
   in a function, called at main.qwe:3
+```
+
+```quillo error
+print(db.transaction({ isolaton: "serializable" }, () => 1))
+```
+
+```output
+line 1: `db.transaction` has no option `isolaton` (isolation, retries)
 ```
 
 ```quillo error

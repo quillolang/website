@@ -26,8 +26,8 @@ true
 - `k` greater than `n` gives `0`, not an error.
 - `k` of `0` or of `n` gives `1`, and `math.comb(0, 0)` is `1`.
 - The result is an int of 64 bits: `math.comb(66, 33)` fits and `math.comb(67, 33)` is
-  a runtime error, `integer overflow`, as is `math.comb(100, 50)`. Python's result grows
-  without bound.
+  a runtime error, `integer overflow`, as is `math.comb(100, 50)`, in the browser as on
+  the server. Python's result grows without bound.
 - A float that is a whole number is accepted as an int.
 
 ```quillo

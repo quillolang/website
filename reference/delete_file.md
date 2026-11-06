@@ -27,6 +27,10 @@ gone
 - A folder is removed with everything in it.
 - `"."`, `""`, `".."` and a path starting at `/` are error values: the program's own
   folder is never removed, and nothing outside it is touched.
+- The program's own files are refused as `write_file` refuses them (its `.qwe` files,
+  `.env`, the databases it has open, in any case and as Windows reads a name), and so is
+  a folder that holds one: `delete_file("data")` with `data/app.db` open is an error
+  value, and nothing is deleted.
 - Links are followed, and where they lead is what counts: a link inside the folder
   that leads inside it works as its target would, and one that leads out of the
   folder, or leads nowhere, is an error value, and nothing is deleted: a path is judged where it leads, so
@@ -53,8 +57,8 @@ err("delete_file: path must be inside the program's folder: ../x") err("delete_f
 
 ### Errors
 
-A path outside the folder is an error value, which `?` passes on; a path that is not a
-string is a runtime error.
+A path outside the folder, or one of the program's own files or a folder holding one,
+is an error value, which `?` passes on; a path that is not a string is a runtime error.
 
 ```quillo
 let r = delete_file("..")
@@ -63,6 +67,15 @@ print(is_err(r), r.error)
 
 ```output
 true delete_file: path must be inside the program's folder: ..
+```
+
+```quillo
+db.open("app.db")
+print(delete_file("app.db"), delete_file("MAIN.qwe"))
+```
+
+```output
+err("delete_file: will not delete app.db: it is the database the program has open") err("delete_file: will not delete MAIN.qwe: it is one of the program's own files")
 ```
 
 ```quillo error

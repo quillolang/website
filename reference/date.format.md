@@ -11,8 +11,12 @@ name, number padded or not), `DD` and `D`, `dddd` and `ddd` (the weekday's name)
 offset); anything else, and text in `[brackets]`, is kept as it is. A map `{ locale,
 style }` gives that locale's `"short"`, `"medium"` (the default), `"long"` or `"full"`
 date, and `{ locale, pattern }` the pattern with that language's names. The locales are
-English (US; British style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`),
-German, French, Spanish, Italian, Dutch and Portuguese; any other is English.
+English, German, French, Spanish, Italian, Dutch and Portuguese, and the regions whose
+styles CLDR gives their own: `en-GB`, `en-CA` (`2026-09-05` short), `en-IE`, `en-AU`,
+`en-NZ`, `en-IN`, `en-ZA`, `de-AT` (`Jänner`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`,
+`nl-BE` and `pt-PT`, the same on the server and in the browser, names in a pattern too.
+Another region takes its language's (`de-CH` is German's), and any other language is
+English.
 
 ### Examples
 
@@ -51,6 +55,7 @@ print(date.format("2026-10-27", "[Day] D [of] MMMM"), date.format("2026-10-27", 
 print(date.format("2026-10-27", "MMMMM"), date.format("2026-10-27", { locale: "DE_de", style: "short" }), date.format("2026-10-27", { locale: "ja-JP", style: "long" }))
 print(date.format("2026-10-27", { locale: "pt-BR", style: "long" }), date.format("2026-10-27", { pattern: "D MMMM", style: "full" }), date.format("2026-10-27", {}))
 print(date.format("2026-10-27", { locale: "en-GB", style: "short" }), date.format("2026-10-27", { style: "short" }))
+print(date.format("2026-09-05", { locale: "en-CA", style: "short" }), date.format("2026-01-05", { locale: "de-AT", style: "long" }), date.format("2026-01-05", { locale: "de-CH", style: "long" }))
 ```
 
 ```output
@@ -60,6 +65,7 @@ Day 27 of October unclosed Today: 27
 October10 27.10.26 October 27, 2026
 27 de outubro de 2026 27 October Oct 27, 2026
 27/10/2026 10/27/26
+2026-09-05 5. Jänner 2026 5. Januar 2026
 ```
 
 ### Errors

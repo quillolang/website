@@ -29,6 +29,9 @@ print(pow(10, 0), pow(-2, 3), pow(1.5, 2))
   `pow(2, 62)` is an int, `pow(2, 63)` stops, and `pow(-2, 63)` still fits. For the
   float, give a float: `pow(2.0, 63)`.
 - A negative int exponent of an int gives a float.
+- An exponent of 2^32 or more is exact for a base of -1, 0 and 1 (`pow(-1,
+  9007199254740993)` is `-1`), and an integer overflow for any other int base, as a
+  smaller one past 64 bits is; it was a float (`1.0`, `inf`).
 - `pow(0, 0)` is `1`; `pow(0, -1)` is `inf`; a float answer past what a float holds is
   `inf`.
 - A negative base with a fractional exponent is `NaN`.
@@ -40,6 +43,7 @@ print(pow(10, 0), pow(-2, 3), pow(1.5, 2))
 ```quillo
 print(pow(2, 62), pow(-2, 63), pow(2.0, 63))
 print(pow(2, 63) ?? "too big", pow(10, 30) ?? "too big")
+print(pow(-1, 9007199254740993), pow(0, 4294967296), pow(1, 4294967296), pow(2, 4294967296) ?? "too big")
 print(pow(0, 0), pow(0, -1), pow(2.0, 1024))
 print(pow(-8, 1.0 / 3.0), pow(-1, 0.5))
 print(pow(2m, 2), pow(1.5m, 3), pow(2m, -2), pow(3m, -1), pow(0m, 0))
@@ -49,6 +53,7 @@ print(pow(1m + 0.05m / 12, 360), type_of(pow(1.1m, 2)), pow(10m, 29) ?? "too big
 ```output
 4611686018427387904 -9223372036854775808 9223372036854776000
 too big too big
+-1 0 1 too big
 1 inf inf
 NaN NaN
 4 3.375 0.25 0.3333333333333333333333333333 1

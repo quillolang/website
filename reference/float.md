@@ -25,11 +25,13 @@ print(float(3), float(dec("1.25")), float(1.5))
 
 - `nan`, `inf` and `-inf` are read as text: `float("nan")` is `NaN`, a float, not an
   error.
-- Only ASCII digits and a point: a comma, a `_` between digits, hex and digits in other
-  scripts are errors.
+- Only ASCII digits and a point: a comma, a `_` between digits, hex (`"0x10"`), binary
+  (`"0b11"`), octal (`"0o17"`) and digits in other scripts are errors, in the browser
+  too.
 - The empty string and `null` are errors, not `0.0`: give the default with `??`.
 - A boolean is an error too, unlike `int(true)`, which is 1.
-- `float(1)` is `1.0`, with `type_of` `float`.
+- `float(1)` is `1.0`, with `type_of` `float`, in the browser too: a whole float stays
+  a float there, so `2.0 / 0` is `inf` and an `int` parameter refuses `2.0`.
 
 ```quillo
 print(float("nan"), float("inf"), float("-inf"))
