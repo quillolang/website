@@ -37,6 +37,8 @@ for path in $(sed 's|^https://[^/]*||' "$out/sitemap.txt"); do
     curl -sf "http://127.0.0.1:$port$path" -o "$out${path}index.html"
 done
 curl -sf "http://127.0.0.1:$port/favicon.svg" -o "$out/favicon.svg"
+curl -sf "http://127.0.0.1:$port/favicon.png" -o "$out/favicon.png"
+curl -sf "http://127.0.0.1:$port/favicon.ico" -o "$out/favicon.ico"
 mkdir -p "$out/plugins"
 curl -sf "http://127.0.0.1:$port/plugins/index.json" -o "$out/plugins/index.json"
 curl -sf "http://127.0.0.1:$port/robots.txt" -o "$out/robots.txt"
