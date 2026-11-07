@@ -12,6 +12,10 @@ again. The status is 301, 302, 303, 307 or 308, and the URL no `javascript:`,
 where it must be. The value can be looked at: `status`, `headers` and `body` (always
 null) are its fields.
 
+It makes an answer; it does not leave. With more code after it, as in
+`if no_user { redirect("/login") }`, the route goes on and shows the page: write
+`reply 303 redirect("/login")`. `quillo check` warns of one nothing takes.
+
 ### Examples
 
 ```quillo

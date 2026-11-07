@@ -97,8 +97,10 @@ paid
 - A key is 1 to 255 visible characters, else 400. The same key with another method,
   path, query or body is refused with 422; one that comes while the first is still
   running gets 409 (on SQLite, it waits for the first and gets its answer).
-- Keys belong to the tenant, the mount point and the user (`session().user`, or the
-  `user` option). The same key from another user is another request.
+- A key runs at most once, whoever asks, within the tenant and the mount point. Its answer
+  goes to the same `user` option (a str or an int), else the same session, else the same
+  credential header; anyone else gets 409, with nothing run or shown. The `user` option
+  gives each user a row of their own, so two accounts may use one key.
 - When the function fails, returns an error value or replies early, the transaction
   rolls back and the answer is sent but not kept, so a retry runs again. To keep a
   refusal, return it: `respond(422, { error })` commits and is kept.

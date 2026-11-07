@@ -8,6 +8,10 @@ In a component's code, calls `f` every `ms` milliseconds in the browser, for as 
 as the code that called it stands: `if running { every(100, step) }` runs while
 `running` is true, starts over when `speed` or anything else it read changes, and
 stops when the condition is false or the component leaves the page. It gives `null`.
+A tick that finds that timer's last run still waiting does nothing, so a poll slower
+than its timer runs one call at a time and shows each answer; a run with no answer after
+30 seconds (or two gaps, if longer) is given up on, and the next tick starts anew. A
+clock's tick should not share an `every` with a call that waits: give it its own.
 At the top of a program it is the server's clock instead: a tick that runs `f` every
 `ms` milliseconds, named after its function or by `{ name: "..." }`.
 
