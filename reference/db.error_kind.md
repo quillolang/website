@@ -8,17 +8,20 @@ What kind of failure a database's error value is, in one word that is the same f
 SQLite, PostgreSQL and MySQL, whose own messages differ: `"unique"` (a key or unique
 column has the value already), `"foreign_key"`, `"not_null"`, `"check"`, or
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
-failure), or `"connection"` (the server ended the connection, or it could not be made)
-*(since 0.7)*. Any other failure, and anything that is not a database error, is `null`. It
-needs no effect, so it can be called from any function.
+failure), `"connection"` (the server ended the connection, or it could not be made)
+*(since 0.7)*, or `"read_only"` (a write the database refused because the transaction only
+reads, as the transaction a tool that only reads runs in does). Any other failure, and
+anything that is not a database error, is `null`. It needs no effect, so it can be called
+from any function.
 
 A PostgreSQL error's message ends in its SQLSTATE, in brackets: `db: duplicate key value
 violates unique constraint "seats_pkey" (Key (k)=(1) already exists.) [23505]`. The code
 is read first, so the kind is found whatever language the server writes its messages in:
 `23505` is `unique`, `23503` `foreign_key`, `23502` `not_null`, `23514` `check`, and
-`40001`, `40P01` and `55P03` `conflict`, and `57P01` to `57P03` and class `08`
-`connection`. MySQL's messages carry their code too
-(`(1062)`), and SQLite's words are always English.
+`40001`, `40P01` and `55P03` `conflict`, `57P01` to `57P03` and class `08`
+`connection`, and `25006` `read_only`. MySQL's messages carry their code too
+(`(1062)`; `1792` is `read_only`), and SQLite's words are always English (`attempt to
+write a readonly database`).
 
 ### Examples
 
@@ -70,6 +73,25 @@ check
 foreign_key
 null true
 null null null null
+```
+
+A tool for AI clients that Quillo sees only reads (see [Tools for AI
+clients](/docs/mcp/#what-quillo-writes-for-you)) runs in a read-only transaction, so a write
+it could not see is refused by the database, and its error is `"read_only"`. SQLite's
+`pragma query_only` refuses writes the same way:
+
+```quillo
+db.open("app.db")
+db.exec("create table notes (text text)")
+db.exec("pragma query_only = 1")
+let r = db.exec("insert into notes values ('x')")
+print(r)
+print(db.error_kind(r))
+```
+
+```output
+err("db: attempt to write a readonly database")
+read_only
 ```
 
 ### Errors

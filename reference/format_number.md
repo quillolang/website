@@ -1,5 +1,5 @@
 # format_number
-format_number(num | dec, str | null=, int | map | null=, str=) -> str
+format_number(num | dec, str | null=, int | map | null=, str | null=) -> str
 group: General
 
 ### What it does
