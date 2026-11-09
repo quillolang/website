@@ -49,7 +49,7 @@ true
   unticked box is.
 - A client that cannot ask (it does not say it can show a form): `confirm` refuses, and
   the call ends with an `isError` saying `this needs the user's yes, and this client
-  cannot ask`. Nothing after it runs. `ask` takes its default there instead.
+  cannot ask`. Nothing after it runs. [about](/docs/reference/about/) takes its default there instead.
 - Ask first. `quillo check` refuses a tool that it sees change something before a
   question (`` `confirm` comes after `db.exec`: ask before changing anything: the call runs
   again with the answer ``). As it runs, a question after any change (a database write, a

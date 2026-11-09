@@ -172,10 +172,13 @@ Call search_notes before add_note, so the same note is not written twice.
 ```
 
 - **The answers.** A typed result goes as `structuredContent` and as the same JSON in a
-  text block. The tool's own `err(v)`, an argument refused, a `reply` or `respond`, and a
-  failure are an `isError` result with text; a failure says only `internal error`, with
+  text block. The tool's own `err(v)`, an argument refused, a `reply` or `respond` (a 2xx
+  too, which `quillo check` warns of in a tool: a tool answers by returning its value), and
+  a failure are an `isError` result with text; a failure says only `internal error`, with
   the real message on stderr or in the log, and the server goes on serving. An answer over
   10 MiB of JSON or 128 levels deep is an `isError` saying so, never a cut answer.
+- **What a client keeps.** A client may keep the tool list and `server/discover`'s answer
+  for 5 minutes (`ttlMs`), so a tool a deploy renames reaches it within that time.
 - **The limits.** Each user may make 60 tool calls a minute, their cookie and their tokens
   together, per tenant (a caller with no `user`: per session or token); one more is a
   `429` with `Retry-After`. Listing the tools is not a call, and neither is the round that
@@ -207,13 +210,13 @@ Call search_notes before add_note, so the same note is not written twice.
 
 A tool can ask the person at the AI client before it acts.
 [`confirm(question)`](/docs/reference/confirm/) gives their yes or no, and
-[`ask(question, choices, default)`](/docs/reference/ask/) the key of the choice they
+[`about(question, choices, default)`](/docs/reference/about/) the key of the choice they
 picked:
 
 ```quillo
 /// Publishes a post. It is public at once.
 fn mcp publish_post(title: str, body: str) -> int with db {
-    let who = ask("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
+    let who = about("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
     if !confirm(`Publish "${title}" now?`) { return err("not published: the user said no") }
     db.one("insert into posts (title, body, draft) values (?, ?, ?) returning id", title, body, who == "draft").id
 }
@@ -228,19 +231,25 @@ fn mcp publish_post(title: str, body: str) -> int with db {
 - So a tool asks before it changes anything. `quillo check` refuses a tool it sees change
   something before a question. As it runs, a question after any change is refused and the
   call stops, the model told `internal error`; the change stands, so this is for code the
-  checker cannot see whole.
+  checker cannot see whole. A change on a way that leaves the function first (`if id == 0
+  { save(0); return false }`, or a `reply`) is no change before a question after that `if`.
+- A question the checker does not see a tool ask, as in a function given to a builtin (a
+  `locale_from` or `tenant_from` rule that calls `confirm`), is refused as it runs, in the
+  tool and in any service its call reaches, and the call stops: no one was asked, so no yes
+  or default is given.
 - The answers come back in a state Quillo signs: good for 10 minutes, once, for the same
   caller, tool and arguments. Anything else is refused and the call starts over.
 - A `confirm` is a box to tick: sent back unticked, declined or dismissed, it is a no. A
-  person who declines or dismisses an `ask` ends the call, with an `isError` saying so.
-- A client that cannot ask: `ask` takes its default, and the result says so (`the user
+  person who declines or dismisses an `about` ends the call, with an `isError` saying so.
+- A client that cannot ask: `about` takes its default, and the result says so (`the user
   was not asked "Who can see it?": the default "Only me, as a draft" was taken`), so the
   model can tell the person; `confirm` refuses (`this needs the user's yes, and this
   client cannot ask`).
 - Outside a tool's call (the program's own code, or a page calling a `server fn mcp`),
-  `ask` gives its default and `confirm` gives true: the page asks in its own way. With two
-  arguments, `ask` is a page's dialog instead, and a component cannot use the
-  three-argument form.
+  `about` gives its default and `confirm` gives true: the page asks in its own way, with
+  [`ask(message, options)`](/docs/reference/ask/), its dialog, which a tool cannot show (in a
+  tool's code, and with three arguments, `ask` is an error that names `about`). A
+  component cannot use `about`.
 - Neither asks for free text, as MCP forbids asking for passwords, keys or payment
   details in a form. A tool that asks and only reads stays read-only, and the instructions
   tell the model which tools ask themselves, so it does not ask again.
@@ -269,7 +278,7 @@ its app hold (`QUILLO_APP_KEY` where billing runs,
 `--split` makes one and sets both), so only the app's door runs billing's tools. A `service
 mcp` whose `auth` signs nothing is refused by `quillo check`. A tool's call that a copy of
 billing did not answer is not run again: it fails, as it may have run. A service function's
-`confirm` and `ask` ask through the app's door. Services must run this Quillo or later, so
+`confirm` and `about` ask through the app's door. Services must run this Quillo or later, so
 upgrade them before the app.
 
 Calling another MCP server from Quillo (`service mcp crm = "https://..."`) is refused for
@@ -281,7 +290,7 @@ now.
   several machines each counts its own.
 - A program with no database keeps its tokens in that process's memory (100 a user,
   10,000 in all), lost at a restart and unknown to the others: run such a program as one
-  process. The states of `confirm` and `ask` over HTTP with no database are each
+  process. The states of `confirm` and `about` over HTTP with no database are each
   process's too, so with several processes sharing `QUILLO_SECRET` the same caller can use
   a state once in each of them until its 10 minutes end; with a database they share, once
   in all.

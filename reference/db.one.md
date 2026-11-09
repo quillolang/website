@@ -39,7 +39,8 @@ null
 - A different number of values than `?` marks, or a `:name` the map lacks, is an error
   value, as are values given to SQL with no placeholder and SQL with no statement in it;
   a map given to SQL that has no names is no value.
-- Several statements in one text: the first one's first row is given.
+- Several statements in one text are an error, as for `db.query`: a query runs one (SQLite
+  gave the first one's first row before 0.8.1).
 - `insert ... returning id` gives the new row's id where the database has `returning`
   (SQLite, PostgreSQL, MariaDB): the way to get it on PostgreSQL, whose `db.exec` has no
   `last_id`, and for an `insert` of several rows, whose `last_id` is null (`db.query`
@@ -61,7 +62,7 @@ null null
 { a: "none" }
 { a: "z" }
 err("db: the query has 1 parameter, got 2")
-{ x: 1 }
+err("db: the SQL has more than one statement: a query, or db.exec given values, runs one (db.exec of the text alone, without values, runs them all)")
 ```
 
 ### Errors

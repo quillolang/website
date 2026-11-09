@@ -40,8 +40,8 @@ print(db.query("select * from todos"))
   once, and a read or a schema statement counts 0.
 - `last_id` is `null` after an `insert` of several rows, an upsert that updated, an
   `update` or a `delete`: it never names an older row.
-- With values, one statement runs: on SQLite what follows the first `;` is ignored, on
-  PostgreSQL it is an error. Without values the whole text runs statement by statement
+- With values, the SQL is one statement: more after its first `;` is an error, on every
+  database (SQLite ignored the rest before 0.8.1). Without values the whole text runs statement by statement
   (a seed file: `db.exec(read_file("seed.sql"))`), and `changes` is the last one's. A
   trigger's, function's or procedure's body (`begin ... end`, `$$ ... $$`) is one
   statement with the rest.
@@ -81,13 +81,13 @@ print(is_err(db.exec("insert into t (a) values (?)", int("4O"))), db.one("select
 
 ```output
 { changes: 1, last_id: 1 } { changes: 0, last_id: null }
-{ changes: 1, last_id: 2 }
-{ changes: 1, last_id: 4 }
-["x", "one", "two", "three"]
+err("db: the SQL has more than one statement: a query, or db.exec given values, runs one (db.exec of the text alone, without values, runs them all)")
+{ changes: 1, last_id: 3 }
+["x", "two", "three"]
 err("db: the query has 1 parameter, got 2")
 err("db: no value for :a")
-{ changes: 1, last_id: 5 }
-{ changes: 1, last_id: 6 } { a: "[1,2]" }
+{ changes: 1, last_id: 4 }
+{ changes: 1, last_id: 5 } { a: "[1,2]" }
 err("db: the SQL has no statement in it (it is empty, or only comments)")
 { changes: 2, last_id: null } { changes: 1, last_id: null }
 err("db: value 1 is NaN, which cannot be stored: SQLite keeps NaN as null and MySQL refuses NaN and the infinities, so no database is given one")
