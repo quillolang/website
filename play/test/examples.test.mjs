@@ -7,7 +7,7 @@
 //   QUILLO=~/.cargo/bin/quillo-0.8.1 node --test ...   (another, such as the live one)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +59,8 @@ async function run(files) {
 }
 
 const example = (slug) => ({ "main.qwe": readFileSync(new URL(`${slug}/main.qwe`, EXAMPLES), "utf8") });
+// The examples of the language alone: no route, so no page.
+const LANGUAGE_ONLY = ["empty", "basics"];
 
 test("play.qwe's play_pageless has the prefix this test reads", () => {
   assert.equal(PREFIX, "quillo: 0 routes listening on ");
@@ -72,7 +74,7 @@ test("the Empty example prints, and has no pages", async () => {
 });
 
 test("the examples with pages are not taken for programs without", async () => {
-  for (const slug of readdirSync(EXAMPLES).filter((s) => s !== "empty")) {
+  for (const slug of readdirSync(EXAMPLES).filter((s) => !LANGUAGE_ONLY.includes(s))) {
     const lines = await run(example(slug));
     assert.ok(lines.some((l) => /^quillo: \d+ routes? listening on unix:/.test(l)), `${slug}:\n${lines.join("\n")}`);
     assert.ok(!pageless(lines), `${slug}:\n${lines.join("\n")}`);
@@ -101,7 +103,89 @@ test("a program of no routes that prints a lot still says it, after what it prin
   assert.ok(said > lines.indexOf("line 499") && lines.indexOf("line 499") >= 0, lines.join("\n"));
 });
 
+// What Basics prints, line by line: its comments say what each part does, and this holds it
+// to them (27 takes 111 steps; push and set leave the list and the map as they were).
+const BASICS = `-- let --
+Ada wrote the first program in 1843
+count is 3
+-- maps --
+Ada
+1815
+no email
+["name", "born", "city"]
+false
+Ada Lovelace
+apples: 3
+pears: 5
+-- lists --
+5
+1
+4
+[5, 3, 8, 1, 9]
+[5, 3, 8, 1, 10, 11]
+[1, 3, 5, 8]
+[1, 8, 3, 5]
+[3, 8]
+17
+8
+true
+a-b-c
+-- conditions --
+warm
+t-shirt
+no nickname
+-- match --
+zero
+a negative number
+a positive number
+a greeting
+the text "Quillo"
+an empty list
+1, then 2 more
+a point at 3,4
+something else
+-- for --
+apple
+pear
+fig
+round 0
+round 1
+round 2
+[1, 4, 9, 16, 25]
+-- while --
+27 reaches 1 in 111 steps
+-- pipes --
+apple, banana, kiwi, pear
+[4, 16, 36, 64, 100]
+220
+best: Ann with 91
+total: 254`;
+
+test("the Basics example prints what its comments say, and has no pages", async () => {
+  const lines = await run(example("basics"));
+  assert.deepEqual(lines.filter((l) => !l.startsWith("quillo: ")), BASICS.split("\n"));
+  assert.ok(pageless(lines), lines.join("\n"));
+});
+
+test("every example passes quillo check with no warning", () => {
+  for (const slug of readdirSync(EXAMPLES)) {
+    const dir = new URL(`${slug}/`, EXAMPLES);
+    const r = spawnSync(QUILLO, ["check", "main.qwe"], { cwd: dir, encoding: "utf8", timeout: 30000 });
+    const said = (r.stdout + r.stderr).trim();
+    assert.equal(r.status, 0, `${slug}: ${said}`);
+    assert.match(said, /^main\.qwe: ok \(/, `${slug}: ${said}`);
+    assert.doesNotMatch(said, /warning/, `${slug}: ${said}`);
+  }
+});
+
+test("the language-only examples have no route, and the others have one", () => {
+  for (const slug of readdirSync(EXAMPLES)) {
+    const text = example(slug)["main.qwe"];
+    assert.equal(/^route /m.test(text), !LANGUAGE_ONLY.includes(slug), slug);
+  }
+});
+
 test("every example's folder holds a main.qwe", () => {
   for (const slug of readdirSync(EXAMPLES)) assert.ok(example(slug)["main.qwe"].length > 0, slug);
-  assert.ok(PAGE.includes('play_example("empty", "Empty", '), "the Empty example is in PLAY_EXAMPLES");
+  for (const slug of readdirSync(EXAMPLES)) assert.ok(PAGE.includes(`play_example("${slug}", `), `${slug} is in PLAY_EXAMPLES`);
 });
