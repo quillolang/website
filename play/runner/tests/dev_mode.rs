@@ -96,10 +96,12 @@ fn dev_mode_runs_a_program_and_stops_it_on_sigterm() {
     .json();
     let token = r["session"].as_str().unwrap();
     let host = format!("s01.play.localhost:{}", pp);
-    assert_eq!(
-        r["enter"],
-        json!(format!("http://{}/__play/enter?t={}", host, token))
-    );
+    // review L4: the link carries an enter token of its own, never the session's
+    let enter = r["enter"].as_str().unwrap();
+    let e = enter
+        .strip_prefix(&format!("http://{}/__play/enter?t=", host))
+        .unwrap_or_else(|| panic!("{}", enter));
+    assert!(quillo_play::util::is_token(e) && e != token, "{}", enter);
     let page = get(pre_a, &host, "/", &[("Cookie", &format!("play={}", token))]);
     assert_eq!(page.status, 200);
     assert!(page.body.contains("Counter page"));
@@ -164,4 +166,87 @@ fn dev_mode_refuses_other_addresses() {
             .unwrap();
         assert!(String::from_utf8_lossy(&o.stderr).contains("Linux"));
     }
+}
+
+/// A spawner's socket that answers every request yes, and counts the stops it is asked for.
+fn fake_spawner(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use std::io::{BufRead, BufReader, Write};
+    let _ = std::fs::remove_file(path);
+    let l = std::os::unix::net::UnixListener::bind(path).unwrap();
+    let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let o = ops.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let mut line = String::new();
+            if BufReader::new(&c).read_line(&mut line).is_err() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let op = v["op"].as_str().unwrap_or("").to_string();
+            let slot = v["slot"].as_str().unwrap_or("").to_string();
+            o.lock().unwrap().push(format!("{} {}", op, slot));
+            let answer = if op == "status" { "{\"ok\":true,\"status\":{}}\n" } else { "{\"ok\":true}\n" };
+            let _ = (&c).write_all(answer.as_bytes());
+        }
+    });
+    ops
+}
+
+#[test]
+fn the_proxy_stops_every_slot_on_sigterm() {
+    // review L6: stopped (not restarted), the proxy stops its programs
+    let (pa, pp) = (free_port(), free_port());
+    let sock = std::path::PathBuf::from(format!("/tmp/qp-l6-{}.sock", std::process::id()));
+    let ops = fake_spawner(&sock);
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo-play"))
+        .args([
+            "proxy",
+            "--spawner",
+            sock.to_str().unwrap(),
+            "--port-api",
+            &pa.to_string(),
+            "--port-preview",
+            &pp.to_string(),
+            "--slots",
+            "3",
+        ])
+        .env("PLAY_SECRET", SECRET)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = child.id() as i32;
+    let mut proxy = Dev(child);
+    let _deadline = Deadline::new(30, "proxy_sigterm", move || unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    });
+    let api_a: SocketAddr = format!("127.0.0.1:{}", pa).parse().unwrap();
+    assert!(quillo_play::dev::wait_until(Duration::from_secs(10), || {
+        std::net::TcpStream::connect(api_a).is_ok()
+    }));
+    let stops = |ops: &std::sync::Mutex<Vec<String>>| {
+        ops.lock().unwrap().iter().filter(|o| o.starts_with("stop ")).count()
+    };
+    // at its start: whatever an earlier proxy left
+    assert!(quillo_play::dev::wait_until(Duration::from_secs(5), || stops(&ops) >= 3));
+    let before = stops(&ops);
+    unsafe {
+        libc::kill(proxy.0.id() as i32, libc::SIGTERM);
+    }
+    let t = Instant::now();
+    let mut exited = None;
+    while t.elapsed() < Duration::from_secs(10) {
+        if let Some(s) = proxy.0.try_wait().unwrap() {
+            exited = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(exited.is_some_and(|s| s.success()), "{:?}", exited);
+    let after: Vec<String> = ops.lock().unwrap().iter().skip(before).filter(|o| o.starts_with("stop ")).cloned().collect();
+    let mut after = after;
+    after.sort();
+    assert_eq!(after, vec!["stop s01", "stop s02", "stop s03"], "{:?}", ops.lock().unwrap());
+    let _ = std::fs::remove_file(&sock);
 }

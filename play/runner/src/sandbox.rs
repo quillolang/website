@@ -27,7 +27,7 @@ pub fn properties(cfg: &Config, slot: &str, uid: u32, gid: u32) -> Vec<String> {
         format!("BindReadOnlyPaths={}/src/{}:/src", root, slot),
         format!("BindReadOnlyPaths={}/bin/quillo:/opt/quillo", root),
         // where it runs and writes (its database too): memory, counted in MemoryMax
-        format!("TemporaryFileSystem=/work:size={},mode=0700,uid={},gid={}", cfg.work_size, uid, gid),
+        format!("TemporaryFileSystem=/work:size={},mode=0700,uid={},gid={},noexec,nosuid,nodev", cfg.work_size, uid, gid),
         "Environment=HOME=/work".into(),
         "Environment=QUILLO_JIT=0".into(),
         format!("StandardOutput=truncate:{}/log/{}.log", root, slot),
@@ -56,8 +56,27 @@ pub fn properties(cfg: &Config, slot: &str, uid: u32, gid: u32) -> Vec<String> {
         "CapabilityBoundingSet=".into(),
         "AmbientCapabilities=".into(),
         "PrivateUsers=yes".into(),
-        "PrivateTmp=yes".into(),
+        // /tmp and /var/tmp in memory, counted in MemoryMax: PrivateTmp's folders are on the
+        // host's disk, with no limit but each file's (review H3)
+        // Every place it can write is noexec: nothing written can be run (review L9).
+        "TemporaryFileSystem=/tmp:size=16m,mode=1777,noexec,nosuid,nodev".into(),
+        "TemporaryFileSystem=/var/tmp:size=16m,mode=1777,noexec,nosuid,nodev".into(),
         "PrivateDevices=yes".into(),
+        // PrivateDevices keeps the host's /dev/shm and ptys: shared memory of its own, in memory
+        // (review M7), and no device but these five, by the cgroup's device filter, so no pty
+        // from the host's pool. (InaccessiblePaths=, NoExecPaths= and ExecPaths= were tried
+        // first: with RootDirectory= they did not reach inside the sandbox, as the server's
+        // probe showed, so mounts and the device policy do it.)
+        "TemporaryFileSystem=/dev/shm:size=8m,mode=1777,noexec,nosuid,nodev".into(),
+        "TemporaryFileSystem=/dev/pts:ro".into(),
+        "DevicePolicy=strict".into(),
+        "DeviceAllow=/dev/null rw".into(),
+        "DeviceAllow=/dev/zero rw".into(),
+        "DeviceAllow=/dev/full rw".into(),
+        "DeviceAllow=/dev/random r".into(),
+        "DeviceAllow=/dev/urandom r".into(),
+        // /usr/local (the host's own tools) is an empty folder there (review L9)
+        "TemporaryFileSystem=/usr/local:ro".into(),
         "PrivateIPC=yes".into(),
         "ProtectProc=invisible".into(),
         "ProcSubset=pid".into(),
@@ -202,12 +221,18 @@ mod tests {
         for p in [
             "User=quillo-play-s07", "Group=quillo-play-s07", "RootDirectory=/var/lib/quillo-play/root", "BindReadOnlyPaths=/usr",
             "BindReadOnlyPaths=/etc/ld.so.cache", "BindReadOnlyPaths=/etc/localtime", "BindReadOnlyPaths=/var/lib/quillo-play/src/s07:/src",
-            "BindReadOnlyPaths=/var/lib/quillo-play/bin/quillo:/opt/quillo", "TemporaryFileSystem=/work:size=32m,mode=0700,uid=1007,gid=1007",
+            "BindReadOnlyPaths=/var/lib/quillo-play/bin/quillo:/opt/quillo", "TemporaryFileSystem=/work:size=32m,mode=0700,uid=1007,gid=1007,noexec,nosuid,nodev",
             "Environment=HOME=/work", "Environment=QUILLO_JIT=0", "StandardOutput=truncate:/var/lib/quillo-play/log/s07.log", "StandardError=inherit",
             "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any", "MemoryMax=192M", "MemorySwapMax=0", "CPUQuota=50%",
             "TasksMax=32", "LimitNOFILE=256", "LimitFSIZE=16M", "LimitCORE=0", "RuntimeMaxSec=660", "OOMScoreAdjust=1000", "Nice=10", "IOWeight=10",
-            "CPUWeight=10", "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateUsers=yes", "PrivateTmp=yes",
-            "PrivateDevices=yes", "PrivateIPC=yes", "ProtectProc=invisible", "ProcSubset=pid", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
+            "CPUWeight=10", "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateUsers=yes",
+            // review H3 took PrivateTmp=yes out for these two; M7 and L9 added the five after PrivateDevices
+            // the server's probe: path settings did not reach inside RootDirectory; mounts and
+            // the device policy do (noexec everywhere it writes, no pty, /usr/local empty)
+            "TemporaryFileSystem=/tmp:size=16m,mode=1777,noexec,nosuid,nodev", "TemporaryFileSystem=/var/tmp:size=16m,mode=1777,noexec,nosuid,nodev",
+            "PrivateDevices=yes", "TemporaryFileSystem=/dev/shm:size=8m,mode=1777,noexec,nosuid,nodev", "TemporaryFileSystem=/dev/pts:ro",
+            "DevicePolicy=strict", "DeviceAllow=/dev/null rw", "DeviceAllow=/dev/zero rw", "DeviceAllow=/dev/full rw",
+            "DeviceAllow=/dev/random r", "DeviceAllow=/dev/urandom r", "TemporaryFileSystem=/usr/local:ro", "PrivateIPC=yes", "ProtectProc=invisible", "ProcSubset=pid", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
             "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes", "RestrictNamespaces=yes",
             "RestrictSUIDSGID=yes", "RestrictRealtime=yes", "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "RemoveIPC=yes", "UMask=0077",
             "KeyringMode=private", "SystemCallArchitectures=native", "SystemCallFilter=@system-service",
@@ -216,6 +241,10 @@ mod tests {
         ] {
             assert!(has(p), "missing {}", p);
         }
+        assert!(
+            !a.iter().any(|x| x == "--property=PrivateTmp=yes"),
+            "review H3: /tmp is a tmpfs of its own, not a folder on the host's disk"
+        );
         assert!(a.contains(&"--unit=quillo-play-s07".to_string()));
         assert!(a.contains(&"--slice=quillo-play.slice".to_string()));
         let cmd = a.last().unwrap();

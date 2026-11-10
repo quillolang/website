@@ -20,7 +20,10 @@ pub struct SystemdBackend {
     cfg: Config,
     ids: HashMap<String, (u32, u32)>,
     locks: HashMap<String, Mutex<()>>,
+    /// Each slot's MainPID, from its start: it stays the same for the unit's life.
     pids: Mutex<HashMap<String, i32>>,
+    /// A slot whose connect just failed is not tried again for 250 ms (review M5).
+    fails: crate::util::FailMemo,
 }
 
 #[repr(C)]
@@ -55,6 +58,7 @@ impl SystemdBackend {
             ids,
             locks,
             pids: Mutex::new(HashMap::new()),
+            fails: crate::util::FailMemo::new(std::time::Duration::from_millis(250)),
         };
         b.layout()
             .map_err(|e| format!("cannot make {}: {}", cfg.root.display(), e))?;
@@ -83,6 +87,7 @@ impl SystemdBackend {
         dir(r.clone(), 0o755)?;
         for d in [
             "usr", "etc", "proc", "sys", "dev", "tmp", "src", "work", "opt", "run", "var",
+            "var/tmp",
         ] {
             dir(r.join(d), 0o755)?;
         }
@@ -144,6 +149,7 @@ impl SystemdBackend {
         let _ = self.systemctl(&["stop", "--quiet", &u]);
         let _ = self.systemctl(&["reset-failed", "--quiet", &u]);
         self.pids.lock().unwrap().remove(slot);
+        self.fails.clear(slot);
     }
 
     fn known(&self, slot: &str) -> Result<(u32, u32), String> {
@@ -238,23 +244,41 @@ impl Backend for SystemdBackend {
                 String::from_utf8_lossy(&o.stderr).trim()
             ));
         }
+        // Type=exec: systemd-run returns once the program is exec'd, so its MainPID is known
         if let Some(pid) = self.main_pid(slot) {
             self.pids.lock().unwrap().insert(slot.to_string(), pid);
         }
+        self.fails.clear(slot);
         Ok(())
     }
 
+    /// The program's socket, through its MainPID kept from start: systemd is asked again
+    /// only when no PID is known or its process is gone, and a slot that just failed is
+    /// not tried again for 250 ms (review M5: no `systemctl show` against PID 1 on every
+    /// preview request while a program has no socket).
     fn connect(&self, slot: &str) -> Result<UnixStream, String> {
         let (uid, _) = self.known(slot)?;
-        let cached = self.pids.lock().unwrap().get(slot).copied();
-        if let Some(pid) = cached {
-            if let Ok(s) = self.connect_pid(slot, pid, uid) {
-                return Ok(s);
-            }
+        let now = std::time::Instant::now();
+        if self.fails.recent(slot, now) {
+            return Err("the program's socket is not there (it just failed)".into());
         }
-        let pid = self.main_pid(slot).ok_or("the program is not running")?;
-        self.pids.lock().unwrap().insert(slot.to_string(), pid);
-        self.connect_pid(slot, pid, uid)
+        let cached = self.pids.lock().unwrap().get(slot).copied();
+        let alive = |p: i32| std::path::Path::new(&format!("/proc/{}", p)).exists();
+        let r = match cached {
+            Some(pid) if alive(pid) => self.connect_pid(slot, pid, uid),
+            _ => match self.main_pid(slot) {
+                Some(pid) => {
+                    self.pids.lock().unwrap().insert(slot.to_string(), pid);
+                    self.connect_pid(slot, pid, uid)
+                }
+                None => Err("the program is not running".into()),
+            },
+        };
+        match &r {
+            Ok(_) => self.fails.clear(slot),
+            Err(_) => self.fails.failed(slot, now),
+        }
+        r
     }
 
     fn status(&self, slots: &[String]) -> HashMap<String, Status> {

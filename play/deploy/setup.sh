@@ -18,7 +18,7 @@ install -d -m 0750 -o root -g root "$ROOT/log"
 
 # The sandboxes' root: empty folders to mount on, and the usual links into /usr.
 cd "$ROOT/root"
-for d in usr etc proc sys dev tmp src work opt run var; do install -d -m 0755 "$d"; done
+for d in usr etc proc sys dev tmp src work opt run var var/tmp; do install -d -m 0755 "$d"; done
 for l in bin lib lib64 sbin; do [ -L "$l" ] || ln -s "usr/$l" "$l"; done
 for f in etc/ld.so.cache etc/localtime opt/quillo; do [ -e "$f" ] || : > "$f"; done
 cd "$here"

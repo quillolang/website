@@ -18,6 +18,8 @@ struct Stack {
     preview: SocketAddr,
     port: u16,
     dev: Arc<DevBackend>,
+    /// The spawner's socket, when there is one: removed at the end.
+    sock: Option<std::path::PathBuf>,
 }
 
 /// Stops the stack's programs when the test ends, a failing one too (the proxy's
@@ -25,6 +27,9 @@ struct Stack {
 impl Drop for Stack {
     fn drop(&mut self) {
         self.dev.stop_all();
+        if let Some(p) = &self.sock {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -44,6 +49,7 @@ fn stack(name: &str, slots: usize, through_spawner: bool) -> Stack {
     c.public_port = Some(preview.local_addr().unwrap().port());
     c.finish().unwrap();
     let dev = Arc::new(DevBackend::new(&c).unwrap());
+    let sock_path = through_spawner.then(|| c.dir.with_extension("sock"));
     let backend: Arc<dyn Backend> = if through_spawner {
         let sock = c.dir.with_extension("sock");
         let _ = std::fs::remove_file(&sock);
@@ -60,6 +66,7 @@ fn stack(name: &str, slots: usize, through_spawner: bool) -> Stack {
         preview: preview.local_addr().unwrap(),
         port: c.public_port.unwrap(),
         dev,
+        sock: sock_path,
     };
     Proxy::new(c, backend).start(api, preview);
     s
@@ -79,35 +86,76 @@ fn run(s: &Stack, files: serde_json::Value, client: &str) -> Reply {
     )
 }
 
-fn enter(s: &Stack, r: &serde_json::Value) -> (String, String) {
+/// The enter flow, as the editor's frame goes through it. Gives the host, the session's
+/// token (the cookie) and the enter token (the link's).
+fn enter(s: &Stack, r: &serde_json::Value) -> (String, String, String) {
     let token = r["session"].as_str().unwrap().to_string();
     let h = r["host"].as_str().unwrap();
     let host = format!("{}:{}", h, s.port);
     let enter = r["enter"].as_str().unwrap();
-    assert_eq!(enter, format!("http://{}/__play/enter?t={}", host, token));
-    let a = get(s.preview, &host, &format!("/__play/enter?t={}", token), &[]);
+    // review L4: the link carries an enter token of its own, never the session's
+    let e = enter
+        .strip_prefix(&format!("http://{}/__play/enter?t=", host))
+        .unwrap_or_else(|| panic!("{}", enter))
+        .to_string();
+    assert!(quillo_play::util::is_token(&e) && e != token, "{}", enter);
+    // the link opened as a page is refused; in a frame it is taken (main session's addition)
+    let page = get(
+        s.preview,
+        &host,
+        &format!("/__play/enter?t={}", e),
+        &[("Sec-Fetch-Dest", "document")],
+    );
+    assert_eq!(page.status, 403, "{}", page.head);
+    let a = get(
+        s.preview,
+        &host,
+        &format!("/__play/enter?t={}", e),
+        &[("Sec-Fetch-Dest", "iframe")],
+    );
     assert_eq!(a.status, 302, "{}", a.head);
     assert_eq!(
         a.header("location").unwrap(),
-        format!("/__play/enter2?t={}", token)
+        format!("/__play/enter2?t={}", e)
     );
     assert_eq!(
         a.header("clear-site-data").unwrap(),
         "\"cache\", \"storage\""
     );
-    let b = get(
-        s.preview,
-        &host,
-        &format!("/__play/enter2?t={}", token),
-        &[],
+    // the session's token is not an enter token
+    assert_eq!(
+        get(s.preview, &host, &format!("/__play/enter2?t={}", token), &[]).status,
+        403
     );
+    assert_eq!(
+        get(
+            s.preview,
+            &host,
+            &format!("/__play/enter2?t={}", e),
+            &[("Sec-Fetch-Dest", "empty")]
+        )
+        .status,
+        403,
+        "a fetch is no frame"
+    );
+    // a browser that says nothing of where a request goes is let in
+    let b = get(s.preview, &host, &format!("/__play/enter2?t={}", e), &[]);
     assert_eq!(b.status, 302);
     assert_eq!(b.header("location").unwrap(), "/");
     assert_eq!(
         b.header("set-cookie").unwrap(),
         format!("play={}; Path=/; HttpOnly; SameSite=Lax", token)
     );
-    (host, token)
+    // once: the link is used up
+    for p in ["/__play/enter", "/__play/enter2"] {
+        assert_eq!(
+            get(s.preview, &host, &format!("{}?t={}", p, e), &[]).status,
+            403,
+            "{} again",
+            p
+        );
+    }
+    (host, token, e)
 }
 
 fn whole_run(through_spawner: bool) {
@@ -155,11 +203,14 @@ fn whole_run(through_spawner: bool) {
     assert_eq!(v["running"], json!(true), "{}", v);
     assert_eq!(v["host"], json!("s01.play.localhost"));
     assert!(v["log"].is_array() && v["next"].is_u64(), "{}", v);
-    let (host, token) = enter(&s, &v);
+    let (host, token, enter_token) = enter(&s, &v);
     let cookie = format!("play={}", token);
 
     let page = get(s.preview, &host, "/", &[("Cookie", &cookie)]);
     assert_eq!(page.status, 200, "{}\n{}", page.head, page.body);
+    // reviews M2 and L2: never kept by a browser, never a second answer
+    assert_eq!(page.header("cache-control").unwrap(), "no-store");
+    assert_eq!(page.header("connection").unwrap(), "close");
     assert!(page.body.contains("Counter page"), "{}", page.body);
     // the editor may frame it, nothing else: quillo's SAMEORIGIN is gone
     assert!(page.header("x-frame-options").is_none(), "{}", page.head);
@@ -304,6 +355,8 @@ fn whole_run(through_spawner: bool) {
         "{:?}",
         text
     );
+    // the enter token is in /run's answer only (main session's addition)
+    assert!(!log.to_string().contains(&enter_token));
     let next = log["next"].as_u64().unwrap();
     let again = api(
         s.api,

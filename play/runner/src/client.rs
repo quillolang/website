@@ -107,13 +107,10 @@ impl Backend for SpawnerClient {
             Duration::from_secs(5),
         )?;
         Self::ok(&v)?;
+        let data = crate::util::b64_decode(v.get("data64").and_then(|d| d.as_str()).unwrap_or(""))
+            .ok_or("the spawner's output is not base64")?;
         Ok(Chunk {
-            data: v
-                .get("data")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .as_bytes()
-                .to_vec(),
+            data,
             next: v.get("next").and_then(|n| n.as_u64()).unwrap_or(offset),
             size: v.get("size").and_then(|n| n.as_u64()).unwrap_or(0),
         })

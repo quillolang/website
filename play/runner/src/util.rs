@@ -140,6 +140,112 @@ pub fn on_signal<F: FnOnce() + Send + 'static>(on_signal: F) {
     }
 }
 
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding: the spawner's output bytes go to the proxy whole, not
+/// through from_utf8_lossy (review L7).
+pub fn b64_encode(d: &[u8]) -> String {
+    let mut o = String::with_capacity(d.len().div_ceil(3) * 4);
+    for c in d.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        o.push(B64[(n >> 18) as usize & 63] as char);
+        o.push(B64[(n >> 12) as usize & 63] as char);
+        o.push(if c.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        o.push(if c.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    o
+}
+
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut o = Vec::with_capacity(b.len() / 4 * 3);
+    for (i, q) in b.chunks(4).enumerate() {
+        let last = i == b.len() / 4 - 1;
+        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (j, &c) in q.iter().enumerate() {
+            let v = if j >= 4 - pad { 0 } else { val(c)? };
+            n = n << 6 | v;
+        }
+        o.push((n >> 16) as u8);
+        if pad < 2 {
+            o.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            o.push(n as u8);
+        }
+    }
+    Some(o)
+}
+
+/// Remembers, for each key, that something just failed, so it is not tried again for a
+/// while (review M5: a preview request whose program has no socket yet does not run
+/// `systemctl show` against PID 1 each time). Time is passed in, for the tests.
+pub struct FailMemo {
+    hold: std::time::Duration,
+    at: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl FailMemo {
+    pub fn new(hold: std::time::Duration) -> FailMemo {
+        FailMemo {
+            hold,
+            at: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+    /// Whether `key` failed less than `hold` before `now`.
+    pub fn recent(&self, key: &str, now: std::time::Instant) -> bool {
+        self.at
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|t| now.saturating_duration_since(*t) < self.hold)
+    }
+    pub fn failed(&self, key: &str, now: std::time::Instant) {
+        self.at.lock().unwrap().insert(key.to_string(), now);
+    }
+    pub fn clear(&self, key: &str) {
+        self.at.lock().unwrap().remove(key);
+    }
+}
+
+/// Who a run is counted against (review M3): `ip:` and an IPv6 address is its /64
+/// (`ip6:2001:db8:1:2::/64`), since one visitor has a whole /64 to choose from; an
+/// IPv4-mapped IPv6 address is its IPv4 (`ip:1.2.3.4`); anything else as it is.
+pub fn normalize_client(client: &str) -> String {
+    let Some(a) = client.strip_prefix("ip:") else {
+        return client.to_string();
+    };
+    let a = a.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(v6) = a.parse::<std::net::Ipv6Addr>() {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return format!("ip:{}", v4);
+        }
+        let s = v6.segments();
+        return format!("ip6:{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]);
+    }
+    if let Ok(v4) = a.parse::<std::net::Ipv4Addr>() {
+        return format!("ip:{}", v4);
+    }
+    client.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +294,57 @@ mod tests {
             html_escape("<a href=\"x\">'&'</a>"),
             "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
         );
+    }
+
+    #[test]
+    fn base64_round_trips_any_bytes() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+        for n in 0..300usize {
+            let d: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+            assert_eq!(b64_decode(&b64_encode(&d)).unwrap(), d, "{}", n);
+        }
+        // bytes that are not UTF-8 stay as they are
+        assert_eq!(b64_decode(&b64_encode(&[0xff, 0xfe, 0x80])).unwrap(), vec![0xff, 0xfe, 0x80]);
+        for bad in ["Zg=", "Z===", "Zg==Zg==", "Zm9v!", "Zm=v"] {
+            assert!(b64_decode(bad).is_none(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn a_failure_is_remembered_for_a_while() {
+        let m = FailMemo::new(std::time::Duration::from_millis(250));
+        let t = std::time::Instant::now();
+        assert!(!m.recent("s01", t));
+        m.failed("s01", t);
+        assert!(m.recent("s01", t + std::time::Duration::from_millis(249)));
+        assert!(!m.recent("s01", t + std::time::Duration::from_millis(250)));
+        assert!(!m.recent("s02", t), "per key");
+        m.failed("s01", t);
+        m.clear("s01");
+        assert!(!m.recent("s01", t));
+        // a time before the failure (clocks of two threads) is not a panic
+        m.failed("s03", t + std::time::Duration::from_secs(1));
+        assert!(m.recent("s03", t));
+    }
+
+    #[test]
+    fn clients_by_address_and_by_ipv6_64() {
+        assert_eq!(normalize_client("u12"), "u12");
+        assert_eq!(normalize_client("ip:1.2.3.4"), "ip:1.2.3.4");
+        assert_eq!(normalize_client("ip:2001:db8:1:2:3:4:5:6"), "ip6:2001:db8:1:2::/64");
+        // every address of one /64 is one client, however it is written
+        assert_eq!(normalize_client("ip:2001:0DB8:0001:0002::ffff"), "ip6:2001:db8:1:2::/64");
+        assert_eq!(normalize_client("ip:[2001:db8:1:2::1]"), "ip6:2001:db8:1:2::/64");
+        assert_ne!(normalize_client("ip:2001:db8:1:3::1"), normalize_client("ip:2001:db8:1:2::1"));
+        assert_eq!(normalize_client("ip:::1"), "ip6:0:0:0:0::/64");
+        // an IPv4 address mapped into IPv6 is that IPv4 address
+        assert_eq!(normalize_client("ip:::ffff:1.2.3.4"), "ip:1.2.3.4");
+        // what is not an address is kept as it is
+        assert_eq!(normalize_client("ip:app"), "ip:app");
+        assert_eq!(normalize_client("ip:"), "ip:");
     }
 }

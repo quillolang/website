@@ -99,7 +99,6 @@ fn proxy(cfg: Config) -> Result<(), String> {
     let backend = Arc::new(quillo_play::client::SpawnerClient {
         socket: cfg.spawner.clone(),
     });
-    quillo_play::util::on_signal(|| {});
     let api = listen(cfg.api)?;
     let preview = listen(cfg.preview)?;
     eprintln!(
@@ -110,6 +109,10 @@ fn proxy(cfg: Config) -> Result<(), String> {
         cfg.spawner.display()
     );
     let p = quillo_play::proxy::Proxy::new(cfg, backend);
+    // stopped (not restarted), it stops its programs too, rather than leave them up to
+    // 11 minutes (review L6); before any thread is made, so the signal is this thread's
+    let ps = p.clone();
+    quillo_play::util::on_signal(move || ps.stop_every_slot());
     p.stop_every_slot();
     p.start(api, preview);
     park()

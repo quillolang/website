@@ -6,7 +6,7 @@
 //!   {"op":"connect","slot":"s07"}                  → {"ok":true} and the socket | {"ok":false,"error":...}
 //!   {"op":"status","slots":["s01",...]}            → {"ok":true,"status":{"s01":{"running":..,"exit":..,"result":..}}}
 //!   {"op":"status","slot":"s01"}                   → the same, for one
-//!   {"op":"log","slot":"s07","offset":N,"max":M}   → {"ok":true,"data":"...","next":N2,"size":S}
+//!   {"op":"log","slot":"s07","offset":N,"max":M}   → {"ok":true,"data64":"<base64>","next":N2,"size":S}
 //!   {"op":"stop","slot":"s07"}                     → {"ok":true}
 
 use crate::backend::Backend;
@@ -27,15 +27,34 @@ pub fn serve(
     slots: Vec<String>,
     allowed_uids: Vec<u32>,
 ) {
+    let mut said = false;
     for c in listener.incoming() {
-        let Ok(c) = c else { continue };
+        let c = match c {
+            Ok(c) => c,
+            Err(e) => {
+                // out of file descriptors and the like: wait, rather than spin (review H2)
+                if !said {
+                    eprintln!("quillo-play spawner: accept: {} (said once)", e);
+                    said = true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         let ok = crate::util::peer_uid(&c).is_ok_and(|u| allowed_uids.contains(&u));
         if !ok {
             continue; // dropped unanswered
         }
         let b = backend.clone();
         let slots = slots.clone();
-        std::thread::spawn(move || handle(c, b.as_ref(), &slots));
+        // a thread that cannot be made drops this request; the loop goes on (review H2)
+        if let Err(e) = std::thread::Builder::new().spawn(move || handle(c, b.as_ref(), &slots)) {
+            if !said {
+                eprintln!("quillo-play spawner: no thread: {} (said once)", e);
+                said = true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -59,6 +78,15 @@ fn handle(c: UnixStream, b: &dyn Backend, slots: &[String]) {
     }
     let (v, sock) = dispatch(&line, b, slots);
     let _ = answer(&c, v, sock.as_ref());
+    if sock.is_some() {
+        // Our copy of the socket is kept until the proxy has its own: it closes this
+        // connection as soon as it has read the answer. A socket that is only in flight when
+        // its last other copy closes can be swept by macOS's unix-socket garbage collector,
+        // which shuts its receiving side: the protocol test saw an EOF there, about 1 run in
+        // 12 under load, on the code before the review's fixes too.
+        let mut one = [0u8; 1];
+        let _ = std::io::Read::read(&mut &c, &mut one);
+    }
 }
 
 fn answer(c: &UnixStream, v: Value, sock: Option<&UnixStream>) -> std::io::Result<()> {
@@ -156,8 +184,9 @@ pub fn dispatch(line: &[u8], b: &dyn Backend, slots: &[String]) -> (Value, Optio
                 .and_then(|o| o.as_u64())
                 .map_or(LOG_MAX, |m| (m as usize).min(LOG_MAX));
             match b.log(slot, offset, max) {
+                // base64: the bytes whole, a character cut at the chunk's edge included (review L7)
                 Ok(c) => (
-                    json!({"ok": true, "data": String::from_utf8_lossy(&c.data), "next": c.next, "size": c.size}),
+                    json!({"ok": true, "data64": crate::util::b64_encode(&c.data), "next": c.next, "size": c.size}),
                     None,
                 ),
                 Err(e) => fail(e),
@@ -218,7 +247,15 @@ mod tests {
                 })
                 .collect()
         }
-        fn log(&self, _slot: &str, offset: u64, _max: usize) -> Result<Chunk, String> {
+        fn log(&self, slot: &str, offset: u64, _max: usize) -> Result<Chunk, String> {
+            if slot == "s01" {
+                // half of é, and a byte that is no UTF-8 at all: they arrive as they are
+                return Ok(Chunk {
+                    data: vec![b'a', 0xc3, 0xff],
+                    next: offset + 3,
+                    size: offset + 3,
+                });
+            }
             Ok(Chunk {
                 data: "héllo\n".as_bytes().to_vec(),
                 next: offset + 7,
@@ -271,6 +308,9 @@ mod tests {
         let l = c.log("s02", 10, 100).unwrap();
         assert_eq!(l.data, "héllo\n".as_bytes());
         assert_eq!(l.next, 17);
+        // review L7: bytes that are not UTF-8 are not turned into U+FFFD on the way
+        let l = c.log("s01", 0, 100).unwrap();
+        assert_eq!(l.data, vec![b'a', 0xc3, 0xff]);
         c.stop("s01");
     }
 

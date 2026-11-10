@@ -65,6 +65,19 @@ pub struct Config {
     pub work_size: String,
     pub max_compute: String,
     pub max_body: String,
+    /// Preview connections at once, in all and for one slot; more get 503 (review H2).
+    pub max_preview_conns: usize,
+    pub max_slot_conns: usize,
+    /// API connections at once.
+    pub max_api_conns: usize,
+    /// How long a preview's program may say nothing (a request's answer), and how long an
+    /// upgraded connection (a WebSocket) may carry nothing either way (review H2).
+    pub upstream_idle: Duration,
+    pub ws_idle: Duration,
+    /// How long the link /run gives (its enter token) may be used, once (review L4).
+    pub enter_ttl: Duration,
+    /// Ended sessions' output kept for /log, all together (review M4).
+    pub ended_budget: usize,
 }
 
 pub const DEFAULT_FILE: &str = "/etc/quillo-play/config";
@@ -122,6 +135,13 @@ impl Config {
             work_size: "32m".into(),
             max_compute: "2s".into(),
             max_body: "1MB".into(),
+            max_preview_conns: 512,
+            max_slot_conns: 48,
+            max_api_conns: 128,
+            upstream_idle: Duration::from_secs(120),
+            ws_idle: Duration::from_secs(600),
+            enter_ttl: Duration::from_secs(60),
+            ended_budget: 16 * 1024 * 1024,
         }
     }
 
@@ -231,6 +251,13 @@ impl Config {
             "work-size" => self.work_size = v.into(),
             "max-compute" => self.max_compute = v.into(),
             "max-body" => self.max_body = v.into(),
+            "max-preview-conns" => self.max_preview_conns = num(v)? as usize,
+            "max-slot-conns" => self.max_slot_conns = num(v)? as usize,
+            "max-api-conns" => self.max_api_conns = num(v)? as usize,
+            "upstream-idle" => self.upstream_idle = Duration::from_secs(num(v)?),
+            "ws-idle" => self.ws_idle = Duration::from_secs(num(v)?),
+            "enter-ttl" => self.enter_ttl = Duration::from_secs(num(v)?),
+            "ended-budget" => self.ended_budget = num(v)? as usize,
             _ => return Err(format!("no setting `{}`", key)),
         }
         Ok(())
@@ -326,6 +353,15 @@ impl Config {
         }
         if self.runs_per_hour == 0 || self.max_runtime.is_zero() || self.idle.is_zero() {
             return Err("`runs-per-hour`, `max-runtime` and `idle` are more than 0".into());
+        }
+        if self.max_preview_conns == 0
+            || self.max_slot_conns == 0
+            || self.max_api_conns == 0
+            || self.upstream_idle.is_zero()
+            || self.ws_idle.is_zero()
+            || self.enter_ttl.is_zero()
+        {
+            return Err("the connection caps, `upstream-idle`, `ws-idle` and `enter-ttl` are more than 0".into());
         }
         Ok(())
     }

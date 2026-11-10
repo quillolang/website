@@ -17,6 +17,9 @@ pub struct Session {
     pub log: Log,
     /// Its program is being started: no output read, no exit looked for, yet.
     pub starting: bool,
+    /// The token of the link /run gave, and when it was made: it lets one browser in, once,
+    /// within enter-ttl (review L4); the session's own token is never in a URL.
+    pub enter: Option<(String, Instant)>,
 }
 
 #[derive(Debug)]
@@ -26,6 +29,8 @@ pub struct Ended {
     pub at: Instant,
 }
 
+// One Begin a run, moved once: its size does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Begin {
     /// The slot taken, and the client's earlier session when this one took its place.
@@ -43,12 +48,17 @@ pub enum Why {
     Idle,
 }
 
+/// What an ended session costs beyond its output, against `ended_budget`.
+pub const ENDED_OVERHEAD: usize = 256;
+
 pub struct Table {
     pub slots: Vec<Option<Session>>,
     pub ended: HashMap<String, Ended>,
     runs: HashMap<String, VecDeque<Instant>>,
     runs_per_hour: usize,
     log_keep: usize,
+    /// Ended sessions' output, all together, is kept under this (review M4): the oldest go.
+    pub ended_budget: usize,
 }
 
 impl Table {
@@ -59,6 +69,7 @@ impl Table {
             runs: HashMap::new(),
             runs_per_hour,
             log_keep,
+            ended_budget: 16 * 1024 * 1024,
         }
     }
 
@@ -89,6 +100,7 @@ impl Table {
             seen: now,
             log: Log::new(self.log_keep),
             starting: true,
+            enter: None,
         });
         Begin::Slot { slot, replaced }
     }
@@ -158,6 +170,62 @@ impl Table {
                 at: now,
             },
         );
+        self.trim_ended();
+    }
+
+    /// Drops the oldest ended sessions until what they hold is within `ended_budget`.
+    fn trim_ended(&mut self) {
+        let mut total: usize = self
+            .ended
+            .values()
+            .map(|e| e.log.cost() + ENDED_OVERHEAD)
+            .sum();
+        if total <= self.ended_budget {
+            return;
+        }
+        let mut by_age: Vec<(Instant, String, usize)> = self
+            .ended
+            .iter()
+            .map(|(k, e)| (e.at, k.clone(), e.log.cost() + ENDED_OVERHEAD))
+            .collect();
+        by_age.sort_by_key(|(at, _, _)| *at);
+        for (_, k, cost) in by_age {
+            if total <= self.ended_budget {
+                break;
+            }
+            self.ended.remove(&k);
+            total -= cost;
+        }
+    }
+
+    /// Gives the slot's session (when it has `token`) the enter token `enter`.
+    pub fn set_enter(&mut self, slot: usize, token: &str, enter: String, now: Instant) -> bool {
+        if !self.holds(slot, token) {
+            return false;
+        }
+        self.slots[slot].as_mut().unwrap().enter = Some((enter, now));
+        true
+    }
+
+    /// Whether `given` is the slot's enter token, still young enough. `take`: it is used up.
+    pub fn check_enter(
+        &mut self,
+        slot: usize,
+        given: &str,
+        now: Instant,
+        ttl: Duration,
+        take: bool,
+    ) -> bool {
+        let Some(Some(s)) = self.slots.get_mut(slot) else {
+            return false;
+        };
+        let ok = s.enter.as_ref().is_some_and(|(e, at)| {
+            ct_eq(e.as_bytes(), given.as_bytes()) && now.saturating_duration_since(*at) < ttl
+        });
+        if ok && take {
+            s.enter = None;
+        }
+        ok
     }
 
     /// Sessions past their time: 10 minutes from the start, or 3 minutes unseen.
@@ -350,5 +418,61 @@ mod tests {
         assert_eq!(t.by_token(""), None);
         assert!(!t.holds(1, &tok(1)));
         assert!(!t.holds(7, &tok(1)));
+    }
+
+    #[test]
+    fn the_enter_token_works_once_and_not_for_long() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let mut t = Table::new(2, 30, 1024);
+        t.begin("a", tok(1), now);
+        assert!(!t.check_enter(0, &tok(7), now, ttl, false), "none made yet");
+        assert!(!t.set_enter(0, &tok(9), tok(7), now), "only for the session's own token");
+        assert!(t.set_enter(0, &tok(1), tok(7), now));
+        assert!(!t.check_enter(0, &tok(1), now, ttl, false), "the session's token is not the enter token");
+        assert!(!t.check_enter(0, &tok(7)[..31], now, ttl, false));
+        assert!(!t.check_enter(1, &tok(7), now, ttl, false), "another slot");
+        assert!(!t.check_enter(9, &tok(7), now, ttl, false), "no such slot");
+        // looked at (the first step) as often as wanted, used (the second) once
+        assert!(t.check_enter(0, &tok(7), now, ttl, false));
+        assert!(t.check_enter(0, &tok(7), now + Duration::from_secs(59), ttl, false));
+        assert!(t.check_enter(0, &tok(7), now + Duration::from_secs(1), ttl, true));
+        assert!(!t.check_enter(0, &tok(7), now + Duration::from_secs(1), ttl, true), "used up");
+        // too old
+        t.set_enter(0, &tok(1), tok(8), now);
+        assert!(!t.check_enter(0, &tok(8), now + ttl, ttl, true));
+        // a new run of the client: a new session, no enter token from the old one
+        t.set_enter(0, &tok(1), tok(8), now);
+        t.begin("a", tok(2), now);
+        assert!(!t.check_enter(0, &tok(8), now, ttl, false));
+    }
+
+    #[test]
+    fn ended_sessions_are_held_to_a_budget_oldest_first() {
+        let start = Instant::now();
+        let mut t = Table::new(1, 1000, 64 * 1024);
+        t.ended_budget = 3 * (8 * 1024 + 2 * 64 + ENDED_OVERHEAD);
+        for i in 0..10 {
+            let now = start + Duration::from_secs(i);
+            t.begin("a", tok(i as usize), now);
+            // two lines of 4 KB each
+            t.slots[0].as_mut().unwrap().log.push(&vec![b'x'; 4096]);
+            t.slots[0].as_mut().unwrap().log.push(b"\n");
+            t.slots[0].as_mut().unwrap().log.push(&vec![b'y'; 4096]);
+            t.end(0, &tok(i as usize), None, None, now);
+            let total: usize = t.ended.values().map(|e| e.log.cost() + ENDED_OVERHEAD).sum();
+            assert!(total <= t.ended_budget, "{} > {}", total, t.ended_budget);
+        }
+        assert!(t.ended.len() <= 3 && !t.ended.is_empty());
+        assert!(t.ended.contains_key(&tok(9)), "the newest is kept");
+        assert!(!t.ended.contains_key(&tok(0)), "the oldest went");
+        // empty ended sessions still count their overhead: never without bound
+        let mut t = Table::new(1, 1_000_000, 1024);
+        t.ended_budget = 100 * ENDED_OVERHEAD;
+        for i in 0..1000 {
+            t.begin("b", tok(i), start);
+            t.end(0, &tok(i), None, None, start + Duration::from_millis(i as u64));
+        }
+        assert!(t.ended.len() <= 100, "{}", t.ended.len());
     }
 }
