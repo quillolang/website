@@ -78,6 +78,8 @@ pub struct Config {
     pub enter_ttl: Duration,
     /// Ended sessions' output kept for /log, all together (review M4).
     pub ended_budget: usize,
+    /// Sessions at once from one network, an IPv6 /64 (second review, item 4).
+    pub per_net: usize,
 }
 
 pub const DEFAULT_FILE: &str = "/etc/quillo-play/config";
@@ -142,6 +144,7 @@ impl Config {
             ws_idle: Duration::from_secs(600),
             enter_ttl: Duration::from_secs(60),
             ended_budget: 16 * 1024 * 1024,
+            per_net: 3,
         }
     }
 
@@ -258,6 +261,7 @@ impl Config {
             "ws-idle" => self.ws_idle = Duration::from_secs(num(v)?),
             "enter-ttl" => self.enter_ttl = Duration::from_secs(num(v)?),
             "ended-budget" => self.ended_budget = num(v)? as usize,
+            "max-per-network" => self.per_net = num(v)? as usize,
             _ => return Err(format!("no setting `{}`", key)),
         }
         Ok(())
@@ -360,6 +364,7 @@ impl Config {
             || self.upstream_idle.is_zero()
             || self.ws_idle.is_zero()
             || self.enter_ttl.is_zero()
+            || self.per_net == 0
         {
             return Err("the connection caps, `upstream-idle`, `ws-idle` and `enter-ttl` are more than 0".into());
         }

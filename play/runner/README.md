@@ -31,7 +31,7 @@ Other settings: `--port-api`, `--port-preview`, `--dir` (where runs go, default
 `/tmp/quillo-play-<pid>`), `--slots`, `--ide-url`, `--idle`, `--max-runtime`, `--runs-per-hour`,
 and the limits below (`--max-preview-conns 512`, `--max-slot-conns 48`, `--max-api-conns 128`,
 `--upstream-idle 120`, `--ws-idle 600`, `--enter-ttl 60` in seconds, `--ended-budget 16777216`
-in bytes). SIGINT or SIGTERM stops every program and removes the folder.
+in bytes, `--max-per-network 3`). SIGINT or SIGTERM stops every program and removes the folder.
 
 ## The API (proxy, for the website)
 
@@ -43,8 +43,13 @@ connection.
   `enter` is the link for the editor's frame: it carries an enter token of its own, good once,
   for 60 seconds; `session` (the cookie's value, and what /log and /stop take) is in no URL, and
   the enter token is in no answer but this one. One session per client (a second run ends the
-  first and takes its slot): `ip:` and an IPv6 address counts as its /64, an IPv4-mapped address
-  as its IPv4; 429 past 30 runs an hour; 503 when all slots are taken; 400 for files it does not take (at most 30, 256 KB in
+  first and takes its slot); the client is the exact address (`ip:2001:db8::1` however it is
+  written, `ip:1.2.3.4`) or the account (`u12`). Its network (an IPv6 address's /64; an IPv4
+  address or an account is its own) may start 30 runs an hour (429 past it) and have 3 sessions
+  at once (429 "too many runs from your network"), so a whole office or school behind one /64
+  gets a session each, but one visitor cannot fill the slots with the /64's many addresses. An
+  IPv4-mapped address is its IPv4 address. 503 when all slots are taken, and once the runner is
+  stopping; 400 for files it does not take (at most 30, 256 KB in
   all, text only, `main.qwe` there, names of letters, digits, `_ . -`, at most three levels, no
   part `.`, `..` or starting with `.`). It answers once the program's socket is up, the program
   ended, quillo printed `watching for changes` without a socket (an error, now waiting for a
@@ -58,7 +63,8 @@ connection.
 
 A session ends 10 minutes after it starts, after 3 minutes with no preview request and no
 `/log` poll, on `/stop`, when its program exits, or when the runner restarts or is stopped
-(the proxy stops every slot on SIGTERM). Ended sessions' output is kept 10 minutes, at most 16 MB
+(on SIGTERM the proxy starts no more runs, then stops every slot, each after any start in
+progress there). Ended sessions' output is kept 10 minutes, at most 16 MB
 of it in all (the oldest goes first). A start that failed, or whose answer timed out, is
 stopped; every 2 seconds, a program running in a slot no session holds is stopped too.
 The spawner is never asked anything while the session table is locked, so a slow answer of
@@ -84,8 +90,10 @@ to the program:
 - The body is sent as long as its `Content-Length` says, and nothing after it (a second request
   in the same write goes nowhere); `Transfer-Encoding` is refused (411), and a WebSocket request
   with a body (400).
-- The program may say nothing for 120 seconds (an upgraded connection, either way, for 10
-  minutes); then the connection goes.
+- The connection goes when it has carried nothing, either way, for its limit: before the answer
+  starts, 120 seconds, counted only from the end of the request's body (a slow upload is no idle
+  program); once the answer has started (an event stream's pauses) and for a WebSocket, 10
+  minutes, one clock for both directions, so a WebSocket the program alone speaks on lives.
 - `X-Forwarded-For` is Limer's, passed on (in dev mode, the TCP peer's); the program is started
   with `--trust-proxy 127.0.0.1`.
 - A GET or HEAD with no body is sent again once when the program closes without a byte of

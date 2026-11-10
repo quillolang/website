@@ -8,11 +8,11 @@ use crate::http::{
     read_head, relay_response, response, slot_of, ReadHead, Relayed, RespFilter, MAX_HEAD,
 };
 use crate::table::{Begin, Table, Why};
-use crate::util::{ct_eq, html_escape, is_token, new_token, normalize_client};
+use crate::util::{client_keys, ct_eq, html_escape, is_token, new_token};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,8 @@ pub struct Proxy {
     /// A failure to make a thread or accept is logged once, not on every connection.
     said_spawn: AtomicBool,
     said_accept: AtomicBool,
+    /// Set on SIGTERM: no new run starts (second review, item 8).
+    stopping: AtomicBool,
 }
 
 struct ConnGuard<'a>(&'a AtomicUsize);
@@ -77,6 +79,77 @@ fn plain(status: u16, text: &str) -> Vec<u8> {
     )
 }
 
+/// When a preview connection last carried a byte, either way, and how long it may carry
+/// none (second review, items 3 and 7): before an answer starts, upstream-idle, its clock
+/// held while the request's body is still being sent (a slow upload is no idle program);
+/// once the answer streams, and for a WebSocket, ws-idle, one clock for both directions.
+pub struct Activity {
+    base: Instant,
+    last_ms: AtomicU64,
+    limit_ms: AtomicU64,
+    /// A request body is still being sent to the program.
+    pub pumping: AtomicBool,
+}
+
+impl Activity {
+    pub fn new(limit: Duration) -> Activity {
+        Activity {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            limit_ms: AtomicU64::new(limit.as_millis() as u64),
+            pumping: AtomicBool::new(false),
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+    pub fn touch(&self) {
+        self.last_ms.fetch_max(self.now_ms(), Ordering::SeqCst);
+    }
+    pub fn set_limit(&self, d: Duration) {
+        self.limit_ms.store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// Whether nothing went either way for the limit; with `wait_for_pump`, never while a
+    /// request body is still being sent.
+    pub fn expired(&self, wait_for_pump: bool) -> bool {
+        if wait_for_pump && self.pumping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let idle = self.now_ms().saturating_sub(self.last_ms.load(Ordering::SeqCst));
+        idle >= self.limit_ms.load(Ordering::SeqCst)
+    }
+}
+
+/// A reader over a socket with a short read timeout: each timeout is waited out until its
+/// connection's Activity says it has been idle for its limit; each byte read is activity.
+pub struct IdleRead<R> {
+    pub inner: R,
+    pub act: Arc<Activity>,
+    pub wait_for_pump: bool,
+}
+
+impl<R: Read> Read for IdleRead<R> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.inner.read(b) {
+                Ok(n) => {
+                    if n > 0 {
+                        self.act.touch();
+                    }
+                    return Ok(n);
+                }
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    if self.act.expired(self.wait_for_pump) {
+                        return Err(e);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 /// What one pull of a program's output found, applied to its log afterwards.
 enum Step {
     Skipped(u64, u64),
@@ -88,6 +161,7 @@ impl Proxy {
         let n = cfg.slots.len();
         let mut table = Table::new(n, cfg.runs_per_hour, cfg.log_keep);
         table.ended_budget = cfg.ended_budget;
+        table.per_net = cfg.per_net;
         Arc::new(Proxy {
             table: Mutex::new(table),
             ops: (0..n).map(|_| Mutex::new(())).collect(),
@@ -96,9 +170,17 @@ impl Proxy {
             api_conns: AtomicUsize::new(0),
             said_spawn: AtomicBool::new(false),
             said_accept: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             cfg,
             backend,
         })
+    }
+
+    /// How often a waiting read looks at its connection's Activity: a quarter of the
+    /// shortest idle limit, between 50 ms and 1 s.
+    fn tick(&self) -> Duration {
+        (self.cfg.upstream_idle.min(self.cfg.ws_idle) / 4)
+            .clamp(Duration::from_millis(50), Duration::from_secs(1))
     }
 
     fn say_once(flag: &AtomicBool, what: &str) {
@@ -346,11 +428,6 @@ impl Proxy {
             None
         };
         let fwd = forward_head(&head, &self.cfg.cookie, upgrade, xff.as_deref());
-        let idle = if upgrade {
-            self.cfg.ws_idle
-        } else {
-            self.cfg.upstream_idle
-        };
         let filter = RespFilter {
             cookie: &self.cfg.cookie,
             frame: &self.cfg.frame_ancestors,
@@ -362,6 +439,7 @@ impl Proxy {
         let bodyless = matches!(head.method.as_str(), "GET" | "HEAD") && len == 0 && !upgrade;
         let mut tries = if bodyless { 2 } else { 1 };
         let name = &self.cfg.slots[slot];
+        let tick = self.tick();
         loop {
             tries -= 1;
             let mut up = match self.backend.connect(name) {
@@ -371,17 +449,24 @@ impl Proxy {
                     return send(&mut c, &self.not_answering_page());
                 }
             };
-            let _ = up.set_read_timeout(Some(idle));
+            let _ = up.set_read_timeout(Some(tick));
             let _ = up.set_write_timeout(Some(Duration::from_secs(60)));
             if let Err(e) = up.write_all(&fwd).and_then(|_| up.write_all(first_body)) {
                 eprintln!("quillo-play: {}: cannot write to the program: {}", name, e);
                 return send(&mut c, &self.not_answering_page());
             }
+            let act = Arc::new(Activity::new(self.cfg.upstream_idle));
+            act.touch();
             let mut first = vec![0u8; 16384];
             let mut got = 0;
             if bodyless {
                 // the client has nothing more to send before the answer: wait for its first bytes
-                got = up.read(&mut first).unwrap_or(0);
+                let mut r = IdleRead {
+                    inner: &mut up,
+                    act: act.clone(),
+                    wait_for_pump: true,
+                };
+                got = r.read(&mut first).unwrap_or(0);
                 if got == 0 {
                     if tries > 0 {
                         eprintln!("quillo-play: {}: the program closed without an answer; sending the request again", name);
@@ -392,16 +477,27 @@ impl Proxy {
                 }
             }
             first.truncate(got);
-            // the rest of the body, as it comes, and no more than it said
+            // the rest of the body, as it comes, and no more than it said; the idle clock
+            // waits until it is all sent
             let body_pump = if remaining > 0 {
-                let _ = c.set_read_timeout(Some(idle));
+                let _ = c.set_read_timeout(Some(tick));
                 let (Ok(c2), Ok(mut up2)) = (c.try_clone(), up.try_clone()) else {
                     return send(&mut c, &self.not_answering_page());
                 };
+                act.pumping.store(true, Ordering::SeqCst);
+                let a2 = act.clone();
                 match std::thread::Builder::new()
                     .stack_size(PREVIEW_STACK)
                     .spawn(move || {
-                        let _ = io::copy(&mut c2.take(remaining), &mut up2);
+                        let mut from = IdleRead {
+                            inner: c2,
+                            act: a2.clone(),
+                            wait_for_pump: false,
+                        }
+                        .take(remaining);
+                        let _ = io::copy(&mut from, &mut up2);
+                        a2.touch();
+                        a2.pumping.store(false, Ordering::SeqCst);
                     }) {
                     Ok(h) => Some(h),
                     Err(e) => {
@@ -413,29 +509,50 @@ impl Proxy {
                 None
             };
             let mut sent = false;
-            let mut from = (&first[..]).chain(&mut up);
-            let r = relay_response(
-                &mut from,
-                &mut CountingWriter {
-                    inner: &mut c,
-                    sent: &mut sent,
-                },
-                &filter,
-            );
+            let r = {
+                let mut from = (&first[..]).chain(IdleRead {
+                    inner: &mut up,
+                    act: act.clone(),
+                    wait_for_pump: true,
+                });
+                relay_response(
+                    &mut from,
+                    &mut CountingWriter {
+                        inner: &mut c,
+                        sent: &mut sent,
+                        streaming: Some((&act, self.cfg.ws_idle)),
+                    },
+                    &filter,
+                )
+            };
             if let Ok(Relayed::Upgraded) = r {
-                // a WebSocket: both ways, each idle at most ws-idle
-                let _ = c.set_read_timeout(Some(self.cfg.ws_idle));
-                if let (Ok(mut c2), Ok(mut up2)) = (c.try_clone(), up.try_clone()) {
+                // a WebSocket: both ways, on one clock: it ends when neither way has carried a
+                // byte for ws-idle (second review, item 7)
+                act.set_limit(self.cfg.ws_idle);
+                act.touch();
+                let _ = c.set_read_timeout(Some(tick));
+                if let (Ok(c2), Ok(mut up2)) = (c.try_clone(), up.try_clone()) {
+                    let a2 = act.clone();
                     let spawned = std::thread::Builder::new()
                         .stack_size(PREVIEW_STACK)
                         .spawn(move || {
-                            let _ = io::copy(&mut c2, &mut up2);
+                            let mut from = IdleRead {
+                                inner: c2,
+                                act: a2,
+                                wait_for_pump: false,
+                            };
+                            let _ = io::copy(&mut from, &mut up2);
                             let _ = up2.shutdown(Shutdown::Write);
                         });
                     match spawned {
                         Ok(h) => {
                             // what came with the 101 is sent already; the rest, as it comes
-                            let _ = io::copy(&mut up, &mut c);
+                            let mut from = IdleRead {
+                                inner: &mut up,
+                                act: act.clone(),
+                                wait_for_pump: false,
+                            };
+                            let _ = io::copy(&mut from, &mut c);
                             let _ = c.shutdown(Shutdown::Both);
                             let _ = up.shutdown(Shutdown::Both);
                             let _ = h.join();
@@ -598,11 +715,9 @@ impl Proxy {
     /// Whether quillo --watch has said it is watching with no socket made: the program
     /// did not start (an error, printed above), and waits for its files to change.
     fn waits_for_a_fix(&self, name: &str) -> bool {
-        self.backend.log(name, 0, LOG_CHUNK).is_ok_and(|c| {
-            String::from_utf8_lossy(&c.data)
-                .lines()
-                .any(|l| l.trim_end().ends_with("watching for changes"))
-        })
+        self.backend
+            .log(name, 0, LOG_CHUNK)
+            .is_ok_and(|c| waits_for_a_fix_in(&String::from_utf8_lossy(&c.data)))
     }
 
     fn status_of(&self, name: &str) -> Status {
@@ -729,8 +844,12 @@ impl Proxy {
                 json!({"error": "`client` names who runs: u12 or ip:1.2.3.4"}),
             );
         }
-        // one IPv6 /64 is one client (review M3)
-        let client = normalize_client(client);
+        if self.stopping.load(Ordering::SeqCst) {
+            return (503, json!({"error": "the runner is stopping; try again in a minute"}));
+        }
+        // the session is the exact address; the hourly limit and the cap on sessions at once
+        // count its network, an IPv6 /64 (second review, item 4)
+        let (client, net) = client_keys(client);
         let token = match new_token() {
             Ok(t) => t,
             Err(e) => return (500, json!({"error": format!("no token: {}", e)})),
@@ -738,7 +857,7 @@ impl Proxy {
         let now = Instant::now();
         let slot = {
             let mut t = self.table.lock().unwrap();
-            match t.begin(&client, token.clone(), now) {
+            match t.begin_in(&client, &net, token.clone(), now) {
                 Begin::TooMany => {
                     return (
                         429,
@@ -749,6 +868,12 @@ impl Proxy {
                     return (
                         503,
                         json!({"error": "busy: every sandbox is taken; try again in a minute"}),
+                    )
+                }
+                Begin::NetFull => {
+                    return (
+                        429,
+                        json!({"error": format!("too many runs from your network: at most {} at once; stop one, or try again in a few minutes", self.cfg.per_net)}),
                     )
                 }
                 Begin::Slot { slot, replaced } => {
@@ -768,6 +893,14 @@ impl Proxy {
         let op = self.ops[slot].lock().unwrap();
         if !self.table.lock().unwrap().holds(slot, &token) {
             return (409, json!({"error": "a newer run took its place"}));
+        }
+        // stopping began while this run waited for its slot: it does not start
+        if self.stopping.load(Ordering::SeqCst) {
+            let mut t = self.table.lock().unwrap();
+            if t.holds(slot, &token) {
+                t.slots[slot] = None;
+            }
+            return (503, json!({"error": "the runner is stopping; try again in a minute"}));
         }
         if let Err(e) = self.backend.start(&name, &files) {
             // it may have started all the same (the answer timed out here): stop it (review L5)
@@ -903,30 +1036,167 @@ impl Proxy {
         (200, json!({}))
     }
 
-    /// Stops every slot (at start: whatever an earlier proxy left running; on SIGTERM:
-    /// what this one runs).
+    /// Stops every slot (at start: whatever an earlier proxy left running), each under its
+    /// slot's lock, so a start in progress finishes first and is then stopped.
     pub fn stop_every_slot(&self) {
-        for s in &self.cfg.slots {
+        for (i, s) in self.cfg.slots.iter().enumerate() {
+            let _op = self.ops[i].lock().unwrap_or_else(|e| e.into_inner());
             self.backend.stop(s);
         }
     }
+
+    /// On SIGTERM: no new run starts (/run answers 503), then every slot is stopped, after any
+    /// start in progress (second review, item 8).
+    pub fn shut_down(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.stop_every_slot();
+    }
 }
 
-/// A writer that notes whether anything was written.
+/// A writer that notes whether anything was written. With `streaming`, the first bytes (the
+/// answer's head) give the connection's Activity its streaming limit: an answer that has
+/// started may go quiet for longer than one that has not (an event stream).
 struct CountingWriter<'a, W: Write> {
     inner: &'a mut W,
     sent: &'a mut bool,
+    streaming: Option<(&'a Activity, Duration)>,
 }
 
 impl<W: Write> Write for CountingWriter<'_, W> {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(b)?;
         if n > 0 {
+            if !*self.sent {
+                if let Some((a, limit)) = self.streaming {
+                    a.set_limit(limit);
+                }
+            }
             *self.sent = true;
+            if let Some((a, _)) = self.streaming {
+                a.touch();
+            }
         }
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// Whether quillo, under --watch, is waiting for a fix rather than serving: it said "watching
+/// for changes" and never that it is listening. A program that is listening has its socket up,
+/// though a connect may still be held back for a moment by the spawner's 250 ms memory of a
+/// failed one (seen on the server: /run answered while that memory turned the first preview
+/// request away with 502); then the wait goes on until the connect succeeds.
+fn waits_for_a_fix_in(output: &str) -> bool {
+    let mut watching = false;
+    for l in output.lines() {
+        let l = l.trim_end();
+        if l.contains(" listening on unix:") || l.contains(" listening on http") {
+            return false;
+        }
+        if l.ends_with("watching for changes") {
+            watching = true;
+        }
+    }
+    watching
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_program_that_listens_is_not_waiting_for_a_fix() {
+        use super::waits_for_a_fix_in as w;
+        assert!(w("main.qwe:2: error: unknown name `b`\nquillo: watching for changes\n"));
+        assert!(!w("quillo: 2 routes listening on unix:/work/app.sock\nquillo: watching for changes\n"));
+        assert!(!w("quillo: 256 file descriptors allowed\nquillo: 1 route listening on unix:app.sock\nquillo: watching for changes\n"));
+        assert!(!w("quillo: 2 routes listening on unix:/work/app.sock\n"));
+        assert!(!w(""));
+        // a program that prints the words itself is not quillo saying them
+        assert!(w("watching for changes\n"));
+    }
+    use super::*;
+
+    /// Times out `waits` times, then gives `data`, then ends.
+    struct Quiet {
+        waits: usize,
+        data: Vec<u8>,
+        sleep: Duration,
+    }
+    impl Read for Quiet {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            if self.waits > 0 {
+                self.waits -= 1;
+                std::thread::sleep(self.sleep);
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "timed out"));
+            }
+            let n = self.data.len().min(b.len());
+            b[..n].copy_from_slice(&self.data[..n]);
+            self.data.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_read_waits_out_timeouts_until_the_connection_is_idle_for_its_limit() {
+        let act = Arc::new(Activity::new(Duration::from_millis(200)));
+        act.touch();
+        // short waits, well inside the limit: the data comes through
+        let mut r = IdleRead {
+            inner: Quiet { waits: 3, data: b"hi".to_vec(), sleep: Duration::from_millis(20) },
+            act: act.clone(),
+            wait_for_pump: false,
+        };
+        let mut b = [0u8; 8];
+        assert_eq!(r.read(&mut b).unwrap(), 2);
+        // nothing for longer than the limit: the timeout comes out
+        let mut r = IdleRead {
+            inner: Quiet { waits: 100, data: vec![], sleep: Duration::from_millis(20) },
+            act: act.clone(),
+            wait_for_pump: false,
+        };
+        let t = Instant::now();
+        let e = r.read(&mut b).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert!(t.elapsed() >= Duration::from_millis(150) && t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn the_clock_waits_while_a_body_is_sent_and_counts_both_ways() {
+        // second review, item 3: a slow upload is no idle program
+        let act = Arc::new(Activity::new(Duration::from_millis(100)));
+        act.touch();
+        act.pumping.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!act.expired(true), "held while the body is sent");
+        assert!(act.expired(false), "the body's own reader is not held");
+        act.pumping.store(false, Ordering::SeqCst);
+        assert!(act.expired(true));
+        act.touch();
+        assert!(!act.expired(true), "counted from the body's last byte");
+        // item 7: activity either way keeps the other way's read alive
+        let act = Arc::new(Activity::new(Duration::from_millis(200)));
+        act.touch();
+        let a2 = act.clone();
+        let other_way = std::thread::spawn(move || {
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(60));
+                a2.touch();
+            }
+        });
+        let mut r = IdleRead {
+            inner: Quiet { waits: 20, data: b"late".to_vec(), sleep: Duration::from_millis(25) },
+            act: act.clone(),
+            wait_for_pump: false,
+        };
+        let mut b = [0u8; 8];
+        assert_eq!(r.read(&mut b).unwrap(), 4, "500 ms of silence this way, but not both ways");
+        other_way.join().unwrap();
+        // a longer limit once the answer streams
+        let act = Activity::new(Duration::from_millis(50));
+        act.touch();
+        act.set_limit(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!act.expired(false));
     }
 }

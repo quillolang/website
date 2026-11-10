@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
+/// An answer in parts: each part's bytes after its pause in ms.
+type Script = Arc<Mutex<Option<Vec<(u64, Vec<u8>)>>>>;
+
 /// Each connection: the first `drop_first` are closed unanswered, the rest answered
 /// with what they asked for (or `answer`, when set); with `hold`, read and never answered.
 /// What came after each head (within 300 ms) is kept in `bodies`.
@@ -33,10 +36,20 @@ struct Fake {
     stops: Mutex<Vec<String>>,
     /// Slots whose program runs though nothing started it here.
     ghosts: Mutex<Vec<String>>,
+    /// An answer in parts, each after its pause (ms); it stops when the proxy closes.
+    script: Script,
+    /// start takes 800 ms.
+    slow_start: AtomicBool,
+    /// "start s01", "stop s01", in order.
+    events: Mutex<Vec<String>>,
 }
 
 impl Backend for Fake {
     fn start(&self, slot: &str, _files: &Files) -> Result<(), String> {
+        if self.slow_start.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        self.events.lock().unwrap().push(format!("start {}", slot));
         if self.fail_start.load(Ordering::SeqCst) {
             // as a start the spawner went on with after the proxy stopped waiting
             self.running.lock().unwrap().insert(slot.into(), true);
@@ -51,12 +64,13 @@ impl Backend for Fake {
             .drop_first
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
-        let (seen, bodies, hold, held, answer) = (
+        let (seen, bodies, hold, held, answer, script) = (
             self.seen.clone(),
             self.bodies.clone(),
             self.hold.clone(),
             self.held.clone(),
             self.answer.clone(),
+            self.script.clone(),
         );
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -83,6 +97,22 @@ impl Backend for Fake {
             }
             let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let mut extra = buf[end..].to_vec();
+            // the whole body first (as long as it says), as a program that answers only then
+            let len: usize = text
+                .lines()
+                .find_map(|l| {
+                    let (n, v) = l.split_once(':')?;
+                    n.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            while extra.len() < len {
+                match b.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => extra.extend_from_slice(&chunk[..n]),
+                }
+            }
+            // then whatever else comes within 300 ms
             b.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
             while let Ok(n) = b.read(&mut chunk) {
                 if n == 0 {
@@ -91,6 +121,29 @@ impl Backend for Fake {
                 extra.extend_from_slice(&chunk[..n]);
             }
             bodies.lock().unwrap().push(extra);
+            let parts = script.lock().unwrap().clone();
+            if let Some(parts) = parts {
+                // stops as soon as the proxy closes its side
+                let closed = Arc::new(AtomicBool::new(false));
+                let (cl, mut watch) = (closed.clone(), b.try_clone().unwrap());
+                watch.set_read_timeout(None).unwrap();
+                std::thread::spawn(move || {
+                    let mut x = [0u8; 64];
+                    while let Ok(n) = watch.read(&mut x) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    cl.store(true, Ordering::SeqCst);
+                });
+                for (pause, bytes) in parts {
+                    std::thread::sleep(Duration::from_millis(pause));
+                    if closed.load(Ordering::SeqCst) || b.write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+                return;
+            }
             let a = answer.lock().unwrap().clone();
             let _ = b.write_all(&a.unwrap_or_else(|| b"HTTP/1.1 200 OK\r\nX-Frame-Options: SAMEORIGIN\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()));
         });
@@ -124,6 +177,7 @@ impl Backend for Fake {
         })
     }
     fn stop(&self, slot: &str) {
+        self.events.lock().unwrap().push(format!("stop {}", slot));
         self.running.lock().unwrap().insert(slot.into(), false);
         self.ghosts.lock().unwrap().retain(|g| g != slot);
         self.stops.lock().unwrap().push(slot.into());
@@ -140,6 +194,15 @@ fn up_with(
     runs_per_hour: usize,
     tweak: impl FnOnce(&mut Config),
 ) -> (SocketAddr, SocketAddr, u16, Arc<Fake>) {
+    let (a, p, port, f, _proxy) = up_proxy(slots, runs_per_hour, tweak);
+    (a, p, port, f)
+}
+
+fn up_proxy(
+    slots: usize,
+    runs_per_hour: usize,
+    tweak: impl FnOnce(&mut Config),
+) -> (SocketAddr, SocketAddr, u16, Arc<Fake>, Arc<Proxy>) {
     let mut c = Config::defaults(Role::Dev);
     c.secret = SECRET.into();
     c.slots = quillo_play::config::slot_names(slots);
@@ -155,8 +218,9 @@ fn up_with(
         pre_l.local_addr().unwrap(),
         c.public_port.unwrap(),
     );
-    Proxy::new(c, f.clone()).start(api_l, pre_l);
-    (a, p, port, f)
+    let proxy = Proxy::new(c, f.clone());
+    proxy.start(api_l, pre_l);
+    (a, p, port, f, proxy)
 }
 
 /// Runs a program for `client` and goes in as its frame would: the host and the cookie.
@@ -497,18 +561,151 @@ fn programs_no_session_holds_are_stopped() {
 }
 
 #[test]
-fn one_ipv6_64_is_one_client() {
-    // review M3
+fn a_session_is_an_address_and_a_network_shares_its_limits() {
+    // second review, item 4 (in place of review M3's test, which made a /64 one client)
     let _d = Deadline::new(30, "v6", || {});
-    let (a, _p, _port, _f) = up(3, 30);
+    let (a, _p, _port, _f) = up_with(6, 5, |_| {});
+    // two people behind one /64: two sessions, neither replacing the other's
     let one = run(a, "ip:2001:db8:1:2::1").json();
-    assert_eq!(one["host"], json!("s01.play.localhost"));
-    let same = run(a, "ip:2001:db8:1:2:ffff:ffff:ffff:ffff").json();
-    assert_eq!(same["host"], json!("s01.play.localhost"), "the same /64: its run takes the first's place");
-    assert_eq!(api(a, "GET", "/health", None, Some(SECRET)).json()["busy"], json!(1));
-    let other = run(a, "ip:2001:db8:1:3::1").json();
-    assert_eq!(other["host"], json!("s02.play.localhost"));
-    let mapped = run(a, "ip:::ffff:10.0.0.1").json();
+    let two = run(a, "ip:2001:db8:1:2::2").json();
+    assert_ne!(one["host"], two["host"]);
+    assert_eq!(api(a, "GET", "/health", None, Some(SECRET)).json()["busy"], json!(2));
+    // one address however written: its own session's place
+    let again = run(a, "ip:2001:0db8:1:2:0:0:0:1").json();
+    assert_eq!(again["host"], one["host"]);
+    // three at once from one /64, and no more
+    let three = run(a, "ip:2001:db8:1:2::3");
+    assert_eq!(three.status, 200);
+    let four = run(a, "ip:2001:db8:1:2::4");
+    assert_eq!(four.status, 429, "{}", four.body);
+    assert!(four.json()["error"].as_str().unwrap().contains("your network"));
+    // runs an hour are the /64's: 4 so far (the refused one was not counted), 1 left
+    assert_eq!(run(a, "ip:2001:db8:1:2::3").status, 200);
+    let over = run(a, "ip:2001:db8:1:2::1");
+    assert_eq!(over.status, 429);
+    assert!(over.json()["error"].as_str().unwrap().contains("an hour"));
+    // another /64 is not held back
+    assert_eq!(run(a, "ip:2001:db8:1:3::1").status, 200);
+    // IPv4: the address for both; an IPv4-mapped address is that address
     let v4 = run(a, "ip:10.0.0.1").json();
-    assert_eq!(mapped["host"], v4["host"], "an IPv4-mapped address is that IPv4 address");
+    let mapped = run(a, "ip:::ffff:10.0.0.1").json();
+    assert_eq!(mapped["host"], v4["host"]);
+}
+
+#[test]
+fn a_slow_upload_is_no_idle_program() {
+    // second review, item 3: the idle clock waits for the body; the program answers after it
+    let _d = Deadline::new(30, "upload", || {});
+    let (a, p, port, f) = up_with(2, 30, |c| c.upstream_idle = Duration::from_secs(1));
+    let (host, cookie) = run_and_enter(a, p, port, "ip:1");
+    let mut s = std::net::TcpStream::connect(p).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(format!("POST /up HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Length: 12\r\n\r\n", host, cookie).as_bytes()).unwrap();
+    // 12 bytes over 3 s: three times the idle limit, but never 1 s without a byte
+    for b in b"abcdefghijkl" {
+        std::thread::sleep(Duration::from_millis(250));
+        s.write_all(&[*b]).unwrap();
+    }
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{}", out);
+    assert_eq!(f.bodies.lock().unwrap().last().unwrap(), b"abcdefghijkl");
+}
+
+#[test]
+fn an_upload_that_stops_is_let_go() {
+    // the idle clock still runs on the client's side of a body
+    let _d = Deadline::new(30, "stalled", || {});
+    let (a, p, port, _f) = up_with(2, 30, |c| c.upstream_idle = Duration::from_secs(1));
+    let (host, cookie) = run_and_enter(a, p, port, "ip:1");
+    let mut s = std::net::TcpStream::connect(p).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(format!("POST /up HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Length: 12\r\n\r\nabc", host, cookie).as_bytes()).unwrap();
+    let t = Instant::now();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    // the body stops; after the idle limit the request goes (the fake program, still waiting
+    // for its body, has said nothing: 502)
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+    assert!(out.is_empty() || out.starts_with("HTTP/1.1 502"), "{}", out);
+}
+
+#[test]
+fn an_event_stream_may_pause_once_it_has_started() {
+    // second review, item 3: a started answer goes quiet for up to ws-idle, not upstream-idle
+    let _d = Deadline::new(30, "sse", || {});
+    let (a, p, port, f) = up_with(2, 30, |c| {
+        c.upstream_idle = Duration::from_secs(1);
+        c.ws_idle = Duration::from_secs(3);
+    });
+    let (host, cookie) = run_and_enter(a, p, port, "ip:1");
+    let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".to_vec();
+    *f.script.lock().unwrap() = Some(vec![(0, head.clone()), (0, b"data: 1\n\n".to_vec()), (2000, b"data: 2\n\n".to_vec())]);
+    let r = get(p, &host, "/events", &[("Cookie", &cookie)]);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, "data: 1\n\ndata: 2\n\n", "a 2 s pause, past upstream-idle: kept");
+    // quiet past ws-idle: the stream ends
+    *f.script.lock().unwrap() = Some(vec![(0, head), (0, b"data: 1\n\n".to_vec()), (5000, b"data: 2\n\n".to_vec())]);
+    let t = Instant::now();
+    let r = get(p, &host, "/events", &[("Cookie", &cookie)]);
+    assert_eq!(r.body, "data: 1\n\n");
+    assert!(t.elapsed() < Duration::from_millis(4800), "{:?}", t.elapsed());
+}
+
+#[test]
+fn a_websocket_lives_while_either_way_carries_bytes() {
+    // second review, item 7: one clock for both directions
+    let _d = Deadline::new(30, "ws", || {});
+    let (a, p, port, f) = up_with(2, 30, |c| c.ws_idle = Duration::from_millis(1500));
+    let (host, cookie) = run_and_enter(a, p, port, "ip:1");
+    let head = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+    let req = format!("GET /ws HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", host, cookie);
+    let frames = |out: &[u8]| out.windows(4).filter(|w| *w == b"\x81\x02hi").count();
+    // the program speaks every 500 ms for 4 s; the browser says nothing: all of it arrives
+    let mut parts = vec![(0, head.clone())];
+    parts.extend((0..8).map(|_| (500, b"\x81\x02hi".to_vec())));
+    *f.script.lock().unwrap() = Some(parts);
+    let out = raw_bytes(p, req.as_bytes());
+    assert_eq!(frames(&out), 8, "{:?}", String::from_utf8_lossy(&out));
+    // neither way says anything: it ends after ws-idle
+    *f.script.lock().unwrap() = Some(vec![(0, head), (5000, b"\x81\x02hi".to_vec())]);
+    let t = Instant::now();
+    let out = raw_bytes(p, req.as_bytes());
+    assert_eq!(frames(&out), 0);
+    assert!(t.elapsed() >= Duration::from_millis(1400) && t.elapsed() < Duration::from_millis(4500), "{:?}", t.elapsed());
+}
+
+/// Sends raw bytes and reads every byte until the server closes.
+fn raw_bytes(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    s.write_all(req).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+#[test]
+fn stopping_starts_no_run_and_stops_after_a_start_in_progress() {
+    // second review, item 8
+    let _d = Deadline::new(30, "stopping", || {});
+    let (a, _p, _port, f, proxy) = up_proxy(2, 30, |_| {});
+    f.slow_start.store(true, Ordering::SeqCst);
+    let starting = std::thread::spawn(move || run(a, "ip:1").status);
+    std::thread::sleep(Duration::from_millis(200));
+    f.events.lock().unwrap().clear();
+    proxy.shut_down();
+    let status = starting.join().unwrap();
+    // the run that was starting finished starting (200), and was then stopped: nothing runs
+    assert_eq!(status, 200);
+    let ev = f.events.lock().unwrap().clone();
+    let started = ev.iter().position(|e| e == "start s01").expect("started");
+    let stopped = ev.iter().rposition(|e| e == "stop s01").expect("stopped");
+    assert!(started < stopped, "{:?}", ev);
+    assert!(f.running.lock().unwrap().values().all(|r| !r), "{:?}", f.running.lock().unwrap());
+    // and no run starts any more
+    f.slow_start.store(false, Ordering::SeqCst);
+    let r = run(a, "ip:2");
+    assert_eq!(r.status, 503);
+    assert!(r.json()["error"].as_str().unwrap().contains("stopping"));
 }

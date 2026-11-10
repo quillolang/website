@@ -109,10 +109,11 @@ fn proxy(cfg: Config) -> Result<(), String> {
         cfg.spawner.display()
     );
     let p = quillo_play::proxy::Proxy::new(cfg, backend);
-    // stopped (not restarted), it stops its programs too, rather than leave them up to
-    // 11 minutes (review L6); before any thread is made, so the signal is this thread's
+    // stopped (not restarted), it starts no more runs and stops its programs, rather than
+    // leave them up to 11 minutes (review L6, second review item 8); before any thread is
+    // made, so the signal is this thread's
     let ps = p.clone();
-    quillo_play::util::on_signal(move || ps.stop_every_slot());
+    quillo_play::util::on_signal(move || ps.shut_down());
     p.stop_every_slot();
     p.start(api, preview);
     park()

@@ -12,6 +12,8 @@ pub const HOUR: Duration = Duration::from_secs(3600);
 pub struct Session {
     pub token: String,
     pub client: String,
+    /// The network the client is on, for the hourly limit and the cap on sessions at once.
+    pub net: String,
     pub started: Instant,
     pub seen: Instant,
     pub log: Log,
@@ -40,6 +42,8 @@ pub enum Begin {
     },
     Busy,
     TooMany,
+    /// The client's network has `per_net` sessions already.
+    NetFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,8 @@ pub struct Table {
     log_keep: usize,
     /// Ended sessions' output, all together, is kept under this (review M4): the oldest go.
     pub ended_budget: usize,
+    /// Sessions at once from one network (an IPv6 /64) (second review, item 4).
+    pub per_net: usize,
 }
 
 impl Table {
@@ -70,32 +76,53 @@ impl Table {
             runs_per_hour,
             log_keep,
             ended_budget: 16 * 1024 * 1024,
+            per_net: 3,
         }
     }
 
-    /// A new run of `client` with `token`: the client's own slot (its earlier session is
-    /// ended), else the first free one.
+    /// A new run of `client` with `token`, its own network: see begin_in.
     pub fn begin(&mut self, client: &str, token: String, now: Instant) -> Begin {
-        let runs = self.runs.entry(client.to_string()).or_default();
-        while runs.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
-            runs.pop_front();
-        }
-        if runs.len() >= self.runs_per_hour {
-            return Begin::TooMany;
+        self.begin_in(client, client, token, now)
+    }
+
+    /// A new run of `client`, on network `net`, with `token`: the client's own slot (its
+    /// earlier session is ended), else the first free one. The network may start
+    /// `runs_per_hour` runs an hour, and have `per_net` sessions at once (a run that takes the
+    /// place of the client's own is not one more).
+    pub fn begin_in(&mut self, client: &str, net: &str, token: String, now: Instant) -> Begin {
+        {
+            let runs = self.runs.entry(net.to_string()).or_default();
+            while runs.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
+                runs.pop_front();
+            }
+            if runs.len() >= self.runs_per_hour {
+                return Begin::TooMany;
+            }
         }
         let own = self
             .slots
             .iter()
             .position(|s| s.as_ref().is_some_and(|s| s.client == client));
+        if own.is_none()
+            && self
+                .slots
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|s| s.net == net))
+                .count()
+                >= self.per_net
+        {
+            return Begin::NetFull;
+        }
         let slot = match own.or_else(|| self.slots.iter().position(|s| s.is_none())) {
             Some(i) => i,
             None => return Begin::Busy,
         };
-        runs.push_back(now);
+        self.runs.entry(net.to_string()).or_default().push_back(now);
         let replaced = self.slots[slot].take();
         self.slots[slot] = Some(Session {
             token,
             client: client.to_string(),
+            net: net.to_string(),
             started: now,
             seen: now,
             log: Log::new(self.log_keep),
@@ -474,5 +501,40 @@ mod tests {
             t.end(0, &tok(i), None, None, start + Duration::from_millis(i as u64));
         }
         assert!(t.ended.len() <= 100, "{}", t.ended.len());
+    }
+
+    #[test]
+    fn a_network_shares_its_hourly_runs_and_has_at_most_three_sessions() {
+        // second review, item 4: one session per address; the /64 counts runs and sessions
+        let start = Instant::now();
+        let mut t = Table::new(6, 5, 1024);
+        let net = "ip6:2001:db8:1:2::/64";
+        let ok = |b: &Begin| matches!(b, Begin::Slot { .. });
+        // three people on one LAN: three sessions, none replacing another's
+        for i in 1..=3 {
+            let b = t.begin_in(&format!("ip:2001:db8:1:2::{}", i), net, tok(i), start);
+            assert!(matches!(b, Begin::Slot { replaced: None, .. }), "{:?}", b);
+        }
+        assert_eq!(t.busy(), 3);
+        // a fourth on it: too many from the network
+        assert!(matches!(t.begin_in("ip:2001:db8:1:2::4", net, tok(4), start), Begin::NetFull));
+        // one of the three runs again: its own session's place, not one more
+        let b = t.begin_in("ip:2001:db8:1:2::2", net, tok(5), start);
+        assert!(matches!(b, Begin::Slot { replaced: Some(_), .. }), "{:?}", b);
+        assert_eq!(t.busy(), 3);
+        // another network is not held back
+        assert!(ok(&t.begin_in("ip:2001:db8:9:9::1", "ip6:2001:db8:9:9::/64", tok(6), start)));
+        // the network's runs an hour are shared: 4 so far (NetFull was not counted), 1 left
+        t.end(0, &tok(1), None, None, start);
+        assert!(ok(&t.begin_in("ip:2001:db8:1:2::7", net, tok(7), start)));
+        t.end(0, &tok(7), None, None, start);
+        assert!(matches!(t.begin_in("ip:2001:db8:1:2::8", net, tok(8), start), Begin::TooMany));
+        // an hour on, the network may run again
+        assert!(ok(&t.begin_in("ip:2001:db8:1:2::8", net, tok(9), start + HOUR)));
+        // a client on its own network (IPv4, an account): one session, as before
+        let mut t = Table::new(3, 30, 1024);
+        assert!(ok(&t.begin("ip:1.2.3.4", tok(1), start)));
+        assert!(matches!(t.begin("ip:1.2.3.4", tok(2), start), Begin::Slot { replaced: Some(_), .. }));
+        assert_eq!(t.busy(), 1);
     }
 }

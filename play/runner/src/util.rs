@@ -225,25 +225,37 @@ impl FailMemo {
     }
 }
 
-/// Who a run is counted against (review M3): `ip:` and an IPv6 address is its /64
-/// (`ip6:2001:db8:1:2::/64`), since one visitor has a whole /64 to choose from; an
-/// IPv4-mapped IPv6 address is its IPv4 (`ip:1.2.3.4`); anything else as it is.
-pub fn normalize_client(client: &str) -> String {
+/// The two keys a run is counted by (second review, item 4):
+/// - the client: whose session it is, one at a time: the exact address (`ip:2001:db8::1`,
+///   written canonically, so two spellings of one address are one client), `ip:1.2.3.4`, or
+///   an account (`u12`);
+/// - the network: what the hourly limit and the cap on sessions at once count: an IPv6
+///   address's /64 (`ip6:2001:db8:1:2::/64`), since one visitor has a whole /64 to choose
+///   from, while a whole office or school behind one /64 still gets a session each; an IPv4
+///   address is its own network, and so is an account.
+///
+/// An IPv4-mapped IPv6 address is its IPv4 address; anything that is no address is both keys.
+pub fn client_keys(client: &str) -> (String, String) {
     let Some(a) = client.strip_prefix("ip:") else {
-        return client.to_string();
+        return (client.to_string(), client.to_string());
     };
     let a = a.trim().trim_start_matches('[').trim_end_matches(']');
     if let Ok(v6) = a.parse::<std::net::Ipv6Addr>() {
         if let Some(v4) = v6.to_ipv4_mapped() {
-            return format!("ip:{}", v4);
+            let k = format!("ip:{}", v4);
+            return (k.clone(), k);
         }
         let s = v6.segments();
-        return format!("ip6:{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]);
+        return (
+            format!("ip:{}", v6),
+            format!("ip6:{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]),
+        );
     }
     if let Ok(v4) = a.parse::<std::net::Ipv4Addr>() {
-        return format!("ip:{}", v4);
+        let k = format!("ip:{}", v4);
+        return (k.clone(), k);
     }
-    client.to_string()
+    (client.to_string(), client.to_string())
 }
 
 #[cfg(test)]
@@ -332,19 +344,27 @@ mod tests {
     }
 
     #[test]
-    fn clients_by_address_and_by_ipv6_64() {
-        assert_eq!(normalize_client("u12"), "u12");
-        assert_eq!(normalize_client("ip:1.2.3.4"), "ip:1.2.3.4");
-        assert_eq!(normalize_client("ip:2001:db8:1:2:3:4:5:6"), "ip6:2001:db8:1:2::/64");
-        // every address of one /64 is one client, however it is written
-        assert_eq!(normalize_client("ip:2001:0DB8:0001:0002::ffff"), "ip6:2001:db8:1:2::/64");
-        assert_eq!(normalize_client("ip:[2001:db8:1:2::1]"), "ip6:2001:db8:1:2::/64");
-        assert_ne!(normalize_client("ip:2001:db8:1:3::1"), normalize_client("ip:2001:db8:1:2::1"));
-        assert_eq!(normalize_client("ip:::1"), "ip6:0:0:0:0::/64");
-        // an IPv4 address mapped into IPv6 is that IPv4 address
-        assert_eq!(normalize_client("ip:::ffff:1.2.3.4"), "ip:1.2.3.4");
+    fn clients_by_address_and_networks_by_ipv6_64() {
+        // second review, item 4: the session is the exact address; the /64 is the network
+        let k = |c: &str| client_keys(c);
+        assert_eq!(k("u12"), ("u12".into(), "u12".into()));
+        assert_eq!(k("ip:1.2.3.4"), ("ip:1.2.3.4".into(), "ip:1.2.3.4".into()));
+        assert_eq!(
+            k("ip:2001:db8:1:2:3:4:5:6"),
+            ("ip:2001:db8:1:2:3:4:5:6".into(), "ip6:2001:db8:1:2::/64".into())
+        );
+        // one address however it is written; another address of the /64 is another client of
+        // the same network
+        assert_eq!(k("ip:2001:0DB8:0001:0002::ffff").0, k("ip:[2001:db8:1:2:0:0:0:ffff]").0);
+        assert_eq!(k("ip:2001:0DB8:0001:0002::ffff").0, "ip:2001:db8:1:2::ffff");
+        assert_ne!(k("ip:2001:db8:1:2::1").0, k("ip:2001:db8:1:2::2").0);
+        assert_eq!(k("ip:2001:db8:1:2::1").1, k("ip:2001:db8:1:2::2").1);
+        assert_ne!(k("ip:2001:db8:1:3::1").1, k("ip:2001:db8:1:2::1").1);
+        assert_eq!(k("ip:::1"), ("ip:::1".into(), "ip6:0:0:0:0::/64".into()));
+        // an IPv4 address mapped into IPv6 is that IPv4 address, both ways
+        assert_eq!(k("ip:::ffff:1.2.3.4"), ("ip:1.2.3.4".into(), "ip:1.2.3.4".into()));
         // what is not an address is kept as it is
-        assert_eq!(normalize_client("ip:app"), "ip:app");
-        assert_eq!(normalize_client("ip:"), "ip:");
+        assert_eq!(k("ip:app"), ("ip:app".into(), "ip:app".into()));
+        assert_eq!(k("ip:"), ("ip:".into(), "ip:".into()));
     }
 }
