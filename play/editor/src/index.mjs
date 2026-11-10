@@ -7,7 +7,7 @@
 // another file is open.
 
 import { EditorView, basicSetup } from "codemirror";
-import { EditorState, Compartment } from "@codemirror/state";
+import { EditorState, Compartment, Prec } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
 import { indentWithTab } from "@codemirror/commands";
 import { indentUnit, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
@@ -83,11 +83,13 @@ export function createEditor(el, options = {}) {
     indentUnit.of("    "),
     EditorState.tabSize.of(4),
     readOnly.of(EditorState.readOnly.of(!!options.readOnly)),
-    keymap.of([
-      { key: "Mod-Enter", preventDefault: true, run: () => { runs.forEach((f) => f()); return true; } },
+    // Ahead of basicSetup's keymap, whose Mod-Enter inserts a blank line (review M1).
+    Prec.highest(keymap.of([
+      // Quillo calls a function with as many arguments as it declares: always give one.
+      { key: "Mod-Enter", preventDefault: true, run: () => { runs.forEach((f) => f("run")); return true; } },
       { key: "Mod-s", preventDefault: true, run: () => { runs.forEach((f) => f("save")); return true; } },
-      indentWithTab,
-    ]),
+    ])),
+    keymap.of([indentWithTab]),
     EditorView.updateListener.of((u) => {
       if (u.docChanged && current != null) {
         const name = current;
@@ -185,9 +187,11 @@ export function createEditor(el, options = {}) {
     },
     // `f(name)` after each edit of the open file.
     onChange(f) { changed.push(f); },
-    // `f()` on Ctrl/Cmd-Enter, `f("save")` on Ctrl/Cmd-S.
+    // `f("run")` on Ctrl/Cmd-Enter, `f("save")` on Ctrl/Cmd-S.
     onKey(f) { runs.push(f); },
     focus() { view.focus(); },
+    // Whether the page is on screen: a hidden tab stops asking for output.
+    visible: () => typeof document === "undefined" || !document.hidden,
     destroy() { view.destroy(); },
   };
 }

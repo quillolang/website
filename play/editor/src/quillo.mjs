@@ -47,10 +47,10 @@ const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input"
 //   "elem"  an element's content       "tag"     a tag being read (< ... >)
 // `last` says whether the token before was a value, which tells `a < b` from `<b>`.
 function startState() {
-  return { stack: [], comment: null, last: false, route: 0 };
+  return { stack: [], comment: null, last: false, route: 0, closing: false, voidTag: false };
 }
 function copyState(s) {
-  return { stack: s.stack.slice(), comment: s.comment, last: s.last, route: s.route };
+  return { stack: s.stack.slice(), comment: s.comment, last: s.last, route: s.route, closing: s.closing, voidTag: s.voidTag };
 }
 const top = (s) => s.stack[s.stack.length - 1];
 
@@ -116,7 +116,9 @@ function tokenContent(stream, state) {
     state.last = false;
     return "brace";
   }
-  stream.eatWhile(/[^<{]/);
+  // Text up to a tag or a `{`; a `<` that starts no tag (`a <= b`, a tag half typed) is text
+  // too. Every token moves on, or CodeMirror stops with "failed to advance stream" (review H2).
+  if (!stream.eatWhile(/[^<{]/)) stream.next();
   return "content";
 }
 

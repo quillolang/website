@@ -33,7 +33,17 @@ async function call(name, args, signedIn = true) {
   assert.equal(r.status, 200, `${name}: ${JSON.stringify(body)}`);
   return body.ok;
 }
-const save = (id, title, files) => call("play_save", [id, title, files]);
+// One save a second for an account (play.qwe): a save refused for that is tried once more,
+// a second later; the test "one save a second" checks the refusal itself.
+const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
+async function save(id, title, files) {
+  const r = await call("play_save", [id, title, files]);
+  if (r && r.error && /a moment ago/.test(r.error)) {
+    await sleep(1100);
+    return call("play_save", [id, title, files]);
+  }
+  return r;
+}
 const sql = (q) => execFileSync("sqlite3", [DB, q], { encoding: "utf8" }).trim();
 
 test("saving needs a sign-in", { skip }, async () => {
@@ -51,7 +61,11 @@ test("files the runner would refuse are refused when saving", { skip }, async ()
     "a dot part": { "main.qwe": "1", "lib/.x": "1" },
     "an absolute path": { "main.qwe": "1", "/etc/x.qwe": "1" },
     "an empty part": { "main.qwe": "1", "lib//x.qwe": "1" },
-    "five parts": { "main.qwe": "1", "a/b/c/d/e.qwe": "1" },
+    "four parts (the runner takes three)": { "main.qwe": "1", "a/b/c/d.qwe": "1" },
+    "a name over 200 characters": { "main.qwe": "1", ["a".repeat(201)]: "1" },
+    "app.sock at the top": { "main.qwe": "1", "app.sock": "1" },
+    "two names but for capitals": { "main.qwe": "1", "lib/x.qwe": "1", "LIB/x.qwe": "1" },
+    "a file that is also a folder": { "main.qwe": "1", "lib": "1", "lib/x.qwe": "1" },
     "a space": { "main.qwe": "1", "my file.qwe": "1" },
     "a backslash": { "main.qwe": "1", "lib\\x.qwe": "1" },
     "a NUL in text": { "main.qwe": "a\u0000b" },
@@ -68,7 +82,9 @@ test("files the runner would refuse are refused when saving", { skip }, async ()
 
 test("what is allowed at the edges is saved", { skip }, async () => {
   const ok = {
-    "four parts": { "main.qwe": "1", "a/b/c/d.qwe": "1" },
+    "three parts": { "main.qwe": "1", "a/b/c.qwe": "1" },
+    "a name of 200 characters": { "main.qwe": "1", ["a".repeat(200)]: "1" },
+    "app.sock in a folder": { "main.qwe": "1", "lib/app.sock": "1" },
     "30 files": Object.fromEntries([["main.qwe", "1"], ...Array.from({ length: 29 }, (_, i) => [`f${i}.qwe`, "1"])]),
     "names with _ - and dots inside": { "main.qwe": "1", "lib/my_file-2.v1.qwe": "1" },
   };
@@ -141,11 +157,19 @@ test("a copy of a program that is not there notes nothing it came from", { skip:
   await call("play_delete", [r.id]);
 });
 
-test("at most 50 saved programs; saving over one still works at 50", { skip }, async () => {
+test("at most 50 saved programs; saving over one still works at 50", { skip: skip || (DB ? false : "PLAY_DB is not set") }, async () => {
   for (const p of await call("play_mine", [])) await call("play_delete", [p.id]);
+  // 49 put in directly (saves are one a second), the 50th saved
+  const me = sql("select id from users where login = 'dev'");
   const ids = [];
-  for (let i = 0; i < 50; i++) ids.push((await save("", `p${i}`, { "main.qwe": `${i}` })).id);
+  for (let i = 0; i < 49; i++) {
+    const id = `cap${String(i).padStart(9, "0")}`;
+    sql(`insert into play_projects (id, user_id, title, files, created, updated) values ('${id}', ${me}, 'p${i}', '{"main.qwe":"${i}"}', 0, 0)`);
+    ids.push(id);
+  }
+  ids.push((await save("", "p49", { "main.qwe": "49" })).id);
   assert.ok(ids.every(Boolean));
+  await sleep(1100);
   const over = await save("", "one too many", { "main.qwe": "x" });
   assert.match(over.error, /50/);
   const again = await save(ids[0], "still fine", { "main.qwe": "y" });
@@ -175,4 +199,48 @@ test("the editor bundle is served as JavaScript", { skip }, async () => {
   assert.equal(r.status, 200);
   assert.match(r.headers.get("content-type"), /javascript/);
   assert.ok((await r.text()).includes("createEditor"));
+});
+
+test("one save a second for an account: a second save at once is refused, then works", { skip }, async () => {
+  const a = await save("", "gap", { "main.qwe": "1" });
+  const quick = await call("play_save", [a.id, "gap 2", { "main.qwe": "2" }]);
+  assert.match(quick.error, /a moment ago/);
+  await sleep(1100);
+  assert.deepEqual(await call("play_save", [a.id, "gap 2", { "main.qwe": "2" }]), { id: a.id, created: false });
+  await call("play_delete", [a.id]);
+});
+
+test("bytes, not characters: a program of 4-byte characters over 320 KB is refused", { skip }, async () => {
+  const r = await save("", "emoji", { "main.qwe": "😀".repeat(90 * 1024) });
+  assert.match(r.error, /256 KB/);
+});
+
+test("8 MB in all for an account", { skip: skip || (DB ? false : "PLAY_DB is not set") }, async () => {
+  for (const p of await call("play_mine", [])) await call("play_delete", [p.id]);
+  const me = sql("select id from users where login = 'dev'");
+  // 27 programs of 310,018 bytes put in directly (8.37 MB); 200 KB more passes 8 MiB
+  sql(`insert into play_projects (id, user_id, title, files, created, updated) select 'big' || value, ${me}, 'big', '{"main.qwe":"' || hex(zeroblob(155000)) || '"}', 0, 0 from generate_series(1, 27)`);
+  await sleep(1100);
+  try {
+    const r = await save("", "one more", { "main.qwe": "x".repeat(200 * 1024) });
+    assert.match(r.error ?? JSON.stringify(r), /8 MB/);
+  } finally {
+    sql(`delete from play_projects where user_id = ${me}`);
+  }
+});
+
+test("a banned account's programs are not found", { skip: skip || (DB ? false : "PLAY_DB is not set") }, async () => {
+  sql("insert or ignore into users (id, github_id, login, name, created, banned) values (998, 998, 'banned1', 'B', 0, 1)");
+  sql(`insert or replace into play_projects (id, user_id, title, files, created, updated) values ('bannedprog01', 998, 'B', '{"main.qwe":"1"}', 0, 0)`);
+  assert.notEqual((await fetch(`${SITE}/play/bannedprog01/`)).status, 200);
+  sql("delete from play_projects where id = 'bannedprog01'");
+});
+
+test("a program's page names its author's login, not the account's number", { skip: skip || (DB ? false : "PLAY_DB is not set") }, async () => {
+  sql("insert or ignore into users (id, github_id, login, name, created) values (999, 999, 'other', 'Other', 0)");
+  sql(`insert or replace into play_projects (id, user_id, title, files, created, updated) values ('authorpage01', 999, 'T', '{"main.qwe":"1"}', 0, 0)`);
+  const html = await (await fetch(`${SITE}/play/authorpage01/`)).text();
+  assert.ok(html.includes("other"), "the login");
+  assert.ok(!/owner_id/.test(html), "no owner id");
+  sql("delete from play_projects where id = 'authorpage01'");
 });

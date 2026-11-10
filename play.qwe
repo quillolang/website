@@ -21,9 +21,14 @@ let PLAY_MAX_FILES = 30
 let PLAY_MAX_BYTES = 256 * 1024
 let PLAY_MAX_PROJECTS = 50
 let PLAY_MAX_TITLE = 80
-// A file's name: letters, digits, `_`, `.` and `-`, in at most three folders; no part starts
-// with a dot (no `..`, no `.quillo/`). The runner checks the same.
-let PLAY_NAME = "^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*){0,3}$"
+// Bytes, as stored (UTF-8 JSON, measured by SQLite): one program's files with their names and
+// escapes, and all of one account's programs (review M7: characters had been counted).
+let PLAY_MAX_ROW = 320 * 1024
+let PLAY_MAX_USER = 8 * 1024 * 1024
+// A file's name: letters, digits, `_`, `.` and `-`, in at most two folders (folder/folder/file),
+// at most 200 characters; no part starts with a dot (no `..`, no `.quillo/`). The runner's rules
+// (play/runner/src/files.rs), so a program that saves is one that runs.
+let PLAY_NAME = "^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*){0,2}$"
 
 fn play_example(slug: str, name: str, note: str) =
     { slug: slug, name: name, note: note, files: { "main.qwe": read_file(`play/examples/${slug}/main.qwe`) } }
@@ -40,9 +45,12 @@ fn play_wrong(files) -> str? {
     let names = keys(files)
     if !has(files, "main.qwe") { return "a program needs a main.qwe" }
     if len(names) > PLAY_MAX_FILES { return `at most ${PLAY_MAX_FILES} files` }
+    if len(unique(names | map((n) => lower(n)))) != len(names) { return "two files have the same name but for capitals" }
     let total = 0
     for n in names {
-        if !re.test(n, PLAY_NAME) { return `not a file name here: ${n}` }
+        if !re.test(n, PLAY_NAME) || len(n) > 200 { return `not a file name here: ${n}` }
+        if n == "app.sock" { return "app.sock is where the program listens: give the file another name" }
+        if any(names, (m) => starts_with(m, n + "/")) { return `${n} is a file and a folder` }
         let text = files[n]
         if type_of(text) != "str" { return `${n} is not text` }
         if contains(text, "\u{0}") { return `${n} is not text` }
@@ -79,10 +87,14 @@ server fn play_run(files: map) {
 }
 
 // What the program printed since line `after`: { lines: [{ n, text }], next, running, exit }.
+// `gone` when the runner has no such session (it ended); `retry` when the runner did not answer
+// (a restart, a slow moment): the session may well be running still (review L5).
 server fn play_log(session: str, after: int = 0) {
-    if !re.test(session, "^[0-9a-f]{32}$") { return { lines: [], next: after, running: false, exit: null, gone: true } }
-    let r = play_ask("GET", `/log?session=${session}&after=${after}`, null)
-    is_err(r) ? { lines: [], next: after, running: false, exit: null, gone: true } : r
+    let gone = { lines: [], next: after, running: false, exit: null, gone: true }
+    if !re.test(session, "^[0-9a-f]{32}$") || !PLAY_ON { return gone }
+    let r = http.request("GET", `${PLAY_URL}/log?session=${session}&after=${after}`, null, { authorization: `Bearer ${PLAY_SECRET}` }, { timeout: 10, redirects: 0, public_only: false })
+    if is_err(r) || r.status >= 500 { return { lines: [], next: after, running: true, exit: null, retry: true } }
+    r.ok ? r.json : gone
 }
 
 server fn play_stop(session: str) {
@@ -102,19 +114,31 @@ server fn play_save(id: str, title: str, files: map) {
     if wrong != null { return { error: wrong } }
     let name = trim(title) == "" ? "Untitled" : slice(trim(title), 0, PLAY_MAX_TITLE)
     let text = json.stringify(files)
+    let size = db.one("select length(cast(? as blob)) as n", text).n
+    if size > PLAY_MAX_ROW { return { error: "at most 256 KB of code in all" } }
     let t = now()
-    let mine = id == "" ? null : db.one("select id from play_projects where id = ? and user_id = ?", id, u.id)
-    if mine != null {
-        db.exec("update play_projects set title = ?, files = ?, updated = ? where id = ?", name, text, t, id)
-        return { id: id, created: false }
+    // Each write is one statement that holds the limits itself (the count, the account's bytes,
+    // one save a second), so they hold however many saves come at once, from any instance.
+    if id != "" && db.one("select id from play_projects where id = ? and user_id = ?", id, u.id) != null {
+        let r = db.exec("update play_projects set title = ?, files = ?, updated = ? where id = ? and user_id = ? and updated <= ? and (select coalesce(sum(length(cast(files as blob))), 0) from play_projects where user_id = ? and id != ?) + ? <= ?",
+            name, text, t, id, u.id, t - 1000, u.id, id, size, PLAY_MAX_USER)
+        if r.changes > 0 { return { id: id, created: false } }
+        return { error: play_save_refusal(u.id, size, id) }
     }
-    let count = db.one("select count(*) as n from play_projects where user_id = ?", u.id).n
-    if count >= PLAY_MAX_PROJECTS { return { error: `you have ${PLAY_MAX_PROJECTS} saved programs, the most there can be: delete one first` } }
     let from = id == "" ? null : db.one("select id from play_projects where id = ?", id)
     let new_id = crypto.token(9)
-    db.exec("insert into play_projects (id, user_id, title, files, forked_from, created, updated) values (?, ?, ?, ?, ?, ?, ?)",
-        new_id, u.id, name, text, from == null ? null : from.id, t, t)
+    let r = db.exec("insert into play_projects (id, user_id, title, files, forked_from, created, updated) select ?, ?, ?, ?, ?, ?, ? where (select count(*) from play_projects where user_id = ?) < ? and (select coalesce(sum(length(cast(files as blob))), 0) from play_projects where user_id = ?) + ? <= ? and (select coalesce(max(updated), 0) from play_projects where user_id = ?) <= ?",
+        new_id, u.id, name, text, from == null ? null : from.id, t, t, u.id, PLAY_MAX_PROJECTS, u.id, size, PLAY_MAX_USER, u.id, t - 1000)
+    if r.changes == 0 { return { error: play_save_refusal(u.id, size, "") } }
     { id: new_id, created: true }
+}
+
+// Why a save was refused, in words, once it has been (the write itself held the limits).
+fn play_save_refusal(uid: int, size: int, id: str) -> str {
+    let n = db.one("select count(*) as n, coalesce(sum(length(cast(files as blob))), 0) as bytes, coalesce(max(updated), 0) as last from play_projects where user_id = ? and id != ?", uid, id)
+    if id == "" && n.n >= PLAY_MAX_PROJECTS { return `you have ${PLAY_MAX_PROJECTS} saved programs, the most there can be: delete one first` }
+    if n.bytes + size > PLAY_MAX_USER { return "your saved programs are 8 MB in all, the most there can be: delete one first" }
+    "saved a moment ago: try again in a second"
 }
 
 // The visitor's saved programs, newest first: [{ id, title, updated }].
@@ -162,6 +186,9 @@ fn play_problem(text: str) {
     m == null ? null : { file: m.groups[0], line: int(m.groups[1]), severity: m.groups[2], message: m.groups[3] }
 }
 
+// The page's own part, in the browser. `ed` is the editor (play/editor's createEditor), which
+// holds every file's text; `names` is the list the file panel shows. A run is `session`, polled
+// for output by one loop at a time: `gen` counts runs and stops, and a loop of an older one ends.
 component Playground(project, examples: list, runner: bool) {
     let start = project != null ? project.files : examples[0].files
     state ed = null
@@ -169,8 +196,10 @@ component Playground(project, examples: list, runner: bool) {
     state open = "main.qwe"
     state title = project != null ? project.title : ""
     state pid = project != null ? project.id : ""
-    state owner = project != null ? project.owner_id : 0
+    state author = project != null ? project.author : ""
+    state base = project != null ? project.updated : 0
     state me = null
+    state me_known = false
     state session = ""
     state host = ""
     state preview = ""
@@ -178,24 +207,44 @@ component Playground(project, examples: list, runner: bool) {
     state next = 0
     state running = false
     state exit_code = null
+    state gen = 0
+    state misses = 0
     state tab = "preview"
     state note = ""
     state starting = false
+    state cancelled = false
     state saving = false
     state dirty = false
+    state draft_due = false
+    state draft_failed = false
     state mine = null
     state log_el = null
-    state restored = false
     state menu_el = null
+    state restored = false
     let problems = lines | map((l) => play_problem(l)) | filter((p) => p != null)
     let errors = problems | filter((p) => p.severity == "error") | len
-    let own = pid != "" && me != null && owner == me.id
+    let own = pid != "" && me != null && me.login == author
     let draft_key = pid == "" ? "quillo-play-draft" : `quillo-play-draft:${pid}`
 
-    // The browser's draft of unsaved work, kept on every edit; a browser that keeps nothing
-    // (a private window, storage off) still edits.
+    // The browser's draft of unsaved work: written a moment after the last edit, with the saved
+    // version it was made from (`base`), so a draft older than what was saved since, from
+    // another browser, is not brought back over it. A browser that keeps nothing still edits.
     fn keep_draft() {
-        if ed != null { js("localStorage.setItem", draft_key, json.stringify({ title: title, files: json.parse(ed.filesJson()) })) ?? null }
+        draft_due = false
+        if ed == null || !dirty { return null }
+        let text = `{"title":${json.stringify(title)},"base":${base},"files":${ed.filesJson()}}`
+        let put = js("localStorage.setItem", draft_key, text)
+        if is_err(put) && !draft_failed {
+            draft_failed = true
+            note = "This browser keeps no drafts (storage full or off): save to keep your work"
+        }
+        null
+    }
+    fn later_draft() {
+        if !draft_due {
+            draft_due = true
+            run_after(800, keep_draft)
+        }
     }
     fn drop_draft() { js("localStorage.removeItem", draft_key) ?? null }
 
@@ -217,18 +266,42 @@ component Playground(project, examples: list, runner: bool) {
         if log_el != null { log_el.scrollTop = log_el.scrollHeight }
     }
 
-    fn poll() {
-        if session == "" { return null }
-        let s = session
-        let r = play_log(s, next)
-        if s != session { return null }
-        if is_err(r) {
-            run_after(2000, poll)
+    // The output kept: at most 2,000 lines and 256 K characters, the newest (review L6).
+    fn keep_lines(all: list) -> list {
+        let kept = len(all) > 2000 ? drop(all, len(all) - 2000) : all
+        let size = sum(kept | map((l) => len(l) + 1))
+        let cut = 0
+        while size > 262144 && cut < len(kept) - 1 {
+            size -= len(kept[cut]) + 1
+            cut += 1
+        }
+        cut == 0 ? kept : drop(kept, cut)
+    }
+
+    // One loop a run: `g` is the run it belongs to. A hidden tab does not poll (so its sandbox
+    // ends after the runner's idle time); it looks again every 1.5 s.
+    fn poll(g: int) {
+        if g != gen || session == "" { return null }
+        if ed != null && !ed.visible() {
+            run_after(1500, () => poll(g))
             return null
         }
+        let s = session
+        let r = play_log(s, next)
+        if g != gen || s != session { return null }
+        if is_err(r) || r.retry == true {
+            misses += 1
+            if misses > 20 {
+                note = "Lost touch with the sandbox: press Run to start again"
+                running = false
+                return null
+            }
+            run_after(2000, () => poll(g))
+            return null
+        }
+        misses = 0
         if len(r.lines) > 0 {
-            let all = lines + (r.lines | map((l) => l.text))
-            lines = len(all) > 2000 ? drop(all, len(all) - 2000) : all
+            lines = keep_lines(lines + (r.lines | map((l) => l.text)))
             mark()
             run_after(0, follow)
         }
@@ -240,16 +313,23 @@ component Playground(project, examples: list, runner: bool) {
             preview = ""
             session = ""
         }
-        if running { run_after(700, poll) }
+        if running { run_after(700, () => poll(g)) }
         null
     }
 
     fn run() {
         if ed == null || starting || !runner { return null }
+        gen += 1
+        let g = gen
         starting = true
+        cancelled = false
         note = ""
         let r = play_run(json.parse(ed.filesJson()))
         starting = false
+        if cancelled || g != gen {
+            if !is_err(r) && r.session != null { play_stop(r.session) }
+            return null
+        }
         if is_err(r) {
             note = `Could not run it: ${error(r)}`
             return null
@@ -261,17 +341,20 @@ component Playground(project, examples: list, runner: bool) {
         session = r.session
         host = r.host
         preview = r.enter
-        lines = r.log | map((l) => l.text)
+        lines = keep_lines(r.log | map((l) => l.text))
         next = r.next
         running = r.running
         exit_code = r.exit
+        misses = 0
         mark()
         if !running || errors > 0 { tab = "output" } else { tab = "preview" }
-        if running { run_after(700, poll) }
+        if running { run_after(700, () => poll(g)) }
         null
     }
 
     fn stop() {
+        gen += 1
+        if starting { cancelled = true }
         if session != "" { play_stop(session) }
         session = ""
         running = false
@@ -280,6 +363,10 @@ component Playground(project, examples: list, runner: bool) {
 
     fn save() {
         if ed == null || saving { return null }
+        if !me_known {
+            me = cm_me() ?? null
+            me_known = true
+        }
         if me == null {
             keep_draft()
             js("location.assign", `/auth/github?next=${url_encode(pid == "" ? "/play/" : `/play/${pid}/`)}`)
@@ -293,15 +380,18 @@ component Playground(project, examples: list, runner: bool) {
             return null
         }
         if r.error != null {
+            if r.signin == true { me = null }
             note = r.error
             return null
         }
         drop_draft()
+        restored = false
         if r.id != pid {
             pid = r.id
-            owner = me.id
+            author = me.login
             js("history.replaceState", null, "", `/play/${r.id}/`) ?? null
         }
+        base = now()
         dirty = false
         note = r.created ? "Saved: its link is in the address bar" : "Saved"
         mine = null
@@ -312,11 +402,14 @@ component Playground(project, examples: list, runner: bool) {
     fn load_example(ex) {
         if menu_el != null { menu_el.open = false }
         if dirty && !(js("confirm", `Replace what is in the editor with the ${ex.name} example?`) ?? true) { return null }
+        drop_draft()
         show(ex.files)
         title = ex.name
         pid = ""
-        owner = 0
+        author = ""
+        base = 0
         dirty = false
+        restored = false
         js("history.replaceState", null, "", "/play/") ?? null
         null
     }
@@ -325,8 +418,8 @@ component Playground(project, examples: list, runner: bool) {
         let n = js("prompt", "A new file's name, e.g. lib/tasks.qwe", "lib/helpers.qwe") ?? null
         if n == null || trim(n) == "" { return null }
         let name = trim(n)
-        if !re.test(name, PLAY_NAME) {
-            note = `Not a file name here: ${name} (letters, digits, _ . - and folders)`
+        if !re.test(name, PLAY_NAME) || len(name) > 200 || name == "app.sock" {
+            note = `Not a file name here: ${name} (letters, digits, _ . - and at most two folders)`
             return null
         }
         if contains(names, name) {
@@ -338,23 +431,16 @@ component Playground(project, examples: list, runner: bool) {
             note = `At most ${PLAY_MAX_FILES} files`
             return null
         }
+        let wrong = play_wrong(set(json.parse(ed.filesJson()), name, ""))
+        if wrong != null {
+            note = wrong
+            return null
+        }
         names = play_order(names + [name])
         ed.open(name, `// ${name}: what this file holds.\n`)
         open = name
         dirty = true
-        keep_draft()
-        null
-    }
-
-    fn remove_file(n: str) {
-        if n == "main.qwe" { return null }
-        if !(js("confirm", `Delete ${n}?`) ?? false) { return null }
-        ed.remove(n)
-        names = names | filter((x) => x != n)
-        open = "main.qwe"
-        ed.open("main.qwe", "")
-        dirty = true
-        keep_draft()
+        later_draft()
         null
     }
 
@@ -363,19 +449,39 @@ component Playground(project, examples: list, runner: bool) {
         let asked = js("prompt", `Rename ${n} to`, n) ?? null
         if asked == null || trim(asked) == "" || trim(asked) == n { return null }
         let to = trim(asked)
-        if !re.test(to, PLAY_NAME) {
-            note = `Not a file name here: ${to} (letters, digits, _ . - and folders)`
+        if !re.test(to, PLAY_NAME) || len(to) > 200 || to == "app.sock" {
+            note = `Not a file name here: ${to} (letters, digits, _ . - and at most two folders)`
             return null
         }
         if contains(names, to) {
             note = `There is a ${to} already`
             return null
         }
+        let files = json.parse(ed.filesJson())
+        let wrong = play_wrong(set(remove(files, n), to, files[n]))
+        if wrong != null {
+            note = wrong
+            return null
+        }
         ed.rename(n, to)
         names = play_order((names | filter((x) => x != n)) + [to])
         if open == n { open = to }
         dirty = true
-        keep_draft()
+        later_draft()
+        null
+    }
+
+    fn remove_file(n: str) {
+        if n == "main.qwe" { return null }
+        if !(js("confirm", `Delete ${n}?`) ?? false) { return null }
+        ed.remove(n)
+        names = names | filter((x) => x != n)
+        if open == n {
+            open = "main.qwe"
+            ed.open("main.qwe", "")
+        }
+        dirty = true
+        later_draft()
         null
     }
 
@@ -394,7 +500,8 @@ component Playground(project, examples: list, runner: bool) {
         mine = play_mine()
         if id == pid {
             pid = ""
-            owner = 0
+            author = ""
+            base = 0
             js("history.replaceState", null, "", "/play/") ?? null
         }
         null
@@ -402,10 +509,10 @@ component Playground(project, examples: list, runner: bool) {
 
     <div.play>
         <div.play-bar>
-            <input.play-title value={title} placeholder="Untitled" maxlength="80" aria-label="Title" oninput={() => { dirty = true }}/>
+            <input.play-title bind:value={title} placeholder="Untitled" maxlength="80" aria-label="Title" @input={() => { dirty = true; later_draft() }}/>
             <button.play-run onclick={run} disabled={!runner || starting} title="Ctrl+Enter">{starting ? "Starting…" : running ? "Run again" : "Run"}</button>
-            {running && <button onclick={stop}>Stop</button>}
-            <button onclick={save} disabled={saving} title="Ctrl+S">{saving ? "Saving…" : me == null ? "Sign in to save" : own || pid == "" ? "Save" : "Save a copy"}</button>
+            {(running || starting) && <button onclick={stop}>Stop</button>}
+            <button onclick={save} disabled={saving} title="Ctrl+S">{saving ? "Saving…" : me_known && me == null ? "Sign in to save" : own || pid == "" ? "Save" : "Save a copy"}</button>
             <details.play-menu @mount={(el) => { menu_el = el }}>
                 <summary>Examples</summary>
                 <div.play-sheet>{for ex in examples =>
@@ -421,6 +528,11 @@ component Playground(project, examples: list, runner: bool) {
                     <button.play-x aria-label={`Delete ${p.title}`} onclick={() => forget(p.id)}>×</button></li>
             }</ul>}
         </div>}
+        // Someone else's program: its pages run in this browser, under play.quillolang.org, and
+        // can set cookies there (review M1, kept by the user's choice of subdomain).
+        {author != "" && !own && <p.play-author>
+            By <a href={`https://github.com/${author}`}>@{author}</a>. Its pages run in your browser when you press Run:
+            run programs from people you trust.</p>}
         {restored && <p.play-restored>Your unsaved changes in this browser are back.
             <button onclick={() => { drop_draft(); restored = false; show(start); title = project != null ? project.title : ""; dirty = false }}>Discard them</button></p>}
         <div.play-main>
@@ -449,23 +561,26 @@ component Playground(project, examples: list, runner: bool) {
                         return null
                     }
                     ed = made
+                    // A draft is brought back only if it was made from the version saved now.
                     let saved = json.parse(js("localStorage.getItem", draft_key) ?? "null") ?? null
-                    let usable = saved != null && type_of(saved) == "map" && play_wrong(saved.files ?? null) == null
+                    let usable = saved != null && type_of(saved) == "map" && (saved.base ?? -1) == base && play_wrong(saved.files ?? null) == null
                     let files = usable ? saved.files : start
+                    if saved != null && !usable { drop_draft() }
+                    names = play_order(keys(files))
+                    for n in names { ed.open(n, files[n]) }
+                    ed.open("main.qwe", files["main.qwe"])
                     if usable {
                         restored = true
                         dirty = true
                         title = saved.title ?? title
                     }
-                    names = play_order(keys(files))
-                    for n in names { ed.open(n, files[n]) }
-                    ed.open("main.qwe", files["main.qwe"])
                     ed.onChange((n) => {
                         dirty = true
-                        keep_draft()
+                        later_draft()
                     })
                     ed.onKey((what) => { if what == "save" { save() } else { run() } })
-                    me = cm_me()
+                    me = cm_me() ?? null
+                    me_known = true
                     () => {
                         stop()
                         ed.destroy()
@@ -498,7 +613,8 @@ component Playground(project, examples: list, runner: bool) {
                 </div>
             </section>
         </div>
-        <p.play-foot>Ctrl+Enter runs, Ctrl+S saves. Programs run on Quillo {QUILLO_VERSION}: see the <a href="/docs/">docs</a> and the <a href="/docs/language-tour/">language tour</a>.</p>
+        <p.play-foot>Ctrl+Enter runs, Ctrl+S saves. Programs run on Quillo {QUILLO_VERSION}: see the <a href="/docs/">docs</a> and the <a href="/docs/language-tour/">language tour</a>.
+            If quillolang.org stops loading after you ran a program, clear this site's cookies in your browser's settings.</p>
     </div>
 }
 
@@ -511,15 +627,18 @@ fn play_page(project, path: str) =
     </SitePage>
 
 // The editor's bundle (play/editor, `npm run build`); a module script, so it must be served as JavaScript.
-route GET /play/editor.mjs = file("public/play/editor.mjs", { cache: "1h" })
+// No `cache`: the browser asks each time (a 304 when unchanged), so a deploy's page never runs an
+// hour-old editor (review L8).
+route GET /play/editor.mjs = file("public/play/editor.mjs")
 
 route GET /play = play_page(null, "/play/")
 
 route GET /play/:id {
     if !re.test(id, "^[A-Za-z0-9_-]{1,24}$") { return not_found(request.path) }
-    let p = db.one("select id, title, files, user_id from play_projects where id = ?", id)
+    // A banned account's programs are gone with it, as its posts are.
+    let p = db.one("select p.id, p.title, p.files, p.updated, u.login from play_projects p join users u on u.id = p.user_id where p.id = ? and u.banned = 0", id)
     if p == null { return not_found(request.path) }
-    play_page({ id: p.id, title: p.title, files: json.parse(p.files), owner_id: p.user_id }, `/play/${p.id}/`)
+    play_page({ id: p.id, title: p.title, files: json.parse(p.files), updated: p.updated, author: p.login }, `/play/${p.id}/`)
 }
 
 let play_style = read_file("play/play.css")

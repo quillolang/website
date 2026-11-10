@@ -13,7 +13,9 @@ function tokens(src) {
     const s = new StringStream(line, 4, 4);
     if (line === "") continue;
     while (!s.eol()) {
+      const before = s.pos;
       const style = P.token(s, state);
+      if (s.pos === before) throw new Error(`no progress at ${before} in ${JSON.stringify(line)}`);
       const text = s.current();
       if (text.trim() !== "") out.push([style, text]);
       s.start = s.pos;
@@ -144,4 +146,36 @@ test("every .qwe file of the site, its tour, demos and plugins, tokenizes and en
   }
   // A few files end inside something the highlighter cannot follow; most must not.
   assert.ok(open.length <= files.length * 0.05, `${open.length} of ${files.length} end open:\n${open.slice(0, 20).join("\n")}`);
+});
+
+// Through CodeMirror itself, as the page uses it: a token that does not move on throws there.
+import { EditorState } from "@codemirror/state";
+import { ensureSyntaxTree } from "@codemirror/language";
+import { quilloLanguage } from "../src/quillo.mjs";
+const parse = (doc) => ensureSyntaxTree(EditorState.create({ doc, extensions: [quilloLanguage] }), doc.length, 5000);
+
+test("a < that starts no tag, inside markup, is text (review H2)", () => {
+  for (const doc of ["<p>a <= b</p>", "<div>\n  <\n</div>", "<div>\n  </\n</div>", "<p>1 < 2 and 3 > 2</p>", "<div><</div>", "<div> < </div>", "<ul>\n<"]) {
+    assert.doesNotThrow(() => parse(doc), doc);
+  }
+});
+
+test("typing each example a character at a time never breaks the parser", async () => {
+  const { readFile } = await import("node:fs/promises");
+  for (const ex of ["hello", "todo", "notes"]) {
+    const text = await readFile(new URL(`../../examples/${ex}/main.qwe`, import.meta.url), "utf8");
+    for (let i = 1; i <= text.length; i++) assert.doesNotThrow(() => parse(text.slice(0, i)), `${ex} at ${i}`);
+  }
+});
+
+test("a state copied in the middle of a tag keeps whether it closes and is void", () => {
+  const st = P.startState(4);
+  const s = new StringStream("<input", 4, 4);
+  while (!s.eol()) { P.token(s, st); s.start = s.pos; }
+  const c = P.copyState(st);
+  assert.equal(c.voidTag, true);
+  const st2 = P.startState(4);
+  const s2 = new StringStream("<p>x</p", 4, 4);
+  while (!s2.eol()) { P.token(s2, st2); s2.start = s2.pos; }
+  assert.equal(P.copyState(st2).closing, true);
 });
