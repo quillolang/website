@@ -162,7 +162,7 @@ test("a < that starts no tag, inside markup, is text (review H2)", () => {
 
 test("typing each example a character at a time never breaks the parser", async () => {
   const { readFile } = await import("node:fs/promises");
-  for (const ex of ["hello", "todo", "notes"]) {
+  for (const ex of ["hello", "todo", "notes", "empty"]) {
     const text = await readFile(new URL(`../../examples/${ex}/main.qwe`, import.meta.url), "utf8");
     for (let i = 1; i <= text.length; i++) assert.doesNotThrow(() => parse(text.slice(0, i)), `${ex} at ${i}`);
   }
