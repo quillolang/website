@@ -100,7 +100,7 @@ test("save, save again over it, list, open its page, delete", { skip }, async ()
   const a = await save("", "  First  ", { "main.qwe": 'route GET / = "one"', "lib/gone_marker.qwe": "let gone_marker_7 = 1" });
   assert.match(a.id, /^[A-Za-z0-9_-]{12}$/);
   const b = await save(a.id, "First, again", { "main.qwe": 'route GET / = "kept_marker_9"' });
-  assert.deepEqual(b, { id: a.id, created: false });
+  assert.deepEqual({ id: b.id, created: b.created }, { id: a.id, created: false }); // and `updated` (second review, item 1)
   const mine = await call("play_mine", []);
   assert.equal(mine[0].id, a.id);
   assert.equal(mine[0].title, "First, again");
@@ -173,7 +173,7 @@ test("at most 50 saved programs; saving over one still works at 50", { skip: ski
   const over = await save("", "one too many", { "main.qwe": "x" });
   assert.match(over.error, /50/);
   const again = await save(ids[0], "still fine", { "main.qwe": "y" });
-  assert.deepEqual(again, { id: ids[0], created: false });
+  assert.deepEqual({ id: again.id, created: again.created }, { id: ids[0], created: false });
   for (const id of ids) await call("play_delete", [id]);
   assert.deepEqual(await call("play_mine", []), []);
 });
@@ -206,7 +206,8 @@ test("one save a second for an account: a second save at once is refused, then w
   const quick = await call("play_save", [a.id, "gap 2", { "main.qwe": "2" }]);
   assert.match(quick.error, /a moment ago/);
   await sleep(1100);
-  assert.deepEqual(await call("play_save", [a.id, "gap 2", { "main.qwe": "2" }]), { id: a.id, created: false });
+  const later = await call("play_save", [a.id, "gap 2", { "main.qwe": "2" }]);
+  assert.deepEqual({ id: later.id, created: later.created }, { id: a.id, created: false });
   await call("play_delete", [a.id]);
 });
 
@@ -243,4 +244,37 @@ test("a program's page names its author's login, not the account's number", { sk
   assert.ok(html.includes("other"), "the login");
   assert.ok(!/owner_id/.test(html), "no owner id");
   sql("delete from play_projects where id = 'authorpage01'");
+});
+
+test("a save answers the time it stored, which the page's draft is checked against", { skip: skip || (DB ? false : "PLAY_DB is not set") }, async () => {
+  const a = await save("", "stamp", { "main.qwe": "1" });
+  assert.equal(typeof a.updated, "number");
+  assert.equal(sql(`select updated from play_projects where id = '${a.id}'`), String(a.updated));
+  await sleep(1100);
+  const b = await save(a.id, "stamp 2", { "main.qwe": "2" });
+  assert.ok(b.updated > a.updated);
+  assert.equal(sql(`select updated from play_projects where id = '${a.id}'`), String(b.updated));
+  await call("play_delete", [a.id]);
+});
+
+test("one save a second for the account, across its programs too", { skip }, async () => {
+  const a = await save("", "first", { "main.qwe": "1" });
+  await sleep(1100);
+  const b = await save("", "second", { "main.qwe": "2" });
+  const quick = await call("play_save", [a.id, "first again", { "main.qwe": "3" }]);
+  assert.match(quick.error, /a moment ago/);
+  await call("play_delete", [a.id]);
+  await call("play_delete", [b.id]);
+});
+
+test("code over 256 KB in UTF-8 bytes is refused to run and to save, as the runner counts", { skip }, async () => {
+  const files = { "main.qwe": "😀".repeat(70 * 1024) }; // 70 K characters, 280 KB
+  const run = await call("play_run", [files], false);
+  assert.match(run.error, /256 KB/);
+  const saved = await save("", "emoji", files);
+  assert.match(saved.error, /256 KB/);
+  const fits = { "main.qwe": "😀".repeat(60 * 1024) }; // 240 KB
+  const ok = await save("", "fits", fits);
+  assert.ok(ok.id, JSON.stringify(ok));
+  await call("play_delete", [ok.id]);
 });

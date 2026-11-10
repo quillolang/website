@@ -189,6 +189,13 @@ export function createEditor(el, options = {}) {
     onChange(f) { changed.push(f); },
     // `f("run")` on Ctrl/Cmd-Enter, `f("save")` on Ctrl/Cmd-S.
     onKey(f) { runs.push(f); },
+    // `f("hide")` when the page is hidden or goes away (a tab switched, closed, reloaded).
+    onHide(f) {
+      if (typeof document === "undefined") return;
+      const hidden = () => { if (document.visibilityState === "hidden") f("hide"); };
+      document.addEventListener("visibilitychange", hidden);
+      window.addEventListener("pagehide", () => f("hide"));
+    },
     focus() { view.focus(); },
     // Whether the page is on screen: a hidden tab stops asking for output.
     visible: () => typeof document === "undefined" || !document.hidden,
