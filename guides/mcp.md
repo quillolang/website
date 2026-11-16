@@ -74,7 +74,10 @@ Claude can then call them: ask it what your notes say about milk, and it can ans
   program or a plugin writes to stdout goes there too. `stdin`, `read_line` and `exit` are
   errors.
 - There are no tokens on stdio: the person who starts it is the caller, and no one is
-  signed in (`session()` is `{}`).
+  signed in (`session()` is `{}`). A `server fn mcp` has a `request` there too *(since
+  0.8.6: it had none, and every call to a tool reading it failed)*: `request.mcp`, and no
+  headers, cookies or query, so a stage written for HTTP answers as it does to a call
+  without them.
 - It ends when stdin closes, and on SIGTERM.
 - Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, such as
   Claude Code before 2.1.319, is told the version is not supported.
