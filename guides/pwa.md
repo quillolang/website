@@ -5,7 +5,8 @@ window of its own; its pages open with no network; and it can tell someone somet
 while the page is closed. Elsewhere that is a manifest written by hand, icons in five
 sizes, a service worker in JavaScript, a push library, a key to keep and a table of
 subscriptions. In Quillo it is a file, a word on a route and two calls, and Quillo writes
-the rest: the manifest, the icons, the service worker, the encryption and the keys.
+the rest: the manifest, the icons, the service worker, the encryption and the keys
+*(since 0.8.7)*.
 
 > **Try it on your machine.** Service workers and notifications need a page served over
 > HTTPS, or from this machine: open the pages at `http://127.0.0.1:8080` or
@@ -111,7 +112,7 @@ worker is needed for that.
 - **`quillo check` reads it**, and says a mistake at its line before the program runs:
 
   ```text
-  app.toml:3: error: theme_color "green-ish" is not a CSS colour: #rgb, #rrggbb, #rrggbbaa or a name such as teal
+  app.toml:4: error: theme_color "green-ish" is not a CSS colour: #rgb, #rrggbb, #rrggbbaa or a name such as teal
   ```
 
   An icon under 512 pixels, `display = "browser"` (a tab, which browsers do not offer to
@@ -119,7 +120,9 @@ worker is needed for that.
 - **Routes of your own win.** A route at `/manifest.webmanifest` is the manifest, and
   Quillo adds no tags. A route that takes any path (a last `route ANY /*rest` for a 404
   page, a React app's `route GET /*path = file("dist/index.html")`) keeps those addresses
-  only with a real answer: anything else there is Quillo's, so the app stays installable.
+  only with a real answer (a `2xx` that is not HTML, or a `3xx`): anything else there, a
+  404 page, a front end's `index.html` or a guard's `401`, is Quillo's, so the app stays
+  installable.
 - **Nothing changes without the file**: no tags, no manifest, nothing a request pays for.
 
 The rest of the rules (where the tags go and where not, `--base`, `--watch`) are in
@@ -152,9 +155,10 @@ What Quillo does for it:
   parameter (here `/`), with the runtime and the bundles its page loads, so a page never
   opened opens offline with its components working. A page with a parameter is kept once it
   is opened. A route that would write is not run for this: the worker asks as a
-  [prefetch](/docs/prefetching/), which changes nothing.
-- **A deploy is a new worker.** Its text names the build, the program and its offline
-  routes, so the browser installs the new one at its next check and the old copies serve
+  [prefetch](/docs/prefetching/), which changes nothing. A page Quillo is too busy to
+  prefetch (others' requests are waiting) is asked again within 5 seconds.
+- **A deploy is a new worker.** Its text names the build, the program's files, its base
+  and its offline routes, so the browser installs the new one at its next check and the old copies serve
   until the new pages are kept.
 - **Calls still go to the server.** A `server fn` called offline gives its error value, as
   with no worker, and live data comes back as soon as the browser is online again.
@@ -170,15 +174,20 @@ session alone:
 - Any change to the session (a sign-out, a sign-in, a cart written into it) drops that
   session's pages; they are kept again as they are opened.
 - A page that reads the visitor another way (a cookie of the program's own, a header) is
-  not kept, and `quillo check` says which route. So is a page holding a form that must not
-  be sent twice, and one that signs someone in or out.
+  not kept, and `quillo check` says which route. Nor is a page holding a form that must
+  not be sent twice, one with waiting parts (`defer`), or an answer that changed the
+  session (a sign-in, a sign-out).
 
 The whole of it, signed-in pages, bounds and what is never kept, is in [Pages that work
 offline](/docs/#pages-that-work-offline).
 
 ### Notifications
 
-The button on `/orders` turns notifications on for the device, and the server sends:
+The button on `/orders` turns notifications on for the device, and the server sends.
+It is not `notify`, which shows a note on a page that is open: `quillo check` refuses
+`notify` and `ask` where the code surely runs on the server (a route, a `server fn`, a job),
+and names `notification.send` for someone who is not on the page *(since 0.8.7: they passed
+the check, and every call was a 500)*.
 
 - **`notification.ask()`**, in a click's handler, asks the person, subscribes the device
   with the server's key, and binds the subscription to `session().user`. It gives
@@ -198,10 +207,15 @@ The button on `/orders` turns notifications on for the device, and the server se
 > comes.
 
 - **One message holds 3,800 bytes**; a longer one is an error value, and nothing is sent.
-  `send` waits as `http.post` does, and the server goes on meanwhile.
+  `send` waits as `http.post` does, and the server goes on meanwhile. It goes to 8 devices
+  at a time over kept connections, all of them within 30 seconds.
+- **At most 20 devices a person**, the oldest replaced by a new one. Push services are
+  reached over https on port 443, on the public internet; a subscription to anything else
+  is refused when the page sends it.
 - **Sign-out stops them.** `end_session()` unbinds every device subscribed in that
   session, and so does signing in as another person, so the next person on a shared
-  computer gets nothing meant for the one before.
+  computer gets nothing meant for the one before. A page that finds its device bound to
+  someone else (after a cookie that simply ran out, say) unbinds it there and then.
 - **The key is `QUILLO_SECRET`.** The push key is derived from it, so every instance and
   every server that shares it signs alike, with nothing to store. Changing it ends every
   subscription; without it, a restart does, which Quillo says as it starts.
@@ -272,8 +286,12 @@ a scope, so such a program tags no route `offline`, and it follows Quillo's rule
 its files named by their content (`/_quillo/b/`, `r/`, `s/`, `t/`, `i/`) may be kept for
 good, and every other `/_quillo/` address must go to the network; pages go to the network
 first; and a page marked `cache-control: private` is someone's, which the Cache API keeps
-all the same unless the worker reads that header itself. The table of addresses and an
-example worker are in [A service worker of your own](/docs/#a-service-worker-of-your-own).
+all the same unless the worker reads that header itself. `notification.ask` on a page
+whose scope has such a worker gives an error value, rather than have Quillo's replace it.
+Under `--watch`, a page a worker answers from its cache cannot be refreshed: it reloads
+once, then says so in the page's error overlay and the console *(since 0.8.7: it reloaded
+without end, or never showed the change)*. The table of addresses and an example worker are in [A service worker of
+your own](/docs/#a-service-worker-of-your-own).
 
 ### Where it does not work yet
 
@@ -293,7 +311,10 @@ example worker are in [A service worker of your own](/docs/#a-service-worker-of-
 - `QUILLO_SECRET` is set, long and random, and the same on every server: it signs sessions,
   and the push key comes from it.
 - The site is served over HTTPS (see [Hosting](/docs/hosting/)): browsers give service
-  workers and notifications to no other site but this machine.
+  workers and notifications to no other site but this machine. Behind a proxy, name it with
+  `--trust-proxy`, so its `X-Forwarded-Proto` is believed: a notification opens the site
+  the page was on, over https only where that proxy (or, under `quillo fcgi`, the web
+  server) says so, and `http://` otherwise.
 - `quillo check main.qwe` says nothing of `app.toml`, and the icon is 512 × 512 or more.
 - Every page tagged `offline` that is someone's reads them through `session()` alone.
 - A sign-out calls `end_session()`, so the device's notifications and kept pages go with it.
