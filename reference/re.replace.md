@@ -38,6 +38,13 @@ HELLO WORLD
 - The function's result is written as `print` would write it: an int as its digits,
   `null` as `null`, a list as a list. Give it text. An error value it gives (an `err`,
   a `?` inside it) is given back as `re.replace`'s answer, not written into the text.
+- A pattern whose searches read on past their match (`[a-z]+X|[a-z]` on a run of
+  letters) reads the text once for each match it finds. Once its searches have read the
+  text 64 times over and computed for more than 0.25 s plus 4 µs a byte, the call is an
+  error value (`` `re.replace`: the pattern scans the text too many times: ... ``), and
+  `--max-compute` ends the request within 64 searches *(since 0.8.7: 300 KB of text held
+  a worker 11 s)*. Each thread keeps 32 MB of compiled patterns, the oldest going first
+  *(since 0.8.7: 256 patterns of any size)*.
 - An empty match is replaced too: an empty pattern puts the replacement between every
   two characters and at both ends, as JavaScript does.
 - Positions in the match given to the function count characters.

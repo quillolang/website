@@ -51,7 +51,8 @@ err("http: not an http(s) URL: not a url")
 - Repeated headers, `Set-Cookie`, interim answers, redirects, codings and proxies are
   taken as `http.get` takes them.
 - A `body` makes the request a POST unless `method` says otherwise; `method` is
-  upper-cased.
+  upper-cased, and one that is not an HTTP token is an error value before anything
+  connects *(since 0.8.7)*.
 - An answer that is not a success (a 401, a 500) is read whole and given with its
   `body`, and `f` is not called.
 - An event or a line that goes past 16 MiB without ending is an error value.

@@ -65,14 +65,19 @@ component Note(id: int, text: str) {
 
 On the server, in a route, a plain program or a `server fn`, the dialog (one or two
 arguments) is a runtime error, not an error value: it stops the request with a message
-that says where to call it.
+that says where to call it, and what reaches someone who is not on the page
+([notification.send](/docs/reference/notification.send/), `publish`). `quillo check`
+refuses it where the code surely runs on the server (a route, a `server fn`, a tick, a
+job, the top level, a page state's initializer) *(since 0.8.7: it passed the check, and
+every call was a 500)*; a plain function, which may run on either side, is not
+guessed.
 
 ```quillo error
 print(ask("Delete everything?"))
 ```
 
 ```output
-line 1: `ask` and `notify` speak to someone in the browser: call them from a component (an event handler)
+line 1: `ask` and `notify` speak to someone in the browser, on a page that is open: call them from a component (an event handler); to reach someone who is not on the page, `notification.send(user, { title, body, url })` sends to their devices, and `publish` updates the pages that are open
 ```
 
 ### Chaining

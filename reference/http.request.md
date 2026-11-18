@@ -34,7 +34,10 @@ err("http: not an http(s) URL: not a url")
 
 ### Edge cases
 
-- The method is any word, in either case: `"get"` is sent as `GET`.
+- The method is any HTTP token, in either case: `"get"` is sent as `GET`. A token is
+  letters, digits and ``!#$%&'*+-.^_`|~``; anything else (a space, a line break, an empty
+  method) is an error value before anything connects *(since 0.8.7: a line break in it
+  rewrote the request)*.
 - `cache` is allowed only when the method is GET; with another it is a runtime error.
 - A body on a GET or a DELETE is sent when given; `http.get` and `http.delete` take
   none.
@@ -45,6 +48,16 @@ err("http: not an http(s) URL: not a url")
   303, or a 301 or 302 after a POST, goes on as a GET with no body, as a browser does.
   To another origin, only the `accept`, `accept-language`, `content-type` and
   `user-agent` headers go on.
+
+```quillo
+print(http.request("GET\r\nX-Admin: 1", "http://127.0.0.1:9/"))
+print(http.request("MY METHOD", "http://127.0.0.1:9/"))
+```
+
+```output
+err("http: not an HTTP method: \"GET\\r\\nX-Admin: 1\" (a method is letters, digits and !#$%&'*+-.^_`|~)")
+err("http: not an HTTP method: \"MY METHOD\" (a method is letters, digits and !#$%&'*+-.^_`|~)")
+```
 
 ```quillo
 print(http.request("delete", "http://127.0.0.1:9/items/1", { reason: "spam" }))

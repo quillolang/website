@@ -193,7 +193,12 @@ Call search_notes before add_note, so the same note is not written twice.
 
 ### What you write
 
-- **`///` on each tool**: what it does and gives, for a reader who sees nothing else.
+- **`///` on each tool**: what it does and gives, for a reader who sees nothing else. A
+  character a reader does not see there (a control character, a bidirectional mark, a
+  zero-width space), or in a string its schema carries (a default, a string type's value),
+  is an error at its line, and so is one in the main file's name, which clients are told
+  *(since 0.8.7: they reached the model)*. A zero width joiner or non-joiner, which emoji
+  and Persian need, passes between two characters a reader sees.
 - **Types on every parameter, and a `->` type**: they are the schema. An untyped
   parameter's schema is `{}`, and the model guesses.
 - **`with`** naming what the tool touches. Without one, a client is told the tool may

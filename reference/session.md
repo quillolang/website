@@ -52,6 +52,10 @@ nobody
   what must not be lost in a table keyed by an id in the session.
 - Inside a `live` loader it is the viewer's session, since the loader runs as a call
   from the page. `unwatched(() => session())` reads it without following anything.
+- A page state's initializer (`state who = session().user ?? "guest"` at the top of a
+  file) reads the visitor's session, as it runs with the request there *(since 0.8.7: it
+  ran before the request, found none, and every `session()` after it in that request
+  gave `{}`)*.
 
 ```quillo
 print(session() == {}, len(keys(session())))

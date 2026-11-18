@@ -49,7 +49,10 @@ null
   `delete_cookie("theme", { path: "/old" })` and then `set_cookie("theme", "dark")`
   move the cookie from `/old` to `/`.
 - A `__Host-` or `__Secure-` name's deletion is `Secure`, as browsers take it no other
-  way.
+  way. Another is `Secure` with `secure: true`, or when the request came over HTTPS: a
+  proxy `--trust-proxy` names says `X-Forwarded-Proto: https`, or under `quillo fcgi` the
+  web server's `HTTPS` is on *(since 0.8.7: anyone's `X-Forwarded-Proto` decided it)*.
+  So a cookie set with `secure: false` can be removed over plain HTTP.
 
 ```quillo
 print(delete_cookie("theme", { path: "/", domain: "example.com" }))

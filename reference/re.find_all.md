@@ -33,6 +33,13 @@ print(re.find_all("hello", "\\d+"))
   positions in the whole text.
 - With `"m"`, `^` and `$` match at each line: a line ends at `\n` or `\r`, and `\r\n` is
   one end (U+2028 is none), on both sides.
+- A pattern whose searches read on past their match (`[a-z]+X|[a-z]` on a run of
+  letters) reads the text once for each match it finds. Once its searches have read the
+  text 64 times over and computed for more than 0.25 s plus 4 µs a byte, the call is an
+  error value (`` `re.find_all`: the pattern scans the text too many times: ... ``), and
+  `--max-compute` ends the request within 64 searches *(since 0.8.7: 300 KB of text held
+  a worker 11 s)*. Each thread keeps 32 MB of compiled patterns, the oldest going first
+  *(since 0.8.7: 256 patterns of any size)*.
 
 ```quillo
 print(re.find_all("aaa", "aa") | map((m) => [m.start, m.end]))

@@ -53,7 +53,14 @@ err("http: not an http(s) URL: not a url")
 - `public_only: true` refuses this machine, private networks and a cloud's metadata
   address before connecting, so a URL someone else chose cannot reach inside. Each
   redirect is checked the same way, through a proxy too *(since 0.7: a proxy's was
-  checked for the first address only)*.
+  checked for the first address only)*. RFC 8215's local-use NAT64 range,
+  `64:ff9b:1::/48`, is not the public internet *(since 0.8.7: it counted as public)*.
+- `cache` gives a kept answer only to the same call: the URL, the headers and every
+  option (`ca`, `cert`, `key`, `timeout`, `redirects`, `public_only`, `cache`), so a call
+  with another client certificate, or none, is asked again *(since 0.8.7: one
+  certificate's answer went to calls with another)*.
+- `timeout` is how long the whole call may take, its redirects included *(since 0.8.7:
+  each hop had its own)*.
 - The headers and the options may each be `null`, as leaving them out.
 - Requests say `User-Agent: quillo/<version>` unless the headers give another; some
   APIs refuse that one.
@@ -96,6 +103,7 @@ print(http.get("ftp://example.com/x"))
 print(http.get("http://localhost:9/", null, null) | is_err)
 print(http.get("http://127.0.0.1:9/", {}, { public_only: true }))
 print(http.get("http://169.254.169.254/latest/meta-data/", {}, { public_only: true }))
+print(http.get("http://[64:ff9b:1::1]/", {}, { public_only: true }))
 ```
 
 ```output
@@ -103,6 +111,7 @@ err("http: not an http(s) URL: ftp://example.com/x")
 true
 err("http: http://127.0.0.1:9/: refused by public_only: 127.0.0.1 is not on the public internet")
 err("http: http://169.254.169.254/latest/meta-data/: refused by public_only: 169.254.169.254 is not on the public internet")
+err("http: http://[64:ff9b:1::1]/: refused by public_only: [64:ff9b:1::1] is not on the public internet")
 ```
 
 ### Errors

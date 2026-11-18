@@ -59,6 +59,9 @@ route GET /old-page = redirect("/new-page", 301)
   leading slashes is `%5C` (`/\evil.com` is `/%5Cevil.com`, so a check for `/` and not
   `//` holds), and its `.` and `..` segments (`%2e` too) are taken out before `--base`
   (`quillo run main.qwe --base /shop`) is put in front, so `..` cannot climb out of it.
+  Where taking them out leaves more than one `/` first, one is written:
+  `redirect("/.//evil.example")` sends the visitor to `/evil.example` on the site *(since
+  0.8.7: it wrote `//evil.example`, which a browser takes to that host)*.
 - The body is null: the redirect carries nothing but its headers. Cookies set in the
   request with `set_cookie` or `set_session` go out with it.
 - Every call makes a new response value; two redirects to one address are not equal.
@@ -74,6 +77,7 @@ print(redirect(`/login?next=${url_encode("/orders?page=2")}`).headers)
 print(redirect("/x") == redirect("/x"))
 print(redirect("/a b/é").headers, redirect("https://bücher.de/").headers)
 print(redirect("/\\evil.com").headers, redirect("/p/../../admin").headers)
+print(redirect("/.//evil.example").headers, redirect("/%2e//evil.example").headers)
 ```
 
 ```output
@@ -82,6 +86,7 @@ print(redirect("/\\evil.com").headers, redirect("/p/../../admin").headers)
 false
 { location: "/a%20b/%C3%A9" } { location: "https://xn--bcher-kva.de/" }
 { location: "/%5Cevil.com" } { location: "/admin" }
+{ location: "/evil.example" } { location: "/evil.example" }
 ```
 
 ### Errors

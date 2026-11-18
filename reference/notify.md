@@ -55,14 +55,18 @@ component Editor() {
 ### Errors
 
 On the server `notify` is a runtime error, not an error value: it stops the request.
-A route that wants to tell the visitor something renders it in the page instead.
+A route that wants to tell the visitor something renders it in the page instead; to
+reach someone who is not on the page, [notification.send](/docs/reference/notification.send/)
+sends to their devices. `quillo check` refuses `notify` where the code surely runs on the
+server (a route, a `server fn`, a tick, a job, the top level, a page state's initializer)
+*(since 0.8.7: it passed the check, and every call was a 500)*.
 
 ```quillo error
 print(notify("Saved"))
 ```
 
 ```output
-line 1: `ask` and `notify` speak to someone in the browser: call them from a component (an event handler)
+line 1: `ask` and `notify` speak to someone in the browser, on a page that is open: call them from a component (an event handler); to reach someone who is not on the page, `notification.send(user, { title, body, url })` sends to their devices, and `publish` updates the pages that are open
 ```
 
 ### Chaining
@@ -76,4 +80,4 @@ does with a result:
 
 ### See also
 
-[ask](/docs/reference/ask/), [every](/docs/reference/every/), [js](/docs/reference/js/)
+[ask](/docs/reference/ask/), [every](/docs/reference/every/), [js](/docs/reference/js/), [notification.send](/docs/reference/notification.send/)

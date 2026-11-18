@@ -30,7 +30,12 @@ print(raw(42), raw(true))
 - `escape` turns it back into text: `escape(raw(x))` shows the tags.
 - `null` gives the text `null`, not an empty value.
 - Inside `<script>{...}</script>`, an `html` value goes in as it is except that `</`
-  becomes `<\/` and `<!--` becomes `<\!--`, so it cannot end the element early.
+  becomes `<\/` and `<!--` becomes `<\!--`, so it cannot end the element early. Inside
+  `<svg>` or `<math>`, where the browser reads a script's text as markup, it goes in a
+  CDATA section, a `]]>` in it split between two *(since 0.8.7: its markup reached the
+  page)*; markup made apart and placed there later is written so too. Write `<script>`
+  and `<style>` in lower case: `<sCript>` is refused where the program is read *(since
+  0.8.7)*.
 - HTML a visitor wrote, even cleaned by a sanitizer, must not keep the attributes
   Quillo's islands are made of, `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`,
   `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>` elements: the page

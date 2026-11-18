@@ -62,8 +62,11 @@ What differs from a browser, then:
   cookies. The program's cookies still reach the program.
 - The app goes only to `http(s)` addresses and its own pages: a `location` of another
   scheme is not followed.
-- Service workers do not run on the app's address. Quillo does not use them; a program's
-  own one does not start.
+- Service workers do not run on the app's address: a program's own one does not start,
+  and Quillo's is not offered. A route tagged `offline` is served as any other (the
+  program is on the device, so its pages open offline anyway), and `notification.ask`
+  says `"unsupported"` for now (see [Installable apps, offline pages and
+  notifications](/docs/pwa/)).
 - A `stream` or `events` route's answer reaches the page whole, when it ends, not as it
   is made. Live data and channels, which go through the bridge, are not affected.
 - The app needs no exception for plain HTTP: the iOS app has no App Transport Security
@@ -96,7 +99,10 @@ env.SHOP_URL = "https://shop.example.com"   # what env("SHOP_URL") gives on the 
 ```
 
 A bad value stops the build and says what is wrong. The icon becomes an asset catalog on
-iOS, and launcher and adaptive icons at every density on Android.
+iOS, and launcher and adaptive icons at every density on Android. The same file makes the
+site installable from a browser *(since 0.8.7)*, with one name and one icon: the web reads
+`name`, `icon` and its own keys, and leaves `id`, `version`, `build`, `site` and `env` to
+the phone builds (see [Installable apps, offline pages and notifications](/docs/pwa/)).
 
 **`env.NAME = "value"`** lines are what `env("NAME")` gives on the phone. A phone has no
 environment, and the program's `.env` is not read there (nor put in the app). Under
@@ -333,6 +339,12 @@ Tried on one machine, with `quillo run shop.qwe --port 8081` and the app's progr
   every visitor's; a line in the log says so once.
 - **Server side only.** `quillo check` refuses `shop.notes()` in a component: call it in
   a `server fn`. Elsewhere `site` is an ordinary name, so `let site = ...` still works.
+- **As `http`'s calls go** *(since 0.8.7: the policy did not apply, and any redirect was
+  followed)*: under a policy, `[http] hosts` must list the site; the proxy `HTTPS_PROXY`
+  or `HTTP_PROXY` names is used (list internal sites in `NO_PROXY`); redirects are
+  followed on the site's own scheme, host and port only, up to 5, and one elsewhere is an
+  error value naming where. A call has 10 s to connect and 30 s in all, its redirects
+  included.
 - **The wire** is the one a site's own pages use, and it is stable:
   `POST <url>/_quillo/rpc/<fn>` with the arguments as a JSON array, answered with
   `{"ok": value}` or `{"err": error}`. A program needs no `Origin` header; a request

@@ -1,5 +1,5 @@
 # db.migrate
-db.migrate(str=) -> list | error(str)
+db.migrate(str=) -> list
 group: Database
 
 ### What it does

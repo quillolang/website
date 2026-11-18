@@ -135,7 +135,9 @@ is not a boolean, `retries` or `isolation` together with `transaction: false`, a
 call without a function (or with the function before the options) are runtime errors.
 Calling it inside `db.transaction` is a runtime error too: it begins a transaction of
 its own. A database that cannot be reached when the key is recorded answers the
-request 503.
+request 503, `{"error": "could not record the Idempotency-Key"}` (or `could not read`):
+the database's own message goes to the log, and to the answer only under `--watch`
+*(since 0.8.7: it reached the visitor)*.
 
 ```quillo error
 print(idempotent({ nope: 1 }, () => 1))

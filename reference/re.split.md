@@ -35,6 +35,13 @@ print(re.split("k1=v1;k2=v2", "[;=]"))
 - The empty pattern cuts between every two characters, with `""` at both ends; a
   pattern that can match the empty text (`a*`) gives empty pieces where it does.
 - Characters, not bytes: `"añb"` cut at `ñ` is `["a", "b"]`.
+- A pattern whose searches read on past their match (`[a-z]+X|[a-z]` on a run of
+  letters) reads the text once for each match it finds. Once its searches have read the
+  text 64 times over and computed for more than 0.25 s plus 4 µs a byte, the call is an
+  error value (`` `re.split`: the pattern scans the text too many times: ... ``), and
+  `--max-compute` ends the request within 64 searches *(since 0.8.7: 300 KB of text held
+  a worker 11 s)*. Each thread keeps 32 MB of compiled patterns, the oldest going first
+  *(since 0.8.7: 256 patterns of any size)*.
 
 ```quillo
 print(re.split(",a,,b,", ","), re.split("x", "x"))

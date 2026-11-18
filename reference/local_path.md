@@ -40,8 +40,12 @@ for n in ["/orders/7?tab=paid", "//evil.example", "/\\evil.example", "/\t/evil.e
 
 - Spaces around the address are dropped; a query and a fragment are kept.
 - `/%2F` and `/%5C` at the start are refused too, as some servers decode them to `//`.
+- A path that starts so once its `.` and `..` are taken out, as a browser takes them
+  out, is null too: `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`
+  *(since 0.8.7)*. Other dot segments are kept as given.
 - Anything that is not text is null, so a missing form field needs no check of its own.
-  It runs the same in the browser.
+  It runs the same in the browser, which refuses C1 controls as the server does *(since
+  0.8.7: the browser's let them through)*.
 
 ```quillo
 print(local_path(" /a#b "), local_path("/%2F/evil"), local_path(null), local_path(3))
@@ -49,6 +53,14 @@ print(local_path(" /a#b "), local_path("/%2F/evil"), local_path(null), local_pat
 
 ```output
 /a#b null null null
+```
+
+```quillo
+print(local_path("/.//evil.example"), local_path("/%2e//evil.example"), local_path("/a/..//evil.example"), local_path("/a/../b"))
+```
+
+```output
+null null null /a/../b
 ```
 
 ### Errors

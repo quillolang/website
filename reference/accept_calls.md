@@ -11,9 +11,13 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
   signs with its own key (`service billing = "billing.qwe" { auth: { key, as: "shop" }
   }`) is known by that name, and no other service can sign as it. A list of keys, `[new,
   old]`, takes either while one is rotated; answers are signed back with the key the call
-  was signed with.
+  was signed with. A call signed with the shared secret that says it is `shop` is refused
+  with a 401 *(since 0.8.7: any service with the secret could be that caller)*.
 - `shared`: `false` refuses calls signed with the shared `QUILLO_SERVICE_SECRET`, which
-  every service holding it can sign as any other. Taken by default.
+  every service holding it can sign as any other. Taken by default; where `keys`,
+  `client_cert` or `jwt` names callers, such a call names none *(since 0.8.7: it was the
+  caller it signed as)*: `request.caller` is `{ name: "", by: "quillo" }`, `for` refuses
+  it, and `_contracts` lists only what has no `for`.
 - `jwt`: bearer tokens, as an identity provider issues them for services (OAuth 2.0's
   client credentials). `{ issuer, audience, jwks }` checks the token's signature
   against the provider's keys (RS256, ES256, EdDSA; a URL, kept ten minutes), or
@@ -25,8 +29,15 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
 - `client_cert: { header: "x-forwarded-client-cert" }`: the certificate a proxy checked
   (mutual TLS ended at the proxy), read from its header only when the request comes from
   an address `--trust-proxy` names (an option of `quillo run`: `quillo run billing.qwe
-  --trust-proxy 10.0.0.1`; see [the options](/docs/)). The name is the SPIFFE id's last part, or the
-  subject's CN.
+  --trust-proxy 10.0.0.1`; see [the options](/docs/)). The name is the SPIFFE id whole,
+  as Istio names principals (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`), or else
+  the subject's CN *(since 0.8.7: the id's last part, so a workload called `shop` in any
+  namespace was `shop`)*; a `for` written with the last part is refused with the id to
+  write. The header is Envoy's form, one element (`SANITIZE_SET`) unless `chain: true`
+  takes the last of several (`APPEND_FORWARD`); `subject: true` reads a header that is the
+  subject alone, as nginx's `$ssl_client_s_dn` (both *since 0.8.7*). The CN is read as RFC
+  2253 writes a subject, escapes decoded; the slash form, two CNs or a CN with `:` name
+  no caller.
 - `check: (caller) => ...`: anything else, in Quillo, run before the arguments are read.
   Only `true` or a map accepts the call, and a map becomes the caller from then on.
   Anything else refuses it with a 403, `false` and null among them *(since 0.7: null, an
