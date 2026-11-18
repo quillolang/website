@@ -464,16 +464,18 @@ visitor:
   that surely writes (the database, a global, the session or a cookie, a file, `publish`,
   `notification.send`, a service) and reads who the visitor is (`session()`, `cookie()`,
   the request's headers), there or in a function, component or middleware it goes
-  through:
+  through.
 
-  ```text
-  main.qwe:9: warning: `GET /dashboard` writes (`set_session`, in `touch`) and reads who the visitor is (`session()`, in `touch`): a link on another site, in an email or in a chat runs it with their session (`SameSite=Lax` cookies go with a followed link). Make it a `POST`, or, if the write is meant (a confirm-your-address link, a sign-in callback, a presence ping), tag it: `route writes GET ...`
-  ```
+The renewal of a session above, written without `writes`, is warned of so:
 
-  Make such a route a `POST`, from a form or a button. Where the write is meant, say so
-  after `route`: `route writes GET /confirm/:code = ...`; after `routes`, `writes` tags
-  each `GET` and `ANY` route of the group. Three or more routes warned of through one
-  write (a helper they all call) are said once, at the write.
+```text
+main.qwe:9: warning: `GET /dashboard` writes (`set_session`, in `touch`) and reads who the visitor is (`session()`, in `touch`): a link on another site, in an email or in a chat runs it with their session (`SameSite=Lax` cookies go with a followed link). Make it a `POST`, or, if the write is meant (a confirm-your-address link, a sign-in callback, a presence ping), tag it: `route writes GET ...`
+```
+
+Make such a route a `POST`, from a form or a button. Where the write is meant, say so
+after `route`: `route writes GET /confirm/:code = ...`; after `routes`, `writes` tags each
+`GET` and `ANY` route of the group. Three or more routes warned of through one write (a
+helper they all call) are said once, at the write.
 
 ### Putting it together
 
