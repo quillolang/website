@@ -1,0 +1,540 @@
+//! HTTP Basic and Digest sign-in for a program's routes (RFC 7617, RFC 7616): the Authorization header read strictly, Basic's password handed to the program's own check (crypto.verify_password) and refused over plain HTTP, Digest checked against the HA1 the program keeps with SHA-256 or MD5 for old clients, and the WWW-Authenticate challenge with a stateless nonce signed by the program's secret that expires; every compare in constant time.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! md-5 = "0.10"
+//! subtle = "2.6"
+//! base64 = "0.22"
+//! rand = "0.8"
+
+// Basic sends the name and password, base64'd but readable, with every request: it is only safe
+// over HTTPS. Quillo serves plain HTTP behind a proxy that ends TLS, so the plugin cannot see the
+// scheme itself: the program says `{ tls: true }` when it is deployed behind HTTPS, and without
+// that Basic is refused both ways: no challenge is made (so no browser asks anyone for a
+// password) and no header is read.
+//
+// Digest never sends the password. The server keeps HA1 = H(user:realm:password) instead, with
+// H SHA-256 or MD5, and checks H(HA1:nonce:nc:cnonce:qop:H(method:uri)). HA1 opens the realm as
+// the password does and is a fast, unsalted hash, so it is kept as carefully as a password and
+// a leaked one is guessed quickly: Digest is for clients that can do nothing better (cameras,
+// printers, old tools). The nonce is stateless: its time, random bytes and an HMAC of both under
+// a key from the program's secret (and, when given, the client's address). One that has expired
+// but is otherwise right is answered `stale=true`, so the client tries again without asking its
+// user. A stateless nonce can be replayed, with its request, until it expires: keep `minutes`
+// short and serve Digest over HTTPS too where you can.
+
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use md5::Md5;
+use rand::RngCore;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+const MAX_HEADER: usize = 8192;
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+fn now_ms(config: &Value) -> i64 {
+    // `now` in the config is for tests only: a fixed clock, in ms since 1970.
+    if let Some(n) = config.get("now").and_then(Value::as_i64) {
+        return n;
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn check_realm(realm: &str) -> Result<(), String> {
+    if realm.is_empty() || realm.len() > 200 || realm.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
+        return Err("the realm is 1 to 200 characters, without quotes, backslashes or control characters".into());
+    }
+    Ok(())
+}
+
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn tls_said(options: &Value) -> bool {
+    options.get("tls").and_then(Value::as_bool) == Some(true)
+}
+
+const PLAIN_HTTP: &str = "Basic sends the password readable by anyone on the way, so it is only taken over HTTPS: serve the site behind a proxy that does TLS and say { tls: true }";
+
+/// The `WWW-Authenticate` value that asks for a name and password: `Basic realm="...", charset="UTF-8"`,
+/// sent with a 401. An error value unless `options` says `{ tls: true }` (the site is served over
+/// HTTPS), so that no browser is made to ask for a password over plain HTTP.
+pub fn http_basic_challenge(realm: &str, options: serde_json::Value) -> Result<String, String> {
+    check_realm(realm)?;
+    if !tls_said(&options) {
+        return Err(PLAIN_HTTP.into());
+    }
+    Ok(format!("Basic realm={}, charset=\"UTF-8\"", quoted(realm)))
+}
+
+/// Reads `Authorization: Basic ...` (the header's value): `{ user, password }`, for the program to
+/// check with crypto.verify_password against the hash it keeps. An error value says why there is
+/// nothing to check: no header, another scheme, base64 that does not decode, text that is not
+/// UTF-8, no colon, an empty name, control characters, or plain HTTP (`options` must say
+/// `{ tls: true }`). The password may hold colons: the first one ends the name. Names and passwords
+/// are given as they came, not normalized (NFC): a password typed as "é" on one device and as
+/// "e" + accent on another is two passwords, as most servers treat it.
+pub fn http_basic_parse(header: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !tls_said(&options) {
+        return Err(PLAIN_HTTP.into());
+    }
+    let h = header.trim();
+    if h.is_empty() {
+        return Err("no credentials: the request has no Authorization header".into());
+    }
+    if h.len() > MAX_HEADER {
+        return Err("the Authorization header is too long".into());
+    }
+    let (scheme, rest) = h.split_once(|c: char| c == ' ' || c == '\t').unwrap_or((h, ""));
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return Err(format!("the Authorization header is {}, not Basic", scheme));
+    }
+    let token = rest.trim();
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+        return Err("the Basic credentials are not base64".into());
+    }
+    let bytes = STANDARD.decode(token).or_else(|_| STANDARD_NO_PAD.decode(token)).map_err(|_| "the Basic credentials are not base64".to_string())?;
+    let text = String::from_utf8(bytes).map_err(|_| "the Basic credentials are not UTF-8 text".to_string())?;
+    let Some((user, password)) = text.split_once(':') else {
+        return Err("the Basic credentials have no colon between the name and the password".into());
+    };
+    if user.is_empty() {
+        return Err("the Basic credentials have an empty name".into());
+    }
+    if text.chars().any(|c| c.is_control()) {
+        return Err("the Basic credentials have a control character in them".into());
+    }
+    Ok(json!({ "user": user, "password": password }))
+}
+
+/// The `Authorization` value a client sends for `user` and `password` with Basic: for scripts and
+/// tests. A name cannot hold a colon.
+pub fn http_basic_header(user: &str, password: &str) -> Result<String, String> {
+    if user.is_empty() || user.contains(':') {
+        return Err("a Basic name is not empty and holds no colon".into());
+    }
+    Ok(format!("Basic {}", STANDARD.encode(format!("{}:{}", user, password))))
+}
+
+// ---- Digest ---------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Algo {
+    Sha256,
+    Md5,
+}
+
+/// An algorithm's name as RFC 7616 writes it, and whether it is the -sess form.
+fn algorithm(name: &str) -> Result<(Algo, bool, &'static str), String> {
+    match name.to_ascii_uppercase().as_str() {
+        "SHA-256" => Ok((Algo::Sha256, false, "SHA-256")),
+        "SHA-256-SESS" => Ok((Algo::Sha256, true, "SHA-256-sess")),
+        "MD5" => Ok((Algo::Md5, false, "MD5")),
+        "MD5-SESS" => Ok((Algo::Md5, true, "MD5-sess")),
+        _ => Err(format!("the algorithm {} is not one of SHA-256, MD5, SHA-256-sess and MD5-sess", name)),
+    }
+}
+
+fn h(a: Algo, s: &str) -> String {
+    let bytes: Vec<u8> = match a {
+        Algo::Sha256 => Sha256::digest(s.as_bytes()).to_vec(),
+        Algo::Md5 => Md5::digest(s.as_bytes()).to_vec(),
+    };
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+struct DigestConfig {
+    realm: String,
+    key: Vec<u8>,
+    algorithms: Vec<&'static str>,
+    life_ms: i64,
+    bind: String,
+    now: i64,
+}
+
+fn digest_config(config: &Value) -> Result<DigestConfig, String> {
+    let secret = config.get("secret").and_then(Value::as_str).unwrap_or("");
+    if secret.len() < 32 {
+        return Err("`secret` signs the nonces: the program's secret, at least 32 characters (32 random bytes as hex is right): openssl rand -hex 32".into());
+    }
+    let realm = config.get("realm").and_then(Value::as_str).unwrap_or("").to_string();
+    check_realm(&realm)?;
+    let mut algorithms = Vec::new();
+    match config.get("algorithms") {
+        None | Some(Value::Null) => algorithms.push("SHA-256"),
+        Some(Value::Array(list)) if !list.is_empty() => {
+            for a in list {
+                let name = algorithm(a.as_str().ok_or("each algorithm is text, such as \"SHA-256\"")?)?.2;
+                if !algorithms.contains(&name) {
+                    algorithms.push(name);
+                }
+            }
+        }
+        Some(_) => return Err("`algorithms` is a list, such as [\"SHA-256\", \"MD5\"]: SHA-256 first, MD5 only for old clients".into()),
+    }
+    let minutes = config.get("minutes").and_then(Value::as_i64).unwrap_or(5);
+    if !(1..=60).contains(&minutes) {
+        return Err(format!("`minutes` (how long a nonce is good) is from 1 to 60, got {}", minutes));
+    }
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    m.update(b"quillo http_auth v1 digest nonce");
+    let bind = config.get("bind").and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(DigestConfig { realm, key: m.finalize().into_bytes().to_vec(), algorithms, life_ms: minutes * 60_000, bind, now: now_ms(config) })
+}
+
+fn nonce_mac(c: &DigestConfig, ts: &[u8], random: &[u8]) -> Vec<u8> {
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&c.key).expect("HMAC takes any key length");
+    for part in [b"nonce".as_slice(), c.realm.as_bytes(), ts, random, c.bind.as_bytes()] {
+        m.update(&(part.len() as u32).to_be_bytes());
+        m.update(part);
+    }
+    m.finalize().into_bytes()[..16].to_vec()
+}
+
+fn opaque_for(c: &DigestConfig, nonce: &str) -> String {
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&c.key).expect("HMAC takes any key length");
+    m.update(b"opaque:");
+    m.update(nonce.as_bytes());
+    URL_SAFE_NO_PAD.encode(&m.finalize().into_bytes()[..12])
+}
+
+fn new_nonce(c: &DigestConfig) -> String {
+    let ts = c.now.to_be_bytes();
+    let mut random = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let mut b = ts.to_vec();
+    b.extend_from_slice(&random);
+    b.extend_from_slice(&nonce_mac(c, &ts, &random));
+    URL_SAFE_NO_PAD.encode(b)
+}
+
+enum NonceIs {
+    Fresh,
+    Stale,
+    Forged,
+}
+
+fn nonce_state(c: &DigestConfig, nonce: &str) -> NonceIs {
+    let Ok(b) = URL_SAFE_NO_PAD.decode(nonce) else { return NonceIs::Forged };
+    if b.len() != 32 {
+        return NonceIs::Forged;
+    }
+    let (ts, rest) = b.split_at(8);
+    let (random, mac) = rest.split_at(8);
+    if !bool::from(nonce_mac(c, ts, random).as_slice().ct_eq(mac)) {
+        return NonceIs::Forged;
+    }
+    let made = i64::from_be_bytes(ts.try_into().expect("8 bytes"));
+    // A nonce from the future (a clock moved back) is as good as stale.
+    if made > c.now + 60_000 || c.now - made > c.life_ms { NonceIs::Stale } else { NonceIs::Fresh }
+}
+
+/// The auth-params of an Authorization or WWW-Authenticate value, RFC 7235: a scheme, then
+/// `name=token` or `name="quoted string"` pairs, comma-separated. Several challenges in one value
+/// come back as several. Names are in lower case; a name given twice is an error.
+fn parse_challenges(s: &str) -> Result<Vec<(String, Map<String, Value>)>, String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<(String, Map<String, Value>)> = Vec::new();
+    let token_char = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    let skip_ws = |i: &mut usize| {
+        while *i < b.len() && (b[*i] == b' ' || b[*i] == b'\t') {
+            *i += 1;
+        }
+    };
+    loop {
+        skip_ws(&mut i);
+        while i < b.len() && b[i] == b',' {
+            i += 1;
+            skip_ws(&mut i);
+        }
+        if i >= b.len() {
+            break;
+        }
+        let start = i;
+        while i < b.len() && token_char(b[i]) {
+            i += 1;
+        }
+        if start == i {
+            return Err("the header is not a list of name=value pairs".into());
+        }
+        let word = &s[start..i];
+        let mut j = i;
+        skip_ws(&mut j);
+        if j < b.len() && b[j] == b'=' {
+            // name=value, for the challenge already begun.
+            let Some(last) = out.last_mut() else { return Err("the header does not start with its scheme".into()) };
+            i = j + 1;
+            skip_ws(&mut i);
+            let value = if i < b.len() && b[i] == b'"' {
+                i += 1;
+                let mut v = String::new();
+                let mut closed = false;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' if i + 1 < b.len() => {
+                            // A quoted pair: the whole character after the backslash, which may
+                            // be several bytes of UTF-8 (`\é`), and never a control character.
+                            let ch = s[i + 1..].chars().next().expect("in bounds");
+                            if ch.is_control() && ch != '\t' {
+                                return Err("the header has a control character in a quoted value".into());
+                            }
+                            v.push(ch);
+                            i += 1 + ch.len_utf8();
+                        }
+                        b'"' => {
+                            closed = true;
+                            i += 1;
+                            break;
+                        }
+                        c if c < 0x20 && c != b'\t' => return Err("the header has a control character in a quoted value".into()),
+                        _ => {
+                            // Copy one UTF-8 character whole.
+                            let ch = s[i..].chars().next().expect("in bounds");
+                            v.push(ch);
+                            i += ch.len_utf8();
+                        }
+                    }
+                }
+                if !closed {
+                    return Err("a quoted value in the header has no closing quote".into());
+                }
+                v
+            } else {
+                let vs = i;
+                while i < b.len() && (token_char(b[i]) || b[i] == b'/' || b[i] == b'=') {
+                    i += 1;
+                }
+                s[vs..i].to_string()
+            };
+            let name = word.to_ascii_lowercase();
+            if last.1.contains_key(&name) {
+                return Err(format!("the header gives `{}` twice", name));
+            }
+            last.1.insert(name, Value::String(value));
+            skip_ws(&mut i);
+            if i < b.len() && b[i] != b',' {
+                return Err("the header's pairs are not separated by commas".into());
+            }
+        } else {
+            out.push((word.to_string(), Map::new()));
+            i = j;
+        }
+    }
+    Ok(out)
+}
+
+/// RFC 8187's `username*=UTF-8''percent-encoded`.
+fn ext_value(v: &str) -> Result<String, String> {
+    let Some(rest) = v.strip_prefix("UTF-8''").or_else(|| v.strip_prefix("utf-8''")) else {
+        return Err("username* is not UTF-8''...".into());
+    };
+    let mut bytes = Vec::new();
+    let raw = rest.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            if i + 2 >= raw.len() {
+                return Err("username* is not percent-encoded".into());
+            }
+            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).map_err(|_| "username* is not percent-encoded".to_string())?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| "username* is not percent-encoded".to_string())?);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| "username* is not UTF-8".into())
+}
+
+fn digest_fields(header: &str) -> Result<Map<String, Value>, String> {
+    let h = header.trim();
+    if h.is_empty() {
+        return Err("no credentials: the request has no Authorization header".into());
+    }
+    if h.len() > MAX_HEADER {
+        return Err("the Authorization header is too long".into());
+    }
+    let mut parsed = parse_challenges(h)?;
+    if parsed.len() != 1 || !parsed[0].0.eq_ignore_ascii_case("digest") {
+        let scheme = parsed.first().map_or("empty", |p| p.0.as_str()).to_string();
+        return Err(format!("the Authorization header is {}, not Digest", scheme));
+    }
+    let mut f = parsed.remove(0).1;
+    if let Some(Value::String(ext)) = f.remove("username*") {
+        if f.contains_key("username") {
+            return Err("the header gives both username and username*".into());
+        }
+        f.insert("username".into(), Value::String(ext_value(&ext)?));
+    }
+    for need in ["username", "realm", "nonce", "uri", "response"] {
+        if f.get(need).and_then(Value::as_str).map_or(true, str::is_empty) {
+            return Err(format!("the Digest header has no {}", need));
+        }
+    }
+    Ok(f)
+}
+
+/// The `WWW-Authenticate` value for a 401 that asks for Digest: one challenge per algorithm in
+/// `config.algorithms` (SHA-256 unless given), joined by commas, each with `qop="auth"`, a fresh
+/// nonce and its opaque. Offer one algorithm per route: given two challenges in one header, curl
+/// and Python's urllib answer with the last one's algorithm, so ["SHA-256", "MD5"] gets MD5 from
+/// them. Keep MD5 for a route of its own, for the old clients that know nothing else. `options`: `{ stale: true }` when the check
+/// said so. `config`: `secret` (the program's, 16 characters or more), `realm`, `algorithms`,
+/// `minutes` (how long a nonce is good, 5), `bind` (the client's address, `request.ip`, so that a
+/// nonce seen on the way is no use from elsewhere; give the same in the check).
+pub fn http_digest_challenge(config: serde_json::Value, options: serde_json::Value) -> Result<String, String> {
+    let c = digest_config(&config)?;
+    let nonce = new_nonce(&c);
+    let opaque = opaque_for(&c, &nonce);
+    let stale = if options.get("stale").and_then(Value::as_bool) == Some(true) { ", stale=true" } else { "" };
+    Ok(c.algorithms
+        .iter()
+        .map(|a| format!("Digest realm={}, qop=\"auth\", algorithm={}, nonce=\"{}\", opaque=\"{}\", charset=UTF-8{}", quoted(&c.realm), a, nonce, opaque, stale))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// The fields of `Authorization: Digest ...`: `{ username, realm, nonce, uri, response, algorithm,
+/// qop, nc, cnonce, opaque }` (`username*` read as UTF-8), so the program can find the user's HA1.
+/// An error value for a header that is missing, not Digest, or malformed.
+pub fn http_digest_parse(header: &str) -> Result<serde_json::Value, String> {
+    Ok(Value::Object(digest_fields(header)?))
+}
+
+/// Checks `Authorization: Digest ...` for a request of `method` to `uri` (the request target as
+/// sent: `request.path`, and `?` + `request.query_string` when there is one), with `ha1` the user's
+/// HA1 (text, or a map by algorithm: `{ "SHA-256": ..., "MD5": ... }`; null for no such user).
+/// Gives `{ ok, user, stale, reason }`. `stale` is true when only the nonce's time is past: answer
+/// with a challenge made with `{ stale: true }`, and the client tries again without asking anyone.
+pub fn http_digest_check(config: serde_json::Value, header: &str, method: &str, uri: &str, ha1: serde_json::Value) -> Result<serde_json::Value, String> {
+    let c = digest_config(&config)?;
+    let no = |reason: &str, stale: bool| json!({ "ok": false, "user": null, "stale": stale, "reason": reason });
+    let f = match digest_fields(header) {
+        Ok(f) => f,
+        Err(why) => return Ok(no(&why, false)),
+    };
+    let get = |name: &str| f.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+    let (algo, sess, name) = match algorithm(f.get("algorithm").and_then(Value::as_str).unwrap_or("MD5")) {
+        Ok(a) => a,
+        Err(why) => return Ok(no(&why, false)),
+    };
+    if !c.algorithms.contains(&name) {
+        return Ok(no(&format!("the algorithm {} is not offered here", name), false));
+    }
+    if !same(&get("realm"), &c.realm) {
+        return Ok(no("the Digest header is for another realm", false));
+    }
+    if f.get("userhash").and_then(Value::as_str).is_some_and(|u| u.eq_ignore_ascii_case("true")) {
+        return Ok(no("userhash is not offered here", false));
+    }
+    if get("qop") != "auth" {
+        return Ok(no("the Digest header has no qop=auth: answers without it (RFC 2069) are not taken", false));
+    }
+    let nc = get("nc");
+    if nc.len() != 8 || !nc.bytes().all(|b| b.is_ascii_hexdigit()) || get("cnonce").is_empty() {
+        return Ok(no("the Digest header has no nc of 8 hex digits, or no cnonce", false));
+    }
+    let nonce = get("nonce");
+    let state = nonce_state(&c, &nonce);
+    if matches!(state, NonceIs::Forged) {
+        return Ok(no("the nonce is not one of ours", false));
+    }
+    if !same(&get("opaque"), &opaque_for(&c, &nonce)) {
+        return Ok(no("the opaque does not belong to the nonce", false));
+    }
+    if !same(&get("uri"), uri) {
+        return Ok(no("the Digest header was made for another address", false));
+    }
+    let given_ha1 = match &ha1 {
+        Value::String(s) => Some(s.to_ascii_lowercase()),
+        Value::Object(m) => {
+            let base = if algo == Algo::Sha256 { "SHA-256" } else { "MD5" };
+            m.get(base).and_then(Value::as_str).map(str::to_ascii_lowercase)
+        }
+        _ => None,
+    };
+    let want_len = if algo == Algo::Sha256 { 64 } else { 32 };
+    let known = given_ha1.as_ref().is_some_and(|x| x.len() == want_len);
+    // An unknown user is checked against a made-up HA1, so the answer takes as long.
+    let base_ha1 = if known { given_ha1.unwrap_or_default() } else { "0".repeat(want_len) };
+    let ha1_used = if sess { h(algo, &format!("{}:{}:{}", base_ha1, nonce, get("cnonce"))) } else { base_ha1 };
+    let ha2 = h(algo, &format!("{}:{}", method.to_ascii_uppercase(), get("uri")));
+    let expected = h(algo, &format!("{}:{}:{}:{}:auth:{}", ha1_used, nonce, nc, get("cnonce"), ha2));
+    let right = same(&expected, &get("response").to_ascii_lowercase()) && known;
+    if !right {
+        return Ok(no("wrong name or password", false));
+    }
+    if matches!(state, NonceIs::Stale) {
+        return Ok(no("the nonce has expired: ask again with stale=true", true));
+    }
+    Ok(json!({ "ok": true, "user": get("username"), "stale": false, "reason": null }))
+}
+
+/// What the program keeps for Digest instead of the password: HA1 = H(user:realm:password), in hex,
+/// with `algorithm` "SHA-256" or "MD5" (the -sess forms use the same). Keep one per algorithm
+/// offered, as carefully as a password: it opens the realm as the password does.
+pub fn http_digest_ha1(user: &str, realm: &str, password: &str, algorithm_name: &str) -> Result<String, String> {
+    check_realm(realm)?;
+    let (algo, _, _) = algorithm(algorithm_name)?;
+    Ok(h(algo, &format!("{}:{}:{}", user, realm, password)))
+}
+
+/// The `Authorization` value a client sends in answer to a Digest challenge (the 401's
+/// `WWW-Authenticate`), for `user` and `password`, a request of `method` to `uri`: for tests, and
+/// for calling old devices. It answers the first challenge whose algorithm it knows, or the one
+/// named by `options.algorithm`.
+pub fn http_digest_client(challenge: &str, user: &str, password: &str, method: &str, uri: &str, options: serde_json::Value) -> Result<String, String> {
+    let want = options.get("algorithm").and_then(Value::as_str).map(|a| algorithm(a).map(|x| x.2)).transpose()?;
+    let all = parse_challenges(challenge)?;
+    let pick = all
+        .iter()
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("digest"))
+        .find_map(|(_, p)| {
+            let a = algorithm(p.get("algorithm").and_then(Value::as_str).unwrap_or("MD5")).ok()?;
+            (want.is_none() || want == Some(a.2)).then_some((a, p))
+        })
+        .ok_or("the challenge has no Digest with an algorithm this client knows")?;
+    let ((algo, sess, name), p) = pick;
+    let get = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    if !get("qop").split(',').any(|q| q.trim() == "auth") {
+        return Err("the challenge does not offer qop=auth".into());
+    }
+    let realm = get("realm");
+    let nonce = get("nonce");
+    let mut cn = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut cn);
+    let cnonce = URL_SAFE_NO_PAD.encode(cn);
+    let nc = "00000001";
+    let mut ha1 = h(algo, &format!("{}:{}:{}", user, realm, password));
+    if sess {
+        ha1 = h(algo, &format!("{}:{}:{}", ha1, nonce, cnonce));
+    }
+    let ha2 = h(algo, &format!("{}:{}", method.to_ascii_uppercase(), uri));
+    let response = h(algo, &format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
+    let mut out = format!(
+        "Digest username={}, realm={}, nonce={}, uri={}, algorithm={}, qop=auth, nc={}, cnonce={}, response={}",
+        quoted(user),
+        quoted(&realm),
+        quoted(&nonce),
+        quoted(uri),
+        name,
+        nc,
+        quoted(&cnonce),
+        quoted(&response)
+    );
+    if p.contains_key("opaque") {
+        out.push_str(&format!(", opaque={}", quoted(&get("opaque"))));
+    }
+    Ok(out)
+}

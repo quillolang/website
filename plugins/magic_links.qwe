@@ -1,0 +1,301 @@
+// Sign-in by email: a link and a 6-digit code, each good once for 15 minutes, kept as HMACs in a
+// table of the program's own. The link carries its token after a #, which browsers never send, so
+// no request log holds it (Quillo's log prints query strings); its page reads the token, posts it
+// with a button and is sent on (303) to /welcome, so a mail scanner that opens the link uses
+// nothing up. The link works in the browser that asked for it (a cookie); opened elsewhere, the
+// visitor is asked to confirm or to type the code. Sends are limited with the catalog's
+// login_limits plugin, and a code takes 5 wrong guesses.
+//
+//   SIGN_IN_SECRET=$(openssl rand -hex 32) SITE_URL=https://shop.example \
+//   SMTP_URL=smtps://user:password@smtp.example.com SMTP_FROM="Shop <shop@example.com>" quillo run magic_links.qwe
+//
+// SITE_URL may be http://localhost:8080 while developing; any other site's links must be https.
+// With EXAMPLE_CHECKS=1 it also has the checks under /checks (POST), which the catalog's test runs.
+// It uses smtp.qwer and login_limits.qwer from the catalog, beside it. For a code by SMS, send
+// s.code with the catalog's sms plugin (sms_send) instead of send_email.
+
+use "magic_links.qwer"
+use "login_limits.qwer"
+use "smtp.qwer"
+
+// A secret of the program's: no default, so no copy of this example runs on a known one.
+fn secret(name: str) {
+    let s = env(name) ?? ""
+    if len(s) < 32 { return err(`${name} is not set, or is shorter than 32 characters: ${name}=$(openssl rand -hex 32)`) }
+    s
+}
+
+db.open("data/magic_links.db")
+let SITE = env("SITE_URL", "http://localhost:8080")
+let SECRET = secret("SIGN_IN_SECRET")?
+let MAGIC = { table: "sign_in_links", database: "sqlite", secret: SECRET, minutes: 15, tries: 5, link: `${SITE}/login/link` }
+let LIMITS = { table: "login_limits", database: "sqlite", secret: SECRET, limits: { send: { tries: 3, per_seconds: 3600 } } }
+db.exec(magic_links_table(MAGIC)?)?
+db.exec(login_limits_table(LIMITS)?)?
+let CHECKS = env("EXAMPLE_CHECKS", "") == "1"
+
+// Runs a plugin's statements. On SQLite and PostgreSQL each is one statement that stands alone,
+// run with no transaction around it; MySQL's update and its read-back come `atomic`, for one short
+// transaction tried again on a deadlock. The last row, or null.
+fn run_sql(q) {
+    if q.atomic {
+        return db.transaction({ retries: 3 }, () => {
+            let row = null
+            for s in q.steps { row = db.one(s.sql, s.args)? }
+            row
+        })
+    }
+    let row = null
+    for s in q.steps { row = db.one(s.sql, s.args)? }
+    row
+}
+
+// The seconds to wait before another email, or 0: 50 sends per 15 minutes from one client, and 3
+// an hour to one address, so nobody's inbox is flooded and nobody mints codes to guess at.
+fn wait_to_send(email: str, ip: str) {
+    for l in [{ kind: "address", key: ip }, { kind: "send", key: email }] {
+        let r = run_sql(login_limits_take(LIMITS, l.kind, l.key)?)?
+        if r.allowed == 0 { return r.retry_after }
+    }
+    0
+}
+
+// Emails a link and a code to `email`, the link bound to `browser` (the value of this browser's
+// cookie): { sent, address, minutes }, or { wait } in seconds when a limit is reached. An address
+// that is no address is an error value.
+fn send_sign_in(email: str, ip: str, browser: str) {
+    let wait = wait_to_send(lower(trim(email)), ip)
+    if wait > 0 { return { sent: false, wait } }
+    let s = magic_links_start(MAGIC, email, "both", { browser })?
+    run_sql(s)?
+    send_email(s.address, "Your sign-in link", `Sign in to the shop: ${s.link}\n\nOr type this code: ${s.code}\n\nEach works once, for ${s.minutes} minutes. If you did not ask for this, ignore it.`, "")?
+    { sent: true, address: s.address, minutes: s.minutes }
+}
+
+// Uses a link ({ token, browser }) or a code ({ address, code }) once: { ok, address, masked,
+// reason, tries_left, other_browser }. A sign-in also ends the other half of its email.
+fn redeem(input) {
+    let r = magic_links_redeem(MAGIC, input)
+    if is_err(r) { return { ok: false, address: null, masked: null, reason: error(r), tries_left: null, other_browser: false } }
+    let out = magic_links_result(MAGIC, input, run_sql(r)?)?
+    if out.ok { run_sql(out)? }
+    out
+}
+
+view Page(title: str, children) =
+    <html lang="en">
+        <head><meta charset="utf-8"/><meta name="referrer" content="no-referrer"/><title>{title}</title></head>
+        <body><main>{children}</main></body>
+    </html>
+
+view CodeForm(email: str = "") =
+    <form method="post" action="/login/code">
+        <label>Email <input name="email" type="email" value={email} autocomplete="email"/></label>
+        <label>Code <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7"/></label>
+        <button>Sign in</button>
+    </form>
+
+route GET / =
+    <Page title="Sign in">
+        <form method="post" action="/login/email">
+            <label>Email <input name="email" type="email" autocomplete="email"/></label>
+            <button>Email me a link</button>
+        </form>
+    </Page>
+
+// The same answer whether the address has an account or not: nobody learns who signs in here.
+route POST /login/email { form: { email: str } } | { json: { email: str } } {
+    let browser = crypto.token()
+    let s = send_sign_in(email, request.ip, browser)
+    if is_err(s) { reply 400 error(s) }
+    if !s.sent { reply 429 respond(429, `Too many emails: try again in ${s.wait} s.`, { "retry-after": str(s.wait) }) }
+    set_cookie("sign_in_browser", browser, { max_age: s.minutes * 60 })
+    <Page title="Check your email">
+        <p>Check your email: the link and the code work once, for {s.minutes} minutes.</p>
+        <CodeForm email={s.address}/>
+    </Page>
+}
+
+// The link's page: the token after the # goes into the form, and leaves the address bar.
+let READ_TOKEN = "document.getElementById('token').value = location.hash.slice(1); history.replaceState(null, '', location.pathname)"
+
+route GET /login/link =
+    <Page title="Sign in">
+        <form method="post" action="/login/link">
+            <input type="hidden" id="token" name="token" value=""/>
+            <button>Sign in</button>
+        </form>
+        <p>Or type the code from the email:</p>
+        <CodeForm/>
+        <script>{raw(READ_TOKEN)}</script>
+    </Page>
+
+route POST /login/link { form: { token: str = "", confirm: str = "" } } {
+    let r = redeem({ token, browser: cookie("sign_in_browser") ?? "", any_browser: confirm == "yes" })
+    if r.other_browser {
+        // Opened in another browser than the one that asked: sign in here only if the visitor says so.
+        reply 409 <Page title="Sign in here?">
+            <p>Sign in as {r.masked}?</p>
+            <p>{r.reason}</p>
+            <form method="post" action="/login/link">
+                <input type="hidden" name="token" value={token}/>
+                <input type="hidden" name="confirm" value="yes"/>
+                <button>I asked for this link: sign in here</button>
+            </form>
+            <CodeForm/>
+        </Page>
+    }
+    if !r.ok { reply 401 <Page title="Not signed in"><p>{r.reason}</p><CodeForm/></Page> }
+    delete_cookie("sign_in_browser")
+    set_session({ user: r.address })
+    redirect("/welcome")
+}
+
+route POST /login/code { form: { email: str, code: str } } | { json: { email: str, code: str } } {
+    let r = redeem({ address: email, code })
+    if !r.ok { reply 401 r.tries_left == null ? r.reason : `${r.reason} (${r.tries_left} tries left)` }
+    set_session({ user: r.address })
+    redirect("/welcome")
+}
+
+route GET /welcome = { signed_in_as: session().user }
+
+every(600000, () => { run_sql(magic_links_sweep(MAGIC)?) })
+
+// ---- the checks, without an inbox: each makes a sign-in and uses it as a visitor would ------
+
+fn checks_on(r) = CHECKS ? r : null
+let A_BROWSER = "browser-cookie-value-0123456789"
+fn make(address: str, what: str) {
+    let s = magic_links_start(MAGIC, address, what, {})?
+    run_sql(s)?
+    s
+}
+
+routes /checks | checks_on {
+    // Four emails asked for one address in a row: three are sent (to the SMTP server), the fourth
+    // waits 20 minutes (3 an hour come back one every 20 minutes). The limits are cleared first,
+    // so the check runs the same every time.
+    route POST /send {
+        run_sql(login_limits_clear(LIMITS, "address", "203.0.113.9")?)?
+        run_sql(login_limits_clear(LIMITS, "send", "sam@example.com")?)?
+        let sends = []
+        for i in range(4) { sends = [...sends, send_sign_in("Sam@Example.com", "203.0.113.9", A_BROWSER)?] }
+        { sent: len(sends | filter((s) => s.sent)), fourth_waits_minutes: round(last(sends).wait / 60), address: sends[0].address }
+    }
+
+    // A link used once: the second time, a forged token and one cut short are all refused.
+    route POST /flow {
+        let s = make(" Ada@Example.com ", "link")
+        let first = redeem({ token: s.link })
+        {
+            link_has_hash: starts_with(s.link, `${SITE}/login/link#`) && len(s.token) == 43,
+            no_code_made: s.code == null,
+            first: { ok: first.ok, address: first.address },
+            again: redeem({ token: s.token }).reason,
+            forged: redeem({ token: crypto.token(32) }).reason,
+            cut_short: redeem({ token: slice(s.token, 0, 40) }).reason,
+        }
+    }
+
+    // A link bound to the browser that asked: elsewhere the visitor is asked first, and once they
+    // confirm it works; in that browser it works at once.
+    route POST /browser {
+        let s = magic_links_start(MAGIC, "bea@example.com", "link", { browser: A_BROWSER })?
+        run_sql(s)?
+        let elsewhere = redeem({ token: s.token, browser: "" })
+        let other = redeem({ token: s.token, browser: "another-browser-cookie-0123" })
+        let confirmed = redeem({ token: s.token, browser: "", any_browser: true })
+        let t = magic_links_start(MAGIC, "bea@example.com", "link", { browser: A_BROWSER })?
+        run_sql(t)?
+        {
+            elsewhere: [elsewhere.ok, elsewhere.other_browser, elsewhere.masked],
+            other_cookie: other.other_browser,
+            confirmed: confirmed.ok,
+            same_browser: redeem({ token: t.token, browser: A_BROWSER }).ok,
+        }
+    }
+
+    // A code: two wrong guesses, the right one, then the right one again.
+    route POST /codes {
+        let s = make("bob@example.com", "code")
+        let wrong = s.code == "000000" ? "000001" : "000000"
+        let w1 = redeem({ address: "bob@example.com", code: wrong })
+        let w2 = redeem({ address: "BOB@example.com", code: wrong })
+        let typed = `${slice(s.code, 0, 3)} ${slice(s.code, 3, 6)}`        // as people type it
+        let right = redeem({ address: "bob@example.com", code: typed })
+        {
+            wrong: [w1.reason, w1.tries_left, w2.tries_left],
+            right: [right.ok, right.address, right.tries_left],
+            again: redeem({ address: "bob@example.com", code: s.code }).reason,
+            no_code: redeem({ address: "nobody@example.com", code: "123456" }).reason,
+            not_digits: redeem({ address: "bob@example.com", code: "12345a" }).reason,
+        }
+    }
+
+    // Five wrong guesses spend a code: the sixth guess is refused even when it is right.
+    route POST /tries {
+        let s = make("carol@example.com", "code")
+        let wrong = s.code == "999999" ? "999998" : "999999"
+        for i in range(5) { redeem({ address: "carol@example.com", code: wrong }) }
+        { sixth_right_code: redeem({ address: "carol@example.com", code: s.code }) | (r) => [r.ok, r.reason, r.tries_left] }
+    }
+
+    // After 15 minutes a link and a code are too old (a clock moved on, for the check).
+    route POST /expired {
+        let s = magic_links_start({ ...MAGIC, now: now() - 16 * 60000 }, "dan@example.com", "both", {})?
+        run_sql(s)?
+        { link: redeem({ token: s.token }).reason, code: redeem({ address: "dan@example.com", code: s.code }).reason }
+    }
+
+    // A new request replaces the address's earlier link and code, and a sign-in ends the other
+    // half of its email.
+    route POST /replaced {
+        let one = make("erin@example.com", "both")
+        let two = make("erin@example.com", "both")
+        {
+            old_link: redeem({ token: one.token }).reason,
+            old_code: one.code == two.code ? "wrong code" : redeem({ address: "erin@example.com", code: one.code }).reason,
+            new_link: redeem({ token: two.token }).ok,
+            its_code_after_the_link: redeem({ address: "erin@example.com", code: two.code }).reason,
+        }
+    }
+
+    // A row edited in the database (another address put on a pending link) is not taken.
+    route POST /tampered {
+        let s = make("mallory@example.com", "link")
+        db.exec("update sign_in_links set address = ? where address = ?", "ada@example.com", "mallory@example.com")?
+        { tampered: redeem({ token: s.token }).reason }
+    }
+
+    // Twenty requests with the right code at the same moment: one signs in. Twenty wrong guesses at
+    // once: five are counted, the rest find the code spent.
+    route POST /race {
+        let s = make("frank@example.com", "code")
+        let rights = parallel(range(20) | map((i) => () => redeem({ address: "frank@example.com", code: s.code })))
+        let g = make("gina@example.com", "code")
+        let wrong = g.code == "111111" ? "111112" : "111111"
+        let guesses = parallel(range(20) | map((i) => () => redeem({ address: "gina@example.com", code: wrong })))
+        {
+            right_code_ok: len(rights | filter((r) => r.ok)),
+            wrong_counted: len(guesses | filter((r) => r.reason == "wrong code")),
+            wrong_refused: len(guesses | filter((r) => starts_with(r.reason, "too many"))),
+        }
+    }
+
+    // What the plugin refuses before any SQL runs.
+    route POST /refusals {
+        let pg = magic_links_redeem({ ...MAGIC, database: "postgres" }, { address: "ada@example.com", code: "123456" })?
+        let my = magic_links_redeem({ ...MAGIC, database: "mysql" }, { address: "ada@example.com", code: "123456" })?
+        {
+            no_tries: error(magic_links_start({ ...MAGIC, tries: null }, "ada@example.com", "code", {})),
+            short_secret: error(magic_links_start({ ...MAGIC, secret: "dev-only-secret" }, "ada@example.com", "link", {})),
+            plain_http_link: error(magic_links_start({ ...MAGIC, link: "http://shop.example/login/link" }, "ada@example.com", "link", {})),
+            what: error(magic_links_start(MAGIC, "ada@example.com", "sms", {})),
+            not_an_address: error(magic_links_start(MAGIC, "ada at example", "code", {})),
+            no_input: error(magic_links_redeem(MAGIC, { code: "123456" })),
+            postgres: [len(pg.steps), pg.atomic, contains(pg.steps[0].sql, "returning")],
+            mysql: [len(my.steps), my.atomic],
+        }
+    }
+}

@@ -1,0 +1,143 @@
+// HTTP Basic for an admin page and Digest for devices, checked against a staff table: Basic's
+// password with crypto.verify_password (Argon2id), Digest against the HA1 kept for SHA-256 (and
+// MD5, on a route of its own, for old devices). Basic is refused over plain HTTP: behind a proxy
+// that serves HTTPS, set BEHIND_TLS=1. Digest's nonces are tied to the client's address.
+//
+//   BEHIND_TLS=1 DIGEST_SECRET=$(openssl rand -hex 32) quillo run http_auth.qwe
+//
+// With EXAMPLE_CHECKS=1 it also has staff to try, ada with "correct horse", and the checks under
+// /checks (POST), which the catalog's test runs:
+//   curl -u "ada:correct horse" localhost:8080/admin
+//   curl --digest -u "ada:correct horse" localhost:8080/device/status      (SHA-256)
+//   curl --digest -u "ada:correct horse" localhost:8080/old/status         (MD5, for old devices)
+
+use "http_auth.qwer"
+
+// A secret of the program's: no default, so no copy of this example runs on a known one.
+fn secret(name: str) {
+    let s = env(name) ?? ""
+    if len(s) < 32 { return err(`${name} is not set, or is shorter than 32 characters: ${name}=$(openssl rand -hex 32)`) }
+    s
+}
+
+db.open("data/http_auth.db")
+let TLS = env("BEHIND_TLS", "") == "1"
+let REALM = "Shop admin"
+let DIGEST = { secret: secret("DIGEST_SECRET")?, realm: "Shop devices", algorithms: ["SHA-256"], minutes: 5 }
+// MD5 on a route of its own, for old devices that know nothing else: offered beside SHA-256 in one
+// header, curl and Python's urllib would pick it.
+let OLD_DIGEST = { ...DIGEST, algorithms: ["MD5"] }
+let CHECKS = env("EXAMPLE_CHECKS", "") == "1"
+
+db.exec("create table if not exists staff (name text primary key, password_hash text not null, ha1_sha256 text not null, ha1_md5 text not null)")?
+fn add_staff(name: str, password: str) {
+    if db.one("select name from staff where name = ?", name) != null { return null }
+    let ha1 = (algorithm: str) => http_digest_ha1(name, DIGEST.realm, password, algorithm)
+    db.exec("insert into staff (name, password_hash, ha1_sha256, ha1_md5) values (?, ?, ?, ?)", name, crypto.hash_password(password), ha1("SHA-256")?, ha1("MD5")?)?
+}
+// Staff with known passwords, only for trying the example.
+if CHECKS {
+    add_staff("ada", "correct horse")?
+    add_staff("bo", "pa:ss wörd")?                 // a colon and a non-ASCII letter in the password
+}
+// Checked for a name nobody has, so that it takes as long as one somebody has.
+let NOBODY = crypto.hash_password(crypto.token())
+
+// What a request's Authorization header gets from Basic: { status: 200, user }, or { status: 401,
+// error, challenge }, or 403 over plain HTTP, where nobody should be asked for a password.
+fn basic_answer(authorization: str) {
+    let ask = http_basic_challenge(REALM, { tls: TLS })
+    if is_err(ask) { return { status: 403, error: error(ask), challenge: null } }
+    let c = http_basic_parse(authorization, { tls: TLS })
+    if is_err(c) { return { status: 401, error: error(c), challenge: ask } }
+    let row = db.one("select password_hash from staff where name = ?", c.user)?
+    let right = crypto.verify_password(c.password, row == null ? NOBODY : row.password_hash)
+    if !right || row == null { return { status: 401, error: "wrong name or password", challenge: ask } }
+    { status: 200, user: c.user }
+}
+
+// What it gets from Digest, for a request of `method` to `target` from `ip`: { status: 200, user },
+// or { status: 401, error, challenge }, the challenge saying stale=true when only the nonce's time
+// ran out, so the client tries again without asking its user.
+fn digest_answer(config, authorization: str, method: str, target: str, ip: str) {
+    let bound = { ...config, bind: ip }
+    let fields = http_digest_parse(authorization)
+    let row = is_err(fields) ? null : db.one("select ha1_sha256, ha1_md5 from staff where name = ?", fields.username)?
+    let r = http_digest_check(bound, authorization, method, target, row == null ? null : { "SHA-256": row.ha1_sha256, "MD5": row.ha1_md5 })?
+    if !r.ok { return { status: 401, error: r.reason, challenge: http_digest_challenge(bound, { stale: r.stale })? } }
+    { status: 200, user: r.user }
+}
+
+// The user, or the route is answered here with the status and the challenge.
+fn signed_in(r) {
+    if r.status == 200 { return r.user }
+    if r.challenge == null { reply r.status respond(r.status, { error: r.error }) }
+    reply r.status respond(r.status, { error: r.error }, { "www-authenticate": r.challenge })
+}
+fn target(req) = req.query_string == "" ? req.path : `${req.path}?${req.query_string}`
+
+route GET /admin = { page: "admin", user: signed_in(basic_answer(request.headers.authorization ?? "")) }
+route GET /device/status = { device: "camera-3", ok: true, user: signed_in(digest_answer(DIGEST, request.headers.authorization ?? "", request.method, target(request), request.ip)) }
+route GET /device/reboot = { rebooting: true, user: signed_in(digest_answer(DIGEST, request.headers.authorization ?? "", request.method, target(request), request.ip)) }
+route GET /old/status = { device: "printer-1", ok: true, user: signed_in(digest_answer(OLD_DIGEST, request.headers.authorization ?? "", request.method, target(request), request.ip)) }
+
+// ---- the checks: each header given to the answers above as a request's would be -------------
+
+fn checks_on(r) = CHECKS ? r : null
+let IP = "203.0.113.5"
+
+routes /checks | checks_on {
+    route POST /basic {
+        let basic = (user: str, password: str) => basic_answer(http_basic_header(user, password)?)
+        let none = basic_answer("")
+        {
+            ok: basic("ada", "correct horse"),
+            colon_utf8: basic("bo", "pa:ss wörd").user,
+            lower_scheme: basic_answer(replace(http_basic_header("ada", "correct horse")?, "Basic", "basic")).status,
+            wrong: [basic("ada", "wrong").status, basic("ada", "wrong").error],
+            unknown: basic("nobody", "x").error,
+            none: [none.status, none.challenge],
+            not_base64: basic_answer("Basic !!!").error,
+            no_colon: basic_answer("Basic YWRh").error,
+            digest_sent: basic_answer("Digest username=\"ada\"").error,
+            plain_http: [error(http_basic_parse("Basic YWRhOng=", {})), is_err(http_basic_challenge(REALM, { tls: false }))],
+        }
+    }
+
+    route POST /digest {
+        let at = (config, header: str, path: str) => digest_answer(config, header, "GET", path, IP)
+        let challenge = at(DIGEST, "", "/device/status").challenge
+        let as_ada = http_digest_client(challenge, "ada", "correct horse", "GET", "/device/status", {})?
+        let old_challenge = at(OLD_DIGEST, "", "/old/status").challenge
+        let stale_challenge = http_digest_challenge({ ...DIGEST, bind: IP, now: now() - 6 * 60000 }, {})?
+        let stale = at(DIGEST, http_digest_client(stale_challenge, "ada", "correct horse", "GET", "/device/status", {})?, "/device/status")
+        {
+            challenge: [contains(challenge, "algorithm=SHA-256"), contains(challenge, "algorithm=MD5"), contains(challenge, "qop=\"auth\"")],
+            sha256: at(DIGEST, as_ada, "/device/status"),
+            md5_old_route: at(OLD_DIGEST, http_digest_client(old_challenge, "ada", "correct horse", "GET", "/old/status", {})?, "/old/status").user,
+            md5_not_offered: at(DIGEST, http_digest_client(replace(challenge, "SHA-256", "MD5"), "ada", "correct horse", "GET", "/device/status", {})?, "/device/status").error,
+            wrong: at(DIGEST, http_digest_client(challenge, "ada", "wrong", "GET", "/device/status", {})?, "/device/status").error,
+            unknown: at(DIGEST, http_digest_client(challenge, "nobody", "x", "GET", "/device/status", {})?, "/device/status").error,
+            other_address: at(DIGEST, as_ada, "/device/reboot").error,
+            other_client: digest_answer(DIGEST, as_ada, "GET", "/device/status", "198.51.100.7").error,
+            stale: [stale.status, stale.error, contains(stale.challenge, "stale=true")],
+            forged_nonce: at(DIGEST, replace(as_ada, "nonce=\"", "nonce=\"A"), "/device/status").error,
+            no_qop: at(DIGEST, replace(as_ada, "qop=auth, ", ""), "/device/status").error,
+            wrong_realm: at(DIGEST, replace(as_ada, "realm=\"Shop devices\"", "realm=\"Other\""), "/device/status").error,
+            garbled: at(DIGEST, "Digest username=\"ada\" realm=\"x\"", "/device/status").error,
+            twice: at(DIGEST, "Digest username=\"ada\", username=\"bo\"", "/device/status").error,
+        }
+    }
+
+    // Headers that once made the parser panic (a backslash before a character of several bytes,
+    // a quote never closed), read as errors or as what they say.
+    route POST /parser {
+        {
+            escaped_utf8: http_digest_parse("Digest username=\"\\é\", realm=\"R\", nonce=\"n\", uri=\"/\", response=\"r\"")?.username,
+            escaped_alone: error(http_digest_parse("Digest username=\"\\é\"")),
+            unclosed: error(http_digest_parse("Digest username=\"ada")),
+            ext_name: http_digest_parse("Digest username*=UTF-8''J%C3%B6rg, realm=\"R\", nonce=\"n\", uri=\"/\", response=\"r\"")?.username,
+            control: error(http_digest_parse("Digest username=\"a\u{1}\"")),
+        }
+    }
+}

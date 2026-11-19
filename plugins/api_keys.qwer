@@ -1,0 +1,374 @@
+//! API keys for scripts and partners: made once and shown once (a prefix, 32 random characters and a check), kept only as an HMAC under the program's secret with an owner, a name, scopes and an expiry in a table of the program's own, each row sealed; listed, revoked, and checked from an `Authorization: Bearer` header in constant time.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! subtle = "2.6"
+//! rand = "0.8"
+//! crc32fast = "1"
+
+// How it works, after core's mcp_token(). A key is `<prefix>_<32 random base62><6 check>`: about
+// 190 random bits, then a CRC-32 of the rest in base62, so a key cut short or mistyped, or a string
+// that is no key at all, is refused before the database is asked (and secret scanners can tell a
+// real-looking key by its prefix and check). The table keeps HMAC-SHA256(key) under a key made
+// from the program's secret, never the key: a copy of the table opens nothing. Each row is sealed
+// (an HMAC of its owner, name, scopes and expiry), so a row changed in the database, a scope
+// widened or an owner swapped, is refused. Rows are found by their HMAC, then compared again here
+// in constant time, as MySQL's usual collations take `A` for `a`.
+//
+// A Rust plugin cannot reach the program's database, so it gives the program the statements to
+// run (`steps`, each `{ sql, args }` with `:name` values, run one by one with `db.one`: `atomic` is
+// always false here) and reads back the rows they give.
+//
+// Not kept: when a key was last used, which would be a write on every request. A program that
+// wants it updates a column of its own, at most once a day per key.
+
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use serde_json::{json, Map, Value};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+
+const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const RANDOM_LEN: usize = 32;
+const CHECK_LEN: usize = 6;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Db {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+fn database(config: &Value) -> Result<Db, String> {
+    let d = config.get("database").and_then(Value::as_str).unwrap_or("sqlite").trim();
+    let lower = d.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "sqlite" => return Ok(Db::Sqlite),
+        "postgres" | "postgresql" | "pg" => return Ok(Db::Postgres),
+        "mysql" | "mariadb" => return Ok(Db::Mysql),
+        _ => {}
+    }
+    if let Some((scheme, _)) = lower.split_once("://") {
+        return match scheme {
+            "postgres" | "postgresql" => Ok(Db::Postgres),
+            "mysql" | "mariadb" => Ok(Db::Mysql),
+            _ => Err(format!("`database`: a {}:// URL is not a database Quillo opens (sqlite, postgres or mysql)", scheme)),
+        };
+    }
+    if lower.contains('/') || lower.contains('.') || lower.contains(':') {
+        return Ok(Db::Sqlite);
+    }
+    Err(format!("`database` is \"sqlite\", \"postgres\" or \"mysql\" (or the URL given to db.open), got \"{}\"", d))
+}
+
+fn table(config: &Value) -> Result<String, String> {
+    let t = config.get("table").and_then(Value::as_str).unwrap_or("api_keys");
+    let ok = !t.is_empty()
+        && t.len() <= 56
+        && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok { Ok(t.to_string()) } else { Err(format!("`table` is a plain name (letters, digits and _, at most 56, not starting with a digit), got \"{}\"", t)) }
+}
+
+fn now_ms(config: &Value) -> i64 {
+    // `now` in the config is for tests only: a fixed clock, in ms since 1970.
+    if let Some(n) = config.get("now").and_then(Value::as_i64) {
+        return n;
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn prefix(config: &Value) -> Result<String, String> {
+    let p = config.get("prefix").and_then(Value::as_str).unwrap_or("key");
+    let ok = (2..=24).contains(&p.len())
+        && p.starts_with(|c: char| c.is_ascii_lowercase())
+        && !p.ends_with('_')
+        && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if ok { Ok(p.to_string()) } else { Err(format!("`prefix` is 2 to 24 small letters, digits and _, starting with a letter (shop_live), got \"{}\"", p)) }
+}
+
+struct Keys {
+    hash: Vec<u8>,
+    seal: Vec<u8>,
+}
+
+fn keys(config: &Value) -> Result<Keys, String> {
+    let secret = config.get("secret").and_then(Value::as_str).unwrap_or("");
+    if secret.len() < 32 {
+        return Err("`secret` is the program's secret for API keys, at least 32 characters (32 random bytes as hex is right): openssl rand -hex 32. Changing it ends every key".into());
+    }
+    let derive = |label: &str| {
+        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+        m.update(format!("quillo api_keys v1 {}", label).as_bytes());
+        m.finalize().into_bytes().to_vec()
+    };
+    Ok(Keys { hash: derive("hash"), seal: derive("seal") })
+}
+
+fn hmac_hex(key: &[u8], parts: &[&str]) -> String {
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
+    for p in parts {
+        m.update(format!("{}:", p.len()).as_bytes());
+        m.update(p.as_bytes());
+    }
+    m.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+fn check_digits(body: &str) -> String {
+    let mut n = crc32fast::hash(body.as_bytes()) as u64;
+    let mut out = vec![b'0'; CHECK_LEN];
+    for i in (0..CHECK_LEN).rev() {
+        out[i] = BASE62[(n % 62) as usize];
+        n /= 62;
+    }
+    String::from_utf8(out).expect("base62 is ASCII")
+}
+
+fn random62(n: usize) -> String {
+    let mut rng = rand::rngs::OsRng;
+    (0..n).map(|_| BASE62[rng.gen_range(0..62)] as char).collect()
+}
+
+/// The key a request carries, as written: from `Authorization: Bearer <key>` or the key alone.
+fn presented_key(config: &Value, presented: &str) -> Result<String, String> {
+    let p = prefix(config)?;
+    let s = presented.trim();
+    if s.is_empty() {
+        return Err("no key: send it as Authorization: Bearer <key>".into());
+    }
+    let key = match s.split_once(char::is_whitespace) {
+        Some((scheme, rest)) => {
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return Err(format!("the Authorization header is {}, not Bearer: send the key as Authorization: Bearer <key>", scheme));
+            }
+            rest.trim()
+        }
+        None => s,
+    };
+    let Some(rest) = key.strip_prefix(&format!("{}_", p)) else {
+        return Err(format!("this is not one of this program's keys: they start with {}_", p));
+    };
+    if rest.len() != RANDOM_LEN + CHECK_LEN || !rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err("the key is malformed: it may have been cut short when copied".into());
+    }
+    let (body, check) = key.split_at(key.len() - CHECK_LEN);
+    if !same(&check_digits(body), check) {
+        return Err("the key is mistyped: its last characters do not match the rest".into());
+    }
+    Ok(key.to_string())
+}
+
+fn owner_json(owner: &Value) -> Result<String, String> {
+    let ok = match owner {
+        Value::String(s) => !s.trim().is_empty() && s.len() <= 200,
+        Value::Number(n) => n.is_i64(),
+        _ => false,
+    };
+    // As it is kept: JSON, whose escapes make text longer, in a column of 255.
+    let kept = owner.to_string();
+    if !ok || kept.len() > 255 {
+        return Err("`owner` is who the key acts for: a user's id, text (1 to 200 characters, 255 once written as JSON) or a whole number".into());
+    }
+    Ok(kept)
+}
+
+fn seal_of(k: &Keys, key_hash: &str, id: &str, owner: &str, name: &str, scopes: &str, made: i64, expires: i64, hint: &str) -> String {
+    hmac_hex(&k.seal, &["row", key_hash, id, owner, name, scopes, &made.to_string(), &expires.to_string(), hint])
+}
+
+fn step(sql: String, args: Map<String, Value>) -> Value {
+    json!({ "sql": sql, "args": Value::Object(args) })
+}
+
+const COLUMNS: &str = "k, id, owner, name, scopes, made, expires, hint, seal";
+
+/// The SQL that makes the keys table, `table` in `config` (default `api_keys`), for its `database`
+/// ("sqlite", "postgres", "mysql", or the URL given to db.open): run it once with `db.exec` as the
+/// program starts. A row per key: its HMAC, its id, owner, name, scopes, when made and when it ends,
+/// its last 4 characters (to tell keys apart in a list), and the seal.
+pub fn api_keys_table(config: serde_json::Value) -> Result<String, String> {
+    let t = table(&config)?;
+    let cols = "k varchar(64) primary key, id varchar(24) not null, owner varchar(255) not null, name varchar(100) not null, scopes text not null, \
+                made bigint not null, expires bigint not null, hint varchar(8) not null, seal varchar(64) not null";
+    Ok(match database(&config)? {
+        Db::Mysql => format!("create table if not exists {t} ({cols}, index {t}_owner (owner)) character set utf8mb4 collate utf8mb4_bin", t = t, cols = cols),
+        _ => format!("create table if not exists {t} ({cols});\ncreate index if not exists {t}_owner on {t} (owner)", t = t, cols = cols),
+    })
+}
+
+/// A new key for `owner` (a user's id: text or a whole number). `options`: `name` (to tell keys
+/// apart: "CI", "Partner X"), `scopes` (a list such as ["orders:read"]; "orders:*" covers
+/// "orders:read", "*" covers all) and `days` (90; 0 never ends). Gives `{ key, id, name, scopes,
+/// made, expires, hint, steps }`: run the steps, show `key` once, and never store it: it cannot be
+/// shown again. Making one also removes the owner's keys that have ended. `{ ..., steps, atomic }`:
+/// two statements, run one by one. Nothing records when a key was last used (a write per request).
+pub fn api_keys_new(config: serde_json::Value, owner: serde_json::Value, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let k = keys(&config)?;
+    let p = prefix(&config)?;
+    let who = owner_json(&owner)?;
+    let name = options.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if name.is_empty() || name.chars().count() > 100 || name.chars().any(|c| c.is_control()) {
+        return Err("`name` says what the key is for (\"CI\", \"Partner X\"): 1 to 100 characters, no line breaks".into());
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    match options.get("scopes") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(list)) => {
+            for s in list {
+                let s = s.as_str().ok_or("each scope is text, such as \"orders:read\"")?;
+                let ok = (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b":._*/-".contains(&b));
+                if !ok {
+                    return Err(format!("the scope \"{}\" is not one: 1 to 64 letters, digits and : . _ * / -", s));
+                }
+                if !scopes.iter().any(|x| x == s) {
+                    scopes.push(s.to_string());
+                }
+            }
+        }
+        Some(_) => return Err("`scopes` is a list, such as [\"orders:read\"]".into()),
+    }
+    if scopes.len() > 50 {
+        return Err("a key has at most 50 scopes".into());
+    }
+    let days = options.get("days").and_then(Value::as_i64).unwrap_or(90);
+    if !(0..=3650).contains(&days) {
+        return Err(format!("`days` (how long the key works) is from 1 to 3650, or 0 for a key that never ends; got {}", days));
+    }
+    let made = now_ms(&config);
+    let expires = if days == 0 { 0 } else { made + days * 86_400_000 };
+    let body = format!("{}_{}", p, random62(RANDOM_LEN));
+    let key = format!("{}{}", body, check_digits(&body));
+    let hint = key[key.len() - 4..].to_string();
+    let id = format!("k{}", random62(15));
+    let key_hash = hmac_hex(&k.hash, &["key", &key]);
+    let scopes_json = serde_json::to_string(&scopes).map_err(|e| e.to_string())?;
+    let mut args = Map::new();
+    args.insert("k".into(), json!(key_hash));
+    args.insert("id".into(), json!(id));
+    args.insert("owner".into(), json!(who));
+    args.insert("name".into(), json!(name));
+    args.insert("scopes".into(), json!(scopes_json));
+    args.insert("made".into(), json!(made));
+    args.insert("expires".into(), json!(expires));
+    args.insert("hint".into(), json!(hint));
+    args.insert("seal".into(), json!(seal_of(&k, &key_hash, &id, &who, &name, &scopes_json, made, expires, &hint)));
+    let mut sweep = Map::new();
+    sweep.insert("owner".into(), json!(who));
+    sweep.insert("now".into(), json!(made));
+    let steps = vec![
+        step(format!("delete from {} where owner = :owner and expires > 0 and expires <= :now", t), sweep),
+        step(format!("insert into {} ({}) values (:k, :id, :owner, :name, :scopes, :made, :expires, :hint, :seal)", t, COLUMNS), args),
+    ];
+    Ok(json!({ "key": key, "id": id, "name": name, "scopes": scopes, "made": made, "expires": if expires == 0 { Value::Null } else { json!(expires) }, "hint": hint, "steps": steps, "atomic": false }))
+}
+
+/// Looks up the key a request carries: `presented` is the `Authorization` header (`Bearer <key>`)
+/// or the key alone. Gives `{ steps }`, whose row goes to api_keys_check; or an error value saying
+/// why it is no key (none sent, another scheme, another prefix, cut short, mistyped), before any
+/// SQL runs.
+pub fn api_keys_find(config: serde_json::Value, presented: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let k = keys(&config)?;
+    let key = presented_key(&config, presented)?;
+    let mut args = Map::new();
+    args.insert("k".into(), json!(hmac_hex(&k.hash, &["key", &key])));
+    Ok(json!({ "steps": [step(format!("select {} from {} where k = :k", COLUMNS, t), args)], "atomic": false }))
+}
+
+/// Whether the key presented is good, from the row api_keys_find's steps gave (or null):
+/// `{ ok, reason, id, owner, name, scopes, expires }`. Refused: no such key (never made, or
+/// revoked), ended, or a row changed in the database. The HMAC and the seal are compared in
+/// constant time.
+pub fn api_keys_check(config: serde_json::Value, presented: &str, row: serde_json::Value) -> Result<serde_json::Value, String> {
+    let k = keys(&config)?;
+    let no = |reason: &str| json!({ "ok": false, "reason": reason, "id": null, "owner": null, "name": null, "scopes": [], "expires": null });
+    let key = match presented_key(&config, presented) {
+        Ok(key) => key,
+        Err(why) => return Ok(no(&why)),
+    };
+    if row.is_null() {
+        return Ok(no("no such key: it was never made, or it was revoked"));
+    }
+    let s = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+    let n = |name: &str| row.get(name).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))).unwrap_or(-1);
+    let key_hash = hmac_hex(&k.hash, &["key", &key]);
+    let sealed = seal_of(&k, &s("k"), &s("id"), &s("owner"), &s("name"), &s("scopes"), n("made"), n("expires"), &s("hint"));
+    if !same(&key_hash, &s("k")) {
+        return Ok(no("no such key: it was never made, or it was revoked"));
+    }
+    if !same(&sealed, &s("seal")) {
+        return Ok(no("this key's row was changed in the database, so it is not taken"));
+    }
+    let expires = n("expires");
+    if expires != 0 && expires <= now_ms(&config) {
+        return Ok(no("this key has ended: make a new one"));
+    }
+    let owner: Value = serde_json::from_str(&s("owner")).unwrap_or(Value::Null);
+    let scopes: Value = serde_json::from_str(&s("scopes")).unwrap_or(json!([]));
+    Ok(json!({ "ok": true, "reason": null, "id": s("id"), "owner": owner, "name": s("name"), "scopes": scopes, "expires": if expires == 0 { Value::Null } else { json!(expires) } }))
+}
+
+/// Whether a key's `scopes` allow `need`: the scope itself, `"*"`, or a family ending in `:*`
+/// ("orders:*" allows "orders:read" and "orders:refund", not "ordersx").
+pub fn api_keys_allows(scopes: serde_json::Value, need: &str) -> bool {
+    let Some(list) = scopes.as_array() else { return false };
+    list.iter().filter_map(Value::as_str).any(|s| s == need || s == "*" || s.strip_suffix('*').is_some_and(|family| family.ends_with(':') && need.starts_with(family)))
+}
+
+/// The statements that read `owner`'s keys: give their rows to api_keys_listed. `{ steps }`.
+pub fn api_keys_list(config: serde_json::Value, owner: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let mut args = Map::new();
+    args.insert("owner".into(), json!(owner_json(&owner)?));
+    Ok(json!({ "steps": [step(format!("select {} from {} where owner = :owner order by made, id", COLUMNS, t), args)], "atomic": false }))
+}
+
+/// `owner`'s keys that still work, from the rows api_keys_list's statement gave (`db.query`), for
+/// a settings page: `{ id, name, scopes, made, expires, hint }` each, oldest first. Never the key,
+/// which nobody has but its holder; rows whose seal fails or that ended are left out.
+pub fn api_keys_listed(config: serde_json::Value, owner: serde_json::Value, rows: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let k = keys(&config)?;
+    let who = owner_json(&owner)?;
+    let now = now_ms(&config);
+    let mut out = Vec::new();
+    for row in rows.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let s = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+        let n = |name: &str| row.get(name).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))).unwrap_or(-1);
+        let sealed = seal_of(&k, &s("k"), &s("id"), &s("owner"), &s("name"), &s("scopes"), n("made"), n("expires"), &s("hint"));
+        let expires = n("expires");
+        if !same(&s("owner"), &who) || !same(&sealed, &s("seal")) || (expires != 0 && expires <= now) {
+            continue;
+        }
+        out.push(json!({
+            "id": s("id"),
+            "name": s("name"),
+            "scopes": serde_json::from_str::<Value>(&s("scopes")).unwrap_or(json!([])),
+            "made": n("made"),
+            "expires": if expires == 0 { Value::Null } else { json!(expires) },
+            "hint": s("hint"),
+        }));
+    }
+    Ok(out)
+}
+
+/// Ends the key `id` of `owner`'s (an id as api_keys_new and api_keys_listed give it): its next
+/// request is refused. Another owner's id does nothing. `{ steps }`; `db.exec` of the one statement
+/// gives `changes`, 1 when there was such a key.
+pub fn api_keys_revoke(config: serde_json::Value, owner: serde_json::Value, id: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let mut args = Map::new();
+    args.insert("owner".into(), json!(owner_json(&owner)?));
+    args.insert("id".into(), json!(id));
+    Ok(json!({ "steps": [step(format!("delete from {} where owner = :owner and id = :id", t), args)], "atomic": false }))
+}

@@ -1,0 +1,184 @@
+// An API that takes keys: a signed-in user makes one for a script or a partner, sees it once,
+// names it and gives it scopes from the program's list; the table keeps only its HMAC. Routes check
+// `Authorization: Bearer <key>` and answer 401 (no key, a wrong, revoked or ended one) or 403 (a
+// key without the scope) with the WWW-Authenticate header RFC 6750 asks for.
+//
+//   API_KEYS_SECRET=$(openssl rand -hex 32) quillo run api_keys.qwe
+//   curl -H "Authorization: Bearer shop_live_..." localhost:8080/api/orders
+//
+// Keys are made at POST /settings/keys by a signed-in user (this example has no sign-in of its
+// own: a real program's sets session().user). With EXAMPLE_CHECKS=1 it also has the checks under
+// /checks (POST), which the catalog's test runs.
+
+use "api_keys.qwer"
+
+// A secret of the program's: no default, so no copy of this example runs on a known one.
+fn secret(name: str) {
+    let s = env(name) ?? ""
+    if len(s) < 32 { return err(`${name} is not set, or is shorter than 32 characters: ${name}=$(openssl rand -hex 32)`) }
+    s
+}
+
+db.open("data/api_keys.db")
+let KEYS = { table: "api_keys", database: "sqlite", secret: secret("API_KEYS_SECRET")?, prefix: "shop_live" }
+// The scopes a user may give a key here.
+let SCOPES = ["orders:read", "orders:write"]
+db.exec(api_keys_table(KEYS)?)?
+let CHECKS = env("EXAMPLE_CHECKS", "") == "1"
+
+// Runs a plugin's statements, one by one (each stands alone; api_keys never asks for a
+// transaction). The last row, or null.
+fn run_sql(q) {
+    let row = null
+    for s in q.steps { row = db.one(s.sql, s.args)? }
+    row
+}
+
+// What a request's Authorization header gets for `scope`: { status: 200, key }, or
+// { status: 401 or 403, error, challenge }.
+fn key_for(authorization: str, scope: str) {
+    let found = api_keys_find(KEYS, authorization)
+    let k = is_err(found) ? { ok: false, reason: error(found) } : api_keys_check(KEYS, authorization, run_sql(found)?)?
+    if !k.ok { return { status: 401, error: k.reason, challenge: "Bearer realm=\"shop\", error=\"invalid_token\"" } }
+    if !api_keys_allows(k.scopes, scope) {
+        return { status: 403, error: `this key may not ${scope}`, challenge: `Bearer realm="shop", error="insufficient_scope", scope="${scope}"` }
+    }
+    { status: 200, key: k }
+}
+
+// The key a request carries, checked for `scope`, or the route is answered 401 or 403 here.
+fn caller(req, scope: str) {
+    let r = key_for(req.headers.authorization ?? "", scope)
+    if r.status != 200 { reply r.status respond(r.status, { error: r.error }, { "www-authenticate": r.challenge }) }
+    r.key
+}
+
+routes /api {
+    route GET /orders {
+        let k = caller(request, "orders:read")
+        { owner: k.owner, key: k.name, orders: [{ id: 1, total: 120.5 }] }
+    }
+    route POST /orders { json: { total: float } } {
+        let k = caller(request, "orders:write")
+        { created: true, by: k.owner, total }
+    }
+}
+
+// The signed-in user, or 401: nobody makes a key for someone else.
+fn me() = session().user ?? reply 401 "Sign in first"
+
+route POST /settings/keys { form: { name: str, scope: [str] } } {
+    let user = me()
+    if len(scope) == 0 { reply 400 "Give the key at least one scope" }
+    let other = scope | filter((s) => !contains(SCOPES, s))
+    if len(other) > 0 { reply 400 `Not a scope a key may have here: ${join(other, ", ")}` }
+    let made = api_keys_new(KEYS, user, { name, scopes: scope, days: 90 })
+    if is_err(made) { reply 400 error(made) }
+    run_sql(made)?
+    { key: made.key, shown: "once: copy it now, it cannot be shown again", id: made.id, expires: made.expires }
+}
+
+route POST /settings/keys/list {
+    let user = me()
+    let q = api_keys_list(KEYS, user)?.steps[0]
+    api_keys_listed(KEYS, user, db.query(q.sql, q.args)?)
+}
+
+route POST /settings/keys/revoke { form: { id: str } } {
+    let s = api_keys_revoke(KEYS, me(), id)?.steps[0]
+    { revoked: db.exec(s.sql, s.args)?.changes == 1 }
+}
+
+// ---- the checks: keys made for "ada", then each header given to key_for as a request's would --
+
+fn checks_on(r) = CHECKS ? r : null
+fn make_at(config, owner, options) {
+    let m = api_keys_new(config, owner, options)?
+    run_sql(m)?
+    m
+}
+fn make(owner, options) = make_at(KEYS, owner, options)
+fn keys_of(owner) {
+    let s = api_keys_list(KEYS, owner)?.steps[0]
+    api_keys_listed(KEYS, owner, db.query(s.sql, s.args)?)
+}
+fn revoke(owner, id: str) {
+    let s = api_keys_revoke(KEYS, owner, id)?.steps[0]
+    db.exec(s.sql, s.args)?.changes
+}
+
+routes /checks | checks_on {
+    route POST /make {
+        let m = make("ada", { name: "CI", scopes: ["orders:read", "orders:read"] })
+        {
+            shape: starts_with(m.key, "shop_live_") && len(m.key) == 48,
+            hint: m.hint == slice(m.key, 44, 48),
+            scopes: m.scopes,
+            days: (m.expires - m.made) / 86400000,
+            listed: contains(keys_of("ada") | map((k) => k.id), m.id),
+            not_stored: len(db.query("select k from api_keys where k = ?", m.key)?) == 0,
+        }
+    }
+
+    // Each kind of key, as a script would send it: the status, and what a refusal says.
+    route POST /requests {
+        let reader = make("ada", { name: "Reports", scopes: ["orders:read"] })
+        let writer = make(42, { name: "Partner", scopes: ["orders:*"], days: 0 })
+        let gone = make("ada", { name: "Old laptop", scopes: ["*"] })
+        revoke("ada", gone.id)?
+        let ended = make_at({ ...KEYS, now: now() - 31 * 86400000 }, "ada", { name: "Last month", scopes: ["*"], days: 30 })
+        let unknown = api_keys_new(KEYS, "ada", { name: "never stored" })?.key
+        let typo = `${slice(reader.key, 0, 20)}${slice(reader.key, 20, 21) == "x" ? "y" : "x"}${slice(reader.key, 21, 48)}`
+        let ok = key_for(`Bearer ${reader.key}`, "orders:read")
+        let none = key_for("", "orders:read")
+        let write = key_for(`Bearer ${reader.key}`, "orders:write")
+        {
+            reader: [ok.status, ok.key.owner, ok.key.name],
+            partner: [key_for(`bearer   ${writer.key}`, "orders:read").status, key_for(`Bearer ${writer.key}`, "orders:refund").key.owner],
+            no_header: [none.status, none.challenge],
+            reader_writes: [write.status, write.challenge, write.error],
+            revoked: key_for(`Bearer ${gone.key}`, "orders:read").error,
+            ended: key_for(`Bearer ${ended.key}`, "orders:read").error,
+            unknown: key_for(`Bearer ${unknown}`, "orders:read").error,
+            mistyped: key_for(`Bearer ${typo}`, "orders:read").error,
+            cut_short: key_for(`Bearer ${slice(reader.key, 0, 40)}`, "orders:read").error,
+            other_prefix: key_for("Bearer sk_live_abcdef", "orders:read").error,
+            basic: key_for("Basic YWRhOnNlY3JldA==", "orders:read").error,
+        }
+    }
+
+    // A key's row changed in the database (its scopes widened, its owner swapped) no longer works.
+    route POST /tampered {
+        let m = make("ada", { name: "Narrow", scopes: ["orders:read"] })
+        db.exec("update api_keys set scopes = ? where id = ?", "[\"*\"]", m.id)?
+        let n = make("bob", { name: "Bob's", scopes: ["orders:read"] })
+        db.exec("update api_keys set owner = ? where id = ?", "\"ada\"", n.id)?
+        { widened: key_for(m.key, "orders:read").error, swapped: key_for(n.key, "orders:read").error, listed: contains(keys_of("ada") | map((k) => k.id), m.id) }
+    }
+
+    // Listing and revoking: only the owner's own keys, never the key itself.
+    route POST /list {
+        db.exec("delete from api_keys where owner = ?", json.stringify("lister"))?
+        let a = make("lister", { name: "first", scopes: ["orders:read"] })
+        let b = make("lister", { name: "second", scopes: ["orders:read"] })
+        let other = make("someone-else", { name: "theirs" })
+        let not_mine = revoke("lister", other.id)
+        revoke("lister", a.id)?
+        let left = keys_of("lister")
+        { not_mine, names: left | map((k) => k.name), kept: left[0].id == b.id, fields: keys(left[0]), scope_family: [api_keys_allows(["orders:*"], "orders:refund"), api_keys_allows(["orders:*"], "ordersx:read"), api_keys_allows(["*"], "anything"), api_keys_allows([], "orders:read")] }
+    }
+
+    // What the plugin refuses before any SQL runs.
+    route POST /refusals {
+        {
+            short_secret: error(api_keys_new({ secret: "dev-only-secret-change-me-012" }, "ada", { name: "x" })),
+            bad_prefix: error(api_keys_new({ ...KEYS, prefix: "Shop-Live" }, "ada", { name: "x" })),
+            no_name: error(api_keys_new(KEYS, "ada", { scopes: [] })),
+            bad_scope: error(api_keys_new(KEYS, "ada", { name: "x", scopes: ["orders read"] })),
+            no_owner: error(api_keys_new(KEYS, null, { name: "x" })),
+            long_owner: error(api_keys_new(KEYS, join(range(150) | map((i) => "\""), ""), { name: "x" })),
+            days: error(api_keys_new(KEYS, "ada", { name: "x", days: 5000 })),
+            no_key: error(api_keys_find(KEYS, "")),
+        }
+    }
+}

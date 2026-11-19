@@ -1,0 +1,194 @@
+// A sign-in whose guesses are limited per account and per address, in a table of the program's
+// own database: every server and instance counts in the same rows, and a restart forgets nothing.
+// Each attempt is counted before the password is checked, in one statement, so a thousand guesses
+// sent at once get five tries, not a thousand.
+//
+//   LIMITS_SECRET=$(openssl rand -hex 32) quillo run login_limits.qwe
+//
+// With EXAMPLE_CHECKS=1 it also has a user to try, ada@example.com with "correct horse", and the
+// checks under /checks (POST /checks/burst ...), which the catalog's test runs:
+//   curl -d "email=ada@example.com&password=wrong" localhost:8080/login            (the sixth waits)
+//   curl -d "email=ada@example.com&password=correct horse" localhost:8080/login
+//
+// Behind a proxy (limer, nginx), run with --trust-proxy <the proxy's address>: without it
+// request.ip is the proxy's for every visitor, and they all share one address limit.
+// On PostgreSQL or MySQL, open that database and say which, { database: "postgres" }: the calls
+// stay the same, the plugin writes that database's SQL.
+
+use "login_limits.qwer"
+
+// A secret of the program's: no default, so no copy of this example runs on a known one.
+fn secret(name: str) {
+    let s = env(name) ?? ""
+    if len(s) < 32 { return err(`${name} is not set, or is shorter than 32 characters: ${name}=$(openssl rand -hex 32)`) }
+    s
+}
+
+db.open("data/login_limits.db")
+let LIMITS = { table: "login_limits", database: "sqlite", secret: secret("LIMITS_SECRET")?, limits: { send: { tries: 2, per_seconds: 3600 } } }
+db.exec(login_limits_table(LIMITS)?)?
+db.exec("create table if not exists users (id integer primary key, email text unique not null, password_hash text not null)")?
+let CHECKS = env("EXAMPLE_CHECKS", "") == "1"
+if CHECKS && db.one("select id from users where email = ?", "ada@example.com") == null {
+    db.exec("insert into users (email, password_hash) values (?, ?)", "ada@example.com", crypto.hash_password("correct horse"))?
+}
+// Checked for an email nobody has, so that it takes as long as one somebody has.
+let NOBODY = crypto.hash_password(crypto.token())
+
+// Runs a plugin's statements. On SQLite and PostgreSQL each is one statement that stands alone,
+// run with no transaction around it; MySQL's upsert and its read-back come `atomic`, for one short
+// transaction tried again on a deadlock. The last row, or null.
+fn run_sql(q) {
+    if q.atomic {
+        return db.transaction({ retries: 3 }, () => {
+            let row = null
+            for s in q.steps { row = db.one(s.sql, s.args)? }
+            row
+        })
+    }
+    let row = null
+    for s in q.steps { row = db.one(s.sql, s.args)? }
+    row
+}
+
+// Counts one attempt against each limit in turn: the seconds to wait from the first one that is
+// full, or 0. The address goes first, so a blocked address takes no tries from the accounts.
+fn wait_for(limits) {
+    for l in limits {
+        let r = run_sql(login_limits_take(LIMITS, l.kind, l.key)?)?
+        if r.allowed == 0 { return r.retry_after }
+    }
+    0
+}
+
+route POST /login { form: { email: str, password: str } } {
+    // The account is found first and counted by its id: a database collation that takes `àdä@` for
+    // `ada@` finds Ada's row for both, and must find one count. An email nobody has is counted by
+    // itself, so its limit behaves the same and tells nobody which accounts exist.
+    let typed = lower(trim(email))
+    let u = db.one("select id, password_hash from users where email = ?", typed)?
+    let account = u == null ? `email:${typed}` : `user:${u.id}`
+    let wait = wait_for([{ kind: "address", key: request.ip }, { kind: "account", key: account }])
+    if wait > 0 { reply 429 respond(429, `Too many tries: try again in ${wait} s.`, { "retry-after": str(wait) }) }
+    let right = crypto.verify_password(password, u == null ? NOBODY : u.password_hash)
+    if !right || u == null { reply 401 "Wrong email or password" }
+    // The account starts again with every try; the address gets back the one this took.
+    run_sql(login_limits_clear(LIMITS, "account", account)?)?
+    run_sql(login_limits_refund(LIMITS, "address", request.ip)?)?
+    set_session({ user: u.id })
+    "Signed in"
+}
+
+// Keys that have every try back are the same as no row: drop them now and then.
+every(600000, () => { run_sql(login_limits_sweep(LIMITS)?) })
+
+// ---- the checks, on a fixed clock so the answers are the same every time (EXAMPLE_CHECKS=1) ---
+
+fn checks_on(r) = CHECKS ? r : null
+
+let T0 = 1800000000000
+fn at(ms: int) = { ...LIMITS, now: T0 + ms }
+fn attempt(kind: str, key: str, ms: int) = run_sql(login_limits_take(at(ms), kind, key)?)
+fn forget(kind: str, key: str) = run_sql(login_limits_clear(LIMITS, kind, key)?)
+
+routes /checks | checks_on {
+    // Seven wrong passwords in a row for one account: five are counted, two wait 3 minutes.
+    route POST /burst {
+        forget("account", "user:burst")?
+        let tries = []
+        for i in range(7) { tries = [...tries, attempt("account", "user:burst", 0)] }
+        {
+            allowed: len(tries | filter((t) => t.allowed == 1)),
+            refused: len(tries | filter((t) => t.allowed == 0)),
+            retry_after: last(tries).retry_after,
+            remaining: tries | map((t) => t.remaining),
+        }
+    }
+
+    // The tries come back one every 3 minutes (15 minutes / 5), not all at once at the end: a
+    // full limit slows its key down, it never locks it.
+    route POST /refill {
+        forget("account", "user:refill")?
+        for i in range(5) { attempt("account", "user:refill", 0)? }
+        {
+            at_179s: attempt("account", "user:refill", 179000),
+            at_180s: attempt("account", "user:refill", 180000),
+            at_181s: attempt("account", "user:refill", 181000).allowed,
+            an_hour_later: attempt("account", "user:refill", 3600000),
+        }
+    }
+
+    // The right password clears the account's count, and gives the address back its try: the
+    // address's next attempt leaves 49, where one with no refund leaves 48.
+    route POST /success {
+        forget("account", "user:ok")?
+        forget("address", "198.51.100.20")?
+        forget("address", "198.51.100.21")?
+        for i in range(4) { attempt("account", "user:ok", 0)? }
+        let before = attempt("account", "user:ok", 0)
+        attempt("address", "198.51.100.20", 0)?
+        attempt("address", "198.51.100.21", 0)?
+        run_sql(login_limits_clear(at(0), "account", "user:ok")?)?
+        run_sql(login_limits_refund(at(0), "address", "198.51.100.20")?)?
+        {
+            account_before: before.remaining,
+            account_after: attempt("account", "user:ok", 0).remaining,
+            address_refunded: attempt("address", "198.51.100.20", 0).remaining,
+            address_not_refunded: attempt("address", "198.51.100.21", 0).remaining,
+        }
+    }
+
+    // An address may try 50 times in 15 minutes (people behind one office router), and an IPv6
+    // address counts as its /64, which its owner can fill with addresses (or /56, /48).
+    route POST /address {
+        forget("address", "2001:db8:1:2::a")?
+        forget("address", "2001:db8:1:3::a")?
+        let first = []
+        for i in range(50) { first = [...first, attempt("address", "2001:db8:1:2::a", 0)] }
+        {
+            allowed: len(first | filter((t) => t.allowed == 1)),
+            same_64: attempt("address", "2001:db8:1:2:ffff::b", 0),
+            other_64: attempt("address", "2001:db8:1:3::a", 0).allowed,
+            counted: [login_limits_counted(LIMITS, "address", "2001:DB8:1:2::A")?, login_limits_counted(LIMITS, "address", "::ffff:203.0.113.7")?, login_limits_counted({ ...LIMITS, ipv6_prefix: 48 }, "address", "2001:db8:1:2::a")?, login_limits_counted(LIMITS, "account", " Ada@Example.COM ")?],
+            with_port: error(login_limits_take(LIMITS, "address", "203.0.113.7:51234")),
+        }
+    }
+
+    // 6-digit codes are a million guesses: three tries per 15 minutes, then one every 5 minutes.
+    route POST /code {
+        forget("code", "user:42")?
+        let tries = []
+        for i in range(4) { tries = [...tries, attempt("code", "user:42", 0)] }
+        { allowed: len(tries | filter((t) => t.allowed == 1)), fourth: last(tries) }
+    }
+
+    // A limit of the program's own, named in the config: two emails an hour per address.
+    route POST /custom {
+        forget("send", "zoe@example.com")?
+        { sends: [attempt("send", "zoe@example.com", 0).allowed, attempt("send", "zoe@example.com", 0).allowed, attempt("send", "zoe@example.com", 0)] }
+    }
+
+    // Fifty attempts on one account at the same moment, from parallel workers: exactly five pass.
+    route POST /race {
+        forget("account", "user:race")?
+        let all = parallel(range(50) | map((i) => () => attempt("account", "user:race", 0)))
+        { allowed: len(all | filter((t) => t.allowed == 1)), refused: len(all | filter((t) => t.allowed == 0)) }
+    }
+
+    // What the plugin refuses before any SQL runs, and what each database is given.
+    route POST /refusals {
+        let mysql = login_limits_take({ ...LIMITS, database: "mysql" }, "account", "user:1")?
+        let pg = login_limits_take({ ...LIMITS, database: "postgres://shop@db/shop" }, "account", "user:1")?
+        {
+            unknown_kind: error(login_limits_take(LIMITS, "pin", "ada")),
+            empty_key: error(login_limits_take(LIMITS, "account", "  ")),
+            bad_table: error(login_limits_table({ table: "limits; drop table users" })),
+            bad_database: error(login_limits_table({ database: "oracle" })),
+            bad_limit: error(login_limits_take({ limits: { account: { tries: 0, per_seconds: 60 } } }, "account", "ada")),
+            short_secret: error(login_limits_take({ secret: "short" }, "account", "ada")),
+            postgres: [len(pg.steps), pg.atomic, contains(pg.steps[0].sql, "returning")],
+            mysql: [len(mysql.steps), mysql.atomic],
+            mysql_table: login_limits_table({ ...LIMITS, database: "mysql" })?,
+        }
+    }
+}

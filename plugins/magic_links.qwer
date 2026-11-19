@@ -1,0 +1,488 @@
+//! Sign-in by email link or 6-digit code (by email or SMS), each good once: made for an address, kept only as HMACs with an expiry in a table of the program's own, used up by one atomic statement, a code's guesses capped by a number the program must give, links optionally bound to the browser that asked, and the link's token after a `#` so that no request log or proxy ever sees it.
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+//! subtle = "2.6"
+//! base64 = "0.22"
+//! rand = "0.8"
+
+// How it works. `magic_links_start` makes a token (32 random bytes) and a code (6 random digits)
+// for an address, and gives the rows to keep: a link's row is found by HMAC(token), a code's by
+// HMAC(address), and the code itself is kept as HMAC(address, code), all under a key made from the
+// program's secret, so the table holds nothing that signs anyone in. Each row is sealed (an HMAC of
+// what it decides), so a row edited in the database (another address put on a link) is refused.
+//
+// Using one up is a single statement that only one request can win: an `update ... returning`
+// on SQLite and PostgreSQL that sets `used` to a random mark where it is still null and the row
+// has not expired, counts a code's guess in the same statement, and gives the row back with
+// whether this request's mark is the one written. It is run alone, with no transaction around it.
+// MySQL and MariaDB have no `returning` there: the update is followed by a read, both in one short
+// transaction (`atomic: true`), tried again on a deadlock.
+//
+// The link is `<link>#<token>`. Browsers never send what follows `#`, so the token reaches no
+// request log, no proxy and no Referer. The page at `<link>` reads it with a line of script and
+// posts it with a button, which also means a mail scanner that opens links uses nothing up. With
+// `browser` given to magic_links_start (a random value the program keeps in a cookie when the link
+// is asked for), the link only works in that browser; opened elsewhere, the program asks the
+// visitor to confirm, or to type the code.
+//
+// A Rust plugin cannot reach the program's database, so it gives the program the statements to
+// run (`steps`, each `{ sql, args }` with `:name` values, and `atomic`) and reads back the row.
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rand::{Rng, RngCore};
+use serde_json::{json, Map, Value};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Db {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+fn database(config: &Value) -> Result<Db, String> {
+    let d = config.get("database").and_then(Value::as_str).unwrap_or("sqlite").trim();
+    let lower = d.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "sqlite" => return Ok(Db::Sqlite),
+        "postgres" | "postgresql" | "pg" => return Ok(Db::Postgres),
+        "mysql" | "mariadb" => return Ok(Db::Mysql),
+        _ => {}
+    }
+    if let Some((scheme, _)) = lower.split_once("://") {
+        return match scheme {
+            "postgres" | "postgresql" => Ok(Db::Postgres),
+            "mysql" | "mariadb" => Ok(Db::Mysql),
+            _ => Err(format!("`database`: a {}:// URL is not a database Quillo opens (sqlite, postgres or mysql)", scheme)),
+        };
+    }
+    if lower.contains('/') || lower.contains('.') || lower.contains(':') {
+        return Ok(Db::Sqlite);
+    }
+    Err(format!("`database` is \"sqlite\", \"postgres\" or \"mysql\" (or the URL given to db.open), got \"{}\"", d))
+}
+
+fn table(config: &Value) -> Result<String, String> {
+    let t = config.get("table").and_then(Value::as_str).unwrap_or("sign_in_links");
+    let ok = !t.is_empty()
+        && t.len() <= 60
+        && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok { Ok(t.to_string()) } else { Err(format!("`table` is a plain name (letters, digits and _, at most 60, not starting with a digit), got \"{}\"", t)) }
+}
+
+fn now_ms(config: &Value) -> i64 {
+    // `now` in the config is for tests only: a fixed clock, in ms since 1970.
+    if let Some(n) = config.get("now").and_then(Value::as_i64) {
+        return n;
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+struct Keys {
+    hash: Vec<u8>,
+    seal: Vec<u8>,
+}
+
+fn keys(config: &Value) -> Result<Keys, String> {
+    let secret = config.get("secret").and_then(Value::as_str).unwrap_or("");
+    if secret.len() < 32 {
+        return Err("`secret` is the program's secret for sign-in links, at least 32 characters (32 random bytes as hex is right): openssl rand -hex 32".into());
+    }
+    let derive = |label: &str| {
+        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+        m.update(format!("quillo magic_links v1 {}", label).as_bytes());
+        m.finalize().into_bytes().to_vec()
+    };
+    Ok(Keys { hash: derive("hash"), seal: derive("seal") })
+}
+
+fn hmac_hex(key: &[u8], parts: &[&str]) -> String {
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
+    for p in parts {
+        // Each part's length first, so no two lists of parts sign the same bytes.
+        m.update(format!("{}:", p.len()).as_bytes());
+        m.update(p.as_bytes());
+    }
+    m.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+fn seal_of(k: &Keys, key: &str, a: &str, address: &str, code_hash: Option<&str>, expires: i64, browser: Option<&str>) -> String {
+    hmac_hex(&k.seal, &[key, a, address, code_hash.unwrap_or("-"), &expires.to_string(), browser.unwrap_or("-")])
+}
+
+/// An address as it is kept: an email trimmed and in lower case, a phone number without the
+/// spaces, dashes, dots and brackets people type.
+fn normal_address(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("an address is needed: an email address or a phone number".into());
+    }
+    if t.chars().any(|c| c.is_control()) {
+        return Err("the address has a control character in it".into());
+    }
+    let out = if t.contains('@') {
+        t.to_lowercase()
+    } else {
+        let p: String = t.chars().filter(|c| !matches!(c, ' ' | '-' | '.' | '(' | ')')).collect();
+        if p.is_empty() || !p.trim_start_matches('+').chars().all(|c| c.is_ascii_digit()) {
+            return Err("the address is neither an email address (it has no @) nor a phone number".into());
+        }
+        p
+    };
+    if out.len() > 320 {
+        return Err("the address is longer than 320 characters".into());
+    }
+    Ok(out)
+}
+
+/// An address as it may be shown to whoever holds a link: enough to tell whose account it is
+/// (`a•••@example.com`, `•••42`), not enough to learn the address.
+fn masked(address: &str) -> String {
+    match address.rsplit_once('@') {
+        Some((local, domain)) => format!("{}•••@{}", local.chars().next().map(String::from).unwrap_or_default(), domain),
+        None => {
+            let digits: Vec<char> = address.chars().collect();
+            format!("•••{}", digits[digits.len().saturating_sub(2)..].iter().collect::<String>())
+        }
+    }
+}
+
+fn normal_token(s: &str) -> Result<String, String> {
+    // The whole link pasted is fine: the token is what follows the #.
+    let t = s.trim();
+    let t = t.rsplit_once('#').map_or(t, |(_, after)| after).trim();
+    let t = t.strip_prefix("t=").unwrap_or(t);
+    if t.len() != 43 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("this is not a sign-in link's token: it may have been cut short when copied".into());
+    }
+    Ok(t.to_string())
+}
+
+fn normal_code(s: &str) -> Result<String, String> {
+    let c: String = s.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+    if c.len() != 6 || !c.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("a code is 6 digits".into());
+    }
+    Ok(c)
+}
+
+fn minutes(config: &Value) -> Result<i64, String> {
+    let m = config.get("minutes").and_then(Value::as_i64).unwrap_or(15);
+    if !(1..=1440).contains(&m) {
+        return Err(format!("`minutes` (how long a link or code is good) is from 1 to 1440, got {}", m));
+    }
+    Ok(m)
+}
+
+/// The cap on wrong codes, which the program must write: with none, a script tries all million
+/// codes in minutes, inside their 15. 0, written out, is no cap (for a program that limits guesses
+/// itself, with login_limits).
+fn max_tries(config: &Value) -> Result<i64, String> {
+    let Some(n) = config.get("tries").and_then(Value::as_i64) else {
+        return Err("`tries` is required: how many wrong codes spend a code (5 is right). Write 0 only when the program limits guesses itself: with no cap, a million codes are tried in minutes".into());
+    };
+    if !(0..=1000).contains(&n) {
+        return Err(format!("`tries` (wrong codes before a code is spent; 0 for no cap) is from 0 to 1000, got {}", n));
+    }
+    Ok(n)
+}
+
+/// The page links point at: https, or plain http only on this machine (localhost, 127.0.0.1, [::1])
+/// while developing, as a link sent over plain http hands its token to anyone on the way.
+fn link_base(config: &Value) -> Result<Option<String>, String> {
+    let Some(b) = config.get("link").and_then(Value::as_str) else { return Ok(None) };
+    let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+        .iter()
+        .any(|p| b.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')));
+    if b.contains('#') || b.chars().any(|c| c.is_whitespace() || c.is_control()) || !(b.starts_with("https://") || local) {
+        return Err("`link` is the sign-in page's https address, with no # in it (https://shop.example/login/link); plain http only for localhost".into());
+    }
+    Ok(Some(b.to_string()))
+}
+
+fn mark() -> String {
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    URL_SAFE_NO_PAD.encode(b)
+}
+
+fn step(sql: String, args: Map<String, Value>) -> Value {
+    json!({ "sql": sql, "args": Value::Object(args) })
+}
+
+const COLUMNS: &str = "k, a, address, code_hash, expires, tries, tried, used, browser, seal";
+
+/// The SQL that makes the table, `table` in `config` (default `sign_in_links`), for its `database`
+/// ("sqlite", "postgres", "mysql", or the URL given to db.open): run it once with `db.exec` as the
+/// program starts. A row per link or code: its HMAC, the address's HMAC, the address, the code's
+/// HMAC, when it ends, guesses, the marks of who guessed last and who used it, the browser's HMAC.
+pub fn magic_links_table(config: serde_json::Value) -> Result<String, String> {
+    let t = table(&config)?;
+    let cols = "k varchar(64) primary key, a varchar(64) not null, address varchar(320) not null, code_hash varchar(64), expires bigint not null, \
+                tries integer not null, tried varchar(32), used varchar(32), browser varchar(64), seal varchar(64) not null";
+    Ok(match database(&config)? {
+        Db::Mysql => format!("create table if not exists {t} ({cols}, index {t}_a (a)) character set utf8mb4 collate utf8mb4_bin", t = t, cols = cols),
+        _ => format!("create table if not exists {t} ({cols});\ncreate index if not exists {t}_a on {t} (a)", t = t, cols = cols),
+    })
+}
+
+/// A sign-in for `address` (an email address or a phone number): `what` is "link", "code" or
+/// "both". `options`: `browser`, a random value the program keeps in a cookie of this browser, so
+/// that the link works only there (or `{}`). Gives `{ address, token, code, link, expires, minutes,
+/// steps, atomic }`: run the steps one by one, then send the link (`config.link` + "#" + token) and
+/// the code, and forget them. Only what is asked for is made, as a code never sent could still be
+/// guessed. The address's earlier links and code stop working, but not strictly: two requests for
+/// one address at the same moment can leave two live links, both to that inbox, each single-use,
+/// and the first sign-in ends the others. `config`: `secret` (the program's, 32 characters or
+/// more), `tries` (required: wrong codes before a code is spent, 5 is right; 0 written out for no
+/// cap), `minutes` (15), `link` (https).
+pub fn magic_links_start(config: serde_json::Value, address: &str, what: &str, options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    let db = database(&config)?;
+    let k = keys(&config)?;
+    max_tries(&config)?;
+    let (want_link, want_code) = match what {
+        "link" => (true, false),
+        "code" => (false, true),
+        "both" => (true, true),
+        _ => return Err(format!("`what` is \"link\", \"code\" or \"both\", got \"{}\"", what)),
+    };
+    let base = link_base(&config)?;
+    let browser = match options.get("browser") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(b)) if b.len() >= 16 && b.len() <= 200 => Some(hmac_hex(&k.hash, &["browser", b])),
+        Some(_) => return Err("`browser` is the random value kept in this browser's cookie (16 to 200 characters: crypto.token())".into()),
+    };
+    let addr = normal_address(address)?;
+    let now = now_ms(&config);
+    let expires = now + minutes(&config)? * 60_000;
+    let a = hmac_hex(&k.hash, &["address", &addr]);
+    let mut steps = Vec::new();
+    let mut del = Map::new();
+    del.insert("a".into(), json!(a));
+    steps.push(step(format!("delete from {} where a = :a", t), del));
+    let mut token = Value::Null;
+    let mut link = Value::Null;
+    if want_link {
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let tok = URL_SAFE_NO_PAD.encode(b);
+        let lk = hmac_hex(&k.hash, &["link", &tok]);
+        let mut args = Map::new();
+        args.insert("k".into(), json!(lk));
+        args.insert("a".into(), json!(a));
+        args.insert("address".into(), json!(addr));
+        args.insert("expires".into(), json!(expires));
+        args.insert("browser".into(), json!(browser));
+        args.insert("seal".into(), json!(seal_of(&k, &lk, &a, &addr, None, expires, browser.as_deref())));
+        steps.push(step(format!("insert into {} ({}) values (:k, :a, :address, null, :expires, 0, null, null, :browser, :seal)", t, COLUMNS), args));
+        link = base.as_ref().map_or(Value::Null, |b| json!(format!("{}#{}", b, tok)));
+        token = json!(tok);
+    }
+    let mut code = Value::Null;
+    if want_code {
+        let c = format!("{:06}", rand::rngs::OsRng.gen_range(0..1_000_000u32));
+        let ck = hmac_hex(&k.hash, &["code", &addr]);
+        let ch = hmac_hex(&k.hash, &["code-value", &addr, &c]);
+        let mut args = Map::new();
+        args.insert("k".into(), json!(ck));
+        args.insert("a".into(), json!(a));
+        args.insert("address".into(), json!(addr));
+        args.insert("ch".into(), json!(ch));
+        args.insert("expires".into(), json!(expires));
+        args.insert("seal".into(), json!(seal_of(&k, &ck, &a, &addr, Some(&ch), expires, None)));
+        // One code per address: a second request at the same moment (a double click) takes the
+        // row over rather than failing on its key, and the newer code is the one that works.
+        let set = "a = :a, address = :address, code_hash = :ch, expires = :expires, tries = 0, tried = null, used = null, browser = null, seal = :seal";
+        let insert = format!("insert into {} ({}) values (:k, :a, :address, :ch, :expires, 0, null, null, null, :seal)", t, COLUMNS);
+        let sql = match db {
+            Db::Mysql => format!("{} on duplicate key update {}", insert, set),
+            _ => format!("{} on conflict (k) do update set {}", insert, set),
+        };
+        steps.push(step(sql, args));
+        code = json!(c);
+    }
+    // Each statement stands alone: no transaction holds the address's rows while the email goes.
+    Ok(json!({ "address": addr, "token": token, "code": code, "link": link, "expires": expires, "minutes": (expires - now) / 60_000, "steps": steps, "atomic": false }))
+}
+
+/// Uses a link or a code, once: `input` is `{ token, browser }` (what followed the link's #, or the
+/// whole link, and the value in the browser's cookie; `any_browser: true` once the visitor has said
+/// to sign in on this one) or `{ address, code }`. Gives `{ steps, atomic }`: on SQLite and
+/// PostgreSQL one `update ... returning`, run alone with `db.one`; on MySQL an update and a read,
+/// `atomic`, for one short `db.transaction({ retries: 3 }, ...)`. Give the row to
+/// magic_links_result. A code's guess is counted in the same statement that may use it up. A
+/// malformed token or code is an error value here, before any SQL.
+pub fn magic_links_redeem(config: serde_json::Value, input: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    let db = database(&config)?;
+    let k = keys(&config)?;
+    let now = now_ms(&config);
+    let m = mark();
+    let flags = |counted: &str| format!("case when used = :mark then 1 else 0 end as won, {} as counted", counted);
+    let finish = |update: String, flags_sql: String, args: Map<String, Value>| -> Value {
+        match db {
+            Db::Sqlite | Db::Postgres => json!({ "steps": [step(format!("{} returning {}, {}", update, COLUMNS, flags_sql), args)], "atomic": false }),
+            Db::Mysql => json!({ "steps": [step(update, args.clone()), step(format!("select {}, {} from {} where k = :k", COLUMNS, flags_sql, t), args)], "atomic": true }),
+        }
+    };
+    if let Some(tok) = input.get("token").and_then(Value::as_str) {
+        let tok = normal_token(tok)?;
+        let mut args = Map::new();
+        args.insert("k".into(), json!(hmac_hex(&k.hash, &["link", &tok])));
+        args.insert("now".into(), json!(now));
+        args.insert("mark".into(), json!(m));
+        let any = input.get("any_browser").and_then(Value::as_bool) == Some(true);
+        let bound = if any {
+            ""
+        } else {
+            let b = input.get("browser").and_then(Value::as_str).unwrap_or("");
+            args.insert("b".into(), json!(if b.is_empty() { String::new() } else { hmac_hex(&k.hash, &["browser", b]) }));
+            " and (browser is null or browser = :b)"
+        };
+        // Always one row back (when the link exists), whether this request won it or not, so the
+        // visitor can be told why: the row is written back as it was when it is not won.
+        let update = format!("update {} set used = case when used is null and expires > :now and code_hash is null{} then :mark else used end where k = :k", t, bound);
+        return Ok(finish(update, flags("0"), args));
+    }
+    let (Some(address), Some(code)) = (input.get("address").and_then(Value::as_str), input.get("code").and_then(Value::as_str)) else {
+        return Err("`input` is { token, browser } for a link, or { address, code } for a code".into());
+    };
+    let addr = normal_address(address)?;
+    let code = normal_code(code)?;
+    let max = max_tries(&config)?;
+    let mut args = Map::new();
+    args.insert("k".into(), json!(hmac_hex(&k.hash, &["code", &addr])));
+    args.insert("h".into(), json!(hmac_hex(&k.hash, &["code-value", &addr, &code])));
+    args.insert("now".into(), json!(now));
+    args.insert("mark".into(), json!(m));
+    let cap = if max > 0 {
+        args.insert("max".into(), json!(max));
+        " and tries < :max"
+    } else {
+        ""
+    };
+    let open = format!("used is null and expires > :now and code_hash is not null{}", cap);
+    // The guess is counted, and the code used up when it is right, in one statement. SQLite and
+    // PostgreSQL read every column as it was before the update; MySQL reads each as the
+    // assignments before it left it, so there `tried` is set first and the others follow from it.
+    // With SIMULTANEOUS_ASSIGNMENT in MariaDB's sql_mode (off by default) it reads them as they were,
+    // `tried = :mark` is never true, and no code is accepted: it fails safe.
+    let update = match db {
+        Db::Mysql => format!(
+            "update {} set tried = case when {o} then :mark else tried end, tries = case when tried = :mark then tries + 1 else tries end, \
+             used = case when tried = :mark and code_hash = :h then :mark else used end where k = :k",
+            t,
+            o = open
+        ),
+        _ => format!(
+            "update {} set tries = case when {o} then tries + 1 else tries end, tried = case when {o} then :mark else tried end, \
+             used = case when {o} and code_hash = :h then :mark else used end where k = :k",
+            t,
+            o = open
+        ),
+    };
+    Ok(finish(update, flags("case when tried = :mark then 1 else 0 end"), args))
+}
+
+/// What a redemption came to, from the same `input` and the row its steps gave (or null):
+/// `{ ok, address, masked, reason, tries_left, other_browser, steps, atomic }`. `ok` is true once, for the
+/// request that used the link or code; the address is then the one it was made for, and `steps`
+/// end the address's other link or code (run them). The row's HMAC and seal are compared here
+/// again, in constant time. `reason` is for the visitor: unknown, used, expired, wrong code, too
+/// many tries, opened in another browser (`other_browser: true`, with `masked`, the address as
+/// `a•••@example.com`: ask the visitor whether to sign in as that, then redeem with
+/// `any_browser: true`, or to type the code; someone sent another's link sees it is not theirs),
+/// or a row changed in the database.
+pub fn magic_links_result(config: serde_json::Value, input: serde_json::Value, row: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    let k = keys(&config)?;
+    let now = now_ms(&config);
+    let is_link = input.get("token").and_then(Value::as_str).is_some();
+    let max = if is_link { 0 } else { max_tries(&config)? };
+    let no = |reason: &str, left: Value, other: Option<String>| json!({ "ok": false, "address": null, "masked": other, "reason": reason, "tries_left": left, "other_browser": other.is_some(), "steps": [], "atomic": false });
+    if row.is_null() {
+        return Ok(no(if is_link { "this link is not one of ours, or a newer one replaced it" } else { "there is no code for this address: ask for a new one" }, Value::Null, None));
+    }
+    let s = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+    let n = |name: &str| row.get(name).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))).unwrap_or(0);
+    let used = row.get("used").is_some_and(|u| !u.is_null());
+    let expired = n("expires") <= now;
+    let tries = n("tries");
+    let left = if max > 0 { json!((max - tries).max(0)) } else { Value::Null };
+    let browser = row.get("browser").and_then(Value::as_str);
+    if n("won") != 1 {
+        if used {
+            return Ok(no(if is_link { "this link was used already: ask for a new one" } else { "this code was used already: ask for a new one" }, Value::Null, None));
+        }
+        if expired {
+            return Ok(no(if is_link { "this link is too old: ask for a new one" } else { "this code is too old: ask for a new one" }, Value::Null, None));
+        }
+        if is_link {
+            if browser.is_some() {
+                return Ok(no("this link was asked for in another browser: sign in here only if you asked for it, or type the code from the email", Value::Null, Some(masked(&s("address")))));
+            }
+            return Ok(no("this link is not one of ours, or a newer one replaced it", Value::Null, None));
+        }
+        // A code, neither used nor too old, whose guess was not counted: its tries are spent.
+        if n("counted") != 1 {
+            return Ok(no("too many wrong codes: ask for a new one", json!(0), None));
+        }
+        return Ok(no("wrong code", left, None));
+    }
+    // This request used it: check the row is the one this input names, and as it was made.
+    let expect_key = if is_link {
+        let tok = normal_token(input.get("token").and_then(Value::as_str).unwrap_or(""))?;
+        hmac_hex(&k.hash, &["link", &tok])
+    } else {
+        let addr = normal_address(input.get("address").and_then(Value::as_str).unwrap_or(""))?;
+        let code = normal_code(input.get("code").and_then(Value::as_str).unwrap_or(""))?;
+        if !same(&hmac_hex(&k.hash, &["code-value", &addr, &code]), &s("code_hash")) {
+            return Ok(no("wrong code", left, None));
+        }
+        hmac_hex(&k.hash, &["code", &addr])
+    };
+    let code_hash = row.get("code_hash").and_then(Value::as_str);
+    let sealed = seal_of(&k, &s("k"), &s("a"), &s("address"), code_hash, n("expires"), browser);
+    if !same(&expect_key, &s("k")) || !same(&sealed, &s("seal")) || (is_link && code_hash.is_some()) {
+        return Ok(no("this sign-in's row was changed in the database, so it is not taken", Value::Null, None));
+    }
+    // The address's other link or code from the same email ends with this sign-in.
+    let mut args = Map::new();
+    args.insert("a".into(), json!(s("a")));
+    let rest = step(format!("delete from {} where a = :a and used is null", t), args);
+    Ok(json!({ "ok": true, "address": s("address"), "masked": null, "reason": null, "tries_left": left, "other_browser": false, "steps": [rest], "atomic": false }))
+}
+
+/// Removes the rows of links and codes that ended more than a day ago: run it now and then (an
+/// `every` tick). Rows are kept that day so that a late click is told "used" or "too old" rather
+/// than "not one of ours". `{ steps, atomic }`.
+pub fn magic_links_sweep(config: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let mut args = Map::new();
+    args.insert("before".into(), json!(now_ms(&config) - 86_400_000));
+    Ok(json!({ "steps": [step(format!("delete from {} where expires < :before", t), args)], "atomic": false }))
+}
+
+/// Ends every link and code made for `address` that is not used yet: when the user asks, or when
+/// the account goes. `{ steps, atomic }`.
+pub fn magic_links_forget(config: serde_json::Value, address: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let k = keys(&config)?;
+    let mut args = Map::new();
+    args.insert("a".into(), json!(hmac_hex(&k.hash, &["address", &normal_address(address)?])));
+    Ok(json!({ "steps": [step(format!("delete from {} where a = :a", t), args)], "atomic": false }))
+}

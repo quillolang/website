@@ -1,0 +1,271 @@
+//! Limits on guessing at sign-in, two-factor and code checks, kept in a table of the program's own database so that every server and instance shares them: per account, per client address (a /64 for IPv6) and a strict mode for 6-digit codes, each attempt one atomic upsert answered "allowed" or "retry after N seconds".
+//! version: 1.0.0
+//!
+//! [dependencies]
+//! hmac = "0.12"
+//! sha2 = "0.10"
+
+// How it works. Each key (a kind and a value: the account "ada@example.com", the address
+// "203.0.113.7") has one row holding the GCRA's theoretical arrival time, `tat`, in ms: the limit
+// is `tries` per `per_seconds`, all of them at once, then one more every per_seconds / tries.
+// An attempt is one statement that moves `tat` on when there is room and leaves it when there is
+// none, and says which it did (`ok`), so two requests at once can never both take the last try.
+// A refused attempt does not count, so waiting is enough: nothing locks an account for good. That
+// is a choice: someone who keeps an account's tries used up (from many addresses) slows its owner
+// to one try every 3 minutes, never shuts them out, and a sign-in by email link still works.
+//
+// A Rust plugin cannot reach the program's database, so it gives the program the statements to
+// run (`steps`, each `{ sql, args }` with `:name` values), and `atomic`. On SQLite and PostgreSQL
+// an attempt is one statement, `insert ... on conflict do update ... returning`, run by itself with
+// `db.one`, with no transaction around it. MySQL and MariaDB have no `returning` there, so the row
+// is read back by a second statement: `atomic: true` says to run the two in one short transaction,
+// `db.transaction({ retries: 3 }, ...)`, where the upsert's row lock keeps every other attempt out
+// until the commit and a deadlock is tried again.
+//
+// Behind a proxy, `request.ip` is the visitor's only when Quillo runs with `--trust-proxy <the
+// proxy>`; without it every visitor has the proxy's address and shares one address limit.
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Db {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+fn database(config: &Value) -> Result<Db, String> {
+    let d = config.get("database").and_then(Value::as_str).unwrap_or("sqlite").trim();
+    let lower = d.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "sqlite" => return Ok(Db::Sqlite),
+        "postgres" | "postgresql" | "pg" => return Ok(Db::Postgres),
+        "mysql" | "mariadb" => return Ok(Db::Mysql),
+        _ => {}
+    }
+    if let Some((scheme, _)) = lower.split_once("://") {
+        return match scheme {
+            "postgres" | "postgresql" => Ok(Db::Postgres),
+            "mysql" | "mariadb" => Ok(Db::Mysql),
+            _ => Err(format!("`database`: a {}:// URL is not a database Quillo opens (sqlite, postgres or mysql)", scheme)),
+        };
+    }
+    // A SQLite file's path, as db.open takes it (any text that is not a server's URL).
+    if lower.contains('/') || lower.contains('.') || lower.contains(':') {
+        return Ok(Db::Sqlite);
+    }
+    Err(format!("`database` is \"sqlite\", \"postgres\" or \"mysql\" (or the URL given to db.open), got \"{}\"", d))
+}
+
+fn table(config: &Value) -> Result<String, String> {
+    let t = config.get("table").and_then(Value::as_str).unwrap_or("login_limits");
+    let ok = !t.is_empty()
+        && t.len() <= 63
+        && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok { Ok(t.to_string()) } else { Err(format!("`table` is a plain name (letters, digits and _, at most 63, not starting with a digit), got \"{}\"", t)) }
+}
+
+fn now_ms(config: &Value) -> i64 {
+    // `now` in the config is for tests only: a fixed clock, in ms since 1970.
+    if let Some(n) = config.get("now").and_then(Value::as_i64) {
+        return n;
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+struct Rule {
+    tries: i64,
+    per_ms: i64,
+}
+
+/// The built-in kinds: per account, per client address (higher, for shared offices and NAT), and
+/// codes (stricter: 6 digits are a million guesses).
+fn rule(config: &Value, kind: &str) -> Result<Rule, String> {
+    let given = config.get("limits").and_then(|l| l.get(kind));
+    let (tries, per) = match (kind, given) {
+        (_, Some(g)) => {
+            let tries = g.get("tries").and_then(Value::as_i64).ok_or_else(|| format!("limits.{}: `tries` is a whole number", kind))?;
+            let per = g.get("per_seconds").and_then(Value::as_i64).ok_or_else(|| format!("limits.{}: `per_seconds` is a whole number", kind))?;
+            (tries, per)
+        }
+        ("account", None) => (5, 900),
+        ("address", None) => (50, 900),
+        ("code", None) => (3, 900),
+        (_, None) => return Err(format!("no limit named `{}`: the built-in ones are account, address and code; give others in the config, `limits: {{ {}: {{ tries: 5, per_seconds: 3600 }} }}`", kind, kind)),
+    };
+    if !(1..=100_000).contains(&tries) {
+        return Err(format!("limits.{}: `tries` is from 1 to 100000, got {}", kind, tries));
+    }
+    if !(1..=31 * 86_400).contains(&per) {
+        return Err(format!("limits.{}: `per_seconds` is from 1 to 2678400 (31 days), got {}", kind, per));
+    }
+    Ok(Rule { tries, per_ms: per * 1000 })
+}
+
+fn ipv6_prefix(config: &Value) -> Result<u32, String> {
+    match config.get("ipv6_prefix").and_then(Value::as_i64).unwrap_or(64) {
+        p @ (48 | 56 | 64) => Ok(p as u32),
+        p => Err(format!("`ipv6_prefix` (how much of an IPv6 address is one client) is 48, 56 or 64, got {}", p)),
+    }
+}
+
+/// An address as it is counted: IPv4 as it is, IPv6 by its /64 (one subscriber's network, which
+/// they can fill with addresses at will; /56 or /48 with `ipv6_prefix`), an IPv4-mapped IPv6 address
+/// as the IPv4 one. Anything else is refused: "203.0.113.7:51234" would make a limit per port.
+fn address_key(config: &Value, s: &str) -> Result<String, String> {
+    let t = s.trim();
+    let ip: std::net::IpAddr = t.parse().map_err(|_| format!("`{}` is not an IP address: give request.ip, without a port or brackets", t.chars().take(60).collect::<String>()))?;
+    Ok(match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let bits = ipv6_prefix(config)?;
+                let masked = u128::from(v6) & (!0u128 << (128 - bits));
+                format!("{}/{}", std::net::Ipv6Addr::from(masked), bits)
+            }
+        },
+    })
+}
+
+fn counted_as(config: &Value, kind: &str, key: &str) -> Result<String, String> {
+    let address = kind == "address" || config.get("limits").and_then(|l| l.get(kind)).and_then(|g| g.get("address")).and_then(Value::as_bool) == Some(true);
+    let k = if address { address_key(config, key)? } else { key.trim().to_lowercase() };
+    if k.is_empty() {
+        return Err(format!("the `{}` limit needs a key (an account, an address): got an empty one", kind));
+    }
+    if k.len() > 1024 {
+        return Err("a key is at most 1024 bytes".into());
+    }
+    Ok(k)
+}
+
+/// The row's key: an HMAC of the kind and the value under a key made from `config.secret`, so
+/// every key has one length and the table holds no account or address anyone can read back. With
+/// no secret it is a plain SHA-256, which keeps the table tidy but can be reversed for an IPv4
+/// address by trying them all.
+fn row_key(config: &Value, kind: &str, counted: &str) -> Result<String, String> {
+    let text = format!("login_limits\u{0}{}\u{0}{}", kind, counted);
+    let d: Vec<u8> = match config.get("secret") {
+        None | Some(Value::Null) => Sha256::digest(text.as_bytes()).to_vec(),
+        Some(Value::String(secret)) if secret.len() >= 32 => {
+            let mut k = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+            k.update(b"quillo login_limits v1 key");
+            let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&k.finalize().into_bytes()).expect("HMAC takes any key length");
+            m.update(text.as_bytes());
+            m.finalize().into_bytes().to_vec()
+        }
+        Some(_) => return Err("`secret`, when given, is at least 32 characters (32 random bytes as hex is right): openssl rand -hex 32".into()),
+    };
+    Ok(d.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+fn step(sql: String, args: Map<String, Value>) -> Value {
+    json!({ "sql": sql, "args": Value::Object(args) })
+}
+
+/// The SQL that makes the limits table, `table` in `config` (default `login_limits`), for its
+/// `database` ("sqlite", "postgres", "mysql", or the URL given to db.open): run it once with
+/// `db.exec` as the program starts. One row per key: an HMAC (with `secret`, 32 characters or
+/// more; else a SHA-256), a time in ms and a flag.
+pub fn login_limits_table(config: serde_json::Value) -> Result<String, String> {
+    let t = table(&config)?;
+    Ok(match database(&config)? {
+        Db::Mysql => format!(
+            "create table if not exists {} (k varchar(64) primary key, tat bigint not null, ok integer not null) character set utf8mb4 collate utf8mb4_bin",
+            t
+        ),
+        _ => format!("create table if not exists {} (k varchar(64) primary key, tat bigint not null, ok integer not null)", t),
+    })
+}
+
+/// Counts one attempt for `key` under the limit `kind` (`account`: 5 per 15 minutes; `address`:
+/// 50 per 15 minutes, IPv6 by its /64; `code`: 3 per 15 minutes; or one of `config.limits`). Gives
+/// `{ steps, atomic }`: one statement on SQLite and PostgreSQL, run alone with `db.one`; two on
+/// MySQL, `atomic`, for one short `db.transaction({ retries: 3 }, ...)`. The last row is the answer,
+/// `{ allowed, retry_after, remaining }`: allowed 1 or 0, the seconds to wait when it is 0, the
+/// tries left. Count before checking the password or code, so that a thousand guesses at once
+/// cannot all slip in before the first is counted; clear the account's count when it succeeds.
+/// Key `account` by the user's id, found first: a database collation that takes `àdä@` for `ada@`
+/// finds Ada's row for both, and two spellings of one account must not get two counts. A full
+/// limit makes its key wait for one try to come back; it never locks it for good.
+pub fn login_limits_take(config: serde_json::Value, kind: &str, key: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    let db = database(&config)?;
+    let r = rule(&config, kind)?;
+    let k = row_key(&config, kind, &counted_as(&config, kind, key)?)?;
+    let now = now_ms(&config);
+    let step_ms = (r.per_ms / r.tries).max(1);
+    let mut args = Map::new();
+    args.insert("k".into(), json!(k));
+    args.insert("now".into(), json!(now));
+    args.insert("step".into(), json!(step_ms));
+    // Room: an attempt is allowed when max(tat, now) + step <= now + per (GCRA, with the whole
+    // limit as the burst). The first attempt for a key always is.
+    args.insert("room".into(), json!(now + step_ms * r.tries));
+    args.insert("first".into(), json!(now + step_ms));
+    // Each database reads a column of the row being updated its own way: PostgreSQL needs the
+    // table's name (EXCLUDED is in scope too), MySQL takes the bare name and sees `tat` as it was
+    // until `tat` itself is set, which comes last.
+    let col = if db == Db::Mysql { "tat".to_string() } else { format!("{}.tat", t) };
+    let start = format!("(case when {c} > :now then {c} else :now end)", c = col);
+    let fits = format!("{} + :step <= :room", start);
+    let sets = format!("ok = case when {f} then 1 else 0 end, tat = case when {f} then {s} + :step else {c} end", f = fits, s = start, c = col);
+    let div = if db == Db::Mysql { "div" } else { "/" };
+    let answer = format!(
+        "ok as allowed, case when ok = 1 then 0 else (tat + :step - :room + 999) {d} 1000 end as retry_after, case when :room > tat then (:room - tat) {d} :step else 0 end as remaining",
+        d = div
+    );
+    let insert = format!("insert into {} (k, tat, ok) values (:k, :first, 1)", t);
+    let steps = match db {
+        Db::Sqlite | Db::Postgres => vec![step(format!("{} on conflict (k) do update set {} returning {}", insert, sets, answer), args)],
+        Db::Mysql => vec![
+            step(format!("{} on duplicate key update {}", insert, sets), args.clone()),
+            step(format!("select {} from {} where k = :k", answer, t), args),
+        ],
+    };
+    Ok(json!({ "steps": steps, "atomic": db == Db::Mysql, "kind": kind, "tries": r.tries, "per_seconds": r.per_ms / 1000 }))
+}
+
+/// Forgets `key`'s count under `kind`, so its next attempt starts with every try: after the right
+/// password or code, for the account. `{ steps, atomic }`: one statement.
+pub fn login_limits_clear(config: serde_json::Value, kind: &str, key: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let mut args = Map::new();
+    args.insert("k".into(), json!(row_key(&config, kind, &counted_as(&config, kind, key)?)?));
+    Ok(json!({ "steps": [step(format!("delete from {} where k = :k", t), args)], "atomic": false }))
+}
+
+/// Gives back the try an attempt took under `kind`, without forgetting the others: after a
+/// successful sign-in, for the address, so that an office of many people signing in each morning
+/// does not use up its address's limit with right passwords. `{ steps }`.
+pub fn login_limits_refund(config: serde_json::Value, kind: &str, key: &str) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let r = rule(&config, kind)?;
+    let mut args = Map::new();
+    args.insert("k".into(), json!(row_key(&config, kind, &counted_as(&config, kind, key)?)?));
+    args.insert("step".into(), json!((r.per_ms / r.tries).max(1)));
+    Ok(json!({ "steps": [step(format!("update {} set tat = tat - :step where k = :k", t), args)], "atomic": false }))
+}
+
+/// Removes the rows of keys that have all their tries back, which are the same as no row: run it
+/// now and then (an `every` tick) to keep the table small. `{ steps }`.
+pub fn login_limits_sweep(config: serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = table(&config)?;
+    database(&config)?;
+    let mut args = Map::new();
+    args.insert("now".into(), json!(now_ms(&config)));
+    Ok(json!({ "steps": [step(format!("delete from {} where tat <= :now", t), args)], "atomic": false }))
+}
+
+/// The value a key is counted by under `kind`: an IPv6 address's /64 (or `ipv6_prefix`), an
+/// IPv4-mapped address as IPv4, other keys trimmed and in lower case. For an admin page, and to
+/// see two keys are one. An address that is not an IP address is an error value.
+pub fn login_limits_counted(config: serde_json::Value, kind: &str, key: &str) -> Result<String, String> {
+    counted_as(&config, kind, key)
+}
