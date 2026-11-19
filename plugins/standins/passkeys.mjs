@@ -6,7 +6,7 @@
 // node:crypto and real signatures, none of it from the plugin's code.
 //
 //   POST /create { options, origin, kind, attest, uv, up, break } -> a credential's toJSON()
-//   POST /get { options, origin, break } -> the same for a sign-in
+//   POST /get { options, origin, uv, break } -> the same for a sign-in
 //
 // `attest` is "self" or "cert" for packed, "tpm" for a format the plugin must refuse; `break` spoils
 // one thing after signing. The certificate is a small hand-built X.509 v3 signed by itself.
@@ -139,7 +139,7 @@ export async function start({ port }) {
         if (!found) fail("NotAllowedError", "no credential here for this site");
         const [id, c] = found;
         c.counter += 1 + Math.floor(Math.random() * 3);
-        const data = authData(o.rpId, 0x01 | 0x04 | 0x08, c.counter);
+        const data = authData(o.rpId, 0x01 | (q.uv === false ? 0 : 0x04) | 0x08, c.counter);
         const client = clientData("webauthn.get", o.challenge, q.origin);
         let signature = c.key.sign(Buffer.concat([data, sha(client)]));
         if (q.break === "signature") signature = c.key.sign(Buffer.concat([data, sha(Buffer.from("something else"))]));

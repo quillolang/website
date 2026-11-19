@@ -1,23 +1,82 @@
-//! Recovery codes for two-factor sign-in: a set made once, shown once, stored only as hashes, and each usable one time.
-//! version: 1.0.0
+//! Recovery codes for two-factor sign-in: a set made once, shown once, stored only as salted Argon2id hashes, and each usable one time.
+//! version: 2.0.0
+//! From 1.x: hashes are salted now: check with mfa_check, not a `where hash = ?` lookup; old SHA-256 hashes still verify; a check costs about 25 ms per stored hash.
 //!
 //! [dependencies]
 //! rand = "0.8"
 //! sha2 = "0.10"
+//! argon2 = "0.5"
 
-use rand::Rng;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
+use rand::{Rng, RngCore};
+use std::sync::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
 /// No 0, o, 1, i or l, so a code copied from paper is read right.
 const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
 
+/// Checked against when a stored value is neither kind of hash, so every value takes about as long.
+const STAND_IN: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3RhbmQtaW4tc2FsdA$DhLSbtFH5pnvXR6WmcnVCvnVK8wTrW0J5FPGMXBhEMk";
+
+/// The most a stored hash may cost: `crypto.hash_password`'s Argon2id, 19 MiB and 2 passes on one
+/// lane. A hash naming more is not checked (it matches nothing), so a changed table cannot make each
+/// check take a second and a gigabyte (quillo FEEDBACK78.md, Q-1153, found in review; quillo-website
+/// branch auth-plugins).
+const MOST_MEMORY_KIB: u32 = 19456;
+const MOST_PASSES: u32 = 2;
+const MOST_LANES: u32 = 1;
+
+/// Checks running now, and the most at once (one per core, at most 8): the rest wait their turn, so
+/// a burst of tries cannot take all the memory and every core.
+static BUSY: Mutex<usize> = Mutex::new(0);
+static FREED: Condvar = Condvar::new();
+
+struct Turn;
+
+impl Turn {
+    fn wait() -> Turn {
+        let most = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 8);
+        let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= most {
+            busy = FREED.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        Turn
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+        *busy -= 1;
+        FREED.notify_one();
+    }
+}
+
+/// Whether a parsed hash is Argon2id at no more than `crypto.hash_password`'s cost.
+fn within_cost(h: &PasswordHash) -> bool {
+    let at_most = |k: &str, most: u32| h.params.get_decimal(k).is_some_and(|v| v <= most);
+    h.algorithm.as_str() == "argon2id" && h.version.map_or(true, |v| v == 19) && at_most("m", MOST_MEMORY_KIB) && at_most("t", MOST_PASSES) && at_most("p", MOST_LANES) && h.hash.is_some_and(|o| o.len() <= 64)
+}
+
 fn normal(code: &str) -> String {
     code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase()
 }
 
-fn hash(code: &str) -> String {
-    let n = normal(code);
-    Sha256::digest(format!("mfa-recovery:{}", n).as_bytes()).iter().map(|b| format!("{:02x}", b)).collect()
+/// 1.x's hash: SHA-256 of the code with a fixed prefix, the same for every user, so one pass over
+/// every possible code (about 11 hours on one GPU) gave every user's codes from a leaked table
+/// (quillo FEEDBACK78.md, Q-1153; quillo-website branch auth-plugins). Only read now, never made.
+fn legacy(code: &str) -> String {
+    Sha256::digest(format!("mfa-recovery:{}", normal(code)).as_bytes()).iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn is_legacy(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// `count` new codes (1 to 50; 10 is usual), each 10 characters as `xxxxx-xxxxx` (about 49 bits): show them to the user once,
@@ -30,24 +89,51 @@ pub fn mfa_codes(count: i64) -> Vec<String> {
     }).collect()
 }
 
-/// The hash to store for a code (SHA-256, hex). Spaces, dashes and capitals do not count, so `ABCDE FGHJK` is `abcde-fghjk`.
-pub fn mfa_hash(code: &str) -> String {
-    hash(code)
+/// The hash to store for a code: Argon2id with a salt of its own (`$argon2id$...`, as `crypto.hash_password` makes, about 25 ms),
+/// so a leaked table must be attacked code by code, user by user. Spaces, dashes and capitals do not count, so `ABCDE FGHJK` is
+/// `abcde-fghjk`. Two hashes of one code differ.
+/// From 1.x: hashes are salted now, so two hashes of one code differ: check with `mfa_check`, not a `where hash = ?` lookup; 1.x's SHA-256 hashes still verify there. A column for them needs about 100 characters, not 64, and a check costs about 25 ms for each stored hash.
+pub fn mfa_hash(code: &str) -> Result<String, String> {
+    let mut salt = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
+    Argon2::default().hash_password(normal(code).as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string())
 }
 
 /// Which stored hash `code` matches: its position in `hashes`, or -1 for none. Remove that hash once it is used: each code
-/// works one time. Every hash is compared, in constant time, so the answer's timing tells nothing.
+/// works one time. Takes 2.0's Argon2id hashes, and 1.x's unsalted SHA-256 ones (64 hex digits), so stores made before keep
+/// working; `mfa_legacy` tells those apart, to replace such a set at its next use. Every hash is checked, whichever matched, so
+/// the answer's timing tells nothing but how many there are (an Argon2id check takes about 25 ms). A hash naming more memory or
+/// passes than `crypto.hash_password` uses matches nothing, and a few checks run at once, the rest waiting their turn.
 pub fn mfa_check(code: &str, hashes: Vec<String>) -> i64 {
-    if normal(code).len() < 8 {
-        return -1;
-    }
-    let h = hash(code);
+    let _turn = Turn::wait();
+    let n = normal(code);
+    let short = n.len() < 8;
+    let old = legacy(code);
+    let argon = Argon2::default();
+    let stand_in = PasswordHash::new(STAND_IN).expect("the stand-in hash parses");
     let mut found = -1i64;
     for (i, s) in hashes.iter().enumerate() {
-        let same = s.len() == h.len() && s.bytes().zip(h.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-        if same && found < 0 {
+        let hit = if is_legacy(s) {
+            same(s, &old)
+        } else {
+            match PasswordHash::new(s) {
+                Ok(h) if within_cost(&h) => argon.verify_password(n.as_bytes(), &h).is_ok(),
+                _ => {
+                    let _ = argon.verify_password(n.as_bytes(), &stand_in);
+                    false
+                }
+            }
+        };
+        if hit && found < 0 && !short {
             found = i as i64;
         }
     }
     found
+}
+
+/// Whether a stored hash is one 1.x made (unsalted SHA-256, 64 hex digits): it still works with `mfa_check`, but a leaked
+/// table gives such codes away. When one is used, make the user a new set and store that set's hashes instead.
+pub fn mfa_legacy(hash: &str) -> bool {
+    is_legacy(hash)
 }

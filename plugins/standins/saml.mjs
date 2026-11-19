@@ -7,7 +7,9 @@
 // order, self-closed elements, a comment, whitespace in tags), so a wrong canonicalizer fails to
 // verify. The `kind` parameter asks for a failing or attacking Response: every signature in the
 // xsw-* attacks is genuine; only where the signed assertion sits changes. /c14n-check runs the
-// `xmllint --exc-c14n` on this Mac over the same document, as a second opinion.
+// `xmllint --exc-c14n` on this Mac over the same document, as a second opinion. /flaky/metadata is the
+// same metadata from an IdP that is down (503) until POST /flaky/up, and again after POST /flaky/down:
+// it starts down, as an IdP that is not running when the program starts.
 //
 //   start({ port }) -> { env: { SAML_IDP_URL, SAML_SP_KEY, SAML_SP_CERT }, close(), check() }
 import { execFileSync } from "node:child_process";
@@ -36,7 +38,7 @@ export async function start({ port }) {
     const stray = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const sp = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const spCert = makeCert({ subject: name("shop.example.com"), spki: spki(sp.publicKey), key: sp.privateKey });
-    const stats = { requests: 0, signedRequests: 0, responses: 0, attacks: 0, c14n: 0 };
+    const stats = { requests: 0, signedRequests: 0, responses: 0, attacks: 0, c14n: 0, flaky: 0 };
 
     const metadata = `<?xml version="1.0"?>
 <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="${DS}" entityID="${ENTITY}">
@@ -149,6 +151,7 @@ ${certB64.match(/.{1,64}/g).join("\n")}
         }
     }
     const C14N_DOC = `<?xml version="1.0"?>\n<!-- outside -->\n<a:root xmlns:a="urn:a" xmlns:b="urn:b" xmlns="urn:default" xmlns:xs="${XS}" z="1" a:y="2" b:x='3 "q" &lt; &#xD;'>\r\n  <child  second="2"   first="1"/>\n  <b:kid xmlns:c="urn:unused" a:attr="v"><!-- gone -->text &amp; &lt;more&gt;<![CDATA[<raw> & stuff]]></b:kid>\n  <plain xmlns=""><inner xml:lang="en"/></plain>\n  <a:twice xmlns:a="urn:a"><a:again xmlns:a="urn:a2"/></a:twice>\n</a:root>\n<?end?>\n`;
+    let flakyUp = false;
     const server = createServer((req, res) => {
         let raw = "";
         req.on("data", (d) => (raw += d));
@@ -156,6 +159,13 @@ ${certB64.match(/.{1,64}/g).join("\n")}
             const url = new URL(req.url, base);
             const json = (v) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(v)); };
             if (url.pathname === "/metadata") { res.writeHead(200, { "content-type": "application/samlmetadata+xml" }); return res.end(metadata); }
+            if (url.pathname === "/flaky/up" || url.pathname === "/flaky/down") { flakyUp = url.pathname === "/flaky/up"; return json({ up: flakyUp }); }
+            if (url.pathname === "/flaky/metadata") {
+                stats.flaky++;
+                if (!flakyUp) { res.writeHead(503, { "content-type": "text/plain" }); return res.end("down"); }
+                res.writeHead(200, { "content-type": "application/samlmetadata+xml" });
+                return res.end(metadata);
+            }
             if (url.pathname === "/check-metadata") {
                 const x = JSON.parse(raw).xml;
                 const has = (s) => x.includes(s);

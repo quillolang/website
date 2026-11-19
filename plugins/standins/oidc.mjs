@@ -10,6 +10,11 @@
 // wrong-at-hash, other-sub and unknown-kid give what they say; rotated signs with a key the JWKS publishes only once
 // a client asks for it again; denied refuses the sign-in.
 //
+// /ms/common/v2.0 and /ms/organizations/v2.0 are Microsoft's multi-tenant endpoints, as their metadata reads
+// (2026-11-19): the issuer is the template /ms/{tenantid}/v2.0, and each token names its tenant in `tid`, its
+// `iss` the template with that tenant in. ms-work and ms-personal are good tokens of two tenants; ms-no-tid has
+// no tid, ms-mismatch a tid that is not its iss's tenant. /ms/elsewhere/v2.0 says a template on another host.
+//
 //   start({ port }) -> { env: { OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI }, close(), check() }
 import { createServer } from "node:http";
 import { generateKeyPairSync, createHash, createHmac, sign, randomBytes } from "node:crypto";
@@ -21,10 +26,11 @@ const ec = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const stranger = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const late = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwk = (k, kid, alg) => ({ ...k.publicKey.export({ format: "jwk" }), kid, alg, use: "sig" });
+const WORK = "11111111-2222-3333-4444-555555555555", PERSONAL = "9188040d-6c67-4c5b-b112-36a304b66dad";
 
 export async function start({ port }) {
     const issuer = `http://127.0.0.1:${port}`;
-    const stats = { discovery: 0, jwks: 0, codes: 0, exchanged: 0, userinfo: 0, refreshed: 0, pkce: 0, basic: 0, machine: 0, rotatedSeen: false };
+    const stats = { discovery: 0, jwks: 0, codes: 0, exchanged: 0, userinfo: 0, refreshed: 0, pkce: 0, basic: 0, machine: 0, rotatedSeen: false, microsoft: 0 };
     const codes = new Map(), tokens = new Map(), refresh = new Map();
 
     function idToken(c, accessToken) {
@@ -35,6 +41,13 @@ export async function start({ port }) {
         if (hint === "other-issuer") claims.iss = "https://evil.example";
         if (hint === "wrong-nonce") claims.nonce = "not-the-one";
         if (hint === "wrong-at-hash") claims.at_hash = b64(randomBytes(16));
+        if (hint?.startsWith("ms-")) {
+            const tid = hint === "ms-personal" ? PERSONAL : WORK;
+            claims.iss = `${issuer}/ms/${tid}/v2.0`;
+            if (hint !== "ms-no-tid") claims.tid = hint === "ms-mismatch" ? PERSONAL : tid;
+            claims.oid = hint === "ms-personal" ? "00000000-0000-0000-66f3-3332eca7ea81" : "a1b2c3d4-0000-4000-8000-00000000ada0";
+            stats.microsoft++;
+        }
         const body = b64(JSON.stringify(claims));
         const es = hint === "es256";
         const head = (h) => b64(JSON.stringify(h)) + "." + body;
@@ -60,6 +73,11 @@ export async function start({ port }) {
                 return send(200, { issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, userinfo_endpoint: `${issuer}/userinfo`, jwks_uri: `${issuer}/jwks`, end_session_endpoint: `${issuer}/logout`, response_types_supported: ["code"], subject_types_supported: ["public"], id_token_signing_alg_values_supported: ["RS256", "ES256"], code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"], scopes_supported: ["openid", "profile", "email"] });
             }
             if (url.pathname === "/other/.well-known/openid-configuration") return send(200, { issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, jwks_uri: `${issuer}/jwks` });
+            const ms = url.pathname.match(/^\/ms\/(common|organizations|elsewhere)\/v2\.0\/\.well-known\/openid-configuration$/);
+            if (ms) {
+                const template = ms[1] === "elsewhere" ? "https://login.microsoftonline.com/{tenantid}/v2.0" : `${issuer}/ms/{tenantid}/v2.0`;
+                return send(200, { issuer: template, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, jwks_uri: `${issuer}/jwks`, response_types_supported: ["code"], id_token_signing_alg_values_supported: ["RS256"], code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"], scopes_supported: ["openid", "profile", "email"] });
+            }
             if (url.pathname === "/jwks") {
                 stats.jwks++;
                 const keys = [jwk(rsa, "rsa-1", "RS256"), jwk(ec, "ec-1", "ES256")];
@@ -144,6 +162,7 @@ export async function start({ port }) {
             if (!stats.userinfo) return "the provider got no userinfo call";
             if (!stats.refreshed) return "the provider got no refresh";
             if (stats.discovery > 3) return `discovery was fetched ${stats.discovery} times: it should be kept`;
+            if (!stats.microsoft) return "no token was asked of the Microsoft-shaped endpoints";
             return null;
         },
     };

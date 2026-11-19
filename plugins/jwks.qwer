@@ -1,5 +1,6 @@
 //! Verify sign-in tokens from an identity provider (Auth0, Okta, Entra ID, Cognito, Keycloak) against its JWKS keys, picking the key by `kid`.
-//! version: 1.0.0
+//! version: 2.0.0
+//! From 1.x: tokens without `exp` are refused (pass allow_no_exp to jwks_check to keep taking them), `nbf` is checked, and `aud` and `iss` must be there when asked for; jwks_check's options are checked, so a wrong one is an error.
 //!
 //! [dependencies]
 //! jsonwebtoken = "9"
@@ -19,11 +20,49 @@ fn keys(jwks: &str) -> Result<JwkSet, String> {
     serde_json::from_str(jwks).map_err(|e| format!("not a JWKS document: {}", e))
 }
 
-/// The claims of `token`, checked against the keys of `jwks` (the text of the provider's `/.well-known/jwks.json`, fetched with
-/// `http.get` and kept a while). The key is the one whose `kid` the token names (the only one when the token names none).
-/// `audience` and `issuer` are checked when not empty; `exp` and `nbf` with 30 s of leeway. Only RS*, PS*, ES* and EdDSA are taken,
-/// never HS*, so a token cannot pass by being signed with the public key as a secret.
-pub fn jwks_verify(token: &str, jwks: &str, audience: &str, issuer: &str) -> Result<Value, String> {
+/// What jsonwebtoken leaves unchecked. `aud` and `iss` must be there whenever an audience and an
+/// issuer are asked for: jsonwebtoken checks them only when a token has them, and `exp` was optional
+/// too, so a token with no end and for no audience passed (quillo FEEDBACK78.md, Q-1154; quillo-website
+/// branch auth-plugins). Asked in a fixed order, so the error always names the same claim; a value of
+/// the wrong type (a number, a map), which jsonwebtoken skips, counts as missing, and an `exp` or
+/// `nbf` that is not a whole number of seconds is refused (found in review).
+fn checked(claims: Value, audience: bool, issuer: bool) -> Result<Value, String> {
+    for k in ["exp", "nbf"] {
+        if !claims[k].is_null() && claims[k].as_u64().is_none() {
+            return Err(format!("the token's {} is not a whole number of seconds", k));
+        }
+    }
+    if audience {
+        let ok = match &claims["aud"] {
+            Value::String(s) => !s.is_empty(),
+            Value::Array(l) => !l.is_empty() && l.iter().all(Value::is_string),
+            _ => false,
+        };
+        if !ok {
+            return Err("Missing required claim: aud".into());
+        }
+    }
+    if issuer && !claims["iss"].as_str().is_some_and(|i| !i.is_empty()) {
+        return Err("Missing required claim: iss".into());
+    }
+    Ok(claims)
+}
+
+/// An option that is a text, or a list of texts (any of them will do), none of them empty; empty
+/// when it is not given. Given as null, it is an error: `{ audience: env("AUDIENCE") }` with the
+/// variable unset turned the check off (quillo FEEDBACK78.md, Q-1154, found in review; quillo-website
+/// branch auth-plugins).
+fn texts(options: &Value, k: &str) -> Result<Vec<String>, String> {
+    match options.as_object().and_then(|o| o.get(k)) {
+        None => Ok(vec![]),
+        Some(Value::Null) => Err(format!("option `{}` is null: leave it out to check no {}, or give a text", k, k)),
+        Some(Value::String(t)) if !t.is_empty() => Ok(vec![t.clone()]),
+        Some(Value::Array(l)) if !l.is_empty() && l.iter().all(|x| x.as_str().is_some_and(|t| !t.is_empty())) => Ok(l.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()),
+        Some(_) => Err(format!("option `{}` is a text, or a list of texts, none of them empty", k)),
+    }
+}
+
+fn verify(token: &str, jwks: &str, audience: &[String], issuer: &[String], require_exp: bool, leeway: u64) -> Result<Value, String> {
     let set = keys(jwks)?;
     let header = decode_header(token).map_err(|e| format!("not a token: {}", e))?;
     let jwk = match &header.kid {
@@ -43,16 +82,62 @@ pub fn jwks_verify(token: &str, jwks: &str, audience: &str, issuer: &str) -> Res
     let key = DecodingKey::from_jwk(jwk).map_err(|e| e.to_string())?;
     let mut v = Validation::new(header.alg);
     v.required_spec_claims.clear();
-    v.leeway = 30;
+    if require_exp {
+        v.required_spec_claims.insert("exp".to_string());
+    }
+    v.validate_nbf = true;
+    v.leeway = leeway;
     if !audience.is_empty() {
-        v.set_audience(&[audience]);
+        v.set_audience(audience);
     } else {
         v.validate_aud = false;
     }
     if !issuer.is_empty() {
-        v.set_issuer(&[issuer]);
+        v.set_issuer(issuer);
     }
-    decode::<Value>(token, &key, &v).map(|d| d.claims).map_err(|e| e.to_string())
+    let claims = decode::<Value>(token, &key, &v).map(|d| d.claims).map_err(|e| e.to_string())?;
+    checked(claims, !audience.is_empty(), !issuer.is_empty())
+}
+
+/// The claims of `token`, checked against the keys of `jwks` (the text of the provider's `/.well-known/jwks.json`, fetched with
+/// `http.get` and kept a while). The key is the one whose `kid` the token names (the only one when the token names none).
+/// The token must have `exp`; `audience` and `issuer`, when not empty, must be its `aud` and `iss`, which it must have; `exp` and
+/// `nbf` are checked with 30 s of leeway. Only RS*, PS*, ES* and EdDSA are taken, never HS*, so a token cannot pass by being signed
+/// with the public key as a secret. `jwks_check` takes options, and can allow a token with no `exp`.
+/// From 1.x: tokens without `exp` are refused; check them with `jwks_check(token, jwks, { allow_no_exp: true })` to keep taking them.
+pub fn jwks_verify(token: &str, jwks: &str, audience: &str, issuer: &str) -> Result<Value, String> {
+    let one = |t: &str| if t.is_empty() { vec![] } else { vec![t.to_string()] };
+    verify(token, jwks, &one(audience), &one(issuer), true, 30)
+}
+
+/// `jwks_verify` with `options`: `audience` and `issuer` (a text, or a list of texts; the token must have them, and they must
+/// match, or match one of the list), `allow_no_exp` (false: a token with no `exp` is good for ever, so it is refused unless this is
+/// true) and `leeway` (seconds, 30; at most 86400). An option not known, or of the wrong type, is an error.
+pub fn jwks_check(token: &str, jwks: &str, options: serde_json::Value) -> Result<Value, String> {
+    // Read as text only, `audience: 5` or a list was skipped, and with it the check (quillo FEEDBACK78.md,
+    // Q-1154, found in review; quillo-website branch auth-plugins).
+    match &options {
+        Value::Object(o) => {
+            for k in o.keys() {
+                if !["audience", "issuer", "allow_no_exp", "leeway"].contains(&k.as_str()) {
+                    return Err(format!("no option `{}` (audience, issuer, allow_no_exp, leeway)", k));
+                }
+            }
+        }
+        Value::Null => {}
+        _ => return Err("the options are a map".into()),
+    }
+    let (audience, issuer) = (texts(&options, "audience")?, texts(&options, "issuer")?);
+    let allow = match &options["allow_no_exp"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err("option `allow_no_exp` is true or false".into()),
+    };
+    let leeway = match &options["leeway"] {
+        Value::Null => 30,
+        l => l.as_u64().filter(|n| *n <= 86400).ok_or("option `leeway` is a whole number of seconds, at most 86400 (a day)")?,
+    };
+    verify(token, jwks, &audience, &issuer, !allow, leeway)
 }
 
 /// The keys of a JWKS document: `{ kid, kty, alg, use }` each, to see what a provider publishes.

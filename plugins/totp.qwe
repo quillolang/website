@@ -1,16 +1,121 @@
-// Setting up two-factor sign-in, and checking a code.
+// Setting up two-factor sign-in, and checking a code: each code is taken once, and wrong codes are
+// counted so they cannot be guessed.
 //
 //   quillo run totp.qwe      then open http://localhost:8080/setup
+//
+// Each account's secret, and the last time step a code was taken for, live in a table of the
+// program's own: a code is refused once it was used, though it stays right for up to 90 s (RFC
+// 6238). The check counts tries per account and per address in a table too, and stops after 5 per
+// account (20 per address, an IPv6 address by its /64) in 15 minutes: there are only a million
+// codes, and one connection can try 20,000 a second. The limit is the program's choice, with its
+// numbers. The database here is SQLite in memory, so a restart forgets it: db.open a file or a
+// server, and every instance and server shares the steps and the counts.
 
 use "totp.qwer"
 
+db.exec("create table if not exists totp_users (account text primary key, secret text not null, last_step integer not null default -1)")
+db.exec("create table if not exists tries (key text not null, at integer not null)")
+db.exec("create index if not exists tries_key on tries (key, at)")
+
+let TRIES = 5                    // tries per account in WINDOW; a right code starts again
+let TRIES_PER_ADDRESS = 20       // tries per address in WINDOW, over every account
+let WINDOW = 15 * 60 * 1000
+
+// The address a try counts against: an IPv6 address by its /64, which one machine or home usually
+// holds whole, so moving inside it does not start the count again; an IPv4 address as it is (also
+// when written inside IPv6, ::ffff:192.0.2.7).
+fn address_key(ip) {
+    let a = lower(split(ip ?? "", "%")[0])
+    if !contains(a, ":") { return a }
+    if contains(a, ".") { return last(split(a, ":")) }
+    let halves = split(a, "::")
+    let head = halves[0] == "" ? [] : split(halves[0], ":")
+    let tail = len(halves) > 1 && halves[1] != "" ? split(halves[1], ":") : []
+    let zeros = map(range(0, max([0, 8 - len(head) - len(tail)])), (i) => "0")
+    let groups = map([...head, ...zeros, ...tail], (g) => re.replace(g, "^0+(.)", "$1"))
+    `${join(take(groups, 4), ":")}::/64`
+}
+
+// Counts a try, then says whether it is over the limit: written first, so tries sent at once all count.
+fn over_limit(account, ip) {
+    let since = now() - WINDOW
+    db.exec("delete from tries where at < ?", since)?
+    db.exec("insert into tries (key, at) values (?, ?), (?, ?)", `account:${account}`, now(), `address:${address_key(ip)}`, now())?
+    let mine = db.one("select count(*) as n from tries where key = ? and at >= ?", `account:${account}`, since)?.n
+    let theirs = db.one("select count(*) as n from tries where key = ? and at >= ?", `address:${address_key(ip)}`, since)?.n
+    mine > TRIES || theirs > TRIES_PER_ADDRESS
+}
+
+// The second step of a sign-in, once the password was right: `{ ok, status, message }`.
+fn second_factor(account, code, ip) {
+    if over_limit(account, ip)? { return { ok: false, status: 429, message: "Too many tries: wait a few minutes." } }
+    let user = db.one("select secret, last_step from totp_users where account = ?", account)?
+    if user == null { return { ok: false, status: 401, message: "Wrong code." } }
+    let r = totp_check(user.secret, code, user.last_step)?
+    if r.reused { return { ok: false, status: 401, message: "That code was used already: wait for the next one." } }
+    if !r.ok { return { ok: false, status: 401, message: "Wrong code." } }
+    // The step is kept only if no other request took it first: one code, one sign-in.
+    if db.exec("update totp_users set last_step = ? where account = ? and last_step < ?", r.step, account, r.step)?.changes != 1 {
+        return { ok: false, status: 401, message: "That code was used already: wait for the next one." }
+    }
+    db.exec("delete from tries where key = ?", `account:${account}`)?
+    { ok: true, status: 200, message: "Signed in." }
+}
+
 route GET /setup {
     let secret = totp_secret()
+    // In a real app the account is the signed-in user's, and the secret is kept once they typed a code from it.
+    db.exec("insert into totp_users (account, secret) values (?, ?) on conflict (account) do update set secret = excluded.secret, last_step = -1", "ada@example.com", secret)?
     { secret, link: totp_url(secret, "Quillo Shop", "ada@example.com")? }
+}
+
+// The form after the password: the session says whose password it was.
+route POST /2fa { form: { code: str } } {
+    let account = session().pending ?? reply 401 "Sign in with your password first."
+    let r = second_factor(account, code, request.ip)?
+    if r.ok { set_session({ user: account }) }
+    respond(r.status, r.message, {})
 }
 
 route GET /check {
     let secret = totp_secret()
     let code = totp_code(secret)?
     { code, right: totp_verify(secret, code)?, wrong: totp_verify(secret, "000000")? }
+}
+
+fn demo_account(secret) {
+    let account = `demo-${crypto.token(6)}@example.com`
+    db.exec("insert into totp_users (account, secret) values (?, ?)", account, secret)?
+    account
+}
+
+// One code, twice: the first signs in, the second is refused, though the code is still right.
+route GET /once {
+    let secret = totp_secret()
+    let account = demo_account(secret)?
+    let code = totp_code(secret)?
+    let first = second_factor(account, code, "192.0.2.1")?
+    let again = second_factor(account, code, "192.0.2.1")?
+    let checked = totp_check(secret, code, -1)?
+    {
+        first: first.message,
+        again: again.message,
+        still_right: totp_verify(secret, code)?,
+        step_given: checked.ok && checked.step > 0,
+        same_step_again: totp_check(secret, code, checked.step)?,
+        wrong: totp_check(secret, "000000", -1)?,
+    }
+}
+
+// Wrong codes: the sixth try in 15 minutes is refused, even with the right code, and so is the 21st
+// from one address over many accounts, here 21 IPv6 addresses in one /64.
+route GET /limit {
+    let secret = totp_secret()
+    let account = demo_account(secret)?
+    let tries = map(range(0, 6), (i) => second_factor(account, "000000", "192.0.2.2")?.status)
+    let locked = second_factor(account, totp_code(secret)?, "192.0.2.2")?.status
+    let spray = map(range(0, 21), (i) => second_factor(`nobody-${i}-${account}`, "000000", `2001:db8:5:6::${i + 1}`)?.status)
+    let fresh = totp_secret()
+    let other = demo_account(fresh)?
+    { tries, locked, address: [spray[19], spray[20]], other_account: second_factor(other, totp_code(fresh)?, "192.0.2.4")?.message, keys: map(["2001:db8:1:2::1", "2001:0DB8:1:2:ffff::9", "2001:db8:1:3::1", "::ffff:192.0.2.7"], (a) => address_key(a)) }
 }

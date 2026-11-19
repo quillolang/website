@@ -4,7 +4,9 @@
 // and drops any packet whose Message-Authenticator or accounting authenticator does not check
 // out with it, as servers do. Users: alice (PAP or CHAP, accepted with a session timeout, an
 // address, a class and vendor attributes), bob (rejected), carol (a challenge: State, then
-// the code 424242). Accounting on port + 1 keeps each session's Start, Interim and Stop.
+// the code 424242), olive (accepted as a server from before 2024 would: no Message-Authenticator
+// in the answer, which BlastRADIUS forges). Accounting on port + 1 keeps each session's Start,
+// Interim and Stop.
 import { createSocket } from "node:dgram";
 import { createHash, createHmac } from "node:crypto";
 
@@ -37,13 +39,13 @@ function bindUdp(sock, port, host = "127.0.0.1") {
 
 export async function start({ port }) {
     const secret = Buffer.from(SECRET);
-    const seen = { pap: 0, chap: 0, challenged: 0, answered: 0, rejected: 0, status: 0, sessions: {}, dropped: [], problems: [] };
-    function reply(req, code, list) {
+    const seen = { pap: 0, chap: 0, challenged: 0, answered: 0, rejected: 0, status: 0, old: 0, sessions: {}, dropped: [], problems: [] };
+    function reply(req, code, list, withMA = true) {
         // the Message-Authenticator first, over the packet with the Request Authenticator in place
-        const body = Buffer.concat([attr(80, Buffer.alloc(16)), ...list, ...attrs(req).filter((a) => a.t === 33).map((a) => attr(33, a.v))]);
+        const body = Buffer.concat([...(withMA ? [attr(80, Buffer.alloc(16))] : []), ...list, ...attrs(req).filter((a) => a.t === 33).map((a) => attr(33, a.v))]);
         const p = Buffer.concat([Buffer.from([code, req[1], 0, 0]), req.subarray(4, 20), body]);
         p.writeUInt16BE(p.length, 2);
-        createHmac("md5", secret).update(p).digest().copy(p, 22);
+        if (withMA) createHmac("md5", secret).update(p).digest().copy(p, 22);
         md5(p.subarray(0, 4), req.subarray(4, 20), p.subarray(20), secret).copy(p, 4);
         return p;
     }
@@ -62,7 +64,7 @@ export async function start({ port }) {
             const req = m.subarray(0, m.readUInt16BE(2));
             const list = attrs(req);
             if (!checkMA(req, list, false)) { seen.dropped.push("no or a wrong Message-Authenticator"); return; } // (BlastRADIUS: required)
-            const send = (code, l) => auth.send(reply(req, code, l), r.port, r.address);
+            const send = (code, l, withMA) => auth.send(reply(req, code, l, withMA), r.port, r.address);
             if (req[0] === 12) { seen.status++; return send(2, [attr(18, Buffer.from("up"))]); }
             if (req[0] !== 1) return;
             const user = list.find((a) => a.t === 1)?.v.toString();
@@ -86,6 +88,7 @@ export async function start({ port }) {
                 return send(2, [attr(18, Buffer.from("Welcome, alice")), attr(27, u32(3600)), attr(8, Buffer.from([10, 20, 0, 15])), attr(25, Buffer.from("gold")),
                     attr(6, u32(2)), vsa(14988, 8, Buffer.from("10M/10M")), vsa(9, 1, Buffer.from("shell:priv-lvl=15")), vsa(9, 1, Buffer.from("ip:inacl#1=permit tcp any any eq 443"))]);
             }
+            if (user === "olive" && ok("oldserver")) { seen.old++; return send(2, [attr(18, Buffer.from("Welcome, olive"))], false); }
             if (user === "carol") {
                 const state = list.find((a) => a.t === 24)?.v.toString();
                 if (!state && ok("carolpass")) { seen.challenged++; return send(11, [attr(18, Buffer.from("Enter the code from your token")), attr(24, Buffer.from("otp-7f3a")), attr(27, u32(60))]); }

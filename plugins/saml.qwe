@@ -6,15 +6,55 @@
 //   then open http://localhost:8080/metadata, /login, /signed-in, /attributes, /refused and /wrapping
 //
 // SAML_IDP_URL serves the IdP's metadata at /metadata. A real program keeps the IdP's certificate in
-// its config, and its session holds the request id between /login and the ACS post. The test IdP
-// here signs real responses, and hands them over as JSON rather than through a browser's form post.
+// its config. The test IdP here signs real responses, and hands them over as JSON; /acs-flow posts
+// one to the ACS as the IdP's page makes a browser do.
+//
+// The sign-in itself is /saml/login and POST /saml/acs. The IdP's page posts the answer to the ACS
+// from another site, and browsers send no SameSite=Lax cookie with such a post, so the session is
+// empty there: the request id is kept in a table, found by the RelayState that comes back with the
+// answer, and taken once. The RelayState is also in a cookie of its own, SameSite=None, which such a
+// post does carry: the ACS takes an answer only from the browser that started that sign-in, so
+// someone cannot sign a visitor in as themselves by having the visitor's browser post their answer.
+// Each assertion used is kept in a table too, with a unique key, so a response is refused a second
+// time after a restart and on every server, which the plugin's own record, the process's, cannot do.
+// SAML_DB names the database (a server's URL with several servers).
 
 use "saml.qwer"
+
+write_file("data/.keep", "")                      // db.open makes no folders
+db.open(env("SAML_DB", "data/saml.db"))
+db.exec("create table if not exists saml_requests (relay text primary key, request_id text not null, made_at integer not null)")
+db.exec("create table if not exists saml_used (assertion_id text primary key, until_ms integer not null)")
+db.exec("create table if not exists saml_idp (base text primary key, xml text not null, fetched_at integer not null)")
+allow_cross_site("/saml/acs")
 
 let IDP = env("SAML_IDP_URL", "http://127.0.0.1:9000")
 let SP = { entity_id: "https://shop.example.com/saml", acs_url: "https://shop.example.com/saml/acs", name_id_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress" }
 
-fn config() = { ...SP, idp: saml_idp_metadata(http.get(`${IDP}/metadata`).body)? }
+let STARTED_LIFE = 10 * 60 * 1000          // ms a started sign-in waits for its answer
+let METADATA_LIFE = 60 * 60 * 1000         // ms the IdP's metadata is kept before it is read again
+let RETRY = 60 * 1000                      // ms before an IdP that could not be reached is asked again
+
+// The IdP's metadata (the text of `${base}/metadata`): read when first needed, not as the program
+// starts, so an IdP that is down for a moment stops sign-ins for that moment, not the program. It is
+// kept an hour in a table, so a visitor's /saml/login costs no call to the IdP; when a new read fails,
+// the last good copy is used, and the IdP asked again a minute later; with no copy at all, an error.
+fn idp_xml(base) {
+    let held = db.one("select xml, fetched_at from saml_idp where base = ?", base)?
+    if held != null && now() - held.fetched_at < METADATA_LIFE { return held.xml }
+    let got = http.get(`${base}/metadata`, {}, { public_only: false })      // the IdP's address is the program's setting
+    if !is_err(got) && got.status == 200 && !is_err(saml_idp_metadata(got.body)) {
+        db.exec("insert into saml_idp (base, xml, fetched_at) values (?, ?, ?) on conflict (base) do update set xml = excluded.xml, fetched_at = excluded.fetched_at", base, got.body, now())?
+        return got.body
+    }
+    print(`the IdP's metadata could not be read from ${base}: ${is_err(got) ? error(got) : got.status}`)
+    if held == null { return err("the identity provider's metadata could not be read, and no copy is kept") }
+    db.exec("update saml_idp set fetched_at = ? where base = ?", now() - METADATA_LIFE + RETRY, base)?
+    held.xml
+}
+
+fn config_of(base) = { ...SP, idp: saml_idp_metadata(idp_xml(base)?)? }
+fn config() = config_of(IDP)
 
 // One round: ask for a sign-in, have the IdP answer that request.
 fn signin(kind) {
@@ -84,6 +124,128 @@ route GET /c14n {
 }
 
 fn refusal(kind) = signin(kind).read.error
+
+// A visitor's sign-in starts here: the request id is kept under a fresh key, which goes to the IdP as
+// RelayState and comes back with its answer, and to this browser in a cookie. Sign-ins started and
+// never finished are dropped once they are too old to finish.
+fn begin(base) {
+    let c = config_of(base)?
+    let relay = crypto.token(24)
+    let req = saml_authn_request(c, { relay_state: relay })?
+    db.exec("delete from saml_requests where made_at < ?", now() - STARTED_LIFE)?
+    db.exec("insert into saml_requests (relay, request_id, made_at) values (?, ?, ?)", relay, req.id, now())?
+    set_cookie("__Host-saml", relay, { same_site: "None", max_age: STARTED_LIFE / 1000 })
+    req.url
+}
+
+route GET /saml/login {
+    let url = begin(IDP)
+    if is_err(url) {
+        print(`SAML sign-in not started: ${error(url)}`)
+        reply 503 "Sign-in is not available right now: try again in a moment."
+    }
+    redirect(url)
+}
+
+// What the IdP posted, checked against the request found by its RelayState, and only from the browser
+// whose cookie holds that RelayState: the user, or an error.
+fn acs(response, relay, held) {
+    if held == "" || !crypto.equal(held, relay) { return err("this browser did not start that sign-in: an answer posted from somewhere else") }
+    let row = db.one("select request_id from saml_requests where relay = ? and made_at >= ?", relay, now() - STARTED_LIFE)?
+    if row == null { return err("no sign-in was started with that RelayState, or it was used") }
+    // Taken by the first post alone: a second one, or one racing it, finds it gone.
+    if db.exec("delete from saml_requests where relay = ?", relay)?.changes != 1 { return err("that sign-in was used already") }
+    // The table below is the record of assertions used: the plugin's own is this process's only.
+    let r = saml_read_response(config(), response, { request_id: row.request_id, allow_replay: true })?
+    db.exec("delete from saml_used where until_ms < ?", now())?
+    let kept = db.exec("insert into saml_used (assertion_id, until_ms) values (?, ?) on conflict (assertion_id) do nothing", r.assertion_id, date.ms(r.not_on_or_after) + 120000)?
+    if kept.changes != 1 { return err(`the assertion ${r.assertion_id} was used already: a replay`) }
+    r
+}
+
+// The IdP's form post: no session cookie comes with it, only the SameSite=None one /saml/login set.
+route POST /saml/acs { form: { SAMLResponse: str, RelayState: str = "" } } {
+    let r = acs(SAMLResponse, RelayState, cookie("__Host-saml") ?? "")
+    delete_cookie("__Host-saml", { same_site: "None" })
+    if is_err(r) {
+        print(`SAML sign-in refused: ${error(r)}`)
+        reply 401 "The sign-in did not work: try again."
+    }
+    set_session({ user: r.name_id })
+    redirect("/")
+}
+
+route GET /saml/me = { user: session().user }
+
+fn post_acs(at, response, relay, cookie) = http.post(at, url_encode({ SAMLResponse: response, RelayState: relay }), { "content-type": "application/x-www-form-urlencoded", cookie }, { redirects: 0, public_only: false })
+
+// The cookies an answer sets, as the Cookie header a browser sends back (one Set-Cookie a line).
+fn cookies_of(answer) = join(map(split(answer.headers["set-cookie"] ?? "", "\n"), (c) => split(c, ";")[0]), "; ")
+
+// A browser's sign-in: /saml/login sends it to the IdP, and the IdP's page posts the answer.
+fn start(here) {
+    let begun = http.get(`${here}/saml/login`, {}, { redirects: 0, public_only: false })?
+    { cookie: cookies_of(begun), got: http.get(`${begun.headers.location}&kind=plain`, {}, { public_only: false }).json }
+}
+
+// The browser's part: it posts the IdP's answer to the ACS with its __Host-saml cookie and no session.
+// The same post again is refused, and so is the same response under another RelayState for the same
+// request, as it would be after a restart or on another server: the tables are the record.
+route GET /acs-flow {
+    let here = `http://${request.headers.host}`
+    let s = start(here)?
+    let got = s.got
+    let first = post_acs(`${here}/saml/acs`, got.saml_response, got.relay_state, s.cookie)?
+    let again = post_acs(`${here}/saml/acs`, got.saml_response, got.relay_state, s.cookie)?
+    db.exec("insert into saml_requests (relay, request_id, made_at) values (?, ?, ?)", "copied-relay", got.request.id, now())?
+    db.exec("insert into saml_requests (relay, request_id, made_at) values (?, ?, ?)", "stale-relay", got.request.id, 0)?
+    start(here)?
+    {
+        first: [first.status, first.headers.location],
+        signed_in_as: http.get(`${here}/saml/me`, { cookie: cookies_of(first) }, { public_only: false })?.json.user,
+        again: [again.status, again.body],
+        replayed: error(acs(got.saml_response, "copied-relay", "copied-relay")),
+        made_up_relay: error(acs(got.saml_response, "made-up", "made-up")),
+        stale_dropped: db.one("select count(*) as n from saml_requests where relay = 'stale-relay'")?.n == 0,
+    }
+}
+
+// The IdP down, then up, then down again (the test IdP's /flaky starts down, as one not running when
+// the program starts): with no copy kept, a sign-in is a plain error; once it answers, its metadata is
+// kept; down again an hour later, the copy kept is used.
+route GET /idp-down {
+    let flaky = `${IDP}/flaky`
+    db.exec("delete from saml_idp where base = ?", flaky)?              // as a program that has kept none yet
+    http.post(`${flaky}/down`, null)?
+    let first = begin(flaky)
+    http.post(`${flaky}/up`, null)?
+    let up = config_of(flaky)?
+    http.post(`${flaky}/down`, null)?
+    db.exec("update saml_idp set fetched_at = 0 where base = ?", flaky)?
+    let later = config_of(flaky)
+    {
+        while_down: error(first),
+        once_up: up.idp.entity_id,
+        down_again: later.idp.entity_id,
+        asks_again_in_a_minute: db.one("select fetched_at from saml_idp where base = ?", flaky)?.fetched_at > now() - METADATA_LIFE,
+    }
+}
+
+// Login CSRF: someone starts a sign-in, signs in at the IdP as themselves, and has a visitor's browser
+// post that answer from their own page. With no __Host-saml cookie, or the visitor's own from a sign-in
+// of theirs, it is refused, and the visitor is not signed in as them.
+route GET /csrf {
+    let here = `http://${request.headers.host}`
+    let theirs = start(here)?.got
+    let visitor = start(here)?
+    let bare = post_acs(`${here}/saml/acs`, theirs.saml_response, theirs.relay_state, "")?
+    let mixed = post_acs(`${here}/saml/acs`, theirs.saml_response, theirs.relay_state, visitor.cookie)?
+    {
+        no_cookie: [bare.status, http.get(`${here}/saml/me`, { cookie: cookies_of(bare) }, { public_only: false })?.json.user],
+        visitors_cookie: [mixed.status, http.get(`${here}/saml/me`, { cookie: cookies_of(mixed) }, { public_only: false })?.json.user],
+        why: error(acs(theirs.saml_response, theirs.relay_state, "")),
+    }
+}
 
 route GET /refused = {
     expired: refusal("expired"),

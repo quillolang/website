@@ -1,11 +1,30 @@
-// Signing in users whose passwords came from an old system, moving them to Argon2.
+// Signing in users whose passwords came from an old system, moving them to Argon2, with tries
+// counted so passwords cannot be sprayed.
 //
 //   quillo run bcrypt.qwe      then open http://localhost:8080/login
+//
+// The users and their hashes live in a table of the program's own: a bcrypt hash that matches is
+// replaced by an Argon2 one. Tries are counted per account and per address in a table too, and stop
+// after 5 per account (20 per address, an IPv6 address by its /64) in 15 minutes. Every failure is
+// answered after the same time, so it tells no one whether an account exists or still has a bcrypt
+// hash. The limit is the program's choice, with its numbers. The database here is SQLite in memory,
+// so a restart forgets it: db.open a file or a server, and every instance and server shares the
+// users and the counts.
 
 use "bcrypt.qwer"
 
+db.exec("create table if not exists users (email text primary key, password_hash text not null)")
+db.exec("create table if not exists tries (key text not null, at integer not null)")
+db.exec("create index if not exists tries_key on tries (key, at)")
+
+let TRIES = 5                    // tries per account in WINDOW; a right password starts again
+let TRIES_PER_ADDRESS = 20       // tries per address in WINDOW, over every account
+let WINDOW = 15 * 60 * 1000
+let SLOWEST = 400                // ms: every failed sign-in answers after this long, longer than any hash check (bcrypt at cost 12 takes about 250 ms)
+
 // A user from the old database, hashed by PHP's password_hash.
 let old_hash = bcrypt_hash("hunter22", 10)?
+db.exec("insert into users (email, password_hash) values (?, ?) on conflict (email) do nothing", "ada@example.com", old_hash)
 
 fn sign_in(password: str, stored: str) {
     if is_bcrypt(stored) {
@@ -16,7 +35,103 @@ fn sign_in(password: str, stored: str) {
     { ok: crypto.verify_password(password, stored) }
 }
 
+// The address a try counts against: an IPv6 address by its /64, which one machine or home usually
+// holds whole, so moving inside it does not start the count again; an IPv4 address as it is (also
+// when written inside IPv6, ::ffff:192.0.2.7).
+fn address_key(ip) {
+    let a = lower(split(ip ?? "", "%")[0])
+    if !contains(a, ":") { return a }
+    if contains(a, ".") { return last(split(a, ":")) }
+    let halves = split(a, "::")
+    let head = halves[0] == "" ? [] : split(halves[0], ":")
+    let tail = len(halves) > 1 && halves[1] != "" ? split(halves[1], ":") : []
+    let zeros = map(range(0, max([0, 8 - len(head) - len(tail)])), (i) => "0")
+    let groups = map([...head, ...zeros, ...tail], (g) => re.replace(g, "^0+(.)", "$1"))
+    `${join(take(groups, 4), ":")}::/64`
+}
+
+// Counts a try, then says whether it is over the limit: written first, so tries sent at once all count.
+fn over_limit(account, ip) {
+    let since = now() - WINDOW
+    db.exec("delete from tries where at < ?", since)?
+    db.exec("insert into tries (key, at) values (?, ?), (?, ?)", `account:${account}`, now(), `address:${address_key(ip)}`, now())?
+    let mine = db.one("select count(*) as n from tries where key = ? and at >= ?", `account:${account}`, since)?.n
+    let theirs = db.one("select count(*) as n from tries where key = ? and at >= ?", `address:${address_key(ip)}`, since)?.n
+    mine > TRIES || theirs > TRIES_PER_ADDRESS
+}
+
+// The whole check: one answer, after one time, for an unknown email and a wrong password. The checks
+// themselves differ (an unknown email is checked against "", which takes an Argon2 check's time; a
+// bcrypt hash takes longer than an Argon2 one), so every failure waits out the rest of SLOWEST, and
+// tells no one which accounts exist or are not moved yet.
+fn check_password(email, password, ip) {
+    let started = now()
+    if over_limit(email, ip)? { return { ok: false, status: 429, message: "Too many tries: wait a few minutes." } }
+    let user = db.one("select password_hash from users where email = ?", email)?
+    let r = sign_in(password, user == null ? "" : user.password_hash)
+    if !r.ok {
+        sleep(max([0, SLOWEST - (now() - started)]))
+        return { ok: false, status: 401, message: "Wrong email or password." }
+    }
+    if r.rehashed != null { db.exec("update users set password_hash = ? where email = ?", r.rehashed, email)? }
+    db.exec("delete from tries where key = ?", `account:${email}`)?
+    { ok: true, status: 200, message: "Signed in." }
+}
+
+route POST /sign-in { form: { email: str, password: str } } {
+    let who = lower(trim(email))
+    let r = check_password(who, password, request.ip)?
+    if r.ok { set_session({ user: who }) }
+    respond(r.status, r.message, {})
+}
+
 route GET /login {
     let good = sign_in("hunter22", old_hash)
     { right: good.ok, moved_to_argon2: starts_with(good.rehashed, "$argon2id$"), wrong: sign_in("hunter2", old_hash).ok }
+}
+
+// Bcrypt reads 72 bytes: a longer password is refused when hashing, rather than cut without a word.
+// Hashes made elsewhere were made from the first 72 bytes, so checking one reads as many.
+route GET /long {
+    let long = repeat("correct horse battery staple ", 3) + "one"
+    let exactly = slice(long, 0, 72)
+    let imported = bcrypt_hash(exactly, 4)?            // what PHP made of `long`, cutting it
+    {
+        bytes: len(long),
+        refused: bcrypt_hash(long, 4).error,
+        at_72: bcrypt_verify(exactly, bcrypt_hash(exactly, 4)?),
+        imported: bcrypt_verify(long, imported),
+        argon2_reads_all: crypto.verify_password(replace(long, "one", "two"), crypto.hash_password(long)),
+    }
+}
+
+// One answer time for an unknown email, a user still on bcrypt and a user moved to Argon2.
+fn failure_ms(email) {
+    let started = now()
+    check_password(email, "not-the-password", "192.0.2.9")?
+    now() - started
+}
+
+route GET /timing {
+    let old = `old-${crypto.token(6)}@example.com`
+    let moved = `moved-${crypto.token(6)}@example.com`
+    db.exec("insert into users (email, password_hash) values (?, ?), (?, ?)", old, bcrypt_hash("hunter22", 12)?, moved, crypto.hash_password("hunter22"))?
+    let times = [failure_ms(`nobody-${old}`)?, failure_ms(old)?, failure_ms(moved)?]
+    { same_time: max(times) - min(times) < 100 && min(times) >= SLOWEST }
+}
+
+// The table: the first right password moves the user to Argon2; five wrong ones stop the sixth try,
+// even a right one, and an unknown email gets the wrong password's answer.
+route GET /limit {
+    let email = `demo-${crypto.token(6)}@example.com`
+    db.exec("insert into users (email, password_hash) values (?, ?)", email, bcrypt_hash("hunter22", 4)?)?
+    let first = check_password(email, "hunter22", "192.0.2.1")?.message
+    let moved = starts_with(db.one("select password_hash from users where email = ?", email)?.password_hash, "$argon2id$")
+    let tries = map(range(0, 6), (i) => check_password(email, "hunter2", "192.0.2.2")?.status)
+    {
+        first, moved, tries,
+        locked: check_password(email, "hunter22", "192.0.2.2")?.status,
+        unknown: check_password(`nobody-${email}`, "hunter22", "192.0.2.3")?.message,
+        keys: map(["2001:db8:1:2::1", "2001:0DB8:1:2:ffff::9", "2001:db8:1:3::1", "::ffff:192.0.2.7"], (a) => address_key(a)),
+    }
 }

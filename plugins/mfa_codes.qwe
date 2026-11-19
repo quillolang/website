@@ -1,14 +1,86 @@
-// Two-factor recovery codes: shown once, kept as hashes, each used one time.
+// Two-factor recovery codes: shown once, kept as salted hashes, each used one time, and counted so
+// they cannot be guessed.
 //
 //   quillo run mfa_codes.qwe      then open http://localhost:8080/setup
+//
+// The hashes live in a table of the program's own, a row each; a code used is deleted, so it works
+// once. Tries are counted per account and per address in a table too, and stop after 5 per account
+// (20 per address, an IPv6 address by its /64) in 15 minutes: a recovery code skips the second
+// factor. The limit is the program's choice, with its numbers. The database here is SQLite in
+// memory, so a restart forgets it: db.open a file or a server, and every instance and server shares
+// the codes and the counts. A set made by 1.x (unsalted hashes) is replaced at its next use.
 
 use "mfa_codes.qwer"
 
-route GET /setup {
+db.exec("create table if not exists recovery_codes (id integer primary key, account text not null, hash text not null)")
+db.exec("create table if not exists tries (key text not null, at integer not null)")
+db.exec("create index if not exists tries_key on tries (key, at)")
+
+let TRIES = 5                    // tries per account in WINDOW; a right code starts again
+let TRIES_PER_ADDRESS = 20       // tries per address in WINDOW, over every account
+let WINDOW = 15 * 60 * 1000
+
+// The address a try counts against: an IPv6 address by its /64, which one machine or home usually
+// holds whole, so moving inside it does not start the count again; an IPv4 address as it is (also
+// when written inside IPv6, ::ffff:192.0.2.7).
+fn address_key(ip) {
+    let a = lower(split(ip ?? "", "%")[0])
+    if !contains(a, ":") { return a }
+    if contains(a, ".") { return last(split(a, ":")) }
+    let halves = split(a, "::")
+    let head = halves[0] == "" ? [] : split(halves[0], ":")
+    let tail = len(halves) > 1 && halves[1] != "" ? split(halves[1], ":") : []
+    let zeros = map(range(0, max([0, 8 - len(head) - len(tail)])), (i) => "0")
+    let groups = map([...head, ...zeros, ...tail], (g) => re.replace(g, "^0+(.)", "$1"))
+    `${join(take(groups, 4), ":")}::/64`
+}
+
+// Counts a try, then says whether it is over the limit: written first, so tries sent at once all count.
+fn over_limit(account, ip) {
+    let since = now() - WINDOW
+    db.exec("delete from tries where at < ?", since)?
+    db.exec("insert into tries (key, at) values (?, ?), (?, ?)", `account:${account}`, now(), `address:${address_key(ip)}`, now())?
+    let mine = db.one("select count(*) as n from tries where key = ? and at >= ?", `account:${account}`, since)?.n
+    let theirs = db.one("select count(*) as n from tries where key = ? and at >= ?", `address:${address_key(ip)}`, since)?.n
+    mine > TRIES || theirs > TRIES_PER_ADDRESS
+}
+
+// A new set for an account: the old set goes, and only the hashes are kept.
+fn new_codes(account) {
     let codes = mfa_codes(10)
-    // Store only the hashes (db.exec("insert into recovery_codes ...") in a real app).
-    write_file("data/recovery.json", json.stringify(codes | map((c) => mfa_hash(c))))
+    db.exec("delete from recovery_codes where account = ?", account)?
+    for c in codes { db.exec("insert into recovery_codes (account, hash) values (?, ?)", account, mfa_hash(c)?)? }
+    codes
+}
+
+// A recovery code in place of the second factor: `{ ok, status, message }`.
+fn recover(account, code, ip) {
+    if over_limit(account, ip)? { return { ok: false, status: 429, message: "Too many tries: wait a few minutes." } }
+    let rows = db.query("select id, hash from recovery_codes where account = ? order by id", account)?
+    let at = mfa_check(code, map(rows, (r) => r.hash))
+    if at < 0 { return { ok: false, status: 401, message: "Wrong code." } }
+    // Deleted by the one request that matched it first: one code, one sign-in.
+    if db.exec("delete from recovery_codes where id = ?", rows[at].id)?.changes != 1 { return { ok: false, status: 401, message: "Wrong code." } }
+    db.exec("delete from tries where key = ?", `account:${account}`)?
+    // A set 1.x made has unsalted hashes, which a leaked table gives away: replace it now, at its use.
+    if any(rows, (r) => mfa_legacy(r.hash)) {
+        return { ok: true, status: 200, message: "Signed in. Your recovery codes were an old kind: here is a new set, shown once.", new_codes: new_codes(account)? }
+    }
+    { ok: true, status: 200, message: `Signed in: ${len(rows) - 1} codes left.`, new_codes: null }
+}
+
+route GET /setup {
+    // In a real app the account is the signed-in user's.
+    let codes = new_codes("ada@example.com")?
     { show_once: codes, count: len(codes) }
+}
+
+// The form in place of the second factor: the session says whose password was right.
+route POST /recover { form: { code: str } } {
+    let account = session().pending ?? reply 401 "Sign in with your password first."
+    let r = recover(account, code, request.ip)?
+    if r.ok { set_session({ user: account }) }
+    respond(r.status, r.new_codes == null ? r.message : { message: r.message, show_once: r.new_codes }, {})
 }
 
 route GET /use {
@@ -18,4 +90,63 @@ route GET /use {
     let at = mfa_check(typed, stored)
     let left = [...slice(stored, 0, at), ...slice(stored, at + 1, len(stored))]
     { matched: at, second_time: mfa_check(typed, left), wrong: mfa_check("aaaaa-bbbbb", stored), left: len(left) }
+}
+
+// Each hash has a salt of its own, so one pass over every code no longer opens every account.
+// Hashes 1.0 stored (unsalted SHA-256) still work, and mfa_legacy finds them.
+route GET /salted {
+    let a = mfa_hash("abcde-fghjk")?
+    let b = mfa_hash("abcde-fghjk")?
+    let old = "51132f750dd9837df23f2a1d7a2d0007c07a4d333f7f0ef938d4f17a3ec7534f"   // 1.0's mfa_hash("abcde-fghjk")
+    {
+        argon2id: starts_with(a, "$argon2id$"),
+        differ: a != b,
+        typed_from_paper: mfa_check("ABCDE FGHJK", [b, a]),
+        old_still_works: mfa_check("abcde-fghjk", [mfa_hash("zzzzz-yyyyy")?, old]),
+        old_found: [mfa_legacy(old), mfa_legacy(a)],
+        not_a_hash: mfa_check("abcde-fghjk", ["", "x", old + "0"]),
+        too_costly: costly(replace(a, "m=19456", "m=4194304")),
+    }
+}
+
+// A stored hash asking for more memory than crypto.hash_password's is not checked: it matches nothing,
+// at once, rather than taking a second and 4 GB.
+fn costly(hash) {
+    let started = now()
+    let at = mfa_check("abcde-fghjk", [hash])
+    [at, now() - started < 200]
+}
+
+// A set 1.x stored: its codes still sign in, and the first use replaces the whole set with a salted one.
+route GET /upgrade {
+    let account = `demo-${crypto.token(6)}@example.com`
+    for c in ["abcde-fghjk", "mnpqr-stuvw", "xyz23-45678"] {
+        db.exec("insert into recovery_codes (account, hash) values (?, ?)", account, crypto.sha256("mfa-recovery:" + replace(c, "-", "")))?
+    }
+    let r = recover(account, "MNPQR STUVW", "192.0.2.5")?
+    let stored = db.query("select hash from recovery_codes where account = ?", account)?
+    {
+        message: r.message,
+        shown: len(r.new_codes),
+        stored: [len(stored), all(stored, (x) => starts_with(x.hash, "$argon2id$"))],
+        old_code: recover(account, "abcde-fghjk", "192.0.2.5")?.message,
+        new_code: recover(account, r.new_codes[0], "192.0.2.5")?.message,
+    }
+}
+
+// A code from the table, twice: it signs in once.
+route GET /once {
+    let account = `demo-${crypto.token(6)}@example.com`
+    let codes = new_codes(account)?
+    let first = recover(account, codes[2], "192.0.2.1")?
+    let again = recover(account, codes[2], "192.0.2.1")?
+    { first: first.message, again: again.message, other: recover(account, codes[7], "192.0.2.1")?.message }
+}
+
+// Wrong codes: the sixth try in 15 minutes is refused, even with a right code.
+route GET /limit {
+    let account = `demo-${crypto.token(6)}@example.com`
+    let codes = new_codes(account)?
+    let tries = map(range(0, 6), (i) => recover(account, "aaaaa-bbbbb", "192.0.2.2")?.status)
+    { tries, locked: recover(account, codes[0], "192.0.2.2")?.status, keys: map(["2001:db8:1:2::1", "2001:0DB8:1:2:ffff::9", "2001:db8:1:3::1", "::ffff:192.0.2.7"], (a) => address_key(a)) }
 }

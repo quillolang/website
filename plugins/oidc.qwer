@@ -1,5 +1,5 @@
-//! OpenID Connect sign-in: discovery, auth URLs with state, nonce and PKCE, the code exchanged, ID tokens checked against the provider's JWKS (RS256 and ES256, issuer, audience, expiry, nonce), userinfo and refresh, in pure Rust.
-//! version: 1.1.0
+//! OpenID Connect sign-in: discovery, auth URLs with state, nonce and PKCE, the code exchanged, ID tokens checked against the provider's JWKS (RS256 and ES256, issuer, audience, expiry, nonce), userinfo and refresh, and Microsoft's multi-tenant endpoints, in pure Rust.
+//! version: 1.2.0
 //!
 //! [dependencies]
 //! serde_json = { version = "1", features = ["preserve_order"] }
@@ -51,6 +51,114 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0).build()
 }
 
+/// Microsoft's endpoints for any work or school account (`organizations`) or any account (`common`) say
+/// their issuer is `https://login.microsoftonline.com/{tenantid}/v2.0`, a template: discovery refused
+/// it, so those sign-ins could not be done (quillo FEEDBACK78.md, Q-1160; quillo-website branch
+/// auth-plugins). Each token names its tenant in `tid`, and its `iss` is the template with it in.
+const TENANT: &str = "{tenantid}";
+
+/// The two sides of a template issuer, when `{tenantid}` is one whole path piece of it, once.
+fn template(said: &str) -> Option<(&str, &str)> {
+    let (before, after) = said.split_once(TENANT)?;
+    (before.ends_with('/') && (after.is_empty() || after.starts_with('/')) && !after.contains(TENANT)).then_some((before, after))
+}
+
+/// Whether `url` is the template with one path piece (a tenant, `common`, `organizations`) where `{tenantid}` is.
+fn fills(said: &str, url: &str) -> bool {
+    let Some((before, after)) = template(said) else { return false };
+    url.len() > before.len() + after.len() && url.starts_with(before) && url.ends_with(after) && {
+        let piece = &url[before.len()..url.len() - after.len()];
+        !piece.is_empty() && piece.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+    }
+}
+
+/// The tenant of Microsoft's personal accounts, which `organizations` (work and school accounts) never takes.
+const CONSUMERS: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+
+/// Whether `t` is a GUID, as Microsoft's tenant ids are: 8-4-4-4-12 hex digits.
+fn is_guid(t: &str) -> bool {
+    t.len() == 36 && t.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() })
+}
+
+/// What an option may be.
+#[derive(Clone, Copy)]
+enum Kind {
+    Text,
+    Whole,
+    Flag,
+    Texts,
+    Map,
+}
+
+const START_OPTIONS: &[(&str, Kind)] = &[("prompt", Kind::Text), ("login_hint", Kind::Text), ("audience", Kind::Text), ("max_age", Kind::Whole), ("extra", Kind::Map)];
+const VERIFY_OPTIONS: &[(&str, Kind)] = &[("leeway", Kind::Whole), ("access_token", Kind::Text), ("max_age", Kind::Whole), ("tenants", Kind::Texts), ("any_tenant", Kind::Flag)];
+const ACCESS_OPTIONS: &[(&str, Kind)] = &[("leeway", Kind::Whole), ("scope", Kind::Text), ("tenants", Kind::Texts), ("any_tenant", Kind::Flag)];
+
+/// Checks `options` against the names and kinds a function takes. An option not known, or of the
+/// wrong kind, is an error: `tenants` given as a text, or misspelled `tenant`, was skipped, and with
+/// it the check, so another tenant's users signed in (quillo FEEDBACK78.md, Q-1160, found in review;
+/// quillo-website branch auth-plugins). A null is an option not given.
+fn options_ok(options: &Value, known: &[(&str, Kind)]) -> Result<(), String> {
+    let o = match options {
+        Value::Object(o) => o,
+        Value::Null => return Ok(()),
+        _ => return Err("the options are a map".into()),
+    };
+    for (k, v) in o {
+        let Some((_, kind)) = known.iter().find(|(n, _)| n == k) else {
+            return Err(format!("no option `{}` ({})", k, known.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")));
+        };
+        let (fits, what) = match kind {
+            Kind::Text => (v.is_string(), "a text"),
+            Kind::Whole => (v.as_u64().is_some_and(|n| k != "leeway" || n <= 86400), if k == "leeway" { "a whole number of seconds, at most 86400 (a day)" } else { "a whole number" }),
+            Kind::Flag => (v.is_boolean(), "true or false"),
+            Kind::Texts => (v.as_array().is_some_and(|l| !l.is_empty() && l.iter().all(|x| x.as_str().is_some_and(|t| !t.is_empty()))), "a list of texts, not empty"),
+            Kind::Map => (v.is_object(), "a map"),
+        };
+        if !fits && !v.is_null() {
+            return Err(format!("option `{}` is {}", k, what));
+        }
+    }
+    Ok(())
+}
+
+/// The issuer a token must name: the one asked for; or, for a template issuer, the template with the
+/// token's `tid` in it, as Microsoft says to check. A template issuer signs for every company's
+/// tenant, so it takes a token only with `tenants` listing its `tid`, or with `any_tenant: true`
+/// (found in review). Then `tenants`, when given, must list the `tid`.
+fn check_issuer(issuer: &str, c: &Value, options: &Value) -> Result<(), String> {
+    let m = oidc_discover(issuer)?;
+    let said = m["issuer"].as_str().unwrap_or("");
+    if template(said).is_some() {
+        if options["tenants"].is_null() && options["any_tenant"] != json!(true) {
+            return Err("this issuer signs tokens for every company's tenant: give `tenants`, the tids taken, or any_tenant: true to take them all".into());
+        }
+        let tid = c["tid"].as_str().unwrap_or("");
+        if tid.is_empty() {
+            return Err("the token has no tid, which an issuer for many tenants needs".into());
+        }
+        if !is_guid(tid) {
+            return Err(format!("the token's tid {:?} is not a tenant id", tid));
+        }
+        if tid == CONSUMERS && issuer.trim_end_matches('/').ends_with("/organizations/v2.0") {
+            return Err("a personal Microsoft account's token, from the endpoint for work and school accounts".into());
+        }
+        let want = said.replacen(TENANT, tid, 1);
+        if !fills(said, &want) || c["iss"].as_str() != Some(want.as_str()) {
+            return Err(format!("the issuer is {}, not {} as the token's tid says", c["iss"], want));
+        }
+    } else if c["iss"].as_str() != Some(issuer) {
+        return Err(format!("the issuer is {}, not {}", c["iss"], issuer));
+    }
+    if let Some(list) = options["tenants"].as_array() {
+        let tid = c["tid"].as_str().unwrap_or("");
+        if !list.iter().any(|t| t.as_str() == Some(tid)) {
+            return Err(format!("the token is from tenant {:?}, which is not among those allowed", tid));
+        }
+    }
+    Ok(())
+}
+
 /// Only a provider on TLS is believed, but for this machine, where tests live.
 fn safe_url(u: &str, what: &str) -> Result<(), String> {
     let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| u.starts_with(p));
@@ -75,7 +183,7 @@ fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
     }
 }
 
-/// The provider's metadata from `<issuer>/.well-known/openid-configuration`, kept an hour. Its `issuer` must be the one asked for, character for character, and it must name the authorization, token and JWKS addresses.
+/// The provider's metadata from `<issuer>/.well-known/openid-configuration`, kept an hour. Its `issuer` must be the one asked for, character for character, or Microsoft's template for its multi-tenant endpoints: `https://login.microsoftonline.com/{tenantid}/v2.0` for `.../common/v2.0` or `.../organizations/v2.0`, `{tenantid}` standing where the piece asked for is. It must name the authorization, token and JWKS addresses.
 pub fn oidc_discover(issuer: &str) -> Result<Value, String> {
     if let Some((m, at)) = META.lock().unwrap().as_ref().and_then(|c| c.get(issuer)) {
         if at.elapsed() < META_LIFE {
@@ -84,7 +192,8 @@ pub fn oidc_discover(issuer: &str) -> Result<Value, String> {
     }
     safe_url(issuer, "issuer")?;
     let m = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')), None)?;
-    if m["issuer"].as_str() != Some(issuer) {
+    let said = m["issuer"].as_str().unwrap_or("");
+    if said != issuer && !fills(said, issuer) {
         return Err(format!("the provider says its issuer is {}, and {} was asked for", m["issuer"], issuer));
     }
     for k in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
@@ -95,8 +204,9 @@ pub fn oidc_discover(issuer: &str) -> Result<Value, String> {
     Ok(m)
 }
 
-/// Starts a sign-in: `client` is `{ client_id, redirect_uri, scope }`, `options` may hold `prompt`, `login_hint`, `max_age`, `audience`, `extra` (a map of more parameters). Gives `{ url, state, nonce, code_verifier }`: keep the last three in the visitor's session and send them to `url`. PKCE is always S256; a provider that says it cannot do it is refused.
+/// Starts a sign-in: `client` is `{ client_id, redirect_uri, scope }`, `options` may hold `prompt`, `login_hint`, `max_age`, `audience`, `extra` (a map of more parameters); an option not known, or of the wrong type, is an error. Gives `{ url, state, nonce, code_verifier }`: keep the last three in the visitor's session and send them to `url`. PKCE is always S256; a provider that says it cannot do it is refused.
 pub fn oidc_start(issuer: &str, client: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    options_ok(&options, START_OPTIONS)?;
     let m = oidc_discover(issuer)?;
     let id = client["client_id"].as_str().filter(|x| !x.is_empty()).ok_or("client: no client_id")?;
     let redirect = client["redirect_uri"].as_str().filter(|x| !x.is_empty()).ok_or("client: no redirect_uri")?;
@@ -131,7 +241,7 @@ pub fn oidc_start(issuer: &str, client: serde_json::Value, options: serde_json::
     Ok(json!({ "url": format!("{}{}{}", base, sep, query.join("&")), "state": state, "nonce": nonce, "code_verifier": verifier }))
 }
 
-/// Reads what came back to the redirect URI: `query` is the request's query, `state` what `oidc_start` gave. Gives the `code`. A provider's `error`, a state that differs, or an `iss` naming another issuer (RFC 9207, against mix-up attacks) is an error.
+/// Reads what came back to the redirect URI: `query` is the request's query, `state` what `oidc_start` gave. Gives the `code`. A provider's `error`, a state that differs, or an `iss` naming another issuer (RFC 9207, against mix-up attacks; for a template issuer, one that is not the template with a tenant in it) is an error.
 pub fn oidc_callback(issuer: &str, query: std::collections::HashMap<String, String>, state: &str) -> Result<String, String> {
     if let Some(e) = query.get("error") {
         return Err(format!("sign-in refused: {}{}", e, query.get("error_description").map(|d| format!(": {}", d)).unwrap_or_default()));
@@ -140,7 +250,8 @@ pub fn oidc_callback(issuer: &str, query: std::collections::HashMap<String, Stri
         return Err("the state does not match: this answer is not to a sign-in this visitor started".into());
     }
     if let Some(i) = query.get("iss") {
-        if i != issuer {
+        let said = META.lock().unwrap().as_ref().and_then(|c| c.get(issuer)).and_then(|(m, _)| m["issuer"].as_str().map(str::to_string)).unwrap_or_default();
+        if i != issuer && !fills(&said, i) {
             return Err(format!("the answer comes from {}, and {} was asked", i, issuer));
         }
     }
@@ -244,8 +355,9 @@ fn check_signature(alg: &str, key: &Value, signed: &[u8], sig: &[u8]) -> Result<
     Ok(k.verify(signed, &s).is_ok())
 }
 
-/// Checks an ID token and gives its claims. The signature against the provider's keys, fetched again once when a `kid` is new; only RS256 and ES256 pass, never `none` or HS256. Then `iss`, `aud` (with `azp` when there are several), `exp`, `iat`, `nbf` and `nonce`. `options`: `leeway` (seconds, 60 by default), `access_token` (also checks `at_hash`), `max_age` (needs a recent `auth_time`).
+/// Checks an ID token and gives its claims. The signature against the provider's keys, fetched again once when a `kid` is new; only RS256 and ES256 pass, never `none` or HS256. Then `iss` (for Microsoft's multi-tenant endpoints, the issuer template with the token's `tid` in it), `aud` (with `azp` when there are several), `exp`, `iat`, `nbf` and `nonce`. `options`: `leeway` (seconds, 60 by default, at most 86400), `access_token` (also checks `at_hash`), `max_age` (needs a recent `auth_time`), `tenants` (a list of the `tid`s taken) and `any_tenant` (true takes every tenant): with Microsoft's `common` or `organizations` one of the two is needed, as any company's users can get a token there. An option not known, or of the wrong type, is an error. Key a user by `iss` and `sub` (with Microsoft's endpoints, by `tid` and `oid`), never by `email`, which the user or another tenant's admin can set to anyone's.
 pub fn oidc_verify(issuer: &str, client_id: &str, id_token: &str, nonce: &str, options: serde_json::Value) -> Result<Value, String> {
+    options_ok(&options, VERIFY_OPTIONS)?;
     let mut parts = id_token.split('.');
     let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
         return Err("an ID token has three parts".into());
@@ -271,9 +383,7 @@ pub fn oidc_verify(issuer: &str, client_id: &str, id_token: &str, nonce: &str, o
         return Err("the ID token's signature is wrong".into());
     }
     let c: Value = serde_json::from_slice(&unb64(p).map_err(|_| "the token's claims are not base64url")?).map_err(|_| "the token's claims are not JSON")?;
-    if c["iss"].as_str() != Some(issuer) {
-        return Err(format!("the issuer is {}, not {}", c["iss"], issuer));
-    }
+    check_issuer(issuer, &c, &options)?;
     let aud: Vec<&str> = match &c["aud"] {
         Value::String(a) => vec![a.as_str()],
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
@@ -344,8 +454,9 @@ pub fn oidc_client_credentials(issuer: &str, client: serde_json::Value) -> Resul
     Ok(t)
 }
 
-/// Checks an access token a client sent this API (RFC 9068), against the provider's keys as `oidc_verify` does: RS256 or ES256, `iss`, `aud` (the API, `audience`), `exp` (required), `nbf`. `options`: `leeway` (seconds, 60), `scope` (a scope the token must have). Its claims, with `scopes` as a list.
+/// Checks an access token a client sent this API (RFC 9068), against the provider's keys as `oidc_verify` does: RS256 or ES256, `iss` (a template issuer's with the token's `tid`), `aud` (the API, `audience`), `exp` (required), `nbf`. `options`: `leeway` (seconds, 60), `scope` (a scope the token must have), `tenants` (the `tid`s taken) and `any_tenant`, as `oidc_verify` takes them. Its claims, with `scopes` as a list.
 pub fn oidc_verify_access(issuer: &str, audience: &str, token: &str, options: serde_json::Value) -> Result<Value, String> {
+    options_ok(&options, ACCESS_OPTIONS)?;
     let mut parts = token.split('.');
     let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
         return Err("an access token here is a JWT: three parts".into());
@@ -365,9 +476,7 @@ pub fn oidc_verify_access(issuer: &str, audience: &str, token: &str, options: se
         return Err("the access token's signature is wrong".into());
     }
     let mut c: Value = serde_json::from_slice(&unb64(p).map_err(|_| "the token's claims are not base64url")?).map_err(|_| "the token's claims are not JSON")?;
-    if c["iss"].as_str() != Some(issuer) {
-        return Err(format!("the issuer is {}, not {}", c["iss"], issuer));
-    }
+    check_issuer(issuer, &c, &options)?;
     let aud: Vec<&str> = match &c["aud"] {
         Value::String(a) => vec![a.as_str()],
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
@@ -410,8 +519,9 @@ pub fn oidc_userinfo(issuer: &str, access_token: &str, sub: &str) -> Result<Valu
     Ok(v)
 }
 
-/// The whole return trip: `oidc_callback`, `oidc_exchange`, `oidc_verify` and, if the provider has it, `oidc_userinfo`. `saved` is what `oidc_start` gave, `options` as for `oidc_verify`. Gives `{ claims, userinfo, tokens }`.
+/// The whole return trip: `oidc_callback`, `oidc_exchange`, `oidc_verify` and, if the provider has it, `oidc_userinfo`. `saved` is what `oidc_start` gave, `options` as for `oidc_verify` (`tenants` or `any_tenant` for Microsoft's multi-tenant endpoints). Gives `{ claims, userinfo, tokens }`: key the user by `claims.iss` and `claims.sub` (Microsoft: `tid` and `oid`), never by an email address.
 pub fn oidc_finish(issuer: &str, client: serde_json::Value, query: std::collections::HashMap<String, String>, saved: serde_json::Value, options: serde_json::Value) -> Result<Value, String> {
+    options_ok(&options, VERIFY_OPTIONS)?;
     let code = oidc_callback(issuer, query, saved["state"].as_str().unwrap_or(""))?;
     let tokens = oidc_exchange(issuer, client.clone(), &code, saved["code_verifier"].as_str().unwrap_or(""))?;
     let id_token = tokens["id_token"].as_str().ok_or("the token answer has no id_token")?;

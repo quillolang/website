@@ -1,7 +1,11 @@
 // A web app's sign-in against Active Directory: a person checked by search-then-bind (and the
-// reasons AD gives when it says no), their groups direct and nested, the devices OU read page by
-// page, a user's entry with its SID and GUID, and a contact added, changed and deleted. Over
-// StartTLS, as a service account.
+// reasons AD gives when it says no, for the program's log), their groups direct and nested, the
+// devices OU read page by page, a user's entry with its SID and GUID, and a contact added, changed
+// and deleted. Over StartTLS, as a service account.
+//
+// Visitors sign in by POSTing a form (a password in a query goes to logs). Every failure gets the
+// same answer after the same time, so the page tells no one which accounts exist or are locked out,
+// and tries are counted per account and per address, in a table of the program's own.
 //
 //   LDAP_URL=ldaps://dc1.corp.example LDAP_BIND_DN="CN=svc-web,OU=Service,DC=corp,DC=example" \
 //   LDAP_PASSWORD=... LDAP_BASE="DC=corp,DC=example" quillo run ldap.qwe   then open http://localhost:8080/sign-in
@@ -24,14 +28,127 @@ let opened = ldap_connect("ad", env("LDAP_URL", "ldap://127.0.0.1:389"), {
 
 route GET /connected = opened?
 
-route POST /sign-in ? { user: str, password: str } = ldap_sign_in("ad", BASE, USERS, user, password, { attrs: ["mail", "displayName"] })?
+// Guessing limits, the program's choice: 5 tries per account (the entry found, or the name as typed,
+// normalized, for none) and 20 per address (an IPv6 address by its /64) in 15 minutes, counted in a
+// table, so a list of common passwords cannot be tried on every account, nor wrong passwords lock out
+// the directory's accounts from outside. The database here is SQLite in memory, so a restart
+// forgets the counts: db.open a file or a server, and every instance and server shares them.
+db.exec("create table if not exists tries (key text not null, at integer not null)")
+db.exec("create index if not exists tries_key on tries (key, at)")
 
+let TRIES = 5                    // tries per account in WINDOW; a right password starts again
+let TRIES_PER_ADDRESS = 20       // tries per address in WINDOW, over every account
+let WINDOW = 15 * 60 * 1000
+let SLOWEST = 400                // ms: every failed sign-in answers after this long, longer than a search and a bind take
+
+// The address a try counts against: an IPv6 address by its /64, which one machine or home usually
+// holds whole, so moving inside it does not start the count again; an IPv4 address as it is (also
+// when written inside IPv6, ::ffff:192.0.2.7).
+fn address_key(ip) {
+    let a = lower(split(ip ?? "", "%")[0])
+    if !contains(a, ":") { return a }
+    if contains(a, ".") { return last(split(a, ":")) }
+    let halves = split(a, "::")
+    let head = halves[0] == "" ? [] : split(halves[0], ":")
+    let tail = len(halves) > 1 && halves[1] != "" ? split(halves[1], ":") : []
+    let zeros = map(range(0, max([0, 8 - len(head) - len(tail)])), (i) => "0")
+    let groups = map([...head, ...zeros, ...tail], (g) => re.replace(g, "^0+(.)", "$1"))
+    `${join(take(groups, 4), ":")}::/64`
+}
+
+// Counts a try against `key`, then says whether it is over `most`: written first, so tries sent at
+// once all count.
+fn over(key, most) {
+    let since = now() - WINDOW
+    db.exec("insert into tries (key, at) values (?, ?)", key, now())?
+    db.one("select count(*) as n from tries where key = ? and at >= ?", key, since)?.n > most
+}
+
+// The account a try counts against: the directory's entry the name finds, however it was spelled
+// (`Grace`, ` grace `), or, when it finds none, the name itself, folded to one case and one form.
+fn account_key(user) {
+    let found = ldap_search("ad", BASE, replace(USERS, "{user}", ldap_escape(user)), ["cn"], { limit: 2, page_size: 0 })
+    if !is_err(found) && len(found) == 1 { return `dn:${lower(found[0].dn)}` }
+    `name:${normalize(lower(trim(user)), "NFKC")}`
+}
+
+// A name a visitor typed, for the log: quoted, with control characters escaped, and cut at 64
+// characters, so it cannot write lines of its own.
+fn loggable(name) = json.stringify(slice(name, 0, 64))
+
+// A visitor's sign-in: `{ ok, status, message, dn }`. The directory's reason goes to the log only.
+fn visitor_sign_in(typed, password, ip) {
+    let started = now()
+    let user = trim(typed)
+    db.exec("delete from tries where at < ?", now() - WINDOW)?
+    // The address first: a try it refuses costs the directory nothing. Only then is the name looked up,
+    // to count the try against the entry it finds.
+    if over(`address:${address_key(ip)}`, TRIES_PER_ADDRESS)? { return { ok: false, status: 429, message: "Too many tries: wait a few minutes." } }
+    let account = account_key(user)
+    if over(`account:${account}`, TRIES)? { return { ok: false, status: 429, message: "Too many tries: wait a few minutes." } }
+    let r = ldap_sign_in("ad", BASE, USERS, user, password, { attrs: ["mail", "displayName"] })
+    if !is_err(r) && r.ok {
+        db.exec("delete from tries where key = ?", `account:${account}`)?
+        return { ok: true, status: 200, message: "Signed in.", dn: r.dn }
+    }
+    print(`sign-in refused for ${loggable(typed)}: ${is_err(r) ? error(r) : r.reason}`)
+    // An unknown name costs searches, a known one searches and a bind: wait out the rest of SLOWEST,
+    // so both answer at the same time.
+    sleep(max([0, SLOWEST - (now() - started)]))
+    { ok: false, status: 401, message: "Wrong user name or password.", dn: null }
+}
+
+route POST /sign-in { form: { user: str, password: str } } {
+    let r = visitor_sign_in(user, password, request.ip)?
+    if r.ok { set_session({ user: r.dn }) }
+    respond(r.status, r.message, {})
+}
+
+// What the plugin tells the program, reasons and all: for its log, never for the visitor.
 route GET /sign-in = {
     ada: ldap_sign_in("ad", BASE, USERS, "ada", "Correct-Horse-1", { attrs: ["mail", "displayName"] })?,
     wrong: ldap_sign_in("ad", BASE, USERS, "ada", "guess", {})?.reason,
     locked: ldap_sign_in("ad", BASE, USERS, "lou", "Correct-Horse-1", {})?.reason,
     star: ldap_sign_in("ad", BASE, USERS, "*", "Correct-Horse-1", {})?.reason,
     empty: ldap_sign_in("ad", BASE, USERS, "ada", "", {})?.ok,
+}
+
+// The form as a browser posts it: one answer, at one time, for an unknown name, a wrong password and a
+// locked account; a password in the query is not taken.
+fn post_form(at, user, password) {
+    let started = now()
+    let r = http.post(at, url_encode({ user, password }), { "content-type": "application/x-www-form-urlencoded" }, { public_only: false })?
+    { status: r.status, body: r.body, ms: now() - started }
+}
+
+route GET /visitor {
+    let at = `http://${request.headers.host}/sign-in`
+    let unknown = post_form(at, "nobody", "guess")?
+    let wrong = post_form(at, "ada", "guess")?
+    let locked = post_form(at, "lou", "Correct-Horse-1")?
+    let right = post_form(at, "ada", "Correct-Horse-1")?
+    let times = [unknown.ms, wrong.ms, locked.ms]
+    {
+        answers: unique([unknown.body, wrong.body, locked.body]),
+        statuses: unique([unknown.status, wrong.status, locked.status]),
+        same_time: max(times) - min(times) < 150 && min(times) >= SLOWEST,
+        right: [right.status, right.body],
+        in_query: http.post(`${at}?user=ada&password=guess`, null, {}, { public_only: false })?.status,
+    }
+}
+
+// The limit: the sixth try for an account in 15 minutes is refused, even with the right password, and
+// so is the 21st from one address over many names.
+route GET /limit {
+    let tries = map(range(0, 6), (i) => visitor_sign_in("grace", "guess", "192.0.2.2")?.status)
+    let spray = map(range(0, 21), (i) => visitor_sign_in(`user${i}`, "Summer2026!", `2001:db8:5:6::${i + 1}`)?.status)
+    let other_spellings = map(["Grace", " grace ", "GRACE"], (u) => visitor_sign_in(u, "Correct-Horse-1", "192.0.2.4")?.status)
+    {
+        tries, locked: visitor_sign_in("grace", "Correct-Horse-1", "192.0.2.2")?.status, address: [spray[19], spray[20]],
+        other_spellings,
+        keys: [account_key("Grace") == account_key("GRACE"), account_key("ＮＯＢＯＤＹ"), account_key("nobody ")],
+        logged: loggable("ada\nsign-in refused for admin" + repeat("x", 80)),
+    }
 }
 
 route GET /groups {
@@ -53,8 +170,10 @@ route GET /devices {
     }
 }
 
-route GET /user ? { name: str = "grace" } {
-    let found = ldap_search("ad", BASE, `(&(objectClass=user)(sAMAccountName=${ldap_escape(name)}))`, ["displayName", "mail", "objectSid", "objectGUID", "title"], {})?
+// One entry read whole, its SID and GUID too. The program picks whom: a route that looked up a name a
+// visitor gives would tell anyone which accounts exist, with their mail.
+route GET /user {
+    let found = ldap_search("ad", BASE, `(&(objectClass=user)(sAMAccountName=${ldap_escape("grace")}))`, ["displayName", "mail", "objectSid", "objectGUID", "title"], {})?
     len(found) == 0 ? { found: false } : found[0]
 }
 
