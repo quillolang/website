@@ -62,6 +62,11 @@ print(notification.send(7, { title: "Back in stock", tag: "stock", badge: 3, ttl
 - The push key is derived from `QUILLO_SECRET`, the same on every instance. Without it,
   the key is made at start and a restart ends every subscription, which Quillo says as it
   starts.
+- The subscriptions it reads are held to `--max-memory` as a query's rows are: past it,
+  the request ends with a 500 that says the limit, as for any other value, and no `??`
+  takes it. A request to `/_quillo/push` that meets the limit is a 500 that says it too
+  *(since 0.8.8: the send gave an error value with the limit's words, which `??` took, and
+  the request answered 200; `/_quillo/push` answered "internal error")*.
 
 ### Errors
 

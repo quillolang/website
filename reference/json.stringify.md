@@ -83,9 +83,11 @@ print(json.stringify(raw("<b>")))
 
 A function anywhere in the value gives an error value naming its path, on both sides
 (it was written as its text). So does a value whose JSON would pass
-256 MiB or nest more than 10,000 deep. A route that answers a value holding a function
-is a 500, with a log line naming the path. Note that a float past 2⁵³ written by it
-and read by JavaScript loses digits; Quillo's own `json.parse` reads it back whole.
+256 MiB or nest more than 10,000 deep, in a `parallel` call's function too, on its
+smaller stack *(since 0.8.8: 20,000 deep there stopped the server)*. A route that
+answers a value holding a function is a 500, with a log line naming the path. Note that
+a float past 2⁵³ written by it and read by JavaScript loses digits; Quillo's own
+`json.parse` reads it back whole.
 
 ```quillo
 print(json.stringify({ user: { name: "Ann", greet: (x) => x } }))
@@ -97,6 +99,18 @@ print(json.parse(json.stringify({ big: 9007199254740993 })))
 err("json.stringify: `user.greet` is a function, which cannot be written as JSON")
 err("json.stringify: `[1]` is a function, which cannot be written as JSON") err("json.stringify: a function cannot be written as JSON")
 { big: 9007199254740993 }
+```
+
+```quillo
+let deep = []
+for i in range(20000) { deep = [deep] }
+print(json.stringify(deep))
+print(parallel(() => json.stringify(deep))[0])
+```
+
+```output
+err("json.stringify: it is nested more than 10000 deep")
+err("json.stringify: it is nested more than 10000 deep")
 ```
 
 ### Chaining

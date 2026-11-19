@@ -36,6 +36,26 @@ print(raw(42), raw(true))
   page)*; markup made apart and placed there later is written so too. Write `<script>`
   and `<style>` in lower case: `<sCript>` is refused where the program is read *(since
   0.8.7)*.
+- Markup given as text (`raw(...)`) is read as the browser reads it, to tell whether a
+  script after it is in SVG or MathML or in HTML. Attributes may be unquoted or quoted
+  either way (`<font size=1>` ends SVG, as `<p>` does). A `/>` closes only a void element
+  (`<br/>`) or an SVG or MathML one (`<circle/>`): `<div/>` stays open as `<div>` does. A
+  comment ends at the first `-->` or `--!>`, and an end tag ends the element it names and
+  those open inside it, as the browser's parser does *(since 0.8.8: Quillo read such
+  markup otherwise than the browser in places, and a script the browser reads as SVG could
+  be written for HTML; `raw("<font size=1>")` inside `<svg>` hung its request)*.
+- Where Quillo cannot tell where the browser is (a `</div>` that names nothing open, a
+  `<table>`, an `<svg>` or `<math>` left open, a second `<li>` or `<p>` that closes the
+  first), every later script on that page is written in the form safe in both readings,
+  the page's deferred parts' too, and an empty `<span></span>`, which ends SVG and MathML
+  wherever the browser is, goes before its `</body>` (and after a deferred part that lost
+  the place), so that what Quillo writes after the page is read as HTML *(since 0.8.8)*.
+- Markup inside `<svg>` or `<math>` that stops partway (`raw("<!-- x")`,
+  `raw("<a href='x")`, a `<script>` with no `</script>`, a last `<`) has its end written
+  (`-->`, `'>`, `</script>`, `&lt;`), so the browser never reads on into the page's next
+  markup. A comment, tag or script split over two `raw` values is therefore ended after
+  the first, and the server log says so once for each line: give the whole of it in one
+  `raw` *(since 0.8.8)*.
 - HTML a visitor wrote, even cleaned by a sanitizer, must not keep the attributes
   Quillo's islands are made of, `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`,
   `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>` elements: the page
@@ -57,6 +77,16 @@ true
 &lt;b&gt;
 null 
 Welcome, <b>&lt;i&gt;Ada&lt;/i&gt;</b>
+```
+
+```quillo
+print(<svg>{raw("<!-- x")}</svg>)
+print(<svg>{raw("<a href='x")}</svg>)
+```
+
+```output
+<svg><!-- x--></svg>
+<svg><a href='x'></svg>
 ```
 
 ### Errors

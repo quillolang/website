@@ -53,6 +53,11 @@ err("http: not an http(s) URL: not a url")
 - A `body` makes the request a POST unless `method` says otherwise; `method` is
   upper-cased, and one that is not an HTTP token is an error value before anything
   connects *(since 0.8.7)*.
+- A `body` sent as JSON is written as [json.stringify](/docs/reference/json.stringify/)
+  writes it, as `http.post`'s is: a function in it is an error value that says where it
+  is, and nothing is sent; so is a body past 256 MiB or nested more than 10,000 deep.
+  Under `--max-memory` the JSON is held to the limit as it is written *(since 0.8.8: a
+  function went out as its text)*.
 - An answer that is not a success (a 401, a 500) is read whole and given with its
   `body`, and `f` is not called.
 - An event or a line that goes past 16 MiB without ending is an error value.
@@ -67,6 +72,14 @@ print(http.stream("http://127.0.0.1:9/events", print, { method: "get", timeout: 
 ```output
 err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: http://127.0.0.1:9/events: Connection Failed: Connect error: Connection refused (os error 111)")
+```
+
+```quillo
+print(http.stream("http://127.0.0.1:9/events", print, { body: { q: [1, print] } }))
+```
+
+```output
+err("http: the body: `q[1]` is a function, which cannot be written as JSON")
 ```
 
 ### Errors

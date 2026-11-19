@@ -177,6 +177,13 @@ session alone:
   not kept, and `quillo check` says which route. Nor is a page holding a form that must
   not be sent twice, one with waiting parts (`defer`), or an answer that changed the
   session (a sign-in, a sign-out).
+- A group's middleware is followed where it is a function of the program's, a lambda
+  written in place, or a lambda a top-level `let` holds. Middleware Quillo cannot follow
+  counts as a read of the visitor, so its group's pages are never kept, and `quillo check`
+  says so of each: a field of a map (`gates.team`), a builtin (`unwrap`), a call that makes
+  the function (`role("admin")`, see [Route groups](/docs/route-groups/)), an index. Write
+  it as a function of the program's, or a lambda in place *(since 0.8.8: the check said
+  nothing of them)*.
 
 The whole of it, signed-in pages, bounds and what is never kept, is in [Pages that work
 offline](/docs/#pages-that-work-offline).
@@ -209,6 +216,11 @@ the check, and every call was a 500)*.
 - **One message holds 3,800 bytes**; a longer one is an error value, and nothing is sent.
   `send` waits as `http.post` does, and the server goes on meanwhile. It goes to 8 devices
   at a time over kept connections, all of them within 30 seconds.
+- **The subscriptions it reads are held to `--max-memory`** as a query's rows are: past
+  it, the request ends with a 500 that says the limit, as for any other value, and no `??`
+  takes it. A request to `/_quillo/push` that meets the limit is a 500 that says it too
+  *(since 0.8.8: the send gave an error value, which `??` took, and `/_quillo/push`
+  answered "internal error")*.
 - **At most 20 devices a person**, the oldest replaced by a new one. Push services are
   reached over https on port 443, on the public internet; a subscription to anything else
   is refused when the page sends it.

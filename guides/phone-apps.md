@@ -345,6 +345,13 @@ Tried on one machine, with `quillo run shop.qwe --port 8081` and the app's progr
   followed on the site's own scheme, host and port only, up to 5, and one elsewhere is an
   error value naming where. A call has 10 s to connect and 30 s in all, its redirects
   included.
+- **Held to `--max-memory`** on a server started with it: the answer is read no further
+  than the limit and made into values held to it as they are read; past it, the request
+  ends with a 500, as `http`'s does, and no `??` takes it. An answer with more values than
+  JSON of its length may have (1,000,000, or one for each 8 bytes of an answer over 8 MB)
+  is an error value that quotes its start
+  (``site shop: `notes` answered 200: {"ok":[0,0,...``) *(since 0.8.8: the answer was read
+  to 64 MiB whatever the limit, and made into values whole)*.
 - **The wire** is the one a site's own pages use, and it is stable:
   `POST <url>/_quillo/rpc/<fn>` with the arguments as a JSON array, answered with
   `{"ok": value}` or `{"err": error}`. A program needs no `Origin` header; a request

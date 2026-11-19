@@ -41,6 +41,11 @@ err("http: not an http(s) URL: not a url")
 - `cache` is allowed only when the method is GET; with another it is a runtime error.
 - A body on a GET or a DELETE is sent when given; `http.get` and `http.delete` take
   none.
+- A body sent as JSON is written as [json.stringify](/docs/reference/json.stringify/)
+  writes it: a function in it, at any depth, is an error value that says where it is, and
+  nothing is sent; so is a body past 256 MiB or nested more than 10,000 deep. Under
+  `--max-memory` the JSON is held to the limit as it is written *(since 0.8.8: a function
+  went out as its text)*.
 - A method the server does not know is answered with a 405 or 501, an answer with
   `ok` false.
 - Under a policy with `[http] hosts` or `private = false`, and with `public_only`, the
@@ -57,6 +62,14 @@ print(http.request("MY METHOD", "http://127.0.0.1:9/"))
 ```output
 err("http: not an HTTP method: \"GET\\r\\nX-Admin: 1\" (a method is letters, digits and !#$%&'*+-.^_`|~)")
 err("http: not an HTTP method: \"MY METHOD\" (a method is letters, digits and !#$%&'*+-.^_`|~)")
+```
+
+```quillo
+print(http.request("PUT", "http://127.0.0.1:9/items/1", { done: true, f: len }))
+```
+
+```output
+err("http: the body: `f` is a function, which cannot be written as JSON")
 ```
 
 ```quillo

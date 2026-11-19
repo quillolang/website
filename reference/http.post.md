@@ -39,6 +39,11 @@ err("http: not an http(s) URL: not a url")
 
 - A body that is a map or a list goes as JSON with `content-type: application/json`;
   a string goes as it is, as `text/plain`.
+- That JSON is written as [json.stringify](/docs/reference/json.stringify/) writes it: a
+  function in the body, at any depth, is an error value that says where it is, and nothing
+  is sent; so is a body past 256 MiB or nested more than 10,000 deep. Under `--max-memory`
+  the JSON is held to the limit as it is written *(since 0.8.8: a function went out as its
+  text)*.
 - No body (`null`, or left out) sends a POST without one.
 - `cache` is for GET: giving it on a POST is a runtime error, since an answer to a
   POST is not the same twice.
@@ -54,6 +59,16 @@ print(http.post("http://127.0.0.1:9/ping", "hello", {}, { public_only: true }))
 err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: http://127.0.0.1:9/ping: Connection Failed: Connect error: Connection refused (os error 111)")
 err("http: http://127.0.0.1:9/ping: refused by public_only: 127.0.0.1 is not on the public internet")
+```
+
+```quillo
+print(http.post("http://127.0.0.1:9/", [len, 1]))
+print(http.post("http://127.0.0.1:9/users", { name: "Ada", greet: (x) => x }))
+```
+
+```output
+err("http: the body: `[0]` is a function, which cannot be written as JSON")
+err("http: the body: `greet` is a function, which cannot be written as JSON")
 ```
 
 ### Errors
