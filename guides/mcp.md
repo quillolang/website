@@ -180,6 +180,11 @@ Call search_notes before add_note, so the same note is not written twice.
   a failure are an `isError` result with text; a failure says only `internal error`, with
   the real message on stderr or in the log, and the server goes on serving. An answer over
   10 MiB of JSON or 128 levels deep is an `isError` saying so, never a cut answer.
+- **What comes in.** A message over HTTP is read as a page's JSON is: under
+  `--max-memory`, one whose values would pass the limit is a parse error that says so
+  *(since 0.8.9: it was read whole first)*. A tool's arguments are checked against its
+  parameters' types once, as a `server fn`'s are *(since 0.8.9: a second time, which took
+  1.4 s for a valid tree 22 levels deep)*.
 - **What a client keeps.** A client may keep the tool list and `server/discover`'s answer
   for 5 minutes (`ttlMs`), so a tool a deploy renames reaches it within that time.
 - **The limits.** Each user may make 60 tool calls a minute, their cookie and their tokens

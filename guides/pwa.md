@@ -172,7 +172,14 @@ session alone:
   only where that cookie names its session. Signed out, or signed in as someone else, the
   visitor gets the offline page, and the pages kept for the session before are dropped.
 - Any change to the session (a sign-out, a sign-in, a cart written into it) drops that
-  session's pages; they are kept again as they are opened.
+  session's pages; they are kept again as they are opened. A sign-out that redirects to
+  another site, whose answer the worker cannot read, drops them at once where the browser
+  gives a worker the Cookie Store API (Chromium's): the worker follows `quillo_tag` itself
+  *(since 0.8.9)*. Elsewhere it is caught at the next page of the site.
+- A kept page whose `content-security-policy` would stop the script that shows it to its
+  session alone (a `sandbox` without `allow-scripts`), or keep it from reading `quillo_tag`
+  (a `sandbox` without `allow-same-origin`), is not given back at all *(since 0.8.9: under
+  `sandbox allow-scripts` the page showed to the next person on the device)*.
 - A page that reads the visitor another way (a cookie of the program's own, a header) is
   not kept, and `quillo check` says which route. Nor is a page holding a form that must
   not be sent twice, one with waiting parts (`defer`), or an answer that changed the
