@@ -36,7 +36,15 @@ print(check_program("plugins/greet.qwe", { "plugins/greet.qwe": "fn greet(n: str
 - It reads only `.qwe` files (and the signatures of `.qwer` and `.rs` files for a
   `use`), none with a dot folder or file in its path, and a link is judged by where it
   leads: `use ".env"` or `use ".git/config"` is an error on that line, and reads
-  nothing. Its messages never show a file's text.
+  nothing. Its messages never show a file's text, a `.rs` file's line included *(since
+  0.8.9: one was quoted)*.
+- Code may be written to be slow to check, so the check has a budget: a type is kept to
+  10,000 parts and 16 levels, what grows past them taken as unknown (which says less,
+  never wrongly), and past 2 s, or about a million parts kept in all, the check gives one
+  error in place of all else, `the code is too complex to check: its types grew past what
+  a check keeps, or the check took too long` *(since 0.8.9: a 699-byte program whose
+  types doubled on each line took the server's memory)*. `quillo check` itself keeps a
+  type to 1,000,000 parts and 64 levels, and never gives that error.
 - The path itself, or a key of the map, that leaves the folder, or is not a Quillo
   file, is an error value.
 - `null` as the map checks what is on disk; an empty override checks an empty program,
@@ -63,6 +71,19 @@ err("check_program: path must stay inside the program's folder: ../main.qwe")
 err("check_program: path must stay inside the program's folder: ../y.qwe")
 3 []
 ["only Quillo files are read (.qwe, and a plugin's .qwer or .rs for `use`), none whose name or folder starts with a dot: .env"]
+```
+
+A function whose result grows by a map on each of 1,600 lines passes the budget:
+
+```quillo
+let lines = ["fn grow(c: bool) {", "    let x0 = { a0: 1 }"]
+for i in range(1, 1601) { lines = push(lines, `    let x${i} = c ? x${i - 1} : { a${i}: 1 }`) }
+let src = join(push(push(lines, "    return x1600.a0 + \"\""), "}"), "\n") + "\n"
+print(check_program("grow.qwe", { "grow.qwe": src }))
+```
+
+```output
+[{ file: "grow.qwe", line: 0, severity: "error", message: "the code is too complex to check: its types grew past what a check keeps, or the check took too long" }]
 ```
 
 ### Errors

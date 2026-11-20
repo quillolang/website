@@ -61,6 +61,14 @@ print(db.query("select * from todos"))
 - An error value given as a value is not stored but given back as the error it was, so
   `int("4O")` never becomes a row; a function is refused.
 - SQL with no statement in it (`""`, only spaces or comments) is an error value.
+- On PostgreSQL, a statement that would change the shared connection's session for later
+  visitors (`set` without `local`, `set_config(..., false)`, `update pg_settings set
+  setting = ...`) is refused outside a transaction, which resets its connection as it
+  ends; `query_to_xml` and its kin (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`,
+  `database_to_xml`), `ts_stat` and `ts_rewrite`, which run SQL Quillo cannot read, run on
+  a connection of their own, reset after them, as a `do` block does, in `db.query` too
+  *(since 0.8.9: `update pg_settings` was not seen, and those functions ran on the shared
+  connection)*.
 
 ```quillo
 db.open("app.db")

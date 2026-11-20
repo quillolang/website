@@ -106,7 +106,11 @@ In a pipeline the text comes first, so the options are the only argument written
 a component the server makes it (a request to `/_quillo/markdown`), awaited like a
 `server fn`: call it in an event handler and keep the text in state. That request takes
 at most 1 MB of text: a larger one is answered 413, and `markdown` in the component
-gives an error value; one that computes past `--max-compute` is a 500.
+gives an error value; one that computes past `--max-compute` is a 500. Under
+`--max-memory`, what the text will take as it is made into HTML (its marks, its tables'
+cells, its fenced code to highlight) is worked out from the text first, and one that would
+pass the limit is a 500 before anything is made *(since 0.8.9: 1 MB of `[` made 180 MB
+under a limit of 8 MB)*.
 
 ```quillo
 print("the *caption*" | markdown({ inline: true }))

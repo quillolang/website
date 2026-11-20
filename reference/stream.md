@@ -78,9 +78,26 @@ print(stream((send) => send("x"), { type: "application/x-ndjson", status: 201 })
   next `send` ends the function; an error in it after the head was sent cuts the
   connection, so the client knows the answer is incomplete. A streamed answer is not
   gzipped and cannot be kept by `idempotent`.
+- Inside a SQLite transaction `send` does not wait for the client, as the transaction
+  holds every other request of the instance: what the client has not read yet is kept, up
+  to 4 MiB (less under `--max-memory`); past that the transaction waits a second in all,
+  then `send` fails as for a client gone, and the transaction rolls back. Read the rows in
+  the transaction and send them after it, as below; `quillo check` warns of a `send`
+  inside `db.transaction` or `db.atomic` *(since 0.8.9: a client that read nothing held
+  every request of the instance for up to 30 s at each `send`)*.
+- An error value a builtin made (a database's, an `http` call's) goes out as `internal
+  error`, as from a route, the real one in the log; one the program wrote with `err` goes
+  as written *(since 0.8.9: a builtin's went to the visitor as it was)*.
 - The answer is chunked; to an HTTP/1.0 client, which cannot read chunks, it goes with
   no length and the connection ends with it. In a phone app or `quillo app`, where the
   program has no socket, the answer reaches the page whole, once the function ends.
+
+```quillo noexec
+route GET /export = stream((send) => {
+    let rows = db.transaction(() => db.query("select * from orders"))
+    for r in rows { send(json.stringify(r) + "\n") }
+})
+```
 
 ```quillo
 let s = stream((send) => { print("sending"); send("x") }, { headers: { "x-accel-buffering": "yes", "content-type": "text/csv" } })

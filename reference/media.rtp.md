@@ -47,10 +47,13 @@ true
 
 - A name is as a channel's: letters, digits, `_`, `-`, `.` and `:`.
 - Calling it again with the same name gives the same stream, not an error.
-- `host` is the address to listen on, every IPv4 address unless given; one this
-  machine does not have is a runtime error.
-- Any sender that reaches the port is taken (the payload type and SSRC are not
-  checked), and there is no RTCP and no SRTP: keep the ports to the camera's network.
+- `host` is the address to listen on, `127.0.0.1` unless given (`"0.0.0.0"` for every
+  address, for a camera elsewhere on the network) *(since 0.8.9: every IPv4 address)*;
+  one this machine does not have is a runtime error.
+- One sender is taken at a time: the first, by its address and SSRC, until it has sent
+  nothing for 2 s, and another's packets are dropped meanwhile *(since 0.8.9: any
+  sender's packets went between the camera's)*. The payload type is not checked, and
+  there is no RTCP and no SRTP: keep the ports to the camera's network.
 - The server keeps the video since the last keyframe (at most 600 frames, and 32 MiB;
   256 MiB for all streams), so a page that starts watching shows a picture at once; a
   page that falls behind, or a lost packet of video, skips to the next keyframe.
@@ -112,7 +115,8 @@ It gives null and is not piped. [media.streams](/docs/reference/media.streams/) 
 what it made, and [media.close](/docs/reference/media.close/) ends it.
 
 ```quillo noexec
-media.on("room:*", { watch: (peer) => peer.session.user != null })
+fn member(name: str, user) = db.one("select 1 as yes from members where room = ? and user = ?", split(name, ":")[1], user) != null
+media.on("room:*", { watch: (peer, name) => member(name, peer.session.user) })     // the rooms one is in
 
 route POST /rooms { form: { name: str } } {
     let id = db.exec("insert into rooms (name) values (?)", name).last_id

@@ -40,6 +40,10 @@ delete_file("tiny.gif")
   or GIF: a `.png` that holds text, for instance.
 - An image claiming more than 12,000 pixels a side is an error value, before anything
   is allocated.
+- A PNG's colour profile (`iCCP`), which is compressed, is read up to 4 MiB once
+  inflated; a larger one is an error value (`the PNG's colour profile (iCCP) is larger
+  than the 4 MiB read`), for `image.info` and `image.convert` alike *(since 0.8.9: a
+  146 KB PNG made `image.info` take 264 MiB)*.
 - The format comes from the bytes, not the file's name.
 - A GIF is reported with `alpha` true.
 

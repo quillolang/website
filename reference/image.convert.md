@@ -83,6 +83,10 @@ err("image: not a JPEG, PNG, WebP or GIF image")
   12000×12000, more than the 40 megapixels converted ``; a crop or a `width` that needs
   too much memory, `` image: converting the 7000×5600 image so would take about ... MiB,
   more than the 640 converted at once ``.
+- A PNG's colour profile (`iCCP`), which is compressed, is read up to 4 MiB once
+  inflated; a larger one is an error value (`the PNG's colour profile (iCCP) is larger
+  than the 4 MiB read`), for `image.info` and `image.convert` alike *(since 0.8.9: a
+  146 KB PNG made `image.info` take 264 MiB)*.
 
 ```quillo
 write_file("tiny.gif", "GIF89a\u0001\u0000\u0001\u0000\u0000\u0000\u0000,\u0000\u0000\u0000\u0000\u0001\u0000\u0001\u0000\u0000\u0002\u0002D\u0001\u0000;")

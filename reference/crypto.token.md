@@ -29,6 +29,9 @@ print(len(crypto.token(16)), len(crypto.token(64)))
   padding: 1 byte gives 2 characters, 1,024 give 1,366.
 - `null` as the argument is the default, 32 bytes.
 - The characters are letters, digits, `-` and `_` only: nothing to escape.
+- A top-level value made from it is kept out of the browser's bundle, as one made from
+  [env](/docs/reference/env/) is: a component that reads it is refused when the program
+  loads *(since 0.8.9: it went into the public JavaScript)*.
 
 ```quillo
 print(crypto.token() == crypto.token())

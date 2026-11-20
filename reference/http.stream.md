@@ -53,6 +53,13 @@ err("http: not an http(s) URL: not a url")
 - A `body` makes the request a POST unless `method` says otherwise; `method` is
   upper-cased, and one that is not an HTTP token is an error value before anything
   connects *(since 0.8.7)*.
+- A `method` other than `GET`, `HEAD` or `OPTIONS`, or a `body`, stops a
+  [prefetch](/docs/prefetching/), as `http.post` does *(since 0.8.9: it was sent, as the
+  visitor)*, and `quillo check` warns of it in a `GET` route that reads who the visitor is
+  *(since 0.8.9)*.
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in `headers` are left out: the client writes them from the body it sends, as
+  `fetch` does *(since 0.8.9: `content-length` was sent as given)*.
 - A `body` sent as JSON is written as [json.stringify](/docs/reference/json.stringify/)
   writes it, as `http.post`'s is: a function in it is an error value that says where it
   is, and nothing is sent; so is a body past 256 MiB or nested more than 10,000 deep.

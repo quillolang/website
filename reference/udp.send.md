@@ -41,6 +41,9 @@ udp.send("10.0.0.5", 9000, "hello", { from: 9000 })     // the answer comes to p
 - A number goes as JSON too: `42` sends the text `42`.
 - The packet reaching nobody (a port nothing listens on) is still `null`: there is no
   answer to wait for.
+- In a [prefetch](/docs/prefetching/) it is refused, and the request is answered "not
+  prefetched", as for `http.post` *(since 0.8.9: it was sent, as the visitor)*; `quillo
+  check` warns of it in a `GET` route that reads who the visitor is *(since 0.8.9)*.
 
 ```quillo
 print(udp.send("localhost", 9, "named host"))

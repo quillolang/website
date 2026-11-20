@@ -57,6 +57,9 @@ err("changed my mind")
   or so later, from any server of the program.
 - `db.transaction` nests inside it as usual; `db.atomic` cannot begin inside a
   transaction already open on one of its databases.
+- `quillo check` warns of a stream's `send` inside it, as inside
+  [db.transaction](/docs/reference/db.transaction/): on SQLite the transaction holds every
+  other request while the client reads *(since 0.8.9)*.
 
 ```quillo
 db.open("app.db")

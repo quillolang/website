@@ -35,6 +35,14 @@ print(re.split("k1=v1;k2=v2", "[;=]"))
 - The empty pattern cuts between every two characters, with `""` at both ends; a
   pattern that can match the empty text (`a*`) gives empty pieces where it does.
 - Characters, not bytes: `"añb"` cut at `ñ` is `["a", "b"]`.
+- A search whose work would pass a quarter of a second (a pattern that follows many ways
+  at once from each place, as `[ab]*a[ab]{900}c` does on a long text of `a` and `b`) is run
+  step by step, counted, and stops after 0.1 s and 0.15 µs a byte of the text, within
+  `--max-compute`, and before its work takes 256 MiB or `--max-memory`. The call is then an
+  error value, `` `re.split`: the pattern is too costly for this text: ...; repeat less, or
+  search a shorter text `` *(since 0.8.9: one search held an instance for seconds to
+  minutes, past `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer
+  as before.
 - A pattern whose searches read on past their match (`[a-z]+X|[a-z]` on a run of
   letters) reads the text once for each match it finds. Once its searches have read the
   text 64 times over and computed for more than 0.25 s plus 4 µs a byte, the call is an

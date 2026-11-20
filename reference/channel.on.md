@@ -8,8 +8,9 @@ Handles a channel on the server: written at the top of a program, once for a nam
 it makes `f(msg, peer)` the function that gets each message a page sends on that
 channel. `peer` is `{ id, session }`: twelve hex characters made for the page's
 connection, and the page's session as it was when it connected. The options map takes
-`join(peer)`, which decides whether a page may join (anything but `null`, `false` or an
-error says yes), `leave(peer)`, which hears that a page left, and `tenants`. Each of the
+`join(peer, name)`, which decides whether a page may join (anything but `null`, `false` or
+an error says yes), given the channel's name second *(since 0.8.9)*, `leave(peer)`, which
+hears that a page left, and `tenants`. Each of the
 three functions is called with as many arguments as it declares. Each tenant has its own
 room of a channel *(since 0.7: one room for all)*: pages on `acme.example.com` and
 `evil.example.com` joining `lobby` are in two rooms, and `tenants: "shared"` makes one
@@ -69,6 +70,9 @@ for the whole program.
   for everyone has one.
 - `session()` inside `f` is the page's session as it was when the page connected: a
   visitor who signs in afterwards is seen so once the page reconnects.
+- The session a page brings is its own program's: in a program that mounts others, a page
+  of one sees its session in that program's handlers only, and none in another's *(since
+  0.8.9: a session a visitor set in one program was taken by another's `join`)*.
 - What `join` broadcasts, or sends to the page that is joining, reaches that page right
   after its yes.
 - `join` and `leave` pair: a page asks to join a room once at a time (a second ask while
@@ -77,7 +81,22 @@ for the whole program.
   was still running. A count kept in `join` and `leave` stays right.
 - `f`, `join` and `leave` run for the page's tenant: what they broadcast, send or list
   is that tenant's room's. A page with no tenant (the bare domain) is in the room of no
-  tenant. Under `--split`, a service's channel is per tenant whatever it says.
+  tenant. Under `--split`, a service's channel is per tenant whatever it says, and while a
+  service does not answer (it is starting again, or down), a page cannot join a channel no
+  program claims, as it may be that service's *(since 0.8.9: it joined as no one's,
+  without the service's `join`, and stayed once the service was back)*.
+- Messages from pages wait for `f` within bounds counted in bytes: 4 MiB a page, an eighth
+  of the total a client (an address, or an IPv6 /64), a quarter a channel, and 256 MiB in
+  all, or `--max-memory` when it is smaller; and 10,000 messages a channel. A page past its
+  share is held back, its socket not read until there is room, so it loses nothing; a
+  message sent as a datagram over WebTransport is dropped instead *(since 0.8.9: only the
+  count was kept, 10,000 messages of up to 1 MiB)*. A message over 1 KiB is read within
+  `--max-memory`.
+- A message a page sends in parts, or over 4 KiB, is read in 8 KiB pieces, against 64 MiB
+  for all such messages at once (or `--max-memory`, when smaller) and an eighth of it for
+  one client, and must be whole within 10 s, and a second more for each 16 KiB that came;
+  past either, the connection ends, and the page connects again *(since 0.8.9: a message
+  never finished held up to 1 MiB for good)*.
 - Pages may ask of 4,096 channel names in all; past that, a page asking to join a new
   name is told no.
 

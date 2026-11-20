@@ -38,7 +38,10 @@ err("http: not an http(s) URL: not a url")
   an error value.
 - `cache` is for GET: giving it here is a runtime error.
 - `public_only: true` refuses addresses that are not on the public internet before
-  connecting.
+  connecting, judged as for [http.get](/docs/reference/http.get/).
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in the headers are left out, as `fetch` leaves them out, and answers read
+  whole share 256 MiB, as http.get's do *(since 0.8.9)*.
 
 ```quillo
 print(http.delete("http://127.0.0.1:9/items/1", null, { timeout: 2, redirects: 0 }))

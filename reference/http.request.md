@@ -48,6 +48,16 @@ err("http: not an http(s) URL: not a url")
   went out as its text)*.
 - A method the server does not know is answered with a 405 or 501, an answer with
   `ok` false.
+- A method other than `GET`, `HEAD` or `OPTIONS` stops a [prefetch](/docs/prefetching/),
+  as `http.post` does *(since 0.8.9: it was sent, as the visitor)*. `quillo check` warns of
+  it in a `GET` route that reads who the visitor is, and of a method a `let` holds too
+  *(since 0.8.9)*.
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in the headers are left out: the client writes them from the body it sends, as
+  `fetch` does *(since 0.8.9: `content-length` was sent as given, against a body of
+  another length, which the server at the other end could read as a second request)*.
+  `host` is sent as given. Answers read whole share 256 MiB, as
+  [http.get](/docs/reference/http.get/)'s do *(since 0.8.9)*.
 - Under a policy with `[http] hosts` or `private = false`, and with `public_only`, the
   address and each redirect are judged as for [http.get](/docs/reference/http.get/); a
   303, or a 301 or 302 after a POST, goes on as a GET with no body, as a browser does.

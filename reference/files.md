@@ -70,8 +70,10 @@ public, max-age=3600, immutable
 - The program's own files are known by their device and inode as well as by name: the
   `.env` and `.env.*` (a service's too), the `--env-file` and `--tls-key` (kept by the
   path given, so a key renewed through a link stays refused), the `.qwe`, `.qwer` and
-  `.rs` files loaded, and the databases open. A hard link to one, or one saved anew, is
-  refused too.
+  `.rs` files loaded, the policy files the program runs under (`quillo.policy`, and one
+  `--policy` names, by any name), and the databases open. A hard link to one, or one saved
+  anew, is refused too. A file named `quillo.policy` is never served *(since 0.8.9: the
+  folder's own was served, which names the secrets' variables, inner hosts and limits)*.
 - No SQLite database is served, whatever its name: each is known by its content (the
   header, a `-wal`, `-shm` or `-journal` beside it), the program's, a tenant's, another
   program's or one no one has open. `file("backup.db")` sends one named on purpose.

@@ -55,6 +55,9 @@ print(channel.broadcast("game", "text", { reliable: true, except: "0123456789ab"
   sent again on `join`.
 - A channel made with `tenants: "shared"` (see [channel.on](/docs/reference/channel.on/))
   has one room, which every tenant's code reaches.
+- In a [prefetch](/docs/prefetching/) it is refused, and the request is answered "not
+  prefetched", as for `http.post` *(since 0.8.9: it was sent, as the visitor)*; `quillo
+  check` warns of it in a `GET` route that reads who the visitor is *(since 0.8.9)*.
 
 ```quillo
 print(channel.broadcast("nobody-here", null))

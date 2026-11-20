@@ -11,8 +11,9 @@ builtins that only compute (`len`, `upper`, `map`, `filter`, `date.parse`, ...),
 the program's functions of those names *(since 0.7: a program's `fn upper` was the
 script's `upper`, run with the program's effects)*. It cannot read files, the
 environment or the database, define functions, routes or state, `use` files, or reply,
-and it gives back no function it made *(since 0.7)*. It stops after 20,000 steps, and a
-value it makes may be up to 1 MB.
+and it gives back no function it made *(since 0.7)*. It stops after 20,000 steps, or
+after 100 ms unless a third argument, `run_script(source, vars, { timeout })`, gives
+another time *(since 0.8.9: it had no time limit)*, and a value it makes may be up to 1 MB.
 
 ### Examples
 
@@ -38,11 +39,29 @@ ANN
   A builtin passed in the map still cannot run (`env` needs the env effect).
 - A function of the program passed in the map runs as the program's, with what the
   program may do: that is how a script asks for more.
-- A runaway script is an error value, not a hang: too many steps, or a value over 1 MB.
+- A runaway script is an error value, not a hang: too many steps, a value over 1 MB, or
+  past its time.
+- Each KB a builtin or a comparison reads costs a step, as each KB the script makes does,
+  so `unique`, `min` or `==` on a list near 1 MB is many steps, not one; what a builtin
+  only looks into (`len` of a list, `get`, `has`, `first`, `last`) or copies into what it
+  gives back (`push`, `set`, `merge`, `sort`) is paid for as made, so `out = push(out, x)`
+  pays for `out` once *(since 0.8.9: a step was one call however much it read, and a
+  143-byte script held its instance for 13 s)*.
+- `timeout` is milliseconds (`250`) or text (`"250ms"`, `"2s"`), from 1 ms to 60 s; past
+  it the script is the error value `the script took longer than its 100 ms` (or the time
+  given). A helper of the program's that waits (a query) counts in that time, and a script
+  run inside another ends by the outer one's time. `--max-compute` still ends the whole
+  request, script and all.
+- A name in its error is cut at 100 characters (``int has no method `aaaa…` ``), and the
+  method names it calls are not kept by the server after it ends *(since 0.8.9: each was
+  kept for good)*.
 - `return` ends the script with that value. A lambda `(x) => ...` is allowed; `fn` is not.
 - A lambda the script gives back, alone or in a list or map, is an error value: it would
   run after the script, without its limits on steps. Builtins and error values in what
   it gives are given back as they are.
+- A top-level value made from it is kept out of the browser's bundle, as one made from
+  [env](/docs/reference/env/) is: a component that reads it is refused when the program
+  loads *(since 0.8.9: it went into the public JavaScript)*.
 
 ```quillo
 print(run_script("1 + 2"), run_script("1 + 2", null), run_script(""))
@@ -70,6 +89,23 @@ err("a script cannot define functions (use `(x) => ...`)")
 err("a script cannot define routes") err("a script cannot reply") err("a script gives values, not markup")
 ```
 
+A wait counts in the script's time, and reading a large list costs a step for each KB:
+
+```quillo
+let big = range(50000)
+print(run_script("wait()", { wait: () => sleep(300) }))
+print(run_script("wait()", { wait: () => sleep(300) }, { timeout: "1s" }))
+print(run_script("let i = 0\nwhile i < 1000 { let u = unique(big)\ni = i + 1 }\n\"done\"", { big: big }))
+print(run_script("let i = 0\nwhile i < 1000 { let u = len(big)\ni = i + 1 }\n\"done\"", { big: big }))
+```
+
+```output
+err("line 1: the script took longer than its 100 ms")
+null
+err("line 2: the script took too many steps")
+done
+```
+
 A program's function of a builtin's name is not the script's, and what a script gives
 back is a value, not a function:
 
@@ -89,7 +125,8 @@ err("a script gives back no function (it would run without the script's limits):
 Whatever goes wrong in the script, a parse error, an unknown name, a bad argument,
 division by zero, is an error value with the script's line, so the program can show
 it to the user; `?? default` gives a value instead. The program's own mistakes are
-runtime errors: a source that is not a string, or values that are not a map.
+runtime errors: a source that is not a string, values that are not a map, and an option
+other than `timeout` or a time out of range *(since 0.8.9)*.
 
 ```quillo
 let r = run_script("1 +")
@@ -112,6 +149,14 @@ print(run_script("1", 2))
 
 ```output
 line 1: `run_script` expects a map as argument 2, got int
+```
+
+```quillo error
+print(run_script("1", null, { timeout: 0 }))
+```
+
+```output
+line 1: `run_script`: `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0
 ```
 
 ### Chaining

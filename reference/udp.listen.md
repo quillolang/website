@@ -68,8 +68,12 @@ echo '{"temp": 19}' | nc -u -w1 127.0.0.1 9000     # prints ok, the reply
 - Packets reach `f` in the order they came, one at a time; an error in `f` is logged
   and the next packet goes on. `f` may wait on the database or `http.*` without holding
   anyone up, and sees the program's globals.
-- A full queue drops its oldest packet, as UDP would; where packets come in bursts,
-  give `queue` room for the largest.
+- A full queue drops its oldest packet, as UDP would, except that a sender holding more
+  than half of it while others wait has its new packet dropped, so one sender cannot push
+  out the rest. More than half is of the queue's packets when it is full by count, and of
+  its bytes when it is full by size, and a sender is its address, or for IPv6 its /64
+  *(since 0.8.9: by bytes alone, so a sender of empty packets filled the queue and was
+  never held back)*. Where packets come in bursts, give `queue` room for the largest.
 - `f` written with no parameter is called with none.
 - One program on a machine listens on a port; with `--instances`, the `quillo run`
   option that runs the program several times over (`quillo run main.qwe --instances 4`),

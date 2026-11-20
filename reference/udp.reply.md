@@ -34,6 +34,9 @@ udp.listen(9000, (p) => {
   since UDP has no way to know.
 - The map must have `port` and `from: { host, port }`; a map made by hand with those
   fields is accepted, as long as the program listens on `port`.
+- In a [prefetch](/docs/prefetching/) it is refused, and the request is answered "not
+  prefetched", as for `http.post` *(since 0.8.9: it was sent, as the visitor)*; `quillo
+  check` warns of it in a `GET` route that reads who the visitor is *(since 0.8.9)*.
 
 ```quillo noexec
 udp.listen(9000, (p) => {

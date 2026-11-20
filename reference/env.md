@@ -67,7 +67,13 @@ component Map() {
 
 A name that is not a string is a runtime error, not an error value. A missing variable
 is never an error: it is `null` or the default. Using `env` in a component, or a
-top-level value made from it, is refused when the program loads.
+top-level value made from it, is refused when the program loads. So is a top-level value
+made from `args()`, `read_line`, `stdin`, `run_script`, `crypto`'s functions, `uuid`, a
+site's call or a plugin's function (a plugin whose file says `//! effects: none` aside)
+*(since 0.8.9: these went into the public bundle)*. A name a parameter, a lambda, a `let`
+or a loop binds is its own, never the builtin of that name, and so is a top-level `let` or
+`fn` of the program's (`fn uuid() = "fixed"`), kept out only when its own value is the
+server's.
 
 ```quillo error
 print(env(42))

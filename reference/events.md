@@ -71,6 +71,9 @@ print(e.status, e.headers, e.body)
   holds one of its six connections to the site; for data every page follows, `live`
   shares one WebSocket instead.
 - An answer of events cannot be kept by `idempotent` and is not gzipped.
+- An error value a builtin made (a database's, an `http` call's) goes out as `internal
+  error`, the real one in the log, as for `stream` *(since 0.8.9: it went to the visitor
+  as it was)*.
 - An HTTP/1.0 client, which cannot read chunks, gets the events with no length, and the
   connection ends with the stream.
 - An option of `send` other than `event`, `id` and `retry`, or a `retry` that is not a

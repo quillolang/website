@@ -36,6 +36,11 @@ err("http: not an http(s) URL: not a url")
 - The headers may give the `content-type`, for a PATCH format the server wants; the
   body is still a map sent as JSON text.
 - `cache` is for GET: on a PATCH it is a runtime error.
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in the headers are left out: the client writes them from the body it sends, as
+  `fetch` does *(since 0.8.9: `content-length` was sent as given, against a body of
+  another length)*. Answers read whole share 256 MiB, as
+  [http.get](/docs/reference/http.get/)'s do *(since 0.8.9)*.
 - A 422 (the server refused the change) is an answer with `ok` false, not an error
   value.
 

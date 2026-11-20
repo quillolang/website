@@ -30,6 +30,8 @@ print(stats.multimode([1, 2, 2, 3]))
 - `1` and `1.0` are one value, and so are `0.0` and `-0.0`; the first seen is given.
 - Text `"1"` and the number `1` are different values.
 - Lists and maps are compared by their contents.
+- It counts in time in proportion to the data, whatever numbers it holds *(since 0.8.9:
+  numbers made to fall together made 3 MB of JSON take 3.5 s)*.
 
 ```quillo
 print(stats.multimode([3, 1, 2]), stats.multimode([]), stats.multimode(null))

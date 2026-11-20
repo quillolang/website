@@ -51,6 +51,9 @@ false
   messages waiting for one page, a plain message is dropped and counted; a `reliable`
   one closes the connection, so the page comes back and joins again.
 - `except` is an option of `channel.broadcast`, not of `channel.send`.
+- In a [prefetch](/docs/prefetching/) it is refused, and the request is answered "not
+  prefetched", as for `http.post` *(since 0.8.9: it was sent, as the visitor)*; `quillo
+  check` warns of it in a `GET` route that reads who the visitor is *(since 0.8.9)*.
 
 ```quillo
 print(channel.send("game", "0123456789ab", null))

@@ -54,7 +54,11 @@ err("http: not an http(s) URL: not a url")
   address before connecting, so a URL someone else chose cannot reach inside. Each
   redirect is checked the same way, through a proxy too *(since 0.7: a proxy's was
   checked for the first address only)*. RFC 8215's local-use NAT64 range,
-  `64:ff9b:1::/48`, is not the public internet *(since 0.8.7: it counted as public)*.
+  `64:ff9b:1::/48`, is not the public internet *(since 0.8.7: it counted as public)*. An
+  IPv4-translated address (`::ffff:0:127.0.0.1`) is judged as the IPv4 address in it, as
+  `::ffff:127.0.0.1` is, and so is an ISATAP one (`::5efe:10.0.0.1`); the rest of `0::/8`
+  is not public, and a policy's `private = false` refuses the same *(since 0.8.9: these
+  were taken for public)*.
 - `cache` gives a kept answer only to the same call: the URL, the headers and every
   option (`ca`, `cert`, `key`, `timeout`, `redirects`, `public_only`, `cache`), so a call
   with another client certificate, or none, is asked again *(since 0.8.7: one
@@ -64,6 +68,12 @@ err("http: not an http(s) URL: not a url")
 - The headers and the options may each be `null`, as leaving them out.
 - Requests say `User-Agent: quillo/<version>` unless the headers give another; some
   APIs refuse that one.
+- The headers that frame the body or belong to the connection, `content-length`,
+  `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and `upgrade`, in any
+  case, are left out of the program's: the client writes them from what it sends, as
+  `fetch` does in a browser *(since 0.8.9: `content-length: 3` before a longer body made
+  the server at the other end read the rest as a second request)*. `host` is sent as
+  given, to reach a virtual host by its address.
 - Interim answers (`100`, `103 Early Hints`) are passed over to the final one.
 - A redirect to the same origin (scheme, host and port) keeps the headers. To another
   origin only `accept`, `accept-language`, `content-type` and `user-agent` go on
@@ -71,6 +81,11 @@ err("http: not an http(s) URL: not a url")
   port of the same host is another origin.
 - A body in `gzip`, `deflate` or `br` is decoded, and `content-encoding` is taken out
   of the headers; another coding (`zstd`) is an error value that names it.
+- The answers being read whole, every call's at once, take at most 256 MiB past the first
+  MiB of each, counted as they arrive: a call whose answer would pass that is an error
+  value (``...: the answers being read at once would take more than the 256 MiB read at
+  once; try again shortly, or read it with http.stream``) *(since 0.8.9: each call could
+  take 64 MiB, and 64 answers of 200 KB of gzip asked for 13 GB)*.
 - `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (in either case) send the call through
   that proxy, unless `NO_PROXY` names its host (a name, `.domain` for it and below, an
   address, or `*`). A call to this machine (`localhost`, `127.0.0.1`, `::1`) never goes
@@ -104,6 +119,7 @@ print(http.get("http://localhost:9/", null, null) | is_err)
 print(http.get("http://127.0.0.1:9/", {}, { public_only: true }))
 print(http.get("http://169.254.169.254/latest/meta-data/", {}, { public_only: true }))
 print(http.get("http://[64:ff9b:1::1]/", {}, { public_only: true }))
+print(http.get("http://[::ffff:0:127.0.0.1]:9/", {}, { public_only: true }))
 ```
 
 ```output
@@ -112,6 +128,7 @@ true
 err("http: http://127.0.0.1:9/: refused by public_only: 127.0.0.1 is not on the public internet")
 err("http: http://169.254.169.254/latest/meta-data/: refused by public_only: 169.254.169.254 is not on the public internet")
 err("http: http://[64:ff9b:1::1]/: refused by public_only: [64:ff9b:1::1] is not on the public internet")
+err("http: http://[::ffff:0:127.0.0.1]:9/: refused by public_only: [::ffff:0:7f00:1] is not on the public internet")
 ```
 
 ### Errors

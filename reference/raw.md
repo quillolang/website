@@ -8,7 +8,9 @@ Marks text as trusted HTML: the result is an `html` value, which markup writes a
 is instead of escaping it. Use it for HTML you made yourself or stored from `markdown`,
 never for what a visitor typed. Any value is taken; its text is what `str` gives.
 `raw(t(key, vars))` is a special form: the translation's markup is kept and the values
-put into it are escaped.
+put into it are escaped; a key no locale has is written as escaped text, and a URL
+attribute a value makes a `javascript:` one is `about:blank#blocked` *(since 0.8.9; see
+[t](/docs/reference/t/))*.
 
 ### Examples
 

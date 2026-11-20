@@ -22,6 +22,9 @@ print(len(words))
 - Bytes that are not UTF-8 are replaced, as `read_file` replaces them.
 - From a terminal with nothing piped, it waits for what is typed, to the end (Ctrl-D).
 - Once read, it is read: a second `stdin()` gives `""`.
+- A top-level value made from it is kept out of the browser's bundle, as one made from
+  [env](/docs/reference/env/) is: a component that reads it is refused when the program
+  loads *(since 0.8.9: it went into the public JavaScript)*.
 
 ### Errors
 

@@ -74,6 +74,21 @@ fn withdraw(account: int, cents: int) with db =
   it does not reach the next request.
 - A function that may run again (`retries`) should do nothing that cannot be taken
   back: no `http.*` calls inside it; global variables it changes are not rolled back.
+- A [stream](/docs/reference/stream/)'s `send` inside a SQLite transaction does not wait
+  for its client: what the client has not read yet is kept, up to 4 MiB (less under
+  `--max-memory`); past that the transaction waits a second in all for the client, then
+  `send` fails as it does for a client gone, and the transaction rolls back. Read the rows
+  inside the transaction and send them after it; `quillo check` warns of a `send` inside
+  `db.transaction` or `db.atomic` *(since 0.8.9: a client that read nothing held every
+  request of the instance for up to 30 s at each `send`)*.
+- On PostgreSQL and MySQL a statement of a transaction goes before other waits, and takes
+  a thread past `--workers` when all are taken, so the transaction that holds a row's lock
+  always finishes, however many requests wait on that row *(since 0.8.9: PostgreSQL could
+  wait for good, and MariaDB 50 s, then error 1205)*. A MySQL transaction waits up to
+  30 s for a connection when all of the pool's are in use, holding no thread meanwhile,
+  then gets `` no MySQL connection free after 30 s: all the pool's are in use
+  (`?pool_max=N` in the URL allows more) `` *(since 0.8.9: it waited on a thread with no
+  limit)*.
 
 ```quillo
 db.open("app.db")

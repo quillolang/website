@@ -45,6 +45,11 @@ err("http: not an http(s) URL: not a url")
   the JSON is held to the limit as it is written *(since 0.8.8: a function went out as its
   text)*.
 - No body (`null`, or left out) sends a POST without one.
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in the headers are left out: the client writes them from the body it sends, as
+  `fetch` does *(since 0.8.9: `content-length` was sent as given, against a body of
+  another length)*. Answers read whole share 256 MiB, as
+  [http.get](/docs/reference/http.get/)'s do *(since 0.8.9)*.
 - `cache` is for GET: giving it on a POST is a runtime error, since an answer to a
   POST is not the same twice.
 - A 4xx or 5xx is an answer with `ok` false and the error's `body`, not an error value.

@@ -23,6 +23,9 @@ while line != null {
 - A `\r\n` ending is taken off as `\n` is; an empty line is `""`, not `null`.
 - The last line counts with or without a line break after it.
 - From a terminal it waits for a line to be typed.
+- A top-level value made from it is kept out of the browser's bundle, as one made from
+  [env](/docs/reference/env/) is: a component that reads it is refused when the program
+  loads *(since 0.8.9: it went into the public JavaScript)*.
 
 ### Errors
 

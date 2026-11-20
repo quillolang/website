@@ -23,7 +23,10 @@ each proves who makes it. Written as a declaration, `accept_calls { ... }`, it t
   against the provider's keys (RS256, ES256, EdDSA; a URL, kept ten minutes), or
   `secret` for HS256. `audience` is required, and so is `exp` in the token. A token a
   user signed in for, whose `sub` is the user and not the client, is refused *(since
-  0.7)*: a service calls with its own, from the client-credentials grant. The same
+  0.7)*: a service calls with its own, from the client-credentials grant. The client is
+  named by `client_id`, `azp`, `cid` (Okta's) or `appid` (Entra ID v1's), else by `sub`
+  *(since 0.8.9: Okta's and Entra ID v1's user tokens, which name the client in `cid` and
+  `appid`, were taken as the client's own, named by the user's login)*. The same
   rules check a visitor's token that a caller passes on with `forward`, as
   `request.user`.
 - `client_cert: { header: "x-forwarded-client-cert" }`: the certificate a proxy checked
@@ -49,7 +52,8 @@ Who called is `request.caller` in the `server fn`: `{ name, by }`, `by` being
 `subject` and `uri` for a certificate. `server fn refund(...) for ["shop"]` takes calls
 from those callers only (403 otherwise), and none from pages: `/_quillo/rpc/refund`
 answers 404, and a page's script has no `server.refund` *(since 0.7: anyone could call
-it there)*. It gives `null`.
+it there)*; the 404 says what it says of a name that is no `server fn`, `` no server fn
+`refund` `` *(since 0.8.9: it named the callers it takes, to anyone)*. It gives `null`.
 
 ### Examples
 

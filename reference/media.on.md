@@ -8,9 +8,11 @@ Lets pages send and watch a stream: after `media.on(name, { publish, watch })`, 
 page's `<quillo-media publish="name">` sends its camera and microphone (or another
 MediaStream as its `source`) to the server, which passes the frames on to every
 `<quillo-media stream="name">`, decoding nothing. A name ending in `*` takes every
-stream it starts (`"call:*"`). `publish(peer)` says which pages may send, and
-`watch(peer)` which may watch, as a channel's `join` does: with the page's session in
-`peer.session`, anything but `null`, `false` or an error says yes. Without `publish`, no
+stream it starts (`"call:*"`). `publish(peer, name)` says which pages may send, and
+`watch(peer, name)` which may watch, as a channel's `join` does: with the page's session
+in `peer.session` and the stream asked for in `name` (`call:42:ana`), anything but `null`,
+`false` or an error says yes *(since 0.8.9: they were given the peer alone)*; a rule
+written with one parameter is called as before. Without `publish`, no
 page sends; without `watch`, no page watches *(since 0.7: any page could)*. Each tenant
 has its own streams of a name; `tenants: "shared"` makes one for every tenant. It is
 written at the top of a program, once for a name, and the program then serves.
@@ -18,9 +20,14 @@ written at the top of a program, once for a name, and the program then serves.
 ### Examples
 
 ```quillo noexec
+// Streams are named call:<room>:<person>: a person sends only their own, and watches only
+// the rooms they are in.
+fn room_of(name: str) = split(name, ":")[1]
+fn in_room(room) = db.one("select 1 as yes from members where room = ? and user = ?", room, session().user) != null
+
 media.on("call:*", {
-    publish: (peer) => peer.session.user != null,
-    watch: (peer) => peer.session.user != null,
+    publish: (peer, name) => name == `call:${room_of(name)}:${session().user}` && in_room(room_of(name)),
+    watch: (peer, name) => in_room(room_of(name)),
 })
 
 component Call(room: str, me: str, others: list) {
@@ -33,6 +40,12 @@ component Call(room: str, me: str, others: list) {
 
 ### Edge cases
 
+- A rule for a name ending in `*` checks the name: one that never reads it lets a page it
+  lets in for one stream watch, or send into, every stream the name starts, and `quillo
+  check` warns of it (`` `media.on("call:*")`'s `publish` never reads which stream is
+  asked for ... ``) *(since 0.8.9: the rules were not told the name, and the example
+  above, written with `peer.session.user != null`, let anyone signed in watch every call
+  and send video into anyone's)*.
 - The browser encodes with WebCodecs: H.264 baseline at 1280x720, 30 frames a second
   and 1.5 Mbit/s with a keyframe every two seconds, and Opus at 64 kbit/s. Sound needs
   Chromium's capture API; a browser without it sends the picture alone.
@@ -60,8 +73,8 @@ component Call(room: str, me: str, others: list) {
 ```quillo noexec
 media.on("lobby")                                           // no page may send or watch "lobby"
 media.on("desk:*", {
-    publish: (peer) => peer.session.role == "agent",
-    watch: (peer) => peer.session.user != null,
+    publish: (peer, name) => peer.session.role == "agent" && name == `desk:${peer.session.user}`,
+    watch: (peer, name) => name == `desk:${peer.session.agent}`,   // the visitor's own agent
 })
 media.on("town-hall", {                                     // one stream for every tenant
     publish: (peer) => peer.session.role == "host",
@@ -132,11 +145,12 @@ It gives null and is not piped. With [media.rtp](/docs/reference/media.rtp/) for
 camera's side and `media.on` for the pages', one page shows both.
 
 ```quillo noexec
+fn on_stage(name: str) = db.one("select 1 as yes from stage where stream = ?", name) != null
 media.rtp("hall", { video: 5004, audio: 5006 })
 media.on("hall", { watch: (peer) => peer.session.ticket != null })
 media.on("questions:*", {
-    publish: (peer) => peer.session.ticket != null,
-    watch: (peer) => peer.session.ticket != null,
+    publish: (peer, name) => name == `questions:${peer.session.ticket}`,       // a ticket holder sends their own
+    watch: (peer, name) => peer.session.ticket != null && on_stage(name),      // and watches those put on stage
 })
 ```
 

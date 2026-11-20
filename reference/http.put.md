@@ -36,6 +36,11 @@ err("http: not an http(s) URL: not a url")
 - A map or a list goes as JSON, a string as text; a number or a decimal goes as JSON
   too.
 - `cache` is for GET: on a PUT it is a runtime error.
+- `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+  `upgrade` in the headers are left out: the client writes them from the body it sends, as
+  `fetch` does *(since 0.8.9: `content-length` was sent as given, against a body of
+  another length)*. Answers read whole share 256 MiB, as
+  [http.get](/docs/reference/http.get/)'s do *(since 0.8.9)*.
 - Every HTTP status is an answer: a 409 for a version conflict has `ok` false and the
   server's `body`, and is not an error value.
 

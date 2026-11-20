@@ -30,6 +30,9 @@ true
 - Lower case: `u == lower(u)`; upper-case it for a display that wants that.
 - Without its dashes it is 32 hex characters.
 - `uuid()` takes no arguments; one given is a runtime error (below).
+- A top-level value made from it is kept out of the browser's bundle, as one made from
+  [env](/docs/reference/env/) is: a component that reads it is refused when the program
+  loads *(since 0.8.9: it went into the public JavaScript)*.
 
 ```quillo
 print(range(1000) | map((i) => uuid()) | unique | len)

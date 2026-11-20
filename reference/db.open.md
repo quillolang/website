@@ -58,6 +58,10 @@ db.open("data/{tenant}.db")                        // a SQLite file per tenant
 - A MySQL or MariaDB database that is not there is an error value (`Unknown database
   'shop'`), as on PostgreSQL, so a typo in a URL makes no empty database; a tenant's is
   made by the driver when the program makes the tenant.
+- A MySQL or MariaDB pool keeps an idle connection a minute, and `inactive_connection_ttl`
+  (seconds) in the URL sets that *(since 0.8.9: the driver closed every connection handed
+  back past ten idle ones, so a busy program opened thousands a second and ran out of
+  ports)*.
 - `files()` and `quillo serve` never send a SQLite file, whatever its name or folder;
   `file("app.db")` sends one on purpose. The program's `write_file`, `delete_file` and
   `save_upload` refuse the databases it has open, with their `-wal`, `-shm` and

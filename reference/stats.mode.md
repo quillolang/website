@@ -31,6 +31,8 @@ red
 - `1` and `1.0` count as the same value; the one seen first is given back.
 - Text `"1"` is not the number `1`.
 - `null`, lists and maps count too.
+- It counts in time in proportion to the data, whatever numbers it holds *(since 0.8.9:
+  numbers made to fall together made 3 MB of JSON take 3.5 s)*.
 
 ```quillo
 print(stats.mode([1, 1, 2, 2]), stats.mode([2, 2, 1, 1]))

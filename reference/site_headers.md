@@ -45,6 +45,14 @@ null null
   belong to each answer, and are refused here.
 - A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in any
   form a browser reads, as `redirect` and `respond` refuse it, naming the scheme given.
+- They reach the answers of a program it mounts, and of a service it serves under a
+  prefix, too, below their own rules: the mounted program's rules and its routes' headers
+  win, and what they take away (`null`) stays away. A mounted program's page is written
+  with the mounting program's policy as well as its own, so that Quillo's scripts in it
+  are let through both; a service `--split` starts is sent the app's policy for the path
+  with each request (signed) and writes its page with it the same way *(since 0.8.9: a
+  program's CSP, HSTS and `Referrer-Policy` never reached `/shop/*` or a service's
+  pages)*.
 
 ### Errors
 

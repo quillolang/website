@@ -87,7 +87,12 @@ null
   `m`, `h`, `d`, `w`, `y`.
 - The signature covers the expiry, the tenant and the program's mount point, so the
   session is no session past its time, for another tenant or in another mounted
-  program.
+  program, its channels' handlers included.
+- The cookie is `__Host-quillo_session` in production. A program mounted under a path has
+  one of its own, with the path in its name and `Path=/`: `__Host-shop.quillo_session` for
+  `mount /shop` *(since 0.8.9: `quillo_session` at `Path=/shop`, which a sibling subdomain
+  could plant)*. With `--watch`, `--plain-http` or under `--base` it is `quillo_session`,
+  with the program's path.
 - The cookie holds the whole session as JSON, signed: keep an id in it and the rest
   in the database. Keep secrets out, since the browser can read it.
 - Two requests of one visitor that set the session at once each start from the cookie

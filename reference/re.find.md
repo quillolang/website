@@ -35,6 +35,14 @@ null
 - An empty match is a match: `re.find("abc", "")` is at 0, with the empty text.
 - Quantifiers are greedy unless followed by `?`.
 - `null` as the result reads well with `??`.
+- A search whose work would pass a quarter of a second (a pattern that follows many ways
+  at once from each place, as `[ab]*a[ab]{900}c` does on a long text of `a` and `b`) is run
+  step by step, counted, and stops after 0.1 s and 0.15 µs a byte of the text, within
+  `--max-compute`, and before its work takes 256 MiB or `--max-memory`. The call is then an
+  error value, `` `re.find`: the pattern is too costly for this text: ...; repeat less, or
+  search a shorter text `` *(since 0.8.9: one search held an instance for seconds to
+  minutes, past `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer
+  as before.
 
 ```quillo
 print(re.find("ab", "a(x)?b"), re.find("ab", "a(?:x)?b"))
@@ -59,6 +67,16 @@ No match is `null`, not an error. A pattern that is not supported (lookaround,
 backreferences, `\p{...}`, a bad escape, a bad flag) is a runtime error, not an error
 value, as is a text, a pattern or flags that are not strings. See
 [re.test](/docs/reference/re.test/) for the list.
+
+A search too costly for its text is an error value *(since 0.8.9)*:
+
+```quillo
+print(re.find(repeat("a", 200000), "((?:a*){900})"))
+```
+
+```output
+err("`re.find`: the pattern is too costly for this text: from each place a match may start, the search follows more ways at once than it can keep (as [ab]*a[ab]{900}c does on a text of a and b), and following them one by one over these 200000 bytes could take longer than the quarter of a second a search may; repeat less, or search a shorter text")
+```
 
 ```quillo error
 print(re.find("abc", "(?=b)"))

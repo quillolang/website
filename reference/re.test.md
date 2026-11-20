@@ -34,6 +34,14 @@ true
 - `\d`, `\w` and `\b` are ASCII, as in JavaScript: `ñ` is not a `\w` and `٣` is not a
   `\d`. `.` and `[...]` match any character, `ñ` as one.
 - `null` as the flags is the same as none.
+- A search whose work would pass a quarter of a second (a pattern that follows many ways
+  at once from each place, as `[ab]*a[ab]{900}c` does on a long text of `a` and `b`) is run
+  step by step, counted, and stops after 0.1 s and 0.15 µs a byte of the text, within
+  `--max-compute`, and before its work takes 256 MiB or `--max-memory`. The call is then an
+  error value, `` `re.test`: the pattern is too costly for this text: ...; repeat less, or
+  search a shorter text `` *(since 0.8.9: one search held an instance for seconds to
+  minutes, past `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer
+  as before.
 
 ```quillo
 print(re.test("a\nb", "^b$"), re.test("a\nb", "^b$", "m"), re.test("a\nb", "a.b"), re.test("a\nb", "a.b", "s"))

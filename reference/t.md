@@ -53,7 +53,19 @@ Bonjour, Ada !
   and `"0x1"`, `"Infinity"` and full-width digits are not numbers, on either side, and
   take `other`.
 - A key missing in the locale falls back to the default locale's text.
-- `raw(t(...))` escapes the values but not the translation.
+- `raw(t(...))` escapes the values but not the translation. A key no locale has shows as
+  itself, and in that form as text, escaped, so `` raw(t(`flash.${msg}`)) `` with a `msg`
+  from the request shows a visitor's `<script>` as text *(since 0.8.9: it was put into the
+  page as HTML)*.
+- In that form, an attribute of the translation's markup that takes a URL (`href`, `src`,
+  `action` and the like) and holds a value is `about:blank#blocked` where what is written
+  there makes a `javascript:` or `vbscript:` URL once the values are put in, as in markup;
+  the same value as text shows as written. An attribute written without quotes that holds
+  a value (`<a href={url}>`) is quoted, so the value cannot end it *(since 0.8.9:
+  `raw(t("site", { url }))` took a visitor's `javascript:` link as it was)*.
+- A page's components load only the keys their code can ask for; a key in `raw(t(...))`
+  counts as one in `t(...)` *(since 0.8.9: it was left out, and the page showed the key
+  itself once its components took over)*.
 
 ```quillo
 translations({
@@ -82,6 +94,22 @@ English only
 Welcome, <b>&lt;i&gt;Ada&lt;/i&gt;</b>
 ["1 item", "1.0 items", "1.0 items", "no items", "0.0 items", "1e3 items", "0x1 items"]
 ["1.5 article", "0.5 article", "2 articles"]
+```
+
+```quillo
+translations({ en: { site: "Visit <a href=\"{url}\">{name}</a>", bare: "<a href={url}>go</a>" } })
+let msg = "<script>alert(1)</script>"
+print(raw(t(`flash.${msg}`)))
+print(raw(t("site", { url: "javascript:alert(1)", name: "my site" })))
+print(raw(t("site", { url: "https://example.com/", name: "JavaScript: The Good Parts" })))
+print(raw(t("bare", { url: "x onmouseover=alert(1)" })))
+```
+
+```output
+flash.&lt;script&gt;alert(1)&lt;/script&gt;
+Visit <a href="about:blank#blocked">my site</a>
+Visit <a href="https://example.com/">JavaScript: The Good Parts</a>
+<a href="x onmouseover=alert(1)">go</a>
 ```
 
 ### Errors
