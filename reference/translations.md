@@ -47,6 +47,13 @@ translations("locales", { default: "fr" })
   start, as Windows editors save one, is skipped.
 - Plural forms are picked by CLDR 47's rules for the number as `{count}` shows it, the
   same on the server and in the browser (see [t](/docs/reference/t/)).
+- A text that holds a value (`{name}`) may hold plain HTML only: a text with a value and a
+  comment, `<!...>`, `<?...>`, `</` without a tag name, or `<script>`, `<style>`, `<xmp>`,
+  `<iframe>`, `<noembed>`, `<noframes>`, `<noscript>`, `<title>`, `<textarea>`,
+  `<plaintext>`, `<template>`, `<svg>` or `<math>` stops the program at start
+  (``translation `k` (de): a text with a value may hold plain HTML only, not `<svg>`: put
+  that markup in the component around `t(...)` ``); a text without a value is not looked at
+  *(since 0.8.9)*.
 - It gives `null`.
 
 ```quillo

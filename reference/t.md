@@ -63,6 +63,13 @@ Bonjour, Ada !
   the same value as text shows as written. An attribute written without quotes that holds
   a value (`<a href={url}>`) is quoted, so the value cannot end it *(since 0.8.9:
   `raw(t("site", { url }))` took a visitor's `javascript:` link as it was)*.
+- A text that holds a value may hold plain HTML only: [`translations`](/docs/reference/translations/)
+  refuses one with a comment, `<!...>`, `<?...>`, `<script>`, `<style>`, `<title>`,
+  `<textarea>`, `<iframe>`, `<template>`, `<svg>`, `<math>` and the like; in plain HTML a value
+  makes no tag after a `<` that starts none (`Must be <{max}`), no character reference after
+  a `&`, and nothing in a tag's or an attribute's name; an `on...` attribute or `srcdoc` that
+  holds a value is written empty, and an SVG animation's values are checked as in templates
+  *(since 0.8.9)*.
 - A page's components load only the keys their code can ask for; a key in `raw(t(...))`
   counts as one in `t(...)` *(since 0.8.9: it was left out, and the page showed the key
   itself once its components took over)*.
