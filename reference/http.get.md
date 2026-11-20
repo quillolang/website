@@ -6,7 +6,8 @@ group: HTTP client
 
 Fetches a URL with GET and gives the answer as a map `{ status, ok, headers, body,
 json }`: `ok` is true for a 2xx status, `headers` has its names in lower case, `body`
-is the text (bytes that are not UTF-8 replaced, cut at 64 MiB) and `json` is the body
+is the text (bytes that are not UTF-8 replaced; a body longer than 64 MiB is an error
+value that says to read it with `http.stream`, *since 0.7*) and `json` is the body
 parsed as JSON, or null. A header the server sent more than once is one value, joined
 with `, `; `set-cookie`, which cannot be joined so, has its lines joined by a line break,
 and each one is also in `cookies`, a list. The second argument is a map of request
