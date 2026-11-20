@@ -50,8 +50,8 @@ err("http: not an http(s) URL: not a url")
   `ok` false.
 - A method other than `GET`, `HEAD` or `OPTIONS` stops a [prefetch](/docs/prefetching/),
   as `http.post` does *(since 0.8.9: it was sent, as the visitor)*. `quillo check` warns of
-  it in a `GET` route that reads who the visitor is, and of a method a `let` holds too
-  *(since 0.8.9)*.
+  it in a `GET` route that reads who the visitor is, and *(since 0.8.9)* of a method a
+  `let` holds too.
 - `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
   `upgrade` in the headers are left out: the client writes them from the body it sends, as
   `fetch` does *(since 0.8.9: `content-length` was sent as given, against a body of

@@ -1249,8 +1249,9 @@ quillo run main.qwe --trust-proxy 127.0.0.1 \
   addresses --trust-proxy names: give --trust-proxy too (any visitor can send that
   header)`). The proxy must set the header in place of any the visitor sent: each field is
   null where its header is missing, came from another address, or is not one value the proxy
-  set (several elements of a certificate's header, several lines, a value with a comma in it,
-  as a proxy that appends puts the visitor's first). The log says why, once. Keep Quillo
+  set (several elements of a certificate's header, several lines, or, for `--user-header`, a
+  value with a comma in it, as a proxy that appends puts the visitor's first; a subject's own
+  commas, `CN=Ada,OU=Staff`, are its parts). The log says why, once. Keep Quillo
   where only the proxy reaches it: on its default `--host`, 127.0.0.1. On a machine others
   share, `--listen unix:app.sock --socket-mode 660 --trust-proxy 127.0.0.1` keeps out other
   users' programs too.

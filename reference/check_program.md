@@ -73,7 +73,7 @@ err("check_program: path must stay inside the program's folder: ../y.qwe")
 ["only Quillo files are read (.qwe, and a plugin's .qwer or .rs for `use`), none whose name or folder starts with a dot: .env"]
 ```
 
-A function whose result grows by a map on each of 1,600 lines passes the budget:
+A function whose result grows by a map on each of 1,600 lines goes past the budget:
 
 ```quillo
 let lines = ["fn grow(c: bool) {", "    let x0 = { a0: 1 }"]

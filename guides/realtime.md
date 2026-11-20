@@ -363,8 +363,9 @@ RTP, lets its ports go for another stream to take, and tells its pages, whose `d
 turns `ended`. It gives true if there was such a stream. Code run for a page or a
 request ends its tenant's stream; a job, a tick or the top level, every tenant's of that
 name. A room made while the program runs needs a `watch` too, for its name or a name
-ending in `*`, which checks the name:
-`media.on("room:*", { watch: (peer, name) => may_watch(name) })`.
+ending in `*`, which checks the name and who asks:
+`media.on("room:*", { watch: (peer, name) => member(name, peer.session.user) })`, where
+`member` is the program's own function that looks the person up in the room's members.
 
 ### Which way a page connects
 

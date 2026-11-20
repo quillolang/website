@@ -178,8 +178,8 @@ session alone:
   *(since 0.8.9)*. Elsewhere it is caught at the next page of the site.
 - A kept page whose `content-security-policy` would stop the script that shows it to its
   session alone (a `sandbox` without `allow-scripts`), or keep it from reading `quillo_tag`
-  (a `sandbox` without `allow-same-origin`), is not given back at all *(since 0.8.9: under
-  `sandbox allow-scripts` the page showed to the next person on the device)*.
+  (a `sandbox` without `allow-same-origin`, *since 0.8.9*: under `sandbox allow-scripts` the
+  page showed to the next person on the device), is not given back at all.
 - A page that reads the visitor another way (a cookie of the program's own, a header) is
   not kept, and `quillo check` says which route. Nor is a page holding a form that must
   not be sent twice, one with waiting parts (`defer`), or an answer that changed the

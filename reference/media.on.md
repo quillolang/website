@@ -74,7 +74,7 @@ component Call(room: str, me: str, others: list) {
 media.on("lobby")                                           // no page may send or watch "lobby"
 media.on("desk:*", {
     publish: (peer, name) => peer.session.role == "agent" && name == `desk:${peer.session.user}`,
-    watch: (peer, name) => name == `desk:${peer.session.agent}`,   // the visitor's own agent
+    watch: (peer, name) => peer.session.agent != null && name == `desk:${peer.session.agent}`,   // the visitor's own agent
 })
 media.on("town-hall", {                                     // one stream for every tenant
     publish: (peer) => peer.session.role == "host",
@@ -149,7 +149,7 @@ fn on_stage(name: str) = db.one("select 1 as yes from stage where stream = ?", n
 media.rtp("hall", { video: 5004, audio: 5006 })
 media.on("hall", { watch: (peer) => peer.session.ticket != null })
 media.on("questions:*", {
-    publish: (peer, name) => name == `questions:${peer.session.ticket}`,       // a ticket holder sends their own
+    publish: (peer, name) => peer.session.ticket != null && name == `questions:${peer.session.ticket}`,   // a ticket holder sends their own
     watch: (peer, name) => peer.session.ticket != null && on_stage(name),      // and watches those put on stage
 })
 ```

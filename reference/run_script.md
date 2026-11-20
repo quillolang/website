@@ -1,5 +1,5 @@
 # run_script
-run_script(str, map | null=) -> any
+run_script(str, map | null=, map | null=) -> any
 group: Files and processes
 
 ### What it does
