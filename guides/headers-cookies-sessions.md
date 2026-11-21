@@ -296,10 +296,10 @@ HMAC-SHA256. The browser holds it and sends it back; it can read it, so keep sec
 out, but it cannot change it, since the signature would no longer match.
 
 ```quillo
-route POST /login { form: { email: str, password: str } } with db, random {
+route POST /login { form: { email: str, password: str } } with db {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")   // same work, user or not
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)   // as long for a stranger's null
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id })
     redirect("/")
 }
@@ -356,8 +356,8 @@ is set on the answer to the call, and the pages the visitor opens next carry it.
 ```quillo
 server fn sign_in(email: str, password: str) -> map {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")
-    if user == null || !crypto.verify_password(password, hash) { return err("Wrong email or password") }
+    let ok = crypto.verify_password(password, user.password_hash)
+    if user == null || !ok { return err("Wrong email or password") }
     set_session({ user: user.id })
     { name: user.name }
 }
@@ -535,10 +535,10 @@ route GET /login ? { next: str = "/" } =
         </form>
     </Page>
 
-route POST /login { form: { email: str, password: str, next: str = "/" } } with db, random, time {
+route POST /login { form: { email: str, password: str, next: str = "/" } } with db, time {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id, at: now() })
     redirect(local(next))
 }

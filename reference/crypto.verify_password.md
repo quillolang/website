@@ -7,9 +7,12 @@ group: Crypto
 Whether a password matches a hash made by
 [crypto.hash_password](/docs/reference/crypto.hash_password/): the password first, the
 hash second. False for a wrong password, and false for anything that is not such a hash,
-`null` included, so a user with no hash stored never gets in. It takes as long either
-way (a stand-in hash is checked when there is none), so an unknown email answers no
-sooner than a known one with a wrong password.
+`null` included, so a user with no hash stored never gets in. It does its whole work
+for a null hash, or text that is no hash, and takes as long as for a real one *(since
+0.8.10: a `$scrypt$` hash or a broken `$argon2id$` one was answered at once)*, so an
+unknown email answers no sooner than a known one with a wrong password. A null check
+before it, `if user == null || ...`, skips that work for a stranger: verify every time,
+then decide.
 
 ### Examples
 

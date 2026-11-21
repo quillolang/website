@@ -34,8 +34,8 @@ print(redirect("https://example.com/", 301).status)
 ```quillo noexec
 route POST /login { form: { email: str, password: str } } {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id })
     redirect("/")
 }

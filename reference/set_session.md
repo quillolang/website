@@ -26,8 +26,8 @@ route GET /login =
 
 route POST /login { form: { email: str, password: str } } {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")   // same work, user or not
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)   // as long for a stranger's null
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id })
     redirect("/")
 }
