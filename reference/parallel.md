@@ -58,7 +58,7 @@ component Account(id: int) {
 - In a component it may be called from an event handler or as a `state` initializer
   (on the server while rendering, in the browser on navigation). In a `let` of the
   component it is refused when the program loads: `` `parallel` waits on the server, so a
-  component can only call it from an event handler (@click={() => { ... }}) or to set
+  component can only call it from an event handler (onclick={() => { ... }}) or to set
   state: state x = parallel(...) ``.
 - `quillo check` does not look at the arguments (`any...`): a value that is not a
   function is found when the call runs.

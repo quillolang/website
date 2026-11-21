@@ -67,7 +67,7 @@ print(notification.ask())
 ```
 
 ```output
-line 1: `notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`@click`); the server sends with `notification.send(user, { title, body, url })`
+line 1: `notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`onclick`); the server sends with `notification.send(user, { title, body, url })`
 ```
 
 ### See also

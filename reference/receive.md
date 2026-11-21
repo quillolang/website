@@ -49,7 +49,7 @@ component Chat() {
   `receive` runs once the stream has ended.
 - It is called from an event handler or `@mount`, where code can wait. In the
   component's own code it is refused when the program loads: `` `receive` waits on the
-  server, so a component can only call it from an event handler (@click={() => { ... }})
+  server, so a component can only call it from an event handler (onclick={() => { ... }})
   or to set state: state x = receive(...) ``. A stream the component should follow by
   itself is `listen`.
 - On the server it sends nothing and gives `null`.

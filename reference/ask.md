@@ -49,7 +49,7 @@ component Note(id: int, text: str) {
   for you.
 - Where it may be called: an event handler or `@mount`, where code can wait. In a
   `let` of the component it is refused when the program loads (`` `ask` waits on the
-  server, so a component can only call it from an event handler (@click={() => { ... }})
+  server, so a component can only call it from an event handler (onclick={() => { ... }})
   or to set state: state x = ask(...) ``). As a `state` initializer it passes the load
   but fails while the server renders the component (a 500), since initializers run on
   the server.
