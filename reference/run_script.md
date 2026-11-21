@@ -7,8 +7,10 @@ group: Files and processes
 Runs Quillo code written by the program's users (a rule on a form's field, who may see a
 record) on the server, in a sandbox, and gives its last expression's value, or an error
 value saying what went wrong. The script sees the values in the map and Quillo's own
-builtins that only compute (`len`, `upper`, `map`, `filter`, `date.parse`, ...), never
-the program's functions of those names *(since 0.7: a program's `fn upper` was the
+builtins that only compute (`len`, `upper`, `map`, `filter`, `date.parse`, ...), with the
+modules `math`, `stats`, `re`, `bit` and `date` (without its clock), `dec` and
+`format_number`, and spreads (`[...xs, 4]`, `{ ...m }`) *(since 0.8.10)*, never the
+program's functions of those names *(since 0.7: a program's `fn upper` was the
 script's `upper`, run with the program's effects)*. It cannot read files, the
 environment or the database, define functions, routes or state, `use` files, or reply,
 and it gives back no function it made *(since 0.7)*. It stops after 20,000 steps, or
@@ -34,11 +36,21 @@ ANN
 ### Edge cases
 
 - The map is optional; `null` means no values. An empty script gives `null`.
-- Effects are out of reach: `env`, `read_file`, `db`, `now`, `random` are unknown names
-  in a script, and `date` has no clock (`date.parse` works, `date.today` does not).
-  A builtin passed in the map still cannot run (`env` needs the env effect).
+- Effects are out of reach: `env`, `read_file`, `db`, `now` and `random` are not there,
+  nor `range` and `vec`, which can make a huge value from a small one, and the error says
+  so *(since 0.8.10: it was an `unknown name`)*. `date` has no clock (`date.parse` works,
+  `date.today` does not). A builtin passed in the map still cannot run (`env` needs the
+  env effect).
 - A function of the program passed in the map runs as the program's, with what the
   program may do: that is how a script asks for more.
+- A function the script makes may be given to one of the program's and called back while
+  the script runs: it runs as the script's, with no effects, its steps and time counted
+  against the script's. Once the script has ended, calling it anywhere (kept in a
+  variable, called from a tick) gives the error value `a script's function runs only while
+  its script does` *(since 0.8.10: it ran past the script's limits)*. Test what it gives
+  with `is_err`, as `if !deny(x)` reads that error as false.
+- Trusted CSS (`` css`...` ``) does not pass through a script: in the map, from a helper,
+  and in what the script gives back, it is plain text.
 - A runaway script is an error value, not a hang: too many steps, a value over 1 MB, or
   past its time.
 - Each KB a builtin or a comparison reads costs a step, as each KB the script makes does,
@@ -49,7 +61,8 @@ ANN
   143-byte script held its instance for 13 s)*.
 - `timeout` is milliseconds (`250`) or text (`"250ms"`, `"2s"`), from 1 ms to 60 s; past
   it the script is the error value `the script took longer than its 100 ms` (or the time
-  given). A helper of the program's that waits (a query) counts in that time, and a script
+  given). The time starts once the script's builtins are ready, so reading its source
+  counts. A helper of the program's that waits (a query) counts in that time, and a script
   run inside another ends by the outer one's time. `--max-compute` still ends the whole
   request, script and all.
 - A name in its error is cut at 100 characters (``int has no method `aaaa…` ``), and the
@@ -78,8 +91,8 @@ print(run_script("route GET / = 1"), run_script("reply 400 \"no\""), run_script(
 
 ```output
 3 3 null
-err("line 1: unknown name `env`") err("line 1: unknown name `db`")
-2026-10-29 err("line 1: unknown name `now`")
+err("line 1: `env` is not available in a script: a script has only the builtins the guide lists for `run_script`, which reach nothing outside it: no database, files, network, clock, randomness, sessions or replies") err("line 1: `db` is not available in a script: a script has only the builtins the guide lists for `run_script`, which reach nothing outside it: no database, files, network, clock, randomness, sessions or replies")
+2026-10-29 err("line 1: `now` is not available in a script: a script has only the builtins the guide lists for `run_script`, which reach nothing outside it: no database, files, network, clock, randomness, sessions or replies")
 err("line 1: `env` needs the env effect, which is not allowed here")
 false
 err("line 2: the script took too many steps")
@@ -118,6 +131,24 @@ print(run_script("(n) => n + 1"))
 ```output
 ANN the program's
 err("a script gives back no function (it would run without the script's limits): give back what it computes")
+```
+
+The modules that only compute are there, and a function the script made works only while
+its script runs:
+
+```quillo
+print(run_script("format_number(stats.mean(xs), \"de-DE\", 2)", { xs: [1, 2, 4] }))
+print(run_script("[...xs, 4]", { xs: [1, 2, 3] }), run_script("range(3)"))
+let kept = []
+print(run_script("keep((x) => x * 2)", { keep: (f) => { kept = push(kept, f); f(21) } }))
+print(kept[0](5), is_err(kept[0](5)))
+```
+
+```output
+2,33
+[1, 2, 3, 4] err("line 1: `range` is not available in a script: it can make a huge value from a small one")
+42
+err("a script's function runs only while its script does") true
 ```
 
 ### Errors

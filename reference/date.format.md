@@ -15,8 +15,10 @@ English, German, French, Spanish, Italian, Dutch and Portuguese, and the regions
 styles CLDR gives their own: `en-GB`, `en-CA` (`2026-09-05` short), `en-IE`, `en-AU`,
 `en-NZ`, `en-IN`, `en-ZA`, `de-AT` (`Jänner`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`,
 `nl-BE` and `pt-PT`, the same on the server and in the browser, names in a pattern too.
-Another region takes its language's (`de-CH` is German's), and any other language is
-English.
+Another region takes its language's (`de-CH` is German's), and any other language gives
+English, with a warning in the log (in the browser's console) once for each locale, as
+`format_number` gives one (`quillo: warning: no date data for locale "ja-JP": written in
+English`) *(since 0.8.10: English in silence)*.
 
 ### Examples
 
@@ -43,8 +45,8 @@ mardi 27 octobre 2026
   with words that hold `D`, `M`, `H` or `A`.
 - Tokens are read longest first: `MMMMM` is `MMMM` then `M`.
 - A locale's case and separator do not matter (`DE_de`); an unknown locale is
-  English; a language without a region (`de`) uses the language's forms, and `pt-BR`
-  is Portuguese.
+  English, with the warning once; a language without a region (`de`) uses the
+  language's forms, and `pt-BR` is Portuguese.
 - `pattern` wins over `style` when both are given; an empty map is the medium English
   style.
 

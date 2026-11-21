@@ -41,7 +41,13 @@ null
   written as `len(problems()) == 0` gives a boolean, which is what is wanted.
 - Adding a check with the name of an earlier one replaces it.
 - `/_quillo/health` is not affected: it says only whether the process is up. Neither
-  request is logged or counted.
+  request is logged or counted (a route of the program's own at a path ending in
+  `/_quillo/ready` is) *(since 0.8.10: each probe was logged and counted)*.
+- With a database per tenant, the database is `"ready (per tenant)"` when a tenant can be
+  opened: the tenants' folder can be written, or their server answers (MySQL by a real
+  login), and no database is opened or made to ask. A server's URL the driver would
+  refuse (a port that is no number) is `"down"`, its reason written once to stderr
+  *(since 0.8.10: it was `"down"` whatever, so such an app was never ready)*.
 - Under a mount or `--base` (the `quillo run` option that serves the program under a
   path: `quillo run main.qwe --base /shop`; see [the options](/docs/)), `/shop/_quillo/ready` asks
   the mounted program.

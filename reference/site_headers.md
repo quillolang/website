@@ -10,7 +10,8 @@ for the answers under a path, `site_headers("/admin", { "cache-control": "no-sto
 A longer path's rule wins over a shorter one's, and a route's own header (from
 `respond`) over both. A null value takes away a header Quillo sends by itself:
 `site_headers("/embed", { "x-frame-options": null })` lets other sites frame those
-pages. It gives null.
+pages, and `"server": null` takes away `server: Quillo`, which a text replaces (a route's
+own `server` still wins) *(since 0.8.10: `server: Quillo` stayed)*. It gives null.
 
 Quillo's own: every HTML page gets `X-Frame-Options: SAMEORIGIN` unless the route or a
 `Content-Security-Policy` with `frame-ancestors` says otherwise, and an answer made from
@@ -42,7 +43,8 @@ null null
 - Names are lower case on the wire; a value may be text, a number or a truth, on one
   line.
 - `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
-  belong to each answer, and are refused here.
+  belong to each answer, and are refused here. So is `x-quillo-marked`, in any spelling,
+  which is Quillo's own *(since 0.8.10)*.
 - A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in any
   form a browser reads, as `redirect` and `respond` refuse it, naming the scheme given.
 - They reach the answers of a program it mounts, and of a service it serves under a

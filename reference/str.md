@@ -12,10 +12,12 @@ into a template or a message.
 
 On a server, an error Quillo made reads `err("internal error")` here, and its text goes to the
 log: it may hold an address with its password. `print` and `error(r)` have the text. In
-a page in production the browser hides it the same way, in text, a template, markup or
-an attribute, so a component made again in the browser shows no more than the server's
-page did; an error the program wrote, a `server fn`'s and the page's own JavaScript's
-are shown as they are.
+a page in production the browser hides it the same way, in text or a template, so a
+component made again in the browser shows no more than the server's page did; an error
+the program wrote, a `server fn`'s and the page's own JavaScript's are made into text as
+they are. Shown in markup (a child, an attribute, a class), any error value shows nothing,
+on the server and in the browser, and the log says so *(since 0.8.10: it showed
+`err("...")`)*: give it a fallback with `??`, or show its words with `error(r)`.
 
 ### Examples
 

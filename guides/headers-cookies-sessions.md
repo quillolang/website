@@ -130,9 +130,10 @@ route GET /log = stream((out) => { for line in tail_log() { out(line) } },
   A list is one header per item for `set-cookie` alone (`{ "set-cookie": ["a=1", "b=2"]
   }` sends two), and an error for any other header, as a map is.
 - `content-length`, `transfer-encoding`, `connection` and `date` are the server's,
-  whatever is given. `server: Quillo` is sent unless the route sets `server` (`null`
-  for none); `x-request-id` and `x-content-type-options: nosniff` are added unless the
-  route names them.
+  whatever is given. `server: Quillo` is sent unless the route or `site_headers` sets
+  `server` (`null` for none, a text in its place; the route's own wins) *(since 0.8.10:
+  `site_headers` could not take it away)*; `x-request-id` and
+  `x-content-type-options: nosniff` are added unless the route names them.
 - A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in
   `respond`, `stream`, `events` and `site_headers` as in `redirect`.
 - `stream` and `events` refuse a status that has no body (204, 205, 304), so no
