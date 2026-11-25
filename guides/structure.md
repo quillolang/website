@@ -353,8 +353,11 @@ network can reach the program.
 | `migrations/` | SQL files, run in order, once | `db.migrate("migrations")` ([Database](/docs/database/)) |
 | `locales/` | `en.json`, `fr.json`, ... | `translations("locales")` |
 | `public/` | Images, fonts, CSS | `route GET /assets/*path = files("public", path)` |
+| `quillo.confirmed` | What each file may reach, as you confirmed it (`quillo confirm`); commit it | every start, `quillo check` ([What a program reaches](/docs/concurrency-and-reloading/#what-a-program-reaches)) |
+| `quillo.policy` | What the host or the repository holds the program to | every start ([Hosting](/docs/hosting/)) |
+| `.quillo/` | Quillo's own: built plugins, `plugins.lock`, keys; no part of a program writes it | Quillo |
 
-`files` serves a folder by the visitor's path, but not `.env`, `.git/`, the program's
-own files or a SQLite database, under any name. `file("public/" + path)` serves
+`files` serves a folder by the visitor's path, but not `.env`, `.git/`, `.quillo`, the
+program's own files or a SQLite database, under any name. `file("public/" + path)` serves
 whatever file it is given, `.env` and `main.qwe` included *(this guide's example until
 0.7)*, and `quillo check` warns about it. See [files](/docs/reference/files/) and [file](/docs/reference/file/).
