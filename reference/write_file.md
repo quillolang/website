@@ -69,7 +69,7 @@ null null second
 null 42
 null { a: 1, b: [1, 2] }
 null 4
-err("write_file: path must stay inside the program's folder: ../x.txt") err("write_file: path must stay inside the program's folder: ")
+err("write_file: path must stay inside the program's folder: ../x.txt; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program write it") err("write_file: path must stay inside the program's folder: ")
 err("write_file: will not write .ENV: it is the program's settings (.env)")
 err("write_file: will not write MAIN.QWE: it is one of the program's own files") err("write_file: will not write main.qwe.: it is one of the program's own files")
 ```
@@ -85,7 +85,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true write_file: path must stay inside the program's folder: /tmp/x.txt
+true write_file: path must stay inside the program's folder: /tmp/x.txt; `--allow-path /tmp` (on `quillo run` or `quillo mcp`) lets the program write it
 ```
 
 ```quillo error

@@ -1,5 +1,5 @@
 # navigate
-navigate(str) -> null
+navigate(str, map | null=) -> null
 group: Browser
 
 ### What it does
@@ -12,6 +12,13 @@ element of the same page, and `"/page#spot"` to the spot once the new page shows
 A `javascript:` or `vbscript:` URL is an error, in the browser and on the server
 *(since 0.7)*. It gives `null`; on the server it does nothing, since there is no page to
 move.
+
+`navigate(path, { replace, scroll })` *(since 0.8.11)*: `replace: true` takes the place of
+the current history entry instead of adding one, and `scroll: false` stays where the page
+is. Back and Forward give each page its scroll back, once the page is long enough again.
+After a move to another path, focus goes to the new page's `<main>`, else its first `<h1>`,
+and the new title is said to a screen reader; never while a field has focus, so a search
+box that navigates as it is typed in keeps it.
 
 ### Examples
 

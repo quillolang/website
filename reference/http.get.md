@@ -157,7 +157,7 @@ print(http.get("http://127.0.0.1:9/", {}, { timout: 5 }))
 ```
 
 ```output
-line 1: `http.get`: unknown option `timout` (the options are redirects, public_only, cache, timeout, ca, cert, key)
+line 1: `http.get`: unknown option `timout` (the options are redirects, public_only, cache, timeout, ca, cert, key, save, max_bytes)
 ```
 
 ```quillo error

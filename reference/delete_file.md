@@ -52,7 +52,7 @@ print(delete_file("../x"), delete_file("/tmp/x"))
 null null
 null gone
 err("delete_file: path must be inside the program's folder: .") err("delete_file: path must be inside the program's folder: ")
-err("delete_file: path must be inside the program's folder: ../x") err("delete_file: path must be inside the program's folder: /tmp/x")
+err("delete_file: path must be inside the program's folder: ../x; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program delete it") err("delete_file: path must be inside the program's folder: /tmp/x; `--allow-path /tmp` (on `quillo run` or `quillo mcp`) lets the program delete it")
 ```
 
 ### Errors
@@ -66,7 +66,7 @@ print(is_err(r), r.error)
 ```
 
 ```output
-true delete_file: path must be inside the program's folder: ..
+true delete_file: path must be inside the program's folder: ..; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program delete it
 ```
 
 ```quillo

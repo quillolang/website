@@ -60,7 +60,7 @@ print(read_file("u.txt"), len(read_file("u.txt")))
 
 ```output
 err("read_file: missing.txt: No such file or directory (os error 2)")
-err("read_file: path must stay inside the program's folder: ../secret.txt") err("read_file: path must stay inside the program's folder: /etc/hosts") err("read_file: path must stay inside the program's folder: ")
+err("read_file: path must stay inside the program's folder: ../secret.txt; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program read it") err("read_file: path must stay inside the program's folder: /etc/hosts; `--allow-path /etc` (on `quillo run` or `quillo mcp`) lets the program read it") err("read_file: path must stay inside the program's folder: ")
 err("read_file: notes: Is a directory (os error 21)")
 42 true
 true
