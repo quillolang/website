@@ -490,6 +490,10 @@ Calls made later (`_quillo_later`, see
 others go, in the program's database or the tenant's, so they commit or roll back with it.
 With a database per tenant, the system database only notes which tenants have some.
 
+*(Since 0.8.12)* On PostgreSQL and MySQL/MariaDB, you can isolate Quillo's own tables under a
+dedicated database role that the program's SQL cannot use or read directly by calling
+[`db.own_setup`](/docs/reference/db.own_setup/) once with `QUILLO_SECRET` set.
+
 ### A database per tenant
 
 One program can serve many tenants (customers, teams, sites), each with a database of
